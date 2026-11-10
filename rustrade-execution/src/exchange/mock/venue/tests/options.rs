@@ -2178,3 +2178,85 @@ fn an_exercised_call_without_the_cash_on_a_margin_venue_borrows_it_and_charges_i
         "the interest follows the delivery's trade: {events:?}"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// Amends: refused for an option order.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn an_option_orders_amend_is_refused_and_changes_nothing() {
+    use crate::order::{
+        amend::{AmendPatch, AmendTarget, RequestAmend},
+        request::OrderRequestAmend,
+    };
+
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    let rested = venue.open_order(limit(option_name(), Side::Buy, "1", "1", "bid"));
+    assert!(rested.response.state.is_accepted());
+    let usd_before = totals(&venue, usd());
+    let order = venue
+        .account
+        .orders()
+        .get(&ClientOrderId::new("bid"))
+        .cloned()
+        .unwrap();
+
+    let outcome = venue.amend_order(OrderRequestAmend {
+        key: order.key.clone(),
+        state: RequestAmend::new(
+            order.state.id.clone(),
+            AmendPatch::default().with_price(d("1.2")),
+            AmendTarget {
+                side: order.side,
+                price: order.price,
+                quantity: order.quantity,
+                kind: order.kind,
+                time_in_force: order.time_in_force,
+                reduce_only: None,
+            },
+            Decimal::ZERO,
+        ),
+    });
+
+    assert!(outcome.events.is_empty());
+    assert!(
+        matches!(
+            outcome.response.state,
+            Err(OrderError::AmendRefused(AmendRefusal::Venue(_)))
+        ),
+        "{:?}",
+        outcome.response.state
+    );
+    assert_eq!(totals(&venue, usd()), usd_before);
+    assert_eq!(
+        venue.account.orders().get(&ClientOrderId::new("bid")),
+        Some(&order)
+    );
+}
+
+/// What a resting sell closes is measured behind the other resting sells, leaving out the one
+/// named: an order costed while it is still on the book does not count against itself.
+#[test]
+fn the_resting_sells_an_order_is_measured_behind_leave_out_the_one_named() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "2");
+    let rested = venue.open_order(limit(option_name(), Side::Sell, "5", "1", "ask"));
+    assert!(rested.response.state.is_accepted());
+    let terms = venue.instrument_terms(&option_name()).unwrap();
+    let position = venue.net_position(&terms, &option_name());
+    assert_eq!(position.quantity, d("2"));
+
+    let behind_all = venue.behind_resting(&terms, &option_name(), Side::Sell, position, None);
+    let behind_others = venue.behind_resting(
+        &terms,
+        &option_name(),
+        Side::Sell,
+        position,
+        Some(&ClientOrderId::new("ask")),
+    );
+
+    assert_eq!(behind_all.quantity, d("1"), "the resting sell of 1 counted");
+    assert_eq!(behind_others.quantity, d("2"), "and left out");
+}

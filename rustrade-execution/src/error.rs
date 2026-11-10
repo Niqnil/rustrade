@@ -678,6 +678,11 @@ pub enum AmendRefusal {
     #[error("the venue still lists the order as it was")]
     NotApplied,
 
+    /// The order is post-only, and its new price would cross the market: amended, it would
+    /// take liquidity rather than rest.
+    #[error("the order is post-only, and its new price would take liquidity")]
+    WouldTakeLiquidity,
+
     /// The venue refused the amend for the order's kind, time in force or instrument, for a
     /// reason the client cannot declare in advance. The message is the venue's or the client's.
     #[error("{0}")]

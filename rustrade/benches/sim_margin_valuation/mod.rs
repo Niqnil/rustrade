@@ -147,6 +147,7 @@ fn venue(instruments: usize, held: usize, liquidation: bool) -> SimulatedVenue {
         fee_asset: None,
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
+        amend: Default::default(),
     };
     let map: FnvHashMap<_, _> = (0..instruments).map(|i| (name(i), spot(i))).collect();
     let mut venue = SimulatedVenue::new_market_driven(&config, map);

@@ -2,7 +2,8 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance, MarginDetails},
     exchange::mock::orders::{
-        AlreadyResting, OpenOrder, OpenOrderEntry, OpenOrders, Reservation, RestingOrder, as_open,
+        AlreadyResting, NotQueued, OpenOrder, OpenOrderEntry, OpenOrders, Rank, Reservation,
+        RestingOrder, as_open,
     },
     margin::MarginEffect,
     order::{
@@ -166,6 +167,26 @@ impl AccountState {
     /// carries it into the order's next reservation: dropped, that charge is never reported.
     pub fn remove_order(&mut self, cid: &ClientOrderId) -> Option<RestingOrder> {
         self.orders_open.remove(cid)
+    }
+
+    /// Replaces the order queued under `order`'s [`ClientOrderId`] with `order`, the same order
+    /// amended, holding `reservation`: see [`OpenOrders::amend`]. Returns the order it replaced,
+    /// with what was held against it.
+    ///
+    /// The caller has already committed `reservation` in place of the replaced one's, and
+    /// reported the replaced reservation's
+    /// [`unreported_interest`](Reservation::unreported_interest) or carried it into
+    /// `reservation`: dropped, that charge is never reported.
+    ///
+    /// # Errors
+    /// [`NotQueued`], as [`OpenOrders::amend`], leaving the book exactly as it was.
+    pub fn amend_order(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        rank: Rank,
+    ) -> Result<RestingOrder, NotQueued> {
+        self.orders_open.amend(order, reservation, rank)
     }
 
     /// Puts `order` on the book holding `reservation`, unless an order is already resting under

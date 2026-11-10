@@ -98,6 +98,23 @@ pub struct RestingOrder {
 #[error("an order is already resting under {}", .0.order.key.cid)]
 pub struct AlreadyResting(pub Box<RestingOrder>);
 
+/// An amend [`OpenOrders::amend`] refused, because no order is queued under its
+/// [`ClientOrderId`]: none rests under it, or the one that does is held or has no price.
+///
+/// Holds the refused order and its reservation, untouched, as [`AlreadyResting`] does.
+#[derive(Debug, Clone, Error)]
+#[error("no order is queued under {}", .0.order.key.cid)]
+pub struct NotQueued(pub Box<RestingOrder>);
+
+/// What an amend does to an order's place in its queue: see [`OpenOrders::amend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rank {
+    /// It keeps its place: only its quantity was lowered.
+    Kept,
+    /// It goes behind every order already queued at its new price, as if it arrived now.
+    Lost,
+}
+
 /// One order's place in one side of one instrument's queue.
 ///
 /// Ordered so that a [`BTreeMap`]'s ascending iteration is **best first** for the side it belongs
@@ -262,19 +279,96 @@ impl OpenOrders {
             self.expiries.insert((expiry, cid.clone()));
         }
 
-        if let Some(price) = order.price.filter(|_| queue) {
-            self.seq += 1;
-            self.queues
-                .entry((order.key.instrument.clone(), order.side))
-                .or_default()
-                .insert(
-                    QueuePosition::new(order.side, price, order.state.time_exchange, self.seq),
-                    cid,
-                );
+        if queue {
+            Self::enqueue(&mut self.queues, &mut self.seq, &order);
         }
 
         vacant.insert(RestingOrder { order, reservation });
         Ok(())
+    }
+
+    /// Files `order` behind everything already queued at its price and instant, if it has a
+    /// price. Takes the two fields it writes rather than `self`, so a caller holding a borrow of
+    /// [`by_id`](Self::by_id) can still call it.
+    fn enqueue(
+        queues: &mut FnvHashMap<
+            (InstrumentNameExchange, Side),
+            BTreeMap<QueuePosition, ClientOrderId>,
+        >,
+        seq: &mut u64,
+        order: &OpenOrder,
+    ) {
+        let Some(price) = order.price else {
+            return;
+        };
+        *seq += 1;
+        queues
+            .entry((order.key.instrument.clone(), order.side))
+            .or_default()
+            .insert(
+                QueuePosition::new(order.side, price, order.state.time_exchange, *seq),
+                order.key.cid.clone(),
+            );
+    }
+
+    /// Replaces the order queued under `order`'s [`ClientOrderId`] with `order`, holding
+    /// `reservation` against it, and returns the order it replaced with what was held against
+    /// that.
+    ///
+    /// `order` is the same order amended: its key, side, kind and time in force are the queued
+    /// order's, and only its price, quantity and state differ. Its deadline is therefore the
+    /// same, and stays indexed.
+    ///
+    /// - [`Rank::Kept`] leaves it where it was in its queue. Its price and
+    ///   [`Open::time_exchange`] must be the queued order's: they are where it was filed.
+    /// - [`Rank::Lost`] files it behind every order queued at its price and
+    ///   [`Open::time_exchange`], as [`insert`](Self::insert) files an arriving order.
+    ///
+    /// # Errors
+    /// [`NotQueued`], carrying `order` and `reservation` back untouched, if no order is queued
+    /// under its id: none rests there, or the one that does is held, or has no price. The book is
+    /// left exactly as it was.
+    ///
+    /// # Panics
+    /// If `order` is not the queued order amended (another side, kind or time in force), or if
+    /// [`Rank::Kept`] is asked for with another price or [`Open::time_exchange`]. Either would
+    /// leave the order filed in its queue under terms its entry no longer has.
+    pub fn amend(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        rank: Rank,
+    ) -> Result<RestingOrder, NotQueued> {
+        let cid = order.key.cid.clone();
+        if !self.is_queued(&cid) {
+            return Err(NotQueued(Box::new(RestingOrder { order, reservation })));
+        }
+        let Some(replaced) = self.by_id.remove(&cid) else {
+            unreachable!("OpenOrders found {cid} queued, which only an order in by_id is");
+        };
+        let before = &replaced.order;
+        assert!(
+            before.key == order.key
+                && before.side == order.side
+                && before.kind == order.kind
+                && before.time_in_force == order.time_in_force,
+            "OpenOrders amended {cid} into a different order: only its price, quantity and state \
+             may change"
+        );
+        match rank {
+            Rank::Kept => assert!(
+                before.price == order.price
+                    && before.state.time_exchange == order.state.time_exchange,
+                "OpenOrders kept {cid}'s queue position while moving its price or arrival, which \
+                 is where that position is filed"
+            ),
+            Rank::Lost => {
+                self.dequeue(before);
+                Self::enqueue(&mut self.queues, &mut self.seq, &order);
+            }
+        }
+        self.by_id.insert(cid, RestingOrder { order, reservation });
+        Ok(replaced)
     }
 
     /// Holds `order` until its venue releases it, with `reservation` held against it: a market
@@ -340,6 +434,19 @@ impl OpenOrders {
     /// Whether an order is resting under `cid`.
     pub fn contains(&self, cid: &ClientOrderId) -> bool {
         self.by_id.contains_key(cid)
+    }
+
+    /// Whether the order resting under `cid` is on its price-time queue, where matching reaches
+    /// it: it has a price, and is not held. See the type's note on held orders.
+    pub fn is_queued(&self, cid: &ClientOrderId) -> bool {
+        self.by_id
+            .get(cid)
+            .is_some_and(|resting| resting.order.price.is_some() && !self.unqueued.contains(cid))
+    }
+
+    /// The order resting under `cid`, with what is held against it.
+    pub fn resting_order(&self, cid: &ClientOrderId) -> Option<&RestingOrder> {
+        self.by_id.get(cid)
     }
 
     /// Removes and returns the order held under `cid`, with whatever is held against it.
@@ -966,6 +1073,15 @@ mod tests {
         let mut held_limit = order("held_limit", Side::Sell, Some(dec!(104)), 4_500);
         held_limit.key.instrument = instrument();
         open.hold(held_limit, None).unwrap();
+        // Amended to the best price at the best order's instant, behind it by insertion alone.
+        open.insert(order("amended", Side::Buy, Some(dec!(99)), 500), None)
+            .unwrap();
+        open.amend(
+            order("amended", Side::Buy, Some(dec!(101)), 2_000),
+            None,
+            Rank::Lost,
+        )
+        .unwrap();
 
         let entries = open.entries();
         let rebuilt = OpenOrders::from_entries(entries.clone()).unwrap();
@@ -976,7 +1092,7 @@ mod tests {
         }
         assert_eq!(
             resting_cids(&rebuilt, Side::Buy),
-            ["best", "second_cid", "first_cid", "deadline"]
+            ["best", "amended", "second_cid", "first_cid", "deadline"]
         );
         assert_eq!(ids(rebuilt.held()), ids(open.held()));
         assert_eq!(ids(rebuilt.held()), ["held_2", "held_limit", "held_1"]);
@@ -990,6 +1106,106 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["unpriced"]
         );
+    }
+
+    /// The quantity, reservation and state of the order queued under `cid`.
+    fn amended_fields(open: &OpenOrders, cid: &str) -> (Decimal, Option<Reservation>, Open) {
+        let resting = open.resting_order(&ClientOrderId::new(cid)).unwrap();
+        (
+            resting.order.quantity,
+            resting.reservation.clone(),
+            resting.order.state.clone(),
+        )
+    }
+
+    fn reservation(amount: Decimal) -> Reservation {
+        Reservation {
+            asset: AssetNameExchange::new("usdt"),
+            amount,
+            borrowed: Decimal::ZERO,
+            excess_borrowed: Decimal::ZERO,
+            effect: MarginEffect::NoSideEffect,
+            unreported_interest: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_amend_that_keeps_its_rank_keeps_its_place_and_replaces_the_order() {
+        let mut open = book([
+            order("first", Side::Buy, Some(dec!(100)), 1_000),
+            order("second", Side::Buy, Some(dec!(100)), 1_000),
+        ]);
+        let mut smaller = order("first", Side::Buy, Some(dec!(100)), 1_000);
+        smaller.quantity = dec!(0.5);
+        smaller.state.id = VenueOrderId::Assigned(OrderId::new("renamed"));
+
+        let replaced = open
+            .amend(smaller.clone(), Some(reservation(dec!(50))), Rank::Kept)
+            .unwrap();
+
+        assert_eq!(
+            replaced.order,
+            order("first", Side::Buy, Some(dec!(100)), 1_000)
+        );
+        assert_eq!(replaced.reservation, None);
+        assert_eq!(resting_cids(&open, Side::Buy), ["first", "second"]);
+        assert_eq!(
+            amended_fields(&open, "first"),
+            (dec!(0.5), Some(reservation(dec!(50))), smaller.state)
+        );
+        assert_eq!(open.len(), 2);
+    }
+
+    #[test]
+    fn an_amend_that_loses_its_rank_goes_behind_its_new_price() {
+        let mut open = book([
+            order("moved", Side::Buy, Some(dec!(101)), 1_000),
+            order("waiting", Side::Buy, Some(dec!(100)), 2_000),
+            order("later", Side::Buy, Some(dec!(99)), 2_000),
+        ]);
+
+        open.amend(
+            order("moved", Side::Buy, Some(dec!(100)), 2_000),
+            None,
+            Rank::Lost,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resting_cids(&open, Side::Buy),
+            ["waiting", "moved", "later"]
+        );
+        assert_eq!(open.len(), 3);
+        // Taken off its old place, so cancelling it leaves nothing queued behind.
+        open.remove(&ClientOrderId::new("moved")).unwrap();
+        assert_eq!(resting_cids(&open, Side::Buy), ["waiting", "later"]);
+    }
+
+    #[test]
+    fn an_amend_of_an_order_not_queued_is_refused_and_nothing_changes() {
+        let mut open = book([order("queued", Side::Buy, Some(dec!(100)), 1_000)]);
+        open.hold(order("held", Side::Buy, Some(dec!(99)), 1_000), None)
+            .unwrap();
+        open.insert(order("unpriced", Side::Buy, None, 1_000), None)
+            .unwrap();
+
+        for cid in ["missing", "held", "unpriced"] {
+            let amended = order(cid, Side::Buy, Some(dec!(98)), 2_000);
+            let Err(NotQueued(refused)) =
+                open.amend(amended.clone(), Some(reservation(dec!(1))), Rank::Lost)
+            else {
+                panic!("{cid} is not queued");
+            };
+            assert_eq!(refused.order, amended);
+            assert_eq!(refused.reservation, Some(reservation(dec!(1))));
+        }
+        assert_eq!(resting_cids(&open, Side::Buy), ["queued"]);
+        assert_eq!(ids(open.held()), ["held"]);
+        assert_eq!(open.len(), 3);
+        assert!(open.is_queued(&ClientOrderId::new("queued")));
+        assert!(!open.is_queued(&ClientOrderId::new("held")));
+        assert!(!open.is_queued(&ClientOrderId::new("unpriced")));
+        assert!(!open.is_queued(&ClientOrderId::new("missing")));
     }
 
     #[test]

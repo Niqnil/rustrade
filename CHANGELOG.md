@@ -56,9 +56,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     quantity filled, or names a field the order's kind does not have, or when the order has a
     request in flight. Amends are sent after every other request in the same batch, so an amend
     of an order that a cancel in that batch has claimed is refused.
-  - **No venue amends yet.** Every client in the library, and the simulated venue used by
-    `MockExecution` and the backtest runner, declares `AmendSupport::NONE`, so an amend is
-    answered as refused there, never silently dropped.
+  - **Venues:** the simulated venue amends, as below. Every live client in the library still
+    declares `AmendSupport::NONE`, so an amend is answered as refused there, never silently
+    dropped.
+- **The simulated venue amends a resting limit order in place** (`rustrade-execution`,
+  `rustrade`, #892). This covers `MockExecution`, the paper venue and the backtest runner. **By
+  default it now amends, where it refused before.**
+  - **What it amends:** price and total quantity, alone or together. It has no conditional orders,
+    so it never amends a trigger price.
+  - **Queue priority:** the order keeps its place only when its quantity is lowered and its price
+    is left alone. Any other amend moves it behind every order at its new price, and restamps its
+    `Open::time_exchange` with the amend's time. `amend_support` declares
+    `AmendPriority::KeptOnQuantityDecrease`.
+  - **Cost:** the order's hold is released and the amended order costed afresh against the
+    venue's current market, as one change.
+    - A new price that crosses the market trades as a taker, up to the size the market has. The
+      rest stays on the book at the new price, under the same id. The fill is reported under the
+      order's id from before the amend.
+    - An amend the account cannot afford is refused with `ApiError::BalanceInsufficient` (or a
+      borrow limit), and changes nothing.
+    - A margin order keeps its loan and borrows only for what the amend adds. It repays what it no
+      longer needs only where the venue repays on a cancel.
+    - The interest on a new borrow waits for a trade only while the order has traded nothing.
+  - **Refused, changing nothing:**
+    - a post-only order whose new price would cross the market: the new
+      `AmendRefusal::WouldTakeLiquidity`;
+    - with `AmendRefusal::Venue`: an order held for a later bar or a fresh market, an order seeded
+      through `initial_state`, an option order, and, on a market that is stale under
+      `StaleMarketPolicy::Wait`, an amend that reprices the order or would trade (a quantity-only
+      amend of an order the market does not reach is made);
+    - an amend raising a CFD sell, or repricing it through the market, that the configured
+      shortability does not allow, measured with the order's own old quantity left out.
+    - The venue checks an amend against the order as it holds it, not the order its sender
+      tracked.
+    - An amend of an order the venue no longer holds gets the answer a cancel would get, such as
+      `ApiError::OrderAlreadyFullyFilled`, or `OrderAlreadyExpired` once its deadline has passed.
+  - **Configured by the new `MockExecutionConfig::amend`**, an `AmendConfig`:
+    - what may change (`price`, `quantity`, as `AmendAllowed`), and whether both at once
+      (`multi_field`);
+    - whether an amended order gets a new venue order id (`reassign_id`), so a test can exercise
+      `Amended::previous_id`.
+    - The default, `AmendConfig::FULL`, amends both fields and keeps the id. `AmendConfig::NONE`
+      restores the old behaviour.
+    - `AmendConfig::support` gives the `AmendSupport` that `MockExecution` declares. The
+      `rustrade` execution builders take it from the venue's config. A client built by hand
+      must pass the same.
 
 ### Changed
 
@@ -74,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `record_in_flight_amend`; one that tracks no orders can leave its body empty.
   - **The engine's `GenerateAlgoOrders` implementation requires `State: PreparesAmend`.**
     `EngineState` implements it; a custom engine state must implement it too.
+- **Breaking: the simulated venue's configs gain amend fields** (`rustrade-execution`, #892).
+  - `MockExecutionConfig` has an `amend` field. A struct literal must set it
+    (`Default::default()` amends both fields, `AmendConfig::NONE` refuses every amend), and
+    `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads
+    as `AmendConfig::FULL`.
+  - `MockExecutionClientConfig` and `MockExecution` have an `amend_support` field, which the
+    `rustrade` builders fill from the venue's config. Their struct literals and `new`
+    constructors must set it.
 
 ### Fixed
 
