@@ -3120,9 +3120,9 @@ impl SimulatedVenue {
     /// stands, and committed in place of the hold through
     /// [`commit_afresh`](Self::commit_afresh). An order the account cannot afford is refused.
     ///
-    /// A refusal changes nothing, the slippage included, and hands `reservation` back. Only the
-    /// held asset's balance timestamp moves, to `time_exchange`, as releasing and restoring the
-    /// hold stamp it; no event reports it. A commit prints the fill, if any, under the order's own id, but
+    /// A refusal changes nothing, the slippage included, and hands `reservation` back. Only
+    /// balance timestamps move, to `time_exchange`: those of the order's hold and of any collateral
+    /// the fill would have released, which are released and restored. No event reports them. A commit prints the fill, if any, under the order's own id, but
     /// leaves the order where it was: the caller puts what is left on the book, or retires an
     /// order filled outright, and reports the order.
     ///
@@ -7091,9 +7091,10 @@ enum Recommitted {
         loan: Decimal,
         excess_borrowed: Decimal,
     },
-    /// The account cannot cover it. The ledger's amounts are as they were, only the held asset's
-    /// balance timestamp moving: the order still holds its reservation, handed back here whole, if
-    /// it held anything.
+    /// The account cannot cover it. The ledger's amounts are as they were, only the timestamps of
+    /// the balances released and restored moving (the order's hold, and any collateral the fill
+    /// would have released): the order still holds its reservation, handed back here whole, if it
+    /// held anything.
     Unaffordable { reservation: Option<Reservation> },
 }
 
