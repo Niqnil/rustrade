@@ -6533,7 +6533,6 @@ impl SimulatedVenue {
         }
     }
 
-    /// Whether `instrument` is an option this venue knows.
     /// Refuses an order whose time in force its instrument's kind does not take under
     /// [`MockExecutionConfig::time_in_force`], as the live venue would.
     fn check_time_in_force_rule(
@@ -6568,6 +6567,7 @@ impl SimulatedVenue {
         ))
     }
 
+    /// Whether `instrument` is an option this venue knows.
     fn is_option(&self, instrument: &InstrumentNameExchange) -> bool {
         self.instruments
             .get(instrument)
