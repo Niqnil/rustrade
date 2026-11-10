@@ -331,6 +331,59 @@ fn a_price_amend_through_a_thin_market_rests_what_is_left_under_its_id() {
     assert_eq!(resting(&venue, "resting").state, answer.open);
 }
 
+/// An order that has paid its ticket pays none again on an amend that trades part of it, nor
+/// holds one for what the amend leaves resting.
+#[test]
+fn a_price_amend_of_an_order_filled_in_part_pays_and_holds_no_second_ticket() {
+    let ticket = FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("5")))]).unwrap(),
+    );
+    let config = spot_config_with_fill("10", "1000000", ticket, SimFillConfig::default());
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(
+        venue
+            .apply_market(
+                &instrument_name(),
+                MarketObservation::new(book("47800", "47900"))
+                    .with_depth(MarketDepth::new(None, Some(d("0.25")))),
+                time(1)
+            )
+            .is_empty()
+    );
+
+    // 0.25 offered through the limit fills that much of the order, which pays its ticket.
+    let arrival = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+    let first = trades_in(&arrival.events);
+    assert_eq!((first[0].quantity, first[0].fees.fees), (d("0.25"), d("5")));
+    advance(&mut venue, time(2));
+
+    // Another 0.25 is offered: the amend through it buys that, and rests the other 0.5.
+    assert!(
+        venue
+            .apply_market(
+                &instrument_name(),
+                MarketObservation::new(book("49000", "49100"))
+                    .with_depth(MarketDepth::new(None, Some(d("0.25")))),
+                time(2),
+            )
+            .is_empty()
+    );
+    let outcome = amend(&mut venue, "resting", price("49200"));
+    let second = trades_in(&outcome.events);
+    assert_eq!(
+        (second[0].quantity, second[0].fees.fees),
+        (d("0.25"), Decimal::ZERO)
+    );
+    assert_eq!(amended(&outcome).open.filled_quantity, d("0.5"));
+    let quote_now = venue.balances(&[quote()])[0].balance;
+    assert_eq!(
+        quote_now.total - quote_now.free,
+        d("24600"),
+        "the 0.5 resting at 49,200, and no ticket"
+    );
+}
+
 // --- Spot margin: the loan follows the order -------------------------------------------------
 
 #[test]

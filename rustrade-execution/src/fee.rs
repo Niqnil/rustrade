@@ -231,13 +231,15 @@ pub enum FeeBasis {
 
 impl FeeBasis {
     /// The charge for an order that has filled `filled` contracts in total, at `input`'s price.
+    ///
+    /// `filled` is above zero: [`FeeComponent::bounded`] charges an order that has filled nothing
+    /// nothing, without asking the basis.
     fn charge(&self, input: &FeeInput, filled: Decimal) -> Decimal {
         match *self {
             Self::PerContract(amount) => amount * filled,
             Self::PerUnderlyingUnit(amount) => amount * filled * input.contract_size,
             Self::Notional(rate) => rate * input.price * filled * input.contract_size,
-            Self::PerOrder(amount) if filled > Decimal::ZERO => amount,
-            Self::PerOrder(_) => Decimal::ZERO,
+            Self::PerOrder(amount) => amount,
         }
     }
 }
