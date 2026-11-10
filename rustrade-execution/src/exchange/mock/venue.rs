@@ -6548,23 +6548,24 @@ impl SimulatedVenue {
         else {
             return Ok(());
         };
-        match self.time_in_force.accepted(kind) {
-            Some(accepted) if !accepted.contains(&time_in_force.kind()) => {
-                let accepted = accepted
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(UnindexedOrderError::unsupported_time_in_force(
-                    time_in_force,
-                    format!(
-                        "{} takes only {accepted} for {kind} orders",
-                        request.key.exchange
-                    ),
-                ))
-            }
-            _ => Ok(()),
+        if self.time_in_force.accepts(kind, time_in_force) {
+            return Ok(());
         }
+        let accepted = self
+            .time_in_force
+            .accepted(kind)
+            .into_iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(UnindexedOrderError::unsupported_time_in_force(
+            time_in_force,
+            format!(
+                "{} takes only {accepted} for {kind} orders",
+                request.key.exchange
+            ),
+        ))
     }
 
     fn is_option(&self, instrument: &InstrumentNameExchange) -> bool {

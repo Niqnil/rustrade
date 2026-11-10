@@ -132,6 +132,8 @@ pub struct MockExecutionConfig {
     /// ones it can model at all. See [`TimeInForceRules`].
     ///
     /// Defaults to no rules: every time in force the venue can model is taken on every kind.
+    /// Orders seeded through `initial_state` are not checked: they stand for orders the live
+    /// venue has already taken.
     #[serde(default, skip_serializing_if = "TimeInForceRules::is_empty")]
     pub time_in_force: TimeInForceRules,
 }

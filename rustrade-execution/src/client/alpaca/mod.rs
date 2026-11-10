@@ -1881,12 +1881,16 @@ impl ExecutionClient for AlpacaClient {
     /// An options order (an OCC symbol) takes only
     /// [`GoodUntilEndOfDay`](TimeInForce::GoodUntilEndOfDay) and
     /// [`GoodUntilCancelled`](TimeInForce::GoodUntilCancelled) without post-only: see
-    /// [`AlpacaClient::OPTION_TIME_IN_FORCE`]. An equity or crypto order also takes
+    /// [`AlpacaClient::OPTION_TIME_IN_FORCE`]. An equity order also takes
     /// [`ImmediateOrCancel`](TimeInForce::ImmediateOrCancel),
     /// [`FillOrKill`](TimeInForce::FillOrKill), [`AtOpen`](TimeInForce::AtOpen) and
     /// [`AtClose`](TimeInForce::AtClose). No order takes post-only, which Alpaca does not offer,
     /// or [`GoodTillDate`](TimeInForce::GoodTillDate), which this client does not yet send. Any
     /// other is refused with [`OrderError::UnsupportedTimeInForce`] without a request.
+    ///
+    /// Alpaca takes a crypto order (a `BASE/QUOTE` symbol) only as `gtc` or `ioc`. This client
+    /// does not check that yet: a crypto order with any other time in force is sent, and Alpaca
+    /// rejects it.
     ///
     /// # Market order price
     ///
