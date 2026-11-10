@@ -1419,8 +1419,14 @@ fn a_refused_buyback_with_free_below_zero_keeps_the_collateral_held() {
     let outcome = venue.open_order(option_request(Side::Buy, "1", None));
 
     assert!(
-        !outcome.response.state.is_accepted(),
-        "100 to pay, 50 in the account"
+        matches!(
+            &outcome.response.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(Some(asset), _)
+            ))) if *asset == usd()
+        ),
+        "100 to pay, 50 in the account: {:?}",
+        outcome.response.state
     );
     assert!(outcome.events.is_empty(), "{:?}", outcome.events);
     assert_eq!(
