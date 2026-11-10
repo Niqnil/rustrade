@@ -543,10 +543,60 @@ fn an_amend_the_account_cannot_afford_is_refused_and_the_order_keeps_its_place()
         "{:?}",
         outcome.response.state
     );
+    assert!(outcome.events.is_empty(), "{:?}", outcome.events);
     assert_eq!(resting(&venue, "resting"), before);
     assert_eq!(queue(&venue, Side::Buy), ["resting", "behind"]);
     assert_eq!(free_quote(&venue), free);
     assert_eq!(venue.balances(&[quote()])[0].balance.total, d("1000000"));
+}
+
+#[test]
+fn a_crossing_amend_the_account_cannot_afford_trades_nothing_and_draws_no_slippage() {
+    let mut config =
+        spot_config_with_fill("10", "1000000", maker_taker_fee(), SimFillConfig::default());
+    config.slippage = SlippageConfig::uniform(d("0.01"), d("0.025"), 3).unwrap();
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(
+        venue
+            .apply_market(
+                &instrument_name(),
+                MarketObservation::new(book("49000", "49100")),
+                time(1)
+            )
+            .is_empty()
+    );
+    let rested = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+    assert_eq!(rested.events.len(), 1, "{:?}", rested.response.state);
+    advance(&mut venue, time(2));
+    let before = resting(&venue, "resting");
+    let free = free_quote(&venue);
+    let slippage = venue.slippage.clone();
+
+    // 30 through the 49,100 ask is about 1.5 million, past the million the account holds.
+    let outcome = amend(&mut venue, "resting", price("49200").with_quantity(d("30")));
+
+    assert!(
+        matches!(
+            refusal(&outcome),
+            OrderError::Rejected(ApiError::BalanceInsufficient(Some(asset), _)) if *asset == quote()
+        ),
+        "{:?}",
+        outcome.response.state
+    );
+    assert!(outcome.events.is_empty(), "{:?}", outcome.events);
+    assert_eq!(resting(&venue, "resting"), before);
+    assert_eq!(free_quote(&venue), free);
+    assert_eq!(venue.slippage, slippage, "a refused fill takes no draw");
+
+    // The same crossing amend, affordable, does draw.
+    assert!(
+        amend(&mut venue, "resting", price("49200"))
+            .response
+            .state
+            .is_ok()
+    );
+    assert_ne!(venue.slippage, slippage);
 }
 
 #[test]
@@ -725,6 +775,21 @@ fn a_venue_that_reassigns_ids_names_the_old_one_and_reports_its_own_fill_under_i
 }
 
 #[test]
+fn a_venue_that_reassigns_ids_reassigns_none_to_an_order_its_amend_fills() {
+    let mut venue = resting_buy_amending(AmendConfig::FULL.with_reassign_id(true));
+    let old = resting(&venue, "resting").state.id;
+    let sequence = venue.order_sequence();
+
+    let outcome = amend(&mut venue, "resting", price("49200"));
+
+    let answer = amended(&outcome);
+    assert_eq!(answer.open.filled_quantity, d("1"));
+    assert_eq!(answer.open.id, old);
+    assert_eq!(answer.previous_id, None);
+    assert_eq!(venue.order_sequence(), sequence);
+}
+
+#[test]
 fn an_order_seeded_through_the_initial_state_is_not_amended() {
     let config = spot_config_holding(
         "1",
@@ -757,4 +822,27 @@ fn on_a_stale_market_a_price_amend_is_refused_and_a_quantity_amend_is_made() {
     let _ = venue.open_order(limit_request("held", Side::Buy, "1", "95", gtc()));
     assert!(venue.account.orders().holds(&instrument_name()));
     assert_venue_refusal(&amend(&mut venue, "held", quantity("2")));
+}
+
+#[test]
+fn a_market_order_held_for_its_next_bar_is_not_amended() {
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..spot_config("10", "1000000", FeeModelConfig::default())
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
+    let held = venue.open_order(market_order("held", Side::Buy, "1", gtc()));
+    assert!(
+        held.response.state.is_accepted(),
+        "{:?}",
+        held.response.state
+    );
+    assert!(venue.account.orders().holds(&instrument_name()));
+    let free = free_quote(&venue);
+
+    assert_venue_refusal(&amend(&mut venue, "held", quantity("2")));
+    assert_eq!(free_quote(&venue), free);
+    assert!(venue.account.orders().holds(&instrument_name()));
 }

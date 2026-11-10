@@ -97,8 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `Amended::previous_id`.
     - The default, `AmendConfig::FULL`, amends both fields and keeps the id. `AmendConfig::NONE`
       restores the old behaviour.
-    - `AmendConfig::support` gives the `AmendSupport` that `MockExecution` declares, so the
-      client and its venue cannot disagree.
+    - `AmendConfig::support` gives the `AmendSupport` that `MockExecution` declares. The
+      `rustrade` execution builders take it from the venue's config. A client built by hand
+      must pass the same.
 
 ### Changed
 

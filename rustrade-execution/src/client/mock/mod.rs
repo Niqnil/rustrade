@@ -161,7 +161,9 @@ pub struct AmendConfig {
     /// Whether an amended order is given a new venue order id, as a venue that amends by
     /// replacing the order does. The answer's
     /// [`Amended::previous_id`](crate::order::amend::Amended::previous_id) then names the old
-    /// one. A fill the amend itself makes is reported under the old id.
+    /// one. A fill the amend itself makes is reported under the old id, and an amend that fills
+    /// the order outright reassigns none. Priority still follows the rule above: a quantity
+    /// decrease at the same price keeps the order's place under its new id.
     pub reassign_id: bool,
 }
 
@@ -190,14 +192,20 @@ impl AmendConfig {
         reassign_id: false,
     };
 
+    /// With [`price`](Self::price): whether the limit price may be amended.
+    #[must_use]
     pub fn with_price(self, price: AmendAllowed) -> Self {
         Self { price, ..self }
     }
 
+    /// With [`quantity`](Self::quantity): whether the total quantity may be amended.
+    #[must_use]
     pub fn with_quantity(self, quantity: AmendAllowed) -> Self {
         Self { quantity, ..self }
     }
 
+    /// With [`multi_field`](Self::multi_field): whether one amend may change both.
+    #[must_use]
     pub fn with_multi_field(self, multi_field: bool) -> Self {
         Self {
             multi_field,
@@ -205,6 +213,9 @@ impl AmendConfig {
         }
     }
 
+    /// With [`reassign_id`](Self::reassign_id): whether an amended order gets a new venue order
+    /// id.
+    #[must_use]
     pub fn with_reassign_id(self, reassign_id: bool) -> Self {
         Self {
             reassign_id,
@@ -230,9 +241,10 @@ pub struct MockExecutionClientConfig<FnTime> {
     pub clock: FnTime,
     pub request_tx: mpsc::UnboundedSender<MockExchangeRequest>,
     pub event_rx: broadcast::Receiver<UnindexedAccountEvent>,
-    /// What the client declares it can amend: the venue's
-    /// [`AmendConfig::support`], read from the same [`MockExecutionConfig::amend`] the venue was
-    /// built with, so the two cannot disagree.
+    /// What the client declares it can amend: the venue's [`AmendConfig::support`]. The
+    /// `rustrade` execution builders read it from the same [`MockExecutionConfig::amend`] the
+    /// venue was built with. A client built by hand must do the same, or it declares amends its
+    /// venue refuses, or refuses amends its venue would make.
     pub amend_support: AmendSupport,
 }
 

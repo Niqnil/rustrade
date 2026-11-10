@@ -328,6 +328,11 @@ impl OpenOrders {
     /// [`NotQueued`], carrying `order` and `reservation` back untouched, if no order is queued
     /// under its id: none rests there, or the one that does is held, or has no price. The book is
     /// left exactly as it was.
+    ///
+    /// # Panics
+    /// If `order` is not the queued order amended (another side, kind or time in force), or if
+    /// [`Rank::Kept`] is asked for with another price or [`Open::time_exchange`]. Either would
+    /// leave the order filed in its queue under terms its entry no longer has.
     pub fn amend(
         &mut self,
         order: OpenOrder,
@@ -342,7 +347,7 @@ impl OpenOrders {
             unreachable!("OpenOrders found {cid} queued, which only an order in by_id is");
         };
         let before = &replaced.order;
-        debug_assert!(
+        assert!(
             before.key == order.key
                 && before.side == order.side
                 && before.kind == order.kind
@@ -351,7 +356,7 @@ impl OpenOrders {
              may change"
         );
         match rank {
-            Rank::Kept => debug_assert!(
+            Rank::Kept => assert!(
                 before.price == order.price
                     && before.state.time_exchange == order.state.time_exchange,
                 "OpenOrders kept {cid}'s queue position while moving its price or arrival, which \

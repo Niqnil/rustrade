@@ -4131,7 +4131,8 @@ impl SimulatedVenue {
     /// as an arriving order's does, only while the order has traded nothing.
     ///
     /// Returns the balances the amend restated, then the fill and interest it reported, then,
-    /// for an order the amend filled outright, the order's terminal snapshot.
+    /// for an order the amend filled outright, the order's terminal snapshot. An order filled
+    /// outright keeps its id, even on a venue configured to reassign one.
     ///
     /// # Refused, changing nothing
     /// - [`AmendRefusal`] from the checks above, or [`AmendRefusal::WouldTakeLiquidity`] for a
@@ -4220,7 +4221,8 @@ impl SimulatedVenue {
             )));
         }
 
-        // Checked against the order as this venue holds it.
+        // Checked against the order as this venue holds it. Reduce-only is the one term the venue
+        // does not keep on its orders, so it is read from the request.
         let filled = order.state.filled_quantity;
         let current = AmendTarget {
             side: order.side,
