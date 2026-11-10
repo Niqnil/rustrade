@@ -126,6 +126,7 @@ fn mock_config() -> MockExecutionConfig {
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
         amend: Default::default(),
+        time_in_force: Default::default(),
     }
 }
 

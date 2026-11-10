@@ -63,8 +63,8 @@ use crate::{
         StreamTerminationReason, UnindexedApiError, UnindexedClientError, UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
-        UnindexedOrderKey, UnindexedOrderSnapshot,
+        Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, TrailingOffsetType,
+        UnindexedInactiveOrder, UnindexedOrderKey, UnindexedOrderSnapshot,
         bracket::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
@@ -1106,6 +1106,17 @@ impl std::fmt::Debug for AlpacaClient {
 }
 
 impl AlpacaClient {
+    /// The time in force Alpaca takes for a US options order: `day` and `gtc`, without post-only.
+    /// This client refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending
+    /// the order.
+    ///
+    /// The same set configures a simulated venue to refuse what Alpaca refuses, through
+    /// [`TimeInForceRules`](crate::client::mock::TimeInForceRules).
+    pub const OPTION_TIME_IN_FORCE: &'static [TimeInForceKind] = &[
+        TimeInForceKind::GoodUntilEndOfDay,
+        TimeInForceKind::GoodUntilCancelled,
+    ];
+
     /// Build a `reqwest::Client` with Alpaca auth headers pre-set.
     ///
     /// # Panics
@@ -1865,6 +1876,22 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// For explicit control, use [`AlpacaClient::open_order_with_intent`].
     ///
+    /// # Time in force
+    ///
+    /// An options order (an OCC symbol) takes only
+    /// [`GoodUntilEndOfDay`](TimeInForce::GoodUntilEndOfDay) and
+    /// [`GoodUntilCancelled`](TimeInForce::GoodUntilCancelled) without post-only: see
+    /// [`AlpacaClient::OPTION_TIME_IN_FORCE`]. An equity order also takes
+    /// [`ImmediateOrCancel`](TimeInForce::ImmediateOrCancel),
+    /// [`FillOrKill`](TimeInForce::FillOrKill), [`AtOpen`](TimeInForce::AtOpen) and
+    /// [`AtClose`](TimeInForce::AtClose). No order takes post-only, which Alpaca does not offer,
+    /// or [`GoodTillDate`](TimeInForce::GoodTillDate), which this client does not yet send. Any
+    /// other is refused with [`OrderError::UnsupportedTimeInForce`] without a request.
+    ///
+    /// Alpaca takes a crypto order (a `BASE/QUOTE` symbol) only as `gtc` or `ioc`. This client
+    /// does not check that yet: a crypto order with any other time in force is sent, and Alpaca
+    /// rejects it.
+    ///
     /// # Market order price
     ///
     /// The returned `Order.price` echoes the request price. For market orders this is
@@ -2283,11 +2310,9 @@ impl AlpacaClient {
                             quantity: request.quantity,
                             kind: OrderKind::Limit,
                             time_in_force: request.time_in_force,
-                            state: OrderState::inactive(OrderError::Rejected(
-                                ApiError::OrderRejected(
-                                    "Alpaca does not support post_only for bracket orders"
-                                        .to_string(),
-                                ),
+                            state: OrderState::inactive(OrderError::unsupported_time_in_force(
+                                request.time_in_force,
+                                "Alpaca does not support post_only for bracket orders",
                             )),
                         },
                     };
@@ -2303,12 +2328,10 @@ impl AlpacaClient {
                         quantity: request.quantity,
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
-                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                            format!(
-                                "Alpaca bracket orders only support Day or GTC time_in_force, got {:?}",
-                                other
-                            ),
-                        ))),
+                        state: OrderState::inactive(OrderError::unsupported_time_in_force(
+                            other,
+                            "Alpaca bracket orders only support day or gtc",
+                        )),
                     },
                 };
             }
@@ -2483,10 +2506,11 @@ impl AlpacaClient {
             };
         }
 
-        // Validate time_in_force before building the request — reject post_only early.
-        let tif_str = match map_time_in_force(time_in_force) {
+        // Refuse a time in force Alpaca would reject for this order before building the request.
+        let option = occ_contract(instrument.name().as_str()).is_some();
+        let tif_str = match map_time_in_force(time_in_force, option) {
             Ok(s) => s,
-            Err(msg) => {
+            Err(reason) => {
                 return Order {
                     key: order_key,
                     side,
@@ -2494,9 +2518,10 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                        msg.to_string(),
-                    ))),
+                    state: OrderState::inactive(OrderError::unsupported_time_in_force(
+                        time_in_force,
+                        reason,
+                    )),
                 };
             }
         };
@@ -5370,15 +5395,24 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
     }
 }
 
-/// Map rustrade's `TimeInForce` to Alpaca's string representation.
+/// Map rustrade's `TimeInForce` to Alpaca's string representation, for an options order when
+/// `option` is set.
 ///
 /// # Errors
 ///
-/// Returns `Err` if `post_only: true` is requested. Alpaca does not support
-/// post-only orders — silently placing a taker-eligible GTC order would be
-/// the opposite of caller intent, risking unexpected taker fees. Callers
-/// requiring maker-only execution must use a different venue or strategy.
-fn map_time_in_force(tif: TimeInForce) -> Result<&'static str, &'static str> {
+/// Returns why Alpaca would not take `tif`:
+/// - for an options order, anything outside [`AlpacaClient::OPTION_TIME_IN_FORCE`];
+/// - `post_only: true` on any order. Alpaca does not support post-only orders: silently placing a
+///   taker-eligible GTC order would be the opposite of caller intent, risking unexpected taker
+///   fees;
+/// - [`TimeInForce::GoodTillDate`], which needs an `expired_at` this client does not yet send.
+fn map_time_in_force(tif: TimeInForce, option: bool) -> Result<&'static str, &'static str> {
+    if option && !AlpacaClient::OPTION_TIME_IN_FORCE.contains(&tif.kind()) {
+        return Err(
+            "Alpaca takes an options order only as day (GoodUntilEndOfDay) or gtc \
+                    (GoodUntilCancelled without post_only)",
+        );
+    }
     match tif {
         TimeInForce::GoodUntilCancelled { post_only } => {
             if post_only {
@@ -5391,9 +5425,6 @@ fn map_time_in_force(tif: TimeInForce) -> Result<&'static str, &'static str> {
         TimeInForce::ImmediateOrCancel => Ok("ioc"),
         TimeInForce::AtOpen => Ok("opg"),
         TimeInForce::AtClose => Ok("cls"),
-        // Alpaca's `gtd` requires an `expired_at` timestamp on the order request,
-        // which this client does not currently surface. Reject to avoid silently
-        // dropping the expiry semantics.
         TimeInForce::GoodTillDate { .. } => {
             Err("Alpaca GoodTillDate is not yet wired through this client")
         }
@@ -6054,19 +6085,52 @@ mod tests {
     #[test]
     fn test_map_time_in_force_roundtrip() {
         assert_eq!(
-            map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: false }),
+            map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: false }, false),
             Ok("gtc")
         );
-        assert_eq!(map_time_in_force(TimeInForce::GoodUntilEndOfDay), Ok("day"));
-        assert_eq!(map_time_in_force(TimeInForce::FillOrKill), Ok("fok"));
-        assert_eq!(map_time_in_force(TimeInForce::ImmediateOrCancel), Ok("ioc"));
+        assert_eq!(
+            map_time_in_force(TimeInForce::GoodUntilEndOfDay, false),
+            Ok("day")
+        );
+        assert_eq!(map_time_in_force(TimeInForce::FillOrKill, false), Ok("fok"));
+        assert_eq!(
+            map_time_in_force(TimeInForce::ImmediateOrCancel, false),
+            Ok("ioc")
+        );
+        assert_eq!(map_time_in_force(TimeInForce::AtOpen, false), Ok("opg"));
+        assert_eq!(map_time_in_force(TimeInForce::AtClose, false), Ok("cls"));
     }
 
     #[test]
     fn test_map_time_in_force_rejects_post_only() {
-        let result = map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: true });
+        let result = map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: true }, false);
         assert!(result.is_err(), "post_only must be rejected");
         assert!(result.unwrap_err().contains("post_only"));
+    }
+
+    #[test]
+    fn an_options_order_maps_only_day_and_gtc() {
+        assert_eq!(
+            map_time_in_force(TimeInForce::GoodUntilEndOfDay, true),
+            Ok("day")
+        );
+        assert_eq!(
+            map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: false }, true),
+            Ok("gtc")
+        );
+        for refused in [
+            TimeInForce::ImmediateOrCancel,
+            TimeInForce::FillOrKill,
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+            TimeInForce::GoodUntilCancelled { post_only: true },
+            TimeInForce::GoodTillDate {
+                expiry: DateTime::<Utc>::MIN_UTC,
+            },
+        ] {
+            let reason = map_time_in_force(refused, true).unwrap_err();
+            assert!(reason.contains("options order"), "{refused}: {reason}");
+        }
     }
 
     // =========================================================================
@@ -9009,6 +9073,88 @@ mod tests {
                 Some("sell_to_close"),
                 "reduce_only Position + Side::Sell should produce position_intent=sell_to_close, got: {body}"
             );
+        }
+
+        /// An options order with a time in force Alpaca does not take for options is refused
+        /// without a request; an equity order with the same one is still sent.
+        #[tokio::test]
+        async fn an_options_ioc_is_refused_unsent_and_an_equity_ioc_is_sent() {
+            use crate::client::ExecutionClient;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rust_decimal::Decimal;
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+            use wiremock::matchers::{method, path};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "test-order-id",
+                    "client_order_id": "equity",
+                    "symbol": "AAPL",
+                    "qty": "1",
+                    "filled_qty": "0",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "ioc",
+                    "limit_price": null,
+                    "created_at": "2025-04-18T14:30:00Z"
+                })))
+                .mount(&server)
+                .await;
+            let client = AlpacaClient::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            fn open<'a>(
+                symbol: &'a InstrumentNameExchange,
+                cid: &str,
+            ) -> OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange> {
+                OrderRequestOpen {
+                    key: OrderKey {
+                        exchange: ExchangeId::AlpacaBroker,
+                        instrument: symbol,
+                        strategy: StrategyId::new("test-strategy"),
+                        cid: ClientOrderId::new(cid),
+                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None,
+                        Decimal::ONE,
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
+                }
+            }
+
+            let option = InstrumentNameExchange::new("AAPL250620C00200000");
+            let refused = client.open_order(open(&option, "option")).await;
+            assert!(
+                matches!(
+                    &refused.state,
+                    OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedTimeInForce {
+                            time_in_force: TimeInForce::ImmediateOrCancel,
+                            ..
+                        }
+                    ))
+                ),
+                "{:?}",
+                refused.state
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+
+            let equity = InstrumentNameExchange::new("AAPL");
+            let sent = client.open_order(open(&equity, "equity")).await;
+            assert!(sent.state.is_accepted(), "{:?}", sent.state);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
 
         /// Verifies that reduce_only No + Buy produces BuyToOpen intent.

@@ -101,6 +101,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `AmendConfig::support` gives the `AmendSupport` that `MockExecution` declares. The
       `rustrade` execution builders take it from the venue's config. A client built by hand
       must pass the same.
+- **A typed refusal for a time in force that is not taken, and the simulated venue refuses what
+  its live venue refuses** (`rustrade-execution`, #902).
+  - **New `OrderError::UnsupportedTimeInForce { time_in_force, reason }`:** the order was refused
+    without being sent, because its time in force is not taken for it. Non-transient. Built with
+    `OrderError::unsupported_time_in_force`.
+  - **`AlpacaClient` refuses an options order whose time in force Alpaca does not take**, before
+    sending it. Alpaca takes an options order only as `day` (`GoodUntilEndOfDay`) or `gtc`
+    (`GoodUntilCancelled` without post-only), and rejects any other with HTTP 422. The set is
+    `AlpacaClient::OPTION_TIME_IN_FORCE`. Equity and crypto orders map as before.
+  - **New `MockExecutionConfig::time_in_force: TimeInForceRules`:** which time in force the
+    simulated venue takes for each kind of instrument, so a backtest refuses what the live venue
+    refuses. `TimeInForceRules::with_accepted` with `InstrumentKindDiscriminant::Option` and
+    `AlpacaClient::OPTION_TIME_IN_FORCE` refuses an options IOC as Alpaca does. A rule only
+    narrows what the venue models. A config without it has no rules.
+  - **New `TimeInForceKind` and `TimeInForce::kind`:** the payload-free spelling of a time in
+    force, with post-only as its own kind.
 
 ### Changed
 
@@ -124,6 +140,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `MockExecutionClientConfig` and `MockExecution` have an `amend_support` field, which the
     `rustrade` builders fill from the venue's config. Their struct literals and `new`
     constructors must set it.
+- **Breaking: a refused time in force is now `OrderError::UnsupportedTimeInForce`**
+  (`rustrade-execution`, #902). It was `OrderError::Rejected(ApiError::OrderRejected(..))`.
+  - `AlpacaClient`: a post-only order, a `GoodTillDate` order, and a bracket order with a time in
+    force other than `day` or `gtc`.
+  - The simulated venue: `AtOpen` and `AtClose` on any order, `GoodUntilEndOfDay` on a limit order,
+    and post-only on a market order.
+  - A caller matching on the old error for these cases must match the new variant.
+  - `MockExecutionConfig` has a `time_in_force` field. A struct literal must set it
+    (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
+    argument.
 
 ### Fixed
 

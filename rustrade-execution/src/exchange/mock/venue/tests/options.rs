@@ -3,13 +3,20 @@
 
 use super::*;
 use crate::{
+    client::mock::TimeInForceRules,
     expiry::LongOptionExpiry,
     fee::PerContractFeeModel,
-    order::request::{RequestCancel, RequestOpen},
+    order::{
+        TimeInForceKind,
+        request::{RequestCancel, RequestOpen},
+    },
     short_option::{Collateral, ShortPutCollateral},
 };
 use rustrade_instrument::instrument::{
-    kind::option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
+    kind::{
+        InstrumentKindDiscriminant,
+        option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
+    },
     name::InstrumentNameInternal,
     quote::InstrumentQuoteAsset,
 };
@@ -222,6 +229,64 @@ fn a_buy_pays_the_premium_times_the_contract_size_and_a_per_contract_fee() {
     assert_eq!(paid.balance.free, paid.balance.total);
     assert_eq!(filled_trade(&outcome).fees.fees, d("1.30"));
     assert_eq!(option_position(&venue), Some(d("2")));
+}
+
+#[test]
+fn a_venue_ruled_to_take_only_day_and_gtc_options_refuses_an_option_ioc_and_takes_a_spot_one() {
+    let mut config = config("100000", FeeModelConfig::default());
+    config.long_option_expiry = LongOptionExpiry::Lapse;
+    config.time_in_force = TimeInForceRules::new().with_accepted(
+        InstrumentKindDiscriminant::Option,
+        &[
+            TimeInForceKind::GoodUntilEndOfDay,
+            TimeInForceKind::GoodUntilCancelled,
+        ],
+    );
+    let mut instruments = instruments_of(spy_instrument());
+    let option = option_instrument(OptionKind::Call, OptionSettlement::Physical);
+    instruments.insert(option.name_exchange.clone(), option);
+    let mut venue = SimulatedVenue::new(&config, instruments);
+    advance(&mut venue, time(1));
+    let with = |mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+                time_in_force| {
+        request.state.time_in_force = time_in_force;
+        request
+    };
+
+    let refused = venue.open_order(with(
+        option_request(Side::Buy, "1", market_prices("1.5")),
+        TimeInForce::ImmediateOrCancel,
+    ));
+    assert!(refused.events.is_empty(), "{:?}", refused.events);
+    match &refused.response.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(
+            OrderError::UnsupportedTimeInForce {
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                reason,
+                ..
+            },
+        )) => assert!(
+            reason.contains("GoodUntilCancelled, GoodUntilEndOfDay for option orders"),
+            "{reason}"
+        ),
+        other => panic!("expected UnsupportedTimeInForce, got: {other:?}"),
+    }
+    assert_eq!(option_position(&venue), None);
+
+    let day = venue.open_order(with(
+        option_request(Side::Buy, "1", market_prices("1.5")),
+        TimeInForce::GoodUntilEndOfDay,
+    ));
+    assert!(day.response.state.is_accepted(), "{:?}", day.response.state);
+    let spot = venue.open_order(with(
+        request(spy_name(), Side::Buy, "1", market_prices("400")),
+        TimeInForce::ImmediateOrCancel,
+    ));
+    assert!(
+        spot.response.state.is_accepted(),
+        "{:?}",
+        spot.response.state
+    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ use crate::{
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
     order::{
-        Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
+        Order, OrderKey, TimeInForce, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
         amend::{AmendAllowed, AmendPriority, AmendSupport},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
@@ -35,6 +35,7 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::error;
@@ -127,6 +128,78 @@ pub struct MockExecutionConfig {
     /// together or alone, and the order keeps its id.
     #[serde(default)]
     pub amend: AmendConfig,
+    /// Which [`TimeInForce`] the mock exchange takes for each kind of instrument, on top of the
+    /// ones it can model at all. See [`TimeInForceRules`].
+    ///
+    /// Defaults to no rules: every time in force the venue can model is taken on every kind.
+    /// Orders seeded through `initial_state` are not checked: they stand for orders the live
+    /// venue has already taken.
+    #[serde(default, skip_serializing_if = "TimeInForceRules::is_empty")]
+    pub time_in_force: TimeInForceRules,
+}
+
+/// Which [`TimeInForce`] a simulated venue takes for each kind of instrument, so it refuses what
+/// the live venue it stands in for refuses.
+///
+/// A kind with no rule takes every time in force the venue can model (see
+/// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)'s "Which `TimeInForce` this venue
+/// honours"). A kind with a rule takes only the [`TimeInForceKind`]s listed, and an order with
+/// any other is refused with [`OrderError::UnsupportedTimeInForce`], as the live client refuses
+/// it. A rule can only narrow what the venue models: listing a time in force it cannot model does
+/// not make it take one.
+///
+/// For example, Alpaca takes a US options order only as `day` or `gtc`. A venue standing in for
+/// it takes the same set for options:
+///
+/// ```
+/// use rustrade_execution::{client::mock::TimeInForceRules, order::TimeInForceKind};
+/// use rustrade_instrument::instrument::kind::InstrumentKindDiscriminant;
+///
+/// let rules = TimeInForceRules::new().with_accepted(
+///     InstrumentKindDiscriminant::Option,
+///     &[TimeInForceKind::GoodUntilEndOfDay, TimeInForceKind::GoodUntilCancelled],
+/// );
+/// ```
+///
+/// With the `alpaca` feature, `AlpacaClient::OPTION_TIME_IN_FORCE` is that set, so
+/// `with_accepted(InstrumentKindDiscriminant::Option, AlpacaClient::OPTION_TIME_IN_FORCE)` keeps
+/// the venue and the client in step.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct TimeInForceRules(BTreeMap<InstrumentKindDiscriminant, BTreeSet<TimeInForceKind>>);
+
+impl TimeInForceRules {
+    /// No rules: every kind takes every time in force the venue can model.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// With `kind` taking only the time in force in `accepted`, replacing any rule it had.
+    #[must_use]
+    pub fn with_accepted(
+        mut self,
+        kind: InstrumentKindDiscriminant,
+        accepted: &[TimeInForceKind],
+    ) -> Self {
+        self.0.insert(kind, accepted.iter().copied().collect());
+        self
+    }
+
+    /// The time in force `kind` is limited to, or `None` if it has no rule.
+    pub fn accepted(&self, kind: InstrumentKindDiscriminant) -> Option<&BTreeSet<TimeInForceKind>> {
+        self.0.get(&kind)
+    }
+
+    /// Whether an order on an instrument of `kind` may carry `time_in_force`.
+    pub fn accepts(&self, kind: InstrumentKindDiscriminant, time_in_force: TimeInForce) -> bool {
+        self.accepted(kind)
+            .is_none_or(|accepted| accepted.contains(&time_in_force.kind()))
+    }
+
+    /// Whether there are no rules.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// What the mock exchange amends in place: see
@@ -767,6 +840,38 @@ mod tests {
     }
 
     #[test]
+    fn time_in_force_rules_narrow_only_the_kinds_they_name() {
+        let rules = TimeInForceRules::new().with_accepted(
+            InstrumentKindDiscriminant::Option,
+            &[
+                TimeInForceKind::GoodUntilEndOfDay,
+                TimeInForceKind::GoodUntilCancelled,
+            ],
+        );
+        let option = InstrumentKindDiscriminant::Option;
+        assert!(rules.accepts(option, TimeInForce::GoodUntilEndOfDay));
+        assert!(rules.accepts(option, TimeInForce::GoodUntilCancelled { post_only: false }));
+        assert!(!rules.accepts(option, TimeInForce::GoodUntilCancelled { post_only: true }));
+        assert!(!rules.accepts(option, TimeInForce::ImmediateOrCancel));
+        assert!(rules.accepts(
+            InstrumentKindDiscriminant::Spot,
+            TimeInForce::ImmediateOrCancel
+        ));
+        assert!(TimeInForceRules::new().accepts(option, TimeInForce::FillOrKill));
+        assert!(!rules.is_empty());
+
+        let json = serde_json::to_value(&rules).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"option": ["GoodUntilCancelled", "GoodUntilEndOfDay"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<TimeInForceRules>(json).unwrap(),
+            rules
+        );
+    }
+
+    #[test]
     fn an_amend_config_missing_from_a_serialized_config_is_full() {
         let config = MockExecutionConfig {
             mocked_exchange: ExchangeId::Mock,
@@ -787,11 +892,17 @@ mod tests {
             long_option_expiry: Default::default(),
             short_put_collateral: Default::default(),
             amend: AmendConfig::NONE,
+            time_in_force: Default::default(),
         };
         let mut json = serde_json::to_value(&config).unwrap();
+        assert!(
+            json.get("time_in_force").is_none(),
+            "no rules are left out of a written config"
+        );
         json.as_object_mut().unwrap().remove("amend");
         let read: MockExecutionConfig = serde_json::from_value(json).unwrap();
         assert_eq!(read.amend, AmendConfig::FULL);
+        assert!(read.time_in_force.is_empty());
 
         let partial: AmendConfig = serde_json::from_str(r#"{"reassign_id": true}"#).unwrap();
         assert_eq!(partial, AmendConfig::FULL.with_reassign_id(true));
