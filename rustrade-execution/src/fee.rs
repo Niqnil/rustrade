@@ -235,8 +235,8 @@ impl FeeBasis {
     /// The charge for an order that has filled `filled` contracts in total, at `input`'s price.
     ///
     /// For a [`PerOrder`](Self::PerOrder) basis, `filled` is above zero: such a component is
-    /// charged through [`FeeComponent::bounded`], which charges an order that has filled nothing
-    /// nothing, without asking the basis.
+    /// charged through [`FeeComponent::bounded`], which charges nothing for an order that has
+    /// filled nothing, without asking the basis.
     fn charge(&self, input: &FeeInput, filled: Decimal) -> Decimal {
         match *self {
             Self::PerContract(amount) => amount * filled,
