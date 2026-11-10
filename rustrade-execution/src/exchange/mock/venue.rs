@@ -3042,6 +3042,97 @@ impl SimulatedVenue {
         terms: &InstrumentTerms,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
+        let (committed, trade, remainder) =
+            match self.reenter(&order, reservation, limit, release, terms, time_exchange) {
+                Reentry::Refused { reservation } => {
+                    let released = reservation
+                        .map(|reservation| self.release_reservation(reservation, time_exchange));
+                    return self.cancel_unfilled(order, released, time_exchange);
+                }
+                Reentry::Entered {
+                    committed,
+                    trade,
+                    remainder,
+                } => (committed, trade, remainder),
+            };
+
+        let terminal = match remainder {
+            // What is left joins the book, carrying what has already traded, holding the loan
+            // this release left the order with, as a remainder rested on arrival does.
+            Some(reservation) => {
+                let filled_total = order.state.filled_quantity
+                    + trade.as_ref().map_or(Decimal::ZERO, |trade| trade.quantity);
+                let open = Open::new(order.state.id.clone(), time_exchange, filled_total);
+                let rested = Order {
+                    key: order.key,
+                    side: order.side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    kind: order.kind,
+                    time_in_force: order.time_in_force,
+                    state: open,
+                };
+                self.book_rested(rested.clone(), reservation);
+                rested.map_state(OrderState::active)
+            }
+            // Filled outright by this one trade, which carries the order's id: a held order has
+            // traded nothing before its release, so the trade's price is the mean of its fills.
+            None => {
+                let Some(trade) = &trade else {
+                    unreachable!("an order with nothing left to rest has traded");
+                };
+                let filled = Order {
+                    key: order.key,
+                    side: order.side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    kind: order.kind,
+                    time_in_force: order.time_in_force,
+                    state: Filled::new(
+                        trade.order_id.clone(),
+                        time_exchange,
+                        order.quantity,
+                        Some(trade.price),
+                    ),
+                };
+                self.account.ack_filled(filled.clone());
+                filled.map_state(OrderState::fully_filled)
+            }
+        };
+
+        let mut events = Vec::with_capacity(4);
+        self.push_committed(&mut events, committed, trade);
+        events.push(self.build_account_event(Snapshot(terminal)));
+        events
+    }
+
+    /// Decides `order`, which this venue already holds against `reservation`, at the market
+    /// `release` gives it, as an arriving limit order at `limit` is decided, and commits what it
+    /// comes to in place of its hold.
+    ///
+    /// - One the market crosses trades as a taker, priced by the venue's [`FillModel`], moved by
+    ///   its slippage and capped at `limit`, up to the size the market has, and what is left of it
+    ///   is held for at `limit`.
+    /// - One the market does not cross is held for whole, at `limit`.
+    /// - A post-only one the market crosses is refused.
+    ///
+    /// The fill and what is left are costed as one requirement, against the position as it
+    /// stands, and committed in place of the hold through
+    /// [`commit_afresh`](Self::commit_afresh). An order the account cannot afford is refused.
+    ///
+    /// A refusal changes nothing, the slippage included, and hands `reservation` back. A commit
+    /// prints the fill, if any, under the order's own id, but leaves the order where it was: the
+    /// caller puts what is left on the book, or retires an order filled outright, and reports the
+    /// order.
+    fn reenter(
+        &mut self,
+        order: &OpenOrder,
+        reservation: Option<Reservation>,
+        limit: Decimal,
+        release: Release<'_>,
+        terms: &InstrumentTerms,
+        time_exchange: DateTime<Utc>,
+    ) -> Reentry {
         let side = order.side;
         let quantity = order.state.quantity_remaining(order.quantity);
 
@@ -3062,9 +3153,7 @@ impl SimulatedVenue {
             TimeInForce::GoodUntilCancelled { post_only: true }
         );
         if marketable && post_only {
-            let released =
-                reservation.map(|reservation| self.release_reservation(reservation, time_exchange));
-            return self.cancel_unfilled(order, released, time_exchange);
+            return Reentry::Refused { reservation };
         }
 
         // What the market has to give this order: nothing if it does not cross, and all of it
@@ -3136,7 +3225,7 @@ impl SimulatedVenue {
             .as_ref()
             .and_then(|(_, fill)| fill.collateral.released.as_ref());
         let (mut committed, loan, excess_borrowed) = match self.commit_afresh(
-            &order,
+            order,
             terms,
             reservation,
             &debit,
@@ -3149,92 +3238,49 @@ impl SimulatedVenue {
                 loan,
                 excess_borrowed,
             } => (commitment, loan, excess_borrowed),
-            Recommitted::Unaffordable { released } => {
+            Recommitted::Unaffordable { reservation } => {
                 self.slippage = slippage_before;
-                return self.cancel_unfilled(order, released, time_exchange);
+                return Reentry::Refused { reservation };
             }
         };
 
-        let mut events = Vec::with_capacity(4);
-        let mut filled_total = order.state.filled_quantity;
-        let mut trade = None;
-        if let Some((price, settlement)) = fill {
+        let trade = fill.map(|(price, settlement)| {
             self.take_fee_apart(&settlement, &mut committed, time_exchange);
             self.consume_depth(&order.key.instrument, side, filled_quantity);
             let fill = Fill {
                 quantity: filled_quantity,
                 price,
             };
-            trade = Some(self.print_fill(terms, &order, fill, settlement.fees, time_exchange));
-            filled_total += filled_quantity;
+            self.print_fill(terms, order, fill, settlement.fees, time_exchange)
+        });
+
+        // What is left holds the loan this commit left the order with. A re-entry that traded
+        // reports every charge after its trade. One that did not leaves them with no position to
+        // belong to, so they wait with the remainder, as on arrival.
+        let remainder = held.map(|held| {
+            let unreported_interest = match trade {
+                Some(_) => Vec::new(),
+                None => {
+                    let mut held = std::mem::take(&mut committed.held_interest);
+                    held.extend(committed.interest.take().map(|flow| *flow));
+                    held
+                }
+            };
+            Reservation {
+                borrowed: loan.min(held.requirement()),
+                excess_borrowed,
+                amount: held.requirement(),
+                asset: held.asset,
+                effect,
+                unreported_interest,
+            }
+        });
+
+        Reentry::Entered {
+            committed,
+            trade,
+            remainder,
         }
-
-        let terminal = match held {
-            // What is left joins the book, carrying what has already traded, holding the loan
-            // this release left the order with, as a remainder rested on arrival does.
-            Some(held) => {
-                let open = Open::new(order.state.id.clone(), time_exchange, filled_total);
-                let rested = Order {
-                    key: order.key,
-                    side,
-                    price: order.price,
-                    quantity: order.quantity,
-                    kind: order.kind,
-                    time_in_force: order.time_in_force,
-                    state: open,
-                };
-                // A release that traded reports every charge after its trade. One that did not
-                // leaves them with no position to belong to, so they wait with the remainder, as
-                // on arrival.
-                let unreported_interest = match trade {
-                    Some(_) => Vec::new(),
-                    None => {
-                        let mut held = std::mem::take(&mut committed.held_interest);
-                        held.extend(committed.interest.take().map(|flow| *flow));
-                        held
-                    }
-                };
-                self.book_rested(
-                    rested.clone(),
-                    Reservation {
-                        borrowed: loan.min(held.requirement()),
-                        excess_borrowed,
-                        amount: held.requirement(),
-                        asset: held.asset,
-                        effect,
-                        unreported_interest,
-                    },
-                );
-                rested.map_state(OrderState::active)
-            }
-            // Filled outright by this one trade, which carries the order's id: a held order has
-            // traded nothing before its release, so the trade's price is the mean of its fills.
-            None => {
-                let Some(trade) = &trade else {
-                    unreachable!("an order with nothing left to rest has traded");
-                };
-                let filled = Order {
-                    key: order.key,
-                    side,
-                    price: order.price,
-                    quantity: order.quantity,
-                    kind: order.kind,
-                    time_in_force: order.time_in_force,
-                    state: Filled::new(
-                        trade.order_id.clone(),
-                        time_exchange,
-                        order.quantity,
-                        Some(trade.price),
-                    ),
-                };
-                self.account.ack_filled(filled.clone());
-                filled.map_state(OrderState::fully_filled)
-            }
-        };
-
-        self.push_committed(&mut events, committed, trade);
-        events.push(self.build_account_event(Snapshot(terminal)));
-        events
     }
 
     /// Records `fill` of `order`, an order this venue already holds, and returns the trade it
@@ -3420,13 +3466,20 @@ impl SimulatedVenue {
             time_exchange,
         ) {
             Recommitted::Committed { commitment, .. } => RestingSettlement::Settled(commitment),
-            Recommitted::Unaffordable { released } => RestingSettlement::Unaffordable { released },
+            Recommitted::Unaffordable { reservation } => RestingSettlement::Unaffordable {
+                released: reservation
+                    .map(|reservation| self.release_reservation(reservation, time_exchange)),
+            },
         }
     }
 
     /// Releases an order's hold and commits `debit` and `credit` afresh in its place, restating
     /// each asset it moved once, or reports the account cannot cover them. See
     /// [`settle_resting_afresh`](Self::settle_resting_afresh) and [`Recommitted`].
+    ///
+    /// A refusal leaves the ledger as it found it: the hold is taken back, so the order still
+    /// holds exactly what it held, and its reservation is handed back whole for the caller to
+    /// keep or release.
     #[allow(clippy::too_many_arguments)] // Each is one fact of the recommit; a struct would only rename them.
     fn commit_afresh(
         &mut self,
@@ -3497,16 +3550,15 @@ impl SimulatedVenue {
                 }
             }
             Err(_) => Recommitted::Unaffordable {
-                released: released.map(|(reservation, balance)| Released {
-                    balance: match !repays_at_cancel || reservation.loan().is_zero() {
-                        true => balance,
-                        false => self.account.repay_loan(
-                            &reservation.asset,
-                            reservation.loan(),
-                            time_exchange,
-                        ),
-                    },
-                    interest: held_interest,
+                reservation: released.map(|(mut reservation, _)| {
+                    #[allow(clippy::expect_used)]
+                    // Unreachable: a refused commit moves nothing, so the hold just released is
+                    // still free.
+                    self.account
+                        .reserve(&reservation.asset, reservation.amount, time_exchange)
+                        .expect("a refused commit leaves the hold it was offered free");
+                    reservation.unreported_interest = held_interest;
+                    reservation
                 }),
             },
         }
@@ -7032,8 +7084,27 @@ enum Recommitted {
         loan: Decimal,
         excess_borrowed: Decimal,
     },
-    /// The account cannot cover it. Carries what the released hold restated, if it held anything.
-    Unaffordable { released: Option<Released> },
+    /// The account cannot cover it. The ledger is as it was: the order still holds its
+    /// reservation, handed back here whole, if it held anything.
+    Unaffordable { reservation: Option<Reservation> },
+}
+
+/// What deciding an order the venue already holds at a market came to — see
+/// `SimulatedVenue::reenter`.
+// `large_enum_variant`: as for `Recommitted`, which this carries the commitment of.
+#[allow(clippy::large_enum_variant)]
+enum Reentry {
+    /// Refused, changing nothing: a post-only order the market crosses, or one the account cannot
+    /// afford. The order still holds its reservation, handed back here whole, if it held anything.
+    Refused { reservation: Option<Reservation> },
+    /// Committed in place of the order's hold, restating these balances, having printed `trade`
+    /// if the order traded. `remainder` is what the venue now holds against what is left of the
+    /// order, or `None` if the trade filled it.
+    Entered {
+        committed: Commitment,
+        trade: Option<Trade<AssetNameExchange, InstrumentNameExchange>>,
+        remainder: Option<Reservation>,
+    },
 }
 
 /// How much of an arriving order traded, and at what price.
