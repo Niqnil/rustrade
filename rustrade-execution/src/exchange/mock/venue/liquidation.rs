@@ -75,6 +75,21 @@ struct Leg {
     delivered_per_unit: Decimal,
 }
 
+/// How far below `Decimal::MAX` the largest quantity a search tries stays, as a factor on its
+/// cost, so that pricing it cannot overflow.
+const SEARCH_HEADROOM: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+impl Leg {
+    /// The most of this leg a search for a quantity tries: one costing about 7.9e22 of what it
+    /// pays with or of quote, more than any account holds, and a millionth of `Decimal::MAX`, so
+    /// that its fee and settlement cannot overflow.
+    fn search_limit(&self) -> Decimal {
+        (Decimal::MAX / SEARCH_HEADROOM)
+            .checked_div(self.paid_per_unit.max(self.price))
+            .unwrap_or(Decimal::MAX)
+    }
+}
+
 impl SimulatedVenue {
     /// Checks a spot margin account against its configured [`SpotMarginLiquidation`] at the end of
     /// an input, sending the margin-call notices it has crossed into and liquidating the account
@@ -505,10 +520,11 @@ impl SimulatedVenue {
     }
 
     /// The least quantity of `leg` that delivers `want`, bisected on the settlement, or `None` if
-    /// no quantity in `Decimal`'s range does.
+    /// none up to its [search limit](Leg::search_limit) does.
     fn needed_leg_quantity(&self, leg: &Leg, want: Decimal) -> Option<Decimal> {
         let delivers = |quantity| delivered(&self.price_leg(leg, quantity).credit) >= want;
-        bracket(want / leg.delivered_per_unit, delivers).map(|high| least(high, delivers))
+        bracket(want / leg.delivered_per_unit, leg.search_limit(), delivers)
+            .map(|high| least(high, delivers))
     }
 
     /// The quantity of `leg` that delivers `want`, or the most that `budget` and the `depth` on
@@ -588,7 +604,9 @@ impl SimulatedVenue {
                     (Some(needed), Some(depth)) => needed.min(depth),
                     (Some(high), None) | (None, Some(high)) => high,
                     (None, None) => {
-                        bracket(budget / leg.paid_per_unit, |quantity| !pays(quantity))?
+                        bracket(budget / leg.paid_per_unit, leg.search_limit(), |quantity| {
+                            !pays(quantity)
+                        })?
                     }
                 };
                 if pays(high) {
@@ -657,12 +675,14 @@ fn delivered(credit: &Credit) -> Decimal {
     }
 }
 
-/// `start`, doubled until `reached` holds of it. `None` if it never does before overflowing, or
-/// within enough doublings to cover `Decimal`'s range.
-fn bracket(start: Decimal, reached: impl Fn(Decimal) -> bool) -> Option<Decimal> {
-    let mut quantity = start;
-    for _ in 0..96 {
-        if quantity > Decimal::ZERO && reached(quantity) {
+/// `start`, doubled until `reached` holds of it, or `None` if it does of none up to `limit`.
+///
+/// A `start` that is not above zero, such as a dust amount that its division rounded to zero,
+/// starts from the least positive `Decimal` instead.
+fn bracket(start: Decimal, limit: Decimal, reached: impl Fn(Decimal) -> bool) -> Option<Decimal> {
+    let mut quantity = start.max(Decimal::new(1, Decimal::MAX_SCALE));
+    while quantity <= limit {
+        if reached(quantity) {
             return Some(quantity);
         }
         quantity = quantity.checked_mul(Decimal::TWO)?;

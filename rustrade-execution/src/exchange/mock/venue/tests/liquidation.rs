@@ -1328,8 +1328,227 @@ fn a_ticket_per_order_leaves_the_budget_for_the_buy_back_it_cannot_cover() {
     let bought = trades(&events);
     assert_eq!(bought.len(), 1, "{:?}", shape(&events));
     assert_eq!(bought[0].quantity, d("0.7992"));
+    // Reported to the fewest decimal places that the budget pays for, not the search's 28.
+    assert_eq!(bought[0].quantity.scale(), 4);
     assert_eq!(
         balance_now(&venue, base()).margin.unwrap().borrowed,
         d("0.2008")
+    );
+}
+
+/// With less on offer than is owed, the buy-back takes what is offered, and each buy-back is its
+/// own order, paying its own ticket.
+#[test]
+fn a_ticket_per_order_buy_back_takes_only_the_depth_on_offer() {
+    let mut venue = short_one_btc_paying_a_ticket(SpotFeeAsset::Quote);
+    let at = |venue: &mut SimulatedVenue, ask: &str, seconds| {
+        venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(traded("18200"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d(ask)))),
+            time(seconds),
+        )
+    };
+
+    let events = at(&mut venue, "0.6", 2);
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(
+        (bought[0].quantity, bought[0].fees.fees),
+        (d("0.6"), d("10"))
+    );
+
+    let events = at(&mut venue, "1", 3);
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(
+        (bought[0].quantity, bought[0].fees.fees),
+        (d("0.4"), d("10"))
+    );
+    assert_eq!(
+        balance_now(&venue, base()).margin.unwrap(),
+        MarginDetails::default()
+    );
+}
+
+/// An account that cannot pay even the ticket buys nothing back.
+#[test]
+fn a_ticket_the_account_cannot_pay_buys_nothing_back() {
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![
+                FeeComponent::new(FeeBasis::PerOrder(d("30000"))).on_side(Side::Buy),
+            ])
+            .unwrap(),
+        ),
+        ..liquidating_config(
+            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    let outcome = venue.open_order(sell_request("1", None));
+    assert_eq!(filled_trade(&outcome).fees.fees, Decimal::ZERO);
+
+    // 20,000 held against 18,200 owed: a margin level of 1.099, and a ticket of 30,000 to buy.
+    let (events, _) = warnings(|| tick(&mut venue, "18200", 2));
+
+    assert!(trades(&events).is_empty(), "{:?}", shape(&events));
+    assert_eq!(balance_now(&venue, base()).margin.unwrap().borrowed, d("1"));
+}
+
+/// A small debt whose ticket, taken in the base the buy receives, outweighs what one unit's price
+/// scales to: the search climbs past that estimate, and buys back the debt and the ticket exactly.
+#[test]
+fn a_ticket_taken_in_base_buys_back_a_small_debt_and_the_ticket_exactly() {
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+        ),
+        spot_fee_asset: SpotFeeAsset::Received,
+        ..liquidating_config(
+            vec![funded(base(), Decimal::ZERO), funded(quote(), d("1110"))],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    let outcome = venue.open_order(sell_request("0.1", None));
+    assert_eq!(filled_trade(&outcome).fees.fees, d("10"));
+
+    // 2,100 held against 2,000 owed: a margin level of 1.05. The ticket is 0.0005 BTC at 20,000,
+    // so 0.1 / (1 - 0.0005) falls short, and 0.1005 delivers the 0.1 owed.
+    let events = tick(&mut venue, "20000", 2);
+
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(
+        (bought[0].quantity, bought[0].fees.fees),
+        (d("0.1005"), d("0.0005"))
+    );
+    // Reported to the fewest decimal places that deliver the debt, not the search's 28.
+    assert_eq!(bought[0].quantity.scale(), 4);
+    assert_eq!(
+        balance_now(&venue, base()),
+        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+    );
+}
+
+/// When no quantity delivers what is owed, the buy-back takes all that the budget pays for.
+///
+/// A fee of the whole notional, less a rebate of 2,000 per order, both on buys and taken in the
+/// base received, leaves every buy delivering the same 2,000 of BTC, whatever its size. At 20,000
+/// the 20,000 held buys exactly 1 BTC. At 30,000 it buys 2/3 BTC, a quantity whose last digit the
+/// division rounds up, so the quantity traded is the one below it that the budget pays for.
+#[test]
+fn a_debt_no_quantity_can_clear_buys_all_the_budget_pays_for() {
+    for (price, quantity) in [("20000", "1"), ("30000", "0.6666666666666666666666666666")] {
+        let config = MockExecutionConfig {
+            fee_model: FeeModelConfig::Composite(
+                CompositeFeeModel::new(vec![
+                    FeeComponent::new(FeeBasis::Notional(Decimal::ONE)).on_side(Side::Buy),
+                    FeeComponent::new(FeeBasis::PerOrder(d("-2000"))).on_side(Side::Buy),
+                ])
+                .unwrap(),
+            ),
+            spot_fee_asset: SpotFeeAsset::Received,
+            ..liquidating_config(
+                vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+                liquidation("1.1", "0.02"),
+            )
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(tick(&mut venue, "10000", 1).is_empty());
+        let outcome = venue.open_order(sell_request("1", None));
+        assert_eq!(filled_trade(&outcome).fees.fees, Decimal::ZERO);
+
+        // 20,000 held against 1 BTC owed at `price`: a margin level of 1 or 2/3.
+        let (events, _) = warnings(|| tick(&mut venue, price, 2));
+
+        let bought = trades(&events);
+        assert_eq!(bought.len(), 1, "at {price}: {:?}", shape(&events));
+        assert_eq!(bought[0].quantity, d(quantity), "at {price}");
+    }
+}
+
+/// A shortfall of dust, too small for its division by the price to leave anything, still raises
+/// only what it and the ticket need, not all the collateral the budget pays for.
+#[test]
+fn a_dust_shortfall_sells_only_what_it_and_the_ticket_need() {
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+        ),
+        ..liquidating_config(
+            vec![
+                funded(base(), d("0.001")),
+                funded(eth(), Decimal::ZERO),
+                funded(quote(), d("1019.999999999999999999999999")),
+            ],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "100010", 1).is_empty());
+    assert!(eth_tick(&mut venue, "1000", 1).is_empty());
+    let sold = venue.open_order(request(eth_instrument_name(), Side::Sell, "1", None));
+    assert_eq!(filled_trade(&sold).fees.fees, d("10"));
+
+    // 100.01 of BTC and 2,010 USDT less 1e-24 against 2,000 of ETH owed: a margin level of 1.055.
+    // Buying the ETH back costs 2,010, so 1e-24 USDT must be raised first: divided by the 100,000
+    // a BTC sold delivers, that rounds to zero.
+    let events = eth_tick(&mut venue, "2000", 2);
+
+    let legs = traded_legs(&events);
+    assert_eq!(legs.len(), 3, "{legs:?}");
+    let (instrument, side, quantity) = &legs[0];
+    assert_eq!((instrument, side), (&instrument_name(), &Side::Sell));
+    // The ticket's 10 USDT and the dust: about 0.0001 BTC of the 0.001 held.
+    assert!(
+        (quantity - d("10") / d("100010")).abs() < d("0.0000000000000000000001"),
+        "{quantity}"
+    );
+    assert_eq!(
+        (&legs[1].0, legs[1].1, legs[1].2),
+        (&eth_instrument_name(), Side::Buy, d("1"))
+    );
+    assert!(balance_now(&venue, base()).total > Decimal::ZERO);
+}
+
+/// A large debt under a ticket per order is still bought back exactly: the search reaches it.
+#[test]
+fn a_ticket_per_order_buys_back_a_large_debt_exactly() {
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+        ),
+        ..liquidating_config(
+            vec![funded(base(), Decimal::ZERO), funded(quote(), d("1000000"))],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    let outcome = venue.open_order(sell_request("100", None));
+    assert_eq!(filled_trade(&outcome).quantity, d("100"));
+
+    // 1,999,990 left of the sale against 1,820,000 owed: a margin level of 1.0989.
+    let events = tick(&mut venue, "18200", 2);
+
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(
+        (bought[0].quantity, bought[0].fees.fees),
+        (d("100"), d("10"))
+    );
+    assert_eq!(
+        balance_now(&venue, base()).margin.unwrap(),
+        MarginDetails::default()
     );
 }
