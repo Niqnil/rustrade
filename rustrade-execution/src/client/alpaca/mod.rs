@@ -1904,6 +1904,10 @@ impl ExecutionClient for AlpacaClient {
     /// or [`GoodTillDate`](TimeInForce::GoodTillDate), which this client does not yet send. Any
     /// other is refused with [`OrderError::UnsupportedTimeInForce`] without a request.
     ///
+    /// Crypto is told apart by the `/` in its symbol. An order for a crypto symbol spelt without
+    /// one, such as `BTCUSD`, is taken for an equity: its time in force is not checked as crypto,
+    /// and Alpaca rejects it.
+    ///
     /// # Market order price
     ///
     /// The returned `Order.price` echoes the request price. For market orders this is
@@ -9177,10 +9181,10 @@ mod tests {
             );
         }
 
-        /// An options order with a time in force Alpaca does not take for options is refused
-        /// without a request; an equity order with the same one is still sent.
+        /// An options IOC and a crypto day order, each a time in force Alpaca does not take for
+        /// its asset class, are refused without a request; an equity IOC is still sent.
         #[tokio::test]
-        async fn an_options_ioc_is_refused_unsent_and_an_equity_ioc_is_sent() {
+        async fn a_time_in_force_its_asset_class_does_not_take_is_refused_unsent() {
             use crate::client::ExecutionClient;
             use crate::order::request::{OrderRequestOpen, RequestOpen};
             use crate::order::{
@@ -9218,6 +9222,7 @@ mod tests {
             fn open<'a>(
                 symbol: &'a InstrumentNameExchange,
                 cid: &str,
+                time_in_force: TimeInForce,
             ) -> OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange> {
                 OrderRequestOpen {
                     key: OrderKey {
@@ -9231,13 +9236,15 @@ mod tests {
                         None,
                         Decimal::ONE,
                         OrderKind::Market,
-                        TimeInForce::ImmediateOrCancel,
+                        time_in_force,
                     ),
                 }
             }
 
             let option = InstrumentNameExchange::new("AAPL250620C00200000");
-            let refused = client.open_order(open(&option, "option")).await;
+            let refused = client
+                .open_order(open(&option, "option", TimeInForce::ImmediateOrCancel))
+                .await;
             assert!(
                 matches!(
                     &refused.state,
@@ -9253,8 +9260,29 @@ mod tests {
             );
             assert!(server.received_requests().await.unwrap().is_empty());
 
+            let crypto = InstrumentNameExchange::new("BTC/USD");
+            let refused = client
+                .open_order(open(&crypto, "crypto", TimeInForce::GoodUntilEndOfDay))
+                .await;
+            assert!(
+                matches!(
+                    &refused.state,
+                    OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedTimeInForce {
+                            time_in_force: TimeInForce::GoodUntilEndOfDay,
+                            ..
+                        }
+                    ))
+                ),
+                "{:?}",
+                refused.state
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+
             let equity = InstrumentNameExchange::new("AAPL");
-            let sent = client.open_order(open(&equity, "equity")).await;
+            let sent = client
+                .open_order(open(&equity, "equity", TimeInForce::ImmediateOrCancel))
+                .await;
             assert!(sent.state.is_accepted(), "{:?}", sent.state);
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
