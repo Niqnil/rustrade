@@ -3683,11 +3683,11 @@ impl SimulatedVenue {
                 Ok(commitment)
             }
             Err(insufficient) => {
-                #[allow(clippy::expect_used)]
-                // Unreachable: a refused commit moves nothing, so what was just released is still free.
-                self.account
-                    .reserve(&release.asset, release.amount, time_exchange)
-                    .expect("a refused commit leaves the collateral it was offered free");
+                // A refused commit moves nothing, so this undoes the release exactly, even when a
+                // charge has left `free` below zero, where re-reserving would be refused.
+                let _ = self
+                    .account
+                    .restore_hold(&release.asset, release.amount, time_exchange);
                 Err(insufficient)
             }
         }

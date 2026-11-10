@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The engine's `GenerateAlgoOrders` implementation requires `State: PreparesAmend`.**
     `EngineState` implements it; a custom engine state must implement it too.
 
+### Fixed
+
+- **A refused option buyback no longer panics the simulated venue when a charge has overdrawn
+  the account** (`rustrade-execution`). A buyback of a short option releases the short's
+  collateral to pay with. When the account still could not pay, the venue reserved the
+  collateral again, and that reserve panicked if `free` had been below zero before the release,
+  as a CFD holding cost can leave it. The venue now undoes the release exactly, as it already did
+  for a resting order's hold, so the buyback is refused and the collateral stays held.
+
 ## [0.22.0] - 2026-11-09
 
 ### Added
