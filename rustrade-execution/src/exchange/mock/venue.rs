@@ -3120,10 +3120,16 @@ impl SimulatedVenue {
     /// stands, and committed in place of the hold through
     /// [`commit_afresh`](Self::commit_afresh). An order the account cannot afford is refused.
     ///
-    /// A refusal changes nothing, the slippage included, and hands `reservation` back. A commit
-    /// prints the fill, if any, under the order's own id, but leaves the order where it was: the
-    /// caller puts what is left on the book, or retires an order filled outright, and reports the
-    /// order.
+    /// A refusal changes nothing, the slippage included, and hands `reservation` back. Only the
+    /// held asset's balance timestamp moves, to `time_exchange`, as releasing and restoring the
+    /// hold stamp it; no event reports it. A commit prints the fill, if any, under the order's own id, but
+    /// leaves the order where it was: the caller puts what is left on the book, or retires an
+    /// order filled outright, and reports the order.
+    ///
+    /// `order` must not be among the resting orders the costing reads: the remainder's
+    /// requirement is priced against the position with what else rests on its side behind it, so
+    /// an order still on the book would count itself twice. A caller that leaves it on the book
+    /// excludes it from that sum.
     fn reenter(
         &mut self,
         order: &OpenOrder,
@@ -3551,12 +3557,13 @@ impl SimulatedVenue {
             }
             Err(_) => Recommitted::Unaffordable {
                 reservation: released.map(|(mut reservation, _)| {
-                    #[allow(clippy::expect_used)]
-                    // Unreachable: a refused commit moves nothing, so the hold just released is
-                    // still free.
-                    self.account
-                        .reserve(&reservation.asset, reservation.amount, time_exchange)
-                        .expect("a refused commit leaves the hold it was offered free");
+                    // A refused commit moves nothing, so this undoes the release exactly, even
+                    // where a charge has left `free` below zero.
+                    let _ = self.account.restore_hold(
+                        &reservation.asset,
+                        reservation.amount,
+                        time_exchange,
+                    );
                     reservation.unreported_interest = held_interest;
                     reservation
                 }),
@@ -7084,8 +7091,9 @@ enum Recommitted {
         loan: Decimal,
         excess_borrowed: Decimal,
     },
-    /// The account cannot cover it. The ledger is as it was: the order still holds its
-    /// reservation, handed back here whole, if it held anything.
+    /// The account cannot cover it. The ledger's amounts are as they were, only the held asset's
+    /// balance timestamp moving: the order still holds its reservation, handed back here whole, if
+    /// it held anything.
     Unaffordable { reservation: Option<Reservation> },
 }
 
@@ -8491,6 +8499,49 @@ mod tests {
         assert_eq!(free_usd(&venue), d("260000"));
         assert_eq!(total_usd(&venue), d("260000"), "nothing settled");
         assert_eq!(cfd_position(&venue), None);
+        assert!(venue.account.is_cancelled(&ClientOrderId::new("flip")));
+    }
+
+    /// As above, but with `free` charged below zero while the order rests, as a holding cost the
+    /// account cannot cover leaves it. Taking the hold back after the refused commit must not be
+    /// refused for the shortfall: the order is still cancelled and its hold given back.
+    #[test]
+    fn a_resting_cfd_order_unaffordable_with_free_below_zero_is_cancelled_and_releases_its_hold() {
+        let mut venue = make_cfd_market_venue("260000");
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        let _ = venue.open_order(cfd_limit("flip", Side::Sell, "3", "5200"));
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert_eq!(free_usd(&venue), d("130000"));
+
+        let _ = venue
+            .account
+            .charge(&usd(), d("-140000"), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(free_usd(&venue), d("-10000"), "the charge overdraws free");
+
+        let events = cfd_market(&mut venue, "5200", "5210", "5200");
+
+        let Some((last, released)) = events.split_last() else {
+            panic!("an unaffordable fill reports its cancelled order");
+        };
+        assert!(
+            matches!(
+                order_of(last).state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            order_of(last).state
+        );
+        let [released] = released else {
+            panic!("exactly the released hold restates: {released:?}");
+        };
+        assert_eq!(
+            balance_of(released).balance.free,
+            d("120000"),
+            "the hold is given back on top of the overdrawn free"
+        );
+        assert_eq!(free_usd(&venue), d("120000"));
+        assert_eq!(total_usd(&venue), d("120000"), "nothing settled");
         assert!(venue.account.is_cancelled(&ClientOrderId::new("flip")));
     }
 
