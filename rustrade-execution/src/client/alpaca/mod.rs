@@ -1117,6 +1117,19 @@ impl AlpacaClient {
         TimeInForceKind::GoodUntilCancelled,
     ];
 
+    /// The time in force Alpaca takes for a crypto order: `gtc`, without post-only, and `ioc`.
+    /// This client refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending
+    /// the order.
+    ///
+    /// A simulated venue standing in for Alpaca crypto alone can take this set as its rule for
+    /// `Spot` instruments, through
+    /// [`TimeInForceRules`](crate::client::mock::TimeInForceRules). One that also trades equities
+    /// cannot, because both are `Spot` there.
+    pub const CRYPTO_TIME_IN_FORCE: &'static [TimeInForceKind] = &[
+        TimeInForceKind::GoodUntilCancelled,
+        TimeInForceKind::ImmediateOrCancel,
+    ];
+
     /// Build a `reqwest::Client` with Alpaca auth headers pre-set.
     ///
     /// # Panics
@@ -1881,16 +1894,15 @@ impl ExecutionClient for AlpacaClient {
     /// An options order (an OCC symbol) takes only
     /// [`GoodUntilEndOfDay`](TimeInForce::GoodUntilEndOfDay) and
     /// [`GoodUntilCancelled`](TimeInForce::GoodUntilCancelled) without post-only: see
-    /// [`AlpacaClient::OPTION_TIME_IN_FORCE`]. An equity order also takes
-    /// [`ImmediateOrCancel`](TimeInForce::ImmediateOrCancel),
+    /// [`AlpacaClient::OPTION_TIME_IN_FORCE`]. A crypto order (a `BASE/QUOTE` symbol) takes only
+    /// [`GoodUntilCancelled`](TimeInForce::GoodUntilCancelled) without post-only and
+    /// [`ImmediateOrCancel`](TimeInForce::ImmediateOrCancel): see
+    /// [`AlpacaClient::CRYPTO_TIME_IN_FORCE`]. An equity order takes those two,
+    /// [`GoodUntilEndOfDay`](TimeInForce::GoodUntilEndOfDay),
     /// [`FillOrKill`](TimeInForce::FillOrKill), [`AtOpen`](TimeInForce::AtOpen) and
     /// [`AtClose`](TimeInForce::AtClose). No order takes post-only, which Alpaca does not offer,
     /// or [`GoodTillDate`](TimeInForce::GoodTillDate), which this client does not yet send. Any
     /// other is refused with [`OrderError::UnsupportedTimeInForce`] without a request.
-    ///
-    /// Alpaca takes a crypto order (a `BASE/QUOTE` symbol) only as `gtc` or `ioc`. This client
-    /// does not check that yet: a crypto order with any other time in force is sent, and Alpaca
-    /// rejects it.
     ///
     /// # Market order price
     ///
@@ -2507,8 +2519,8 @@ impl AlpacaClient {
         }
 
         // Refuse a time in force Alpaca would reject for this order before building the request.
-        let option = occ_contract(instrument.name().as_str()).is_some();
-        let tif_str = match map_time_in_force(time_in_force, option) {
+        let asset_class = OrderAssetClass::of(instrument.name().as_str());
+        let tif_str = match map_time_in_force(time_in_force, asset_class) {
             Ok(s) => s,
             Err(reason) => {
                 return Order {
@@ -5395,23 +5407,57 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
     }
 }
 
-/// Map rustrade's `TimeInForce` to Alpaca's string representation, for an options order when
-/// `option` is set.
+/// What an order symbol names, as far as the time in force Alpaca takes for it depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderAssetClass {
+    Equity,
+    Option,
+    Crypto,
+}
+
+impl OrderAssetClass {
+    /// An OCC symbol is an option, a `BASE/QUOTE` pair is crypto, and any other is an equity.
+    fn of(symbol: &str) -> Self {
+        if occ_contract(symbol).is_some() {
+            Self::Option
+        } else if is_options_or_equity_symbol(symbol) {
+            Self::Equity
+        } else {
+            Self::Crypto
+        }
+    }
+}
+
+/// Map rustrade's `TimeInForce` to Alpaca's string representation, for an order on an instrument
+/// of `asset_class`.
 ///
 /// # Errors
 ///
 /// Returns why Alpaca would not take `tif`:
 /// - for an options order, anything outside [`AlpacaClient::OPTION_TIME_IN_FORCE`];
+/// - for a crypto order, anything outside [`AlpacaClient::CRYPTO_TIME_IN_FORCE`];
 /// - `post_only: true` on any order. Alpaca does not support post-only orders: silently placing a
 ///   taker-eligible GTC order would be the opposite of caller intent, risking unexpected taker
 ///   fees;
 /// - [`TimeInForce::GoodTillDate`], which needs an `expired_at` this client does not yet send.
-fn map_time_in_force(tif: TimeInForce, option: bool) -> Result<&'static str, &'static str> {
-    if option && !AlpacaClient::OPTION_TIME_IN_FORCE.contains(&tif.kind()) {
-        return Err(
-            "Alpaca takes an options order only as day (GoodUntilEndOfDay) or gtc \
-                    (GoodUntilCancelled without post_only)",
-        );
+fn map_time_in_force(
+    tif: TimeInForce,
+    asset_class: OrderAssetClass,
+) -> Result<&'static str, &'static str> {
+    match asset_class {
+        OrderAssetClass::Option if !AlpacaClient::OPTION_TIME_IN_FORCE.contains(&tif.kind()) => {
+            return Err(
+                "Alpaca takes an options order only as day (GoodUntilEndOfDay) or gtc \
+                 (GoodUntilCancelled without post_only)",
+            );
+        }
+        OrderAssetClass::Crypto if !AlpacaClient::CRYPTO_TIME_IN_FORCE.contains(&tif.kind()) => {
+            return Err(
+                "Alpaca takes a crypto order only as gtc (GoodUntilCancelled without post_only) \
+                 or ioc (ImmediateOrCancel)",
+            );
+        }
+        OrderAssetClass::Equity | OrderAssetClass::Option | OrderAssetClass::Crypto => {}
     }
     match tif {
         TimeInForce::GoodUntilCancelled { post_only } => {
@@ -6085,25 +6131,40 @@ mod tests {
     #[test]
     fn test_map_time_in_force_roundtrip() {
         assert_eq!(
-            map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: false }, false),
+            map_time_in_force(
+                TimeInForce::GoodUntilCancelled { post_only: false },
+                OrderAssetClass::Equity
+            ),
             Ok("gtc")
         );
         assert_eq!(
-            map_time_in_force(TimeInForce::GoodUntilEndOfDay, false),
+            map_time_in_force(TimeInForce::GoodUntilEndOfDay, OrderAssetClass::Equity),
             Ok("day")
         );
-        assert_eq!(map_time_in_force(TimeInForce::FillOrKill, false), Ok("fok"));
         assert_eq!(
-            map_time_in_force(TimeInForce::ImmediateOrCancel, false),
+            map_time_in_force(TimeInForce::FillOrKill, OrderAssetClass::Equity),
+            Ok("fok")
+        );
+        assert_eq!(
+            map_time_in_force(TimeInForce::ImmediateOrCancel, OrderAssetClass::Equity),
             Ok("ioc")
         );
-        assert_eq!(map_time_in_force(TimeInForce::AtOpen, false), Ok("opg"));
-        assert_eq!(map_time_in_force(TimeInForce::AtClose, false), Ok("cls"));
+        assert_eq!(
+            map_time_in_force(TimeInForce::AtOpen, OrderAssetClass::Equity),
+            Ok("opg")
+        );
+        assert_eq!(
+            map_time_in_force(TimeInForce::AtClose, OrderAssetClass::Equity),
+            Ok("cls")
+        );
     }
 
     #[test]
     fn test_map_time_in_force_rejects_post_only() {
-        let result = map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: true }, false);
+        let result = map_time_in_force(
+            TimeInForce::GoodUntilCancelled { post_only: true },
+            OrderAssetClass::Equity,
+        );
         assert!(result.is_err(), "post_only must be rejected");
         assert!(result.unwrap_err().contains("post_only"));
     }
@@ -6111,11 +6172,14 @@ mod tests {
     #[test]
     fn an_options_order_maps_only_day_and_gtc() {
         assert_eq!(
-            map_time_in_force(TimeInForce::GoodUntilEndOfDay, true),
+            map_time_in_force(TimeInForce::GoodUntilEndOfDay, OrderAssetClass::Option),
             Ok("day")
         );
         assert_eq!(
-            map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: false }, true),
+            map_time_in_force(
+                TimeInForce::GoodUntilCancelled { post_only: false },
+                OrderAssetClass::Option
+            ),
             Ok("gtc")
         );
         for refused in [
@@ -6128,9 +6192,47 @@ mod tests {
                 expiry: DateTime::<Utc>::MIN_UTC,
             },
         ] {
-            let reason = map_time_in_force(refused, true).unwrap_err();
+            let reason = map_time_in_force(refused, OrderAssetClass::Option).unwrap_err();
             assert!(reason.contains("options order"), "{refused}: {reason}");
         }
+    }
+
+    #[test]
+    fn a_crypto_order_maps_only_gtc_and_ioc() {
+        assert_eq!(
+            map_time_in_force(
+                TimeInForce::GoodUntilCancelled { post_only: false },
+                OrderAssetClass::Crypto
+            ),
+            Ok("gtc")
+        );
+        assert_eq!(
+            map_time_in_force(TimeInForce::ImmediateOrCancel, OrderAssetClass::Crypto),
+            Ok("ioc")
+        );
+        for refused in [
+            TimeInForce::GoodUntilEndOfDay,
+            TimeInForce::FillOrKill,
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+            TimeInForce::GoodUntilCancelled { post_only: true },
+            TimeInForce::GoodTillDate {
+                expiry: DateTime::<Utc>::MIN_UTC,
+            },
+        ] {
+            let reason = map_time_in_force(refused, OrderAssetClass::Crypto).unwrap_err();
+            assert!(reason.contains("crypto order"), "{refused}: {reason}");
+        }
+    }
+
+    #[test]
+    fn an_order_symbol_names_its_asset_class() {
+        assert_eq!(
+            OrderAssetClass::of("AAPL250620C00200000"),
+            OrderAssetClass::Option
+        );
+        assert_eq!(OrderAssetClass::of("BTC/USD"), OrderAssetClass::Crypto);
+        assert_eq!(OrderAssetClass::of("AAPL"), OrderAssetClass::Equity);
     }
 
     // =========================================================================
