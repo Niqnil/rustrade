@@ -94,7 +94,9 @@
 //!
 //! - **Order types**: Market, Limit, Stop, StopLimit, TrailingStop, TrailingStopLimit,
 //!   and Bracket (entry + take-profit + stop-loss) supported. No Algo orders.
-//! - **TimeInForce**: No `post_only` (IB has no maker-only orders)
+//! - **TimeInForce**: No `post_only` (IB has no maker-only orders), and `AtClose` only on a
+//!   market or limit order (sent as market- or limit-on-close), never on a bracket. The client
+//!   refuses these unsent with [`OrderError::UnsupportedTimeInForce`]; IB decides the rest
 //! - **Client order ids** travel as each order's IB order reference, so they are at most 128
 //!   ASCII characters
 //! - **No order modification.** This client never modifies an open order, though IB allows it.
@@ -241,8 +243,8 @@ use ibapi::{
 };
 pub use order::{BracketOrderRequest, BracketOrderResult};
 use order::{
-    OrderContext, OrderIdMap, PendingCancels, build_ib_bracket_with_oca, build_ib_order,
-    side_to_action, time_in_force_to_ib,
+    OrderContext, OrderIdMap, OrderMappingError, PendingCancels, build_ib_bracket_with_oca,
+    build_ib_order, side_to_action, time_in_force_to_ib,
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
@@ -1856,12 +1858,22 @@ impl IbkrClient {
         // Validate time_in_force and convert to IB wire format
         let ib_tif = match time_in_force_to_ib(&request.time_in_force) {
             Ok(tif) => tif,
+            // AtClose makes an IB order market- or limit-on-close, which a bracket's stop leg
+            // cannot be.
+            Err(OrderMappingError::AtCloseRequiresOrderTypeChange) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::unsupported_time_in_force(
+                        request.time_in_force,
+                        "this client sends no AtClose bracket: AtClose makes an IB order \
+                         market- or limit-on-close, which the stop-loss leg cannot be",
+                    ),
+                );
+            }
             Err(e) => {
                 return make_all_inactive_bracket(
                     &request,
-                    OrderError::Rejected(ApiError::OrderRejected(format!(
-                        "TIF not supported by IB: {e}"
-                    ))),
+                    e.into_order_error(request.time_in_force),
                 );
             }
         };
@@ -3130,9 +3142,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                        e.to_string(),
-                    ))),
+                    state: OrderState::inactive(e.into_order_error(request.state.time_in_force)),
                 };
             }
         };
