@@ -31,11 +31,15 @@ use futures::{StreamExt, stream::BoxStream};
 use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
+    calendar::{DailyClose, SessionCalendar},
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::error;
@@ -136,6 +140,68 @@ pub struct MockExecutionConfig {
     /// venue has already taken.
     #[serde(default, skip_serializing_if = "TimeInForceRules::is_empty")]
     pub time_in_force: TimeInForceRules,
+    /// When the mock exchange's trading sessions close, which is when a
+    /// [`TimeInForce::GoodUntilEndOfDay`] limit order expires. See [`SessionCalendarConfig`].
+    ///
+    /// Defaults to `None`: the venue has no session calendar and refuses a day limit order with
+    /// [`OrderError::UnsupportedTimeInForce`]. A calendar of your own can be attached instead with
+    /// [`SimulatedVenue::with_session_calendar`].
+    ///
+    /// [`SimulatedVenue::with_session_calendar`]:
+    ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_close: Option<SessionCalendarConfig>,
+}
+
+/// When a simulated venue's trading sessions close: what a
+/// [`TimeInForce::GoodUntilEndOfDay`] limit order lives until.
+///
+/// A day limit order the venue accepts expires at the first instant after the next close (see
+/// [`SessionCalendar::next_close_after`]), as a [`TimeInForce::GoodTillDate`] order expires at
+/// its `expiry`. Something trading at the close itself can still fill it. An order sent after
+/// the close, on a weekend or before the open is accepted and expires at the next close, so one
+/// sent after Friday's close expires at Monday's.
+///
+/// # Known limitations
+/// - **No holidays or early closes** in [`Daily`](Self::Daily): a day order lives through a
+///   market holiday, and past an early close, until the next weekday's regular close.
+/// - **No open time**: a day order sent after the close works at once, so it can fill on
+///   after-hours data that the live venue would hold until the next open.
+/// - **One close for the whole venue**: a venue whose instruments close at different times (US
+///   equity options at 16:00 ET, index options at 16:15 ET) has the wrong close for some, and
+///   an instrument that trades around the clock gets the same close. Refuse a day order where the
+///   live venue refuses one with [`MockExecutionConfig::time_in_force`].
+///
+/// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller. Not
+/// `Copy`, so that such a source may hold a list of dates; `Ord` and `Hash` are what
+/// [`MockExecutionConfig`] requires.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCalendarConfig {
+    /// One close time in a time zone, every weekday: see [`DailyClose`].
+    ///
+    /// ```
+    /// use chrono::NaiveTime;
+    /// use rustrade_execution::client::mock::SessionCalendarConfig;
+    /// use rustrade_instrument::calendar::{DailyClose, Tz};
+    ///
+    /// // US equity options close at 16:00 New York time.
+    /// let close = SessionCalendarConfig::Daily(DailyClose::new(
+    ///     NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+    ///     "America/New_York".parse::<Tz>().unwrap(),
+    /// ));
+    /// ```
+    Daily(DailyClose),
+}
+
+impl SessionCalendarConfig {
+    /// The calendar this configuration names.
+    pub fn calendar(&self) -> Arc<dyn SessionCalendar> {
+        match self {
+            Self::Daily(close) => Arc::new(*close),
+        }
+    }
 }
 
 /// Which [`TimeInForce`] a simulated venue takes for each kind of instrument, so it refuses what
@@ -893,6 +959,7 @@ mod tests {
             short_put_collateral: Default::default(),
             amend: AmendConfig::NONE,
             time_in_force: Default::default(),
+            session_close: None,
         };
         let mut json = serde_json::to_value(&config).unwrap();
         assert!(

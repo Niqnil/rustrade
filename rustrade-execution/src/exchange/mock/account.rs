@@ -189,8 +189,8 @@ impl AccountState {
         self.orders_open.amend(order, reservation, rank)
     }
 
-    /// Puts `order` on the book holding `reservation`, unless an order is already resting under
-    /// its [`ClientOrderId`].
+    /// Puts `resting` on the book, the order holding its reservation until its deadline if it has
+    /// one, unless an order is already resting under its [`ClientOrderId`].
     ///
     /// A client order id names one order at a time, not one for good: once an order has ended its
     /// id may name a new one. So booking forgets how an earlier order under the same id ended,
@@ -198,32 +198,36 @@ impl AccountState {
     /// it twice.
     ///
     /// # Errors
-    /// [`AlreadyResting`], with `order` and `reservation` handed back and nothing changed, if an
-    /// order is already resting under its id. See [`OpenOrders::insert`].
-    pub fn book(
-        &mut self,
-        order: OpenOrder,
-        reservation: Option<Reservation>,
-    ) -> Result<(), AlreadyResting> {
-        let cid = order.key.cid.clone();
-        self.orders_open.insert(order, reservation)?;
+    /// [`AlreadyResting`], with `resting` handed back and nothing changed, if an order is already
+    /// resting under its id. See [`OpenOrders::insert`].
+    pub fn book(&mut self, resting: RestingOrder) -> Result<(), AlreadyResting> {
+        let cid = resting.order.key.cid.clone();
+        self.orders_open.insert(resting)?;
         self.forget_ended(&cid);
         Ok(())
     }
 
-    /// Holds `order` until its venue releases it, with `reservation` held against it, unless an
-    /// order is already resting under its [`ClientOrderId`]. Forgets how an earlier order under
+    /// Gives each open order with no deadline the one `deadline_for` answers for it. See
+    /// [`OpenOrders::resolve_deadlines`].
+    ///
+    /// # Errors
+    /// The first error `deadline_for` returns.
+    pub fn resolve_deadlines<E>(
+        &mut self,
+        deadline_for: impl FnMut(&OpenOrder) -> Result<Option<DateTime<Utc>>, E>,
+    ) -> Result<(), E> {
+        self.orders_open.resolve_deadlines(deadline_for)
+    }
+
+    /// Holds `resting` until its venue releases it, with its reservation held against it, unless
+    /// an order is already resting under its [`ClientOrderId`]. Forgets how an earlier order under
     /// the id ended, as [`book`](Self::book) does.
     ///
     /// # Errors
     /// [`AlreadyResting`], as for [`book`](Self::book). See [`OpenOrders::hold`].
-    pub fn hold(
-        &mut self,
-        order: OpenOrder,
-        reservation: Option<Reservation>,
-    ) -> Result<(), AlreadyResting> {
-        let cid = order.key.cid.clone();
-        self.orders_open.hold(order, reservation)?;
+    pub fn hold(&mut self, resting: RestingOrder) -> Result<(), AlreadyResting> {
+        let cid = resting.order.key.cid.clone();
+        self.orders_open.hold(resting)?;
         self.forget_ended(&cid);
         Ok(())
     }
@@ -1161,7 +1165,7 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
                     }
                     // Seeded, not booked here: the venue holds nothing against it.
                     orders_open
-                        .insert(open, None)
+                        .insert(RestingOrder::new(open, None))
                         .map_err(|_| DuplicateSeededOrder(cid))?;
                 }
                 OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {

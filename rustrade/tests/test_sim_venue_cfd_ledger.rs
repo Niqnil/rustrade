@@ -135,6 +135,7 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         short_put_collateral: Default::default(),
         amend: Default::default(),
         time_in_force: Default::default(),
+        session_close: None,
     }
 }
 

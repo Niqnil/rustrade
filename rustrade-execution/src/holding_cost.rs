@@ -29,7 +29,7 @@ use crate::cash_flow::CashFlowKind;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc, Weekday};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
-use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use rustrade_instrument::{calendar::instant_at_local, instrument::name::InstrumentNameExchange};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt::Debug, sync::Arc};
 
@@ -341,8 +341,7 @@ const CUTOFF_SEARCH_DAYS: u32 = 3660;
 ///
 /// A cutoff is a local time of day in `zone` (`Utc`, a `chrono::FixedOffset`, or a
 /// `chrono_tz::Tz` such as `America/New_York`, which moves with daylight saving). A cutoff
-/// that falls in a daylight-saving gap is taken at the first local time after the gap, and one
-/// that falls twice is taken the first time.
+/// is placed as [`instant_at_local`] places one in a daylight-saving gap or overlap.
 #[derive(Debug, Clone)]
 pub struct DailyAccrual<Tz: TimeZone = Utc> {
     cutoff: NaiveTime,
@@ -420,16 +419,7 @@ impl<Tz: TimeZone> DailyAccrual<Tz> {
 
     /// The instant of the cutoff on local `date`.
     fn cutoff_on(&self, date: NaiveDate) -> DateTime<Utc> {
-        let local = date.and_time(self.cutoff);
-
-        // A daylight-saving gap is at most a few hours wide; step past it a minute at a time.
-        (0..=24 * 60)
-            .find_map(|minutes| {
-                self.zone
-                    .from_local_datetime(&(local + TimeDelta::minutes(minutes)))
-                    .earliest()
-            })
-            .map(|instant| instant.with_timezone(&Utc))
+        instant_at_local(&self.zone, date, self.cutoff)
             .unwrap_or_else(|| panic!("DailyAccrual cannot place a cutoff on {date} in its zone"))
     }
 }

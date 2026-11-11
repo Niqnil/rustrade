@@ -2078,7 +2078,7 @@ fn a_request_priced_venue_that_exercises_counts_resting_buys_against_the_short()
             .collect(),
         {
             let mut book = OpenOrders::default();
-            book.insert(
+            book.insert(RestingOrder::new(
                 Order {
                     key: OrderKey {
                         exchange: EXCHANGE,
@@ -2098,7 +2098,7 @@ fn a_request_priced_venue_that_exercises_counts_resting_buys_against_the_short()
                     },
                 },
                 None,
-            )
+            ))
             .unwrap();
             book
         },

@@ -44,6 +44,8 @@ rust_decimal = { workspace = true }
 
 # Misc
 chrono = { workspace = true, features = ["serde"] }
+# IANA time zones for a session calendar's close, which moves with daylight saving.
+chrono-tz = { workspace = true, features = ["serde"] }
 derive_more = { workspace = true, features = ["display"] }
 thiserror = { workspace = true }
 
