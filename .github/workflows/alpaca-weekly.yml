@@ -61,8 +61,9 @@ jobs:
         run: cargo test --locked -p rustrade-data --features alpaca --test alpaca_data -- --ignored --skip sip --skip opra
 
       # Option orders that fill, so only here: the schedule above falls in US regular trading hours
-      # all year (10:00 or 11:00 AM ET), and each test checks Alpaca's clock first. A test that
-      # fails after placing an order cancels its orders and closes its position before failing.
+      # on a trading day (10:00 or 11:00 AM ET), and each test checks Alpaca's clock first, so a
+      # Wednesday market holiday fails this step with a message saying the market is closed. A test
+      # that fails after placing an order cancels its orders and closes its position before failing.
       - name: Options paper tests
         id: options-tests
         continue-on-error: true
