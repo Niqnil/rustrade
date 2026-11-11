@@ -619,6 +619,7 @@ mod tests {
             Default::default(),
             Default::default(),
             None,
+            Default::default(),
         );
         let mut venue = SimulatedVenue::new_market_driven(
             &config,

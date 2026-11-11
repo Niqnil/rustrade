@@ -20,7 +20,7 @@ use itertools::Either;
 use rust_decimal::Decimal;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
-    FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
+    FeeInput, FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
     cash_flow::{CashFlow, CashFlowKind, CashFlowPeriod, InterestTiming},
     order::{
         Order, OrderKey,
@@ -808,6 +808,12 @@ pub struct InstrumentState<
     /// `Position` PnL calculations include exchange commissions. Defaults to
     /// [`FeeModelConfig::Zero`] (no commission). Override with
     /// [`FeeModelConfig::PerContract`] for options brokers that charge per-contract.
+    ///
+    /// Each fill is priced as taker, since a `Trade` does not say which side of the book it was
+    /// on. What its order had filled before it is read from
+    /// [`Trade::order_filled_quantity`](rustrade_execution::trade::Trade::order_filled_quantity);
+    /// a fill that does not report it is priced as its order's first, so a fee charged once per
+    /// order (see [`FeeModelConfig::Composite`]) is charged on each such fill.
     ///
     /// Only enable [`FeeModelConfig::PerContract`] when the `ExecutionClient` reports
     /// `Trade.fees.fees = 0` (i.e., commission is not already embedded in fill reports).
@@ -2681,11 +2687,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // from, and guessing taker is the conservative direction: it overstates cost rather than
         // inventing profit. A venue that reports its own fees is the accurate path — see the
         // double-counting warning on `FeeModelConfig`.
+        //
+        // What the order had filled before this trade comes from the order's cumulative fill
+        // quantity, where the venue reports it. Where it does not, the trade is priced as its
+        // order's first fill, so a fee charged once per order is charged on every such fill: an
+        // overstatement again, never an understatement.
+        let prior_filled = trade.order_filled_quantity.map_or(Decimal::ZERO, |filled| {
+            (filled - trade.quantity.abs()).max(Decimal::ZERO)
+        });
         let computed_fee = self.fee_model.compute_fee(
-            trade.price,
-            trade.quantity,
-            contract_size,
-            Liquidity::Taker,
+            &FeeInput::new(trade.side, trade.price, trade.quantity, contract_size)
+                .with_liquidity(Liquidity::Taker)
+                .with_prior_filled(prior_filled),
         );
 
         let augmented;
@@ -5660,7 +5673,7 @@ mod tests {
         assert_eq!(position.pnl_realised, dec!(-1.1));
 
         let mut zero_venue_fee = instrument_state(OmsMode::Netting);
-        zero_venue_fee.fee_model = state.fee_model;
+        zero_venue_fee.fee_model = state.fee_model.clone();
         let _ = zero_venue_fee.update_from_trade(&fill_charging(
             Side::Buy,
             dec!(1),
@@ -5670,6 +5683,45 @@ mod tests {
         let position = netting_position(&zero_venue_fee).unwrap();
         assert_eq!(position.quantity_abs, dec!(1));
         assert_eq!(position.pnl_realised, dec!(-1));
+    }
+
+    /// The engine's fee model learns what a fill's order had filled before it from the order's
+    /// cumulative filled quantity, so a ticket per order is charged on its first fill only. A fill
+    /// that does not report it is priced as its order's first.
+    #[test]
+    fn an_engine_fee_model_charges_a_ticket_once_per_order_where_the_fill_says_what_filled() {
+        use rustrade_execution::{CompositeFeeModel, FeeBasis, FeeComponent};
+
+        let mut state = instrument_state(OmsMode::Netting);
+        state.fee_model = FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(dec!(5)))]).unwrap(),
+        );
+        let fees = |state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>| {
+            -netting_position(state).unwrap().pnl_realised
+        };
+
+        let mut first = fill_reporting(OrderId::new("a"), Side::Buy, dec!(1), dec!(1));
+        first.id = TradeId::new("a1");
+        let _ = state.update_from_trade(&first);
+        assert_eq!(
+            fees(&state),
+            dec!(5),
+            "the order's first fill pays the ticket"
+        );
+
+        let mut second = fill_reporting(OrderId::new("a"), Side::Buy, dec!(1), dec!(2));
+        second.id = TradeId::new("a2");
+        let _ = state.update_from_trade(&second);
+        assert_eq!(fees(&state), dec!(5), "its second fill does not");
+
+        let mut unreported = fill(OrderId::new("a"), Side::Buy, dec!(1));
+        unreported.id = TradeId::new("a3");
+        let _ = state.update_from_trade(&unreported);
+        assert_eq!(
+            fees(&state),
+            dec!(10),
+            "a fill that does not say what its order filled is priced as the order's first"
+        );
     }
 
     /// Only a fee in the base asset is a change in the holding. One in quote, or in a third asset

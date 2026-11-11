@@ -2,7 +2,8 @@
 //! See [`SpotMarginLiquidation`] for what the venue does, and when.
 
 use super::{
-    InstrumentTerms, MarginCheck, NetPosition, Prices, SimulatedVenue, Valued, mid_or_last, owed,
+    FeePricing, InstrumentTerms, MarginCheck, NetPosition, Prices, Settlement, SimulatedVenue,
+    Valued, mid_or_last, owed,
 };
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
@@ -16,7 +17,7 @@ use crate::{
     trade::{TimeSource, Trade, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
@@ -69,9 +70,32 @@ struct Leg {
     pay: AssetNameExchange,
     price: Decimal,
     /// What one unit of base costs in [`pay`](Self::pay), fee included where it is charged in it.
+    /// Under a fee model that is not linear in quantity, the average over the quantity `leg`
+    /// probed, which only seeds the search.
     paid_per_unit: Decimal,
-    /// What one unit of base delivers of the asset received, net of any fee charged in it.
+    /// What one unit of base delivers of the asset received, net of any fee charged in it,
+    /// averaged as [`paid_per_unit`](Self::paid_per_unit) is.
     delivered_per_unit: Decimal,
+}
+
+/// How far below `Decimal::MAX` the largest quantity a search tries stays, as a factor on its
+/// cost, so that pricing it cannot overflow.
+const SEARCH_HEADROOM: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+impl Leg {
+    /// The most of this leg a search for a quantity tries; see [`search_limit`].
+    fn search_limit(&self) -> Decimal {
+        search_limit(self.paid_per_unit, self.price)
+    }
+}
+
+/// The most of a leg priced at `price` and paying `paid_per_unit` that a search tries: one costing
+/// about 7.9e22 of what it pays with or of quote, more than any account holds, and a millionth of
+/// `Decimal::MAX`, so that its fee and settlement cannot overflow.
+fn search_limit(paid_per_unit: Decimal, price: Decimal) -> Decimal {
+    (Decimal::MAX / SEARCH_HEADROOM)
+        .checked_div(paid_per_unit.max(price))
+        .unwrap_or(Decimal::MAX)
 }
 
 impl SimulatedVenue {
@@ -287,8 +311,7 @@ impl SimulatedVenue {
         let Some(leg) = self.leg(valuation, asset, owed) else {
             return;
         };
-        let cost = owed / leg.delivered_per_unit * leg.paid_per_unit;
-        let short = cost - self.account.free(valuation);
+        let short = self.leg_cost(&leg, owed) - self.account.free(valuation);
         self.raise(valuation, short, time_exchange, events);
         self.fill_leg(&leg, owed, time_exchange, events);
     }
@@ -349,7 +372,8 @@ impl SimulatedVenue {
 
     /// A forced trade paying `pay` for `receive`, priced for about `want` of `receive`, or `None`
     /// if no spot instrument pairing the two has a market here that prices it, or what it
-    /// delivers is not worth more than its fee.
+    /// delivers is not worth more than its fee: at one unit under a fee model linear in quantity,
+    /// at any quantity up to the [search limit](search_limit) under one that is not.
     ///
     /// The instrument is the first by name, either way round. Priced by the fill model and
     /// slipped, as a market order on arrival is, which draws from the slippage stream.
@@ -391,20 +415,35 @@ impl SimulatedVenue {
             return None;
         }
 
-        // Every fee model is linear in quantity, so one unit's settlement prices any quantity.
-        let one = self.fill_settlement(
-            &terms,
-            NetPosition::default(),
-            side,
-            Decimal::ONE,
-            price,
-            Liquidity::Taker,
-        );
-        let delivered_per_unit = match one.credit {
-            Credit::Delivery(delivery) => delivery.amount,
+        // One unit's settlement prices any quantity when the fee model is linear in quantity, and
+        // gives a quantity to start from when it is not; see `fill_leg`. A charge per order can
+        // outweigh what one unit delivers, so under such a model the probe doubles until what it
+        // delivers is positive, and its average per unit seeds the search.
+        let probe = |quantity| {
+            self.fill_settlement(
+                &terms,
+                NetPosition::default(),
+                side,
+                quantity,
+                price,
+                FeePricing::first(Liquidity::Taker),
+            )
+        };
+        let mut quantity = Decimal::ONE;
+        let mut sample = probe(quantity);
+        if !self.fee_model_for(&terms).is_linear() {
+            let limit = search_limit(sample.amount, price);
+            while delivered(&sample.credit) <= Decimal::ZERO {
+                quantity = quantity.checked_mul(Decimal::TWO).filter(|q| *q <= limit)?;
+                sample = probe(quantity);
+            }
+        }
+        let delivered_per_unit = match sample.credit {
+            Credit::Delivery(delivery) => delivery.amount / quantity,
             Credit::PaidBack(_) => return None,
         };
-        if delivered_per_unit <= Decimal::ZERO || one.amount <= Decimal::ZERO {
+        let paid_per_unit = sample.amount / quantity;
+        if delivered_per_unit <= Decimal::ZERO || paid_per_unit <= Decimal::ZERO {
             return None;
         }
 
@@ -414,7 +453,7 @@ impl SimulatedVenue {
             side,
             pay: pay.clone(),
             price,
-            paid_per_unit: one.amount,
+            paid_per_unit,
             delivered_per_unit,
         })
     }
@@ -430,42 +469,12 @@ impl SimulatedVenue {
         events: &mut Vec<UnindexedAccountEvent>,
     ) -> Decimal {
         let budget = self.account.free(&leg.pay);
-        let mut cap = budget / leg.paid_per_unit;
-        if let Some(available) = self.depth_available(&leg.instrument, leg.side) {
-            cap = cap.min(available);
-        }
-        let mut quantity = (want / leg.delivered_per_unit).min(cap);
-
-        // The divisions round, so the quantity is nudged by its last digit until it delivers all
-        // of `want` without costing more than the account holds. A quantity that costs too much
-        // lowers the cap, so the nudge never climbs back to it. The largest affordable quantity
-        // tried is traded, which may deliver a digit short of `want`.
-        let mut affordable = None;
-        for _ in 0..4 {
-            if quantity <= Decimal::ZERO {
-                break;
-            }
-            let priced = self.fill_settlement(
-                &leg.terms,
-                NetPosition::default(),
-                leg.side,
-                quantity,
-                leg.price,
-                Liquidity::Taker,
-            );
-            let step = Decimal::new(1, quantity.scale());
-            if priced.amount > budget {
-                cap = quantity - step;
-                quantity = cap;
-                continue;
-            }
-            let short = delivered(&priced.credit) < want && quantity + step <= cap;
-            affordable = Some((quantity, priced));
-            if !short {
-                break;
-            }
-            quantity += step;
-        }
+        let depth = self.depth_available(&leg.instrument, leg.side);
+        let affordable = if self.fee_model_for(&leg.terms).is_linear() {
+            self.linear_leg_quantity(leg, want, budget, depth)
+        } else {
+            self.searched_leg_quantity(leg, want, budget, depth)
+        };
         let Some((quantity, settlement)) = affordable else {
             return Decimal::ZERO;
         };
@@ -508,6 +517,141 @@ impl SimulatedVenue {
 
         self.push_committed(events, commitment, Some(trade));
         delivered(&settlement.credit)
+    }
+
+    /// What filling `quantity` of `leg` costs and delivers, as its own order's only fill.
+    fn price_leg(&self, leg: &Leg, quantity: Decimal) -> Settlement {
+        self.fill_settlement(
+            &leg.terms,
+            NetPosition::default(),
+            leg.side,
+            quantity,
+            leg.price,
+            FeePricing::first(Liquidity::Taker),
+        )
+    }
+
+    /// What `leg` costs in what it pays with to deliver `want` of what it receives. Zero when no
+    /// quantity up to the search limit delivers `want`, so that nothing is raised for a buy that
+    /// cannot clear the debt: the buy then takes what the free balance pays for.
+    fn leg_cost(&self, leg: &Leg, want: Decimal) -> Decimal {
+        if self.fee_model_for(&leg.terms).is_linear() {
+            return want / leg.delivered_per_unit * leg.paid_per_unit;
+        }
+        self.needed_leg_quantity(leg, want)
+            .map_or(Decimal::ZERO, |quantity| {
+                self.price_leg(leg, quantity).amount
+            })
+    }
+
+    /// The least quantity of `leg` that delivers `want`, bisected on the settlement, or `None` if
+    /// none up to its [search limit](Leg::search_limit) does.
+    fn needed_leg_quantity(&self, leg: &Leg, want: Decimal) -> Option<Decimal> {
+        let delivers = |quantity| delivered(&self.price_leg(leg, quantity).credit) >= want;
+        bracket(want / leg.delivered_per_unit, leg.search_limit(), delivers)
+            .map(|high| least(high, delivers))
+    }
+
+    /// The quantity of `leg` that delivers `want`, or the most that `budget` and the `depth` on
+    /// offer allow, under a fee model linear in quantity, with what it settles. `None` if nothing
+    /// is affordable.
+    ///
+    /// One unit's settlement prices every quantity, so the quantity is a division, then nudged by
+    /// its last digit to absorb the division's rounding.
+    fn linear_leg_quantity(
+        &self,
+        leg: &Leg,
+        want: Decimal,
+        budget: Decimal,
+        depth: Option<Decimal>,
+    ) -> Option<(Decimal, Settlement)> {
+        let mut cap = budget / leg.paid_per_unit;
+        if let Some(available) = depth {
+            cap = cap.min(available);
+        }
+        let mut quantity = (want / leg.delivered_per_unit).min(cap);
+
+        // The divisions round, so the quantity is nudged by its last digit until it delivers all
+        // of `want` without costing more than the account holds. A quantity that costs too much
+        // lowers the cap, so the nudge never climbs back to it. The largest affordable quantity
+        // tried is traded, which may deliver a digit short of `want`.
+        let mut affordable = None;
+        for _ in 0..4 {
+            if quantity <= Decimal::ZERO {
+                break;
+            }
+            let priced = self.price_leg(leg, quantity);
+            let step = Decimal::new(1, quantity.scale());
+            if priced.amount > budget {
+                cap = quantity - step;
+                quantity = cap;
+                continue;
+            }
+            let short = delivered(&priced.credit) < want && quantity + step <= cap;
+            affordable = Some((quantity, priced));
+            if !short {
+                break;
+            }
+            quantity += step;
+        }
+        affordable
+    }
+
+    /// As [`linear_leg_quantity`](Self::linear_leg_quantity), under a fee model that is not linear
+    /// in quantity: one charging per order, or bounded per order.
+    ///
+    /// What a fill costs and delivers both grow with its quantity, so each is found by bisecting
+    /// on the settlement itself: the least quantity that delivers `want`, else the most that
+    /// `budget` pays for, within the `depth` on offer. Bisection lands a digit from the bound, so
+    /// the result is then rounded up to the fewest decimal places that still meet it: a quantity
+    /// that delivers exactly `want`, or one `budget` still pays for. `None` also when what
+    /// `budget` pays for delivers nothing, its fee outweighing it.
+    fn searched_leg_quantity(
+        &self,
+        leg: &Leg,
+        want: Decimal,
+        budget: Decimal,
+        depth: Option<Decimal>,
+    ) -> Option<(Decimal, Settlement)> {
+        let pays = |quantity| self.price_leg(leg, quantity).amount <= budget;
+        let within = |quantity| depth.is_none_or(|depth| quantity <= depth);
+
+        let needed = self.needed_leg_quantity(leg, want);
+        let quantity = match needed {
+            Some(needed) if within(needed) && pays(needed) => shortest_round_up(needed, |round| {
+                within(round) && {
+                    let priced = self.price_leg(leg, round);
+                    priced.amount <= budget && delivered(&priced.credit) == want
+                }
+            }),
+            needed => {
+                // What the account can pay for, short of what it needs: at most `needed` when that
+                // is known, and the depth, else up to the first doubling it cannot pay for.
+                let high = match (needed, depth) {
+                    (Some(needed), Some(depth)) => needed.min(depth),
+                    (Some(needed), None) => needed,
+                    // The depth is only observed, so it is held to the search limit.
+                    (None, Some(depth)) => depth.min(leg.search_limit()),
+                    (None, None) => {
+                        bracket(budget / leg.paid_per_unit, leg.search_limit(), |quantity| {
+                            !pays(quantity)
+                        })?
+                    }
+                };
+                if pays(high) {
+                    high
+                } else {
+                    let low = greatest(high, pays);
+                    shortest_round_up(low, |round| round <= high && pays(round))
+                }
+            }
+        };
+        // A quantity short of `want` can deliver nothing, or less, when a fee taken in what it
+        // receives outweighs it. Trading it would spend the budget for nothing, and a sale would
+        // take the rest of its fee from the very balance it was raising.
+        (quantity > Decimal::ZERO)
+            .then(|| (quantity, self.price_leg(leg, quantity)))
+            .filter(|(_, settlement)| delivered(&settlement.credit) > Decimal::ZERO)
     }
 
     /// Every asset the account owes, by name.
@@ -563,4 +707,64 @@ fn delivered(credit: &Credit) -> Decimal {
         Credit::Delivery(delivery) => delivery.amount,
         Credit::PaidBack(_) => Decimal::ZERO,
     }
+}
+
+/// `start`, doubled until `reached` holds of it, or `None` if it does of none up to `limit`.
+///
+/// A `start` that is not above zero, such as a dust amount that its division rounded to zero,
+/// starts from the least positive `Decimal` instead.
+fn bracket(start: Decimal, limit: Decimal, reached: impl Fn(Decimal) -> bool) -> Option<Decimal> {
+    let mut quantity = start.max(Decimal::new(1, Decimal::MAX_SCALE));
+    while quantity <= limit {
+        if reached(quantity) {
+            return Some(quantity);
+        }
+        quantity = quantity.checked_mul(Decimal::TWO)?;
+    }
+    None
+}
+
+/// The least quantity in `(0, high]` of which `holds` holds, to `Decimal`'s precision, given that
+/// it holds of `high` and of every quantity above the least.
+fn least(high: Decimal, holds: impl Fn(Decimal) -> bool) -> Decimal {
+    let (mut low, mut high) = (Decimal::ZERO, high);
+    for _ in 0..256 {
+        let middle = low + (high - low) / Decimal::TWO;
+        if middle <= low || middle >= high {
+            break;
+        }
+        if holds(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
+/// The greatest quantity in `[0, high]` of which `holds` holds, to `Decimal`'s precision, given
+/// that it holds of every quantity below the greatest. Zero if it holds of none above zero.
+fn greatest(high: Decimal, holds: impl Fn(Decimal) -> bool) -> Decimal {
+    let (mut low, mut high) = (Decimal::ZERO, high);
+    for _ in 0..256 {
+        let middle = low + (high - low) / Decimal::TWO;
+        if middle <= low || middle >= high {
+            break;
+        }
+        if holds(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// `quantity` rounded up to the fewest decimal places for which `accept` holds of it, or
+/// `quantity` itself if it holds at none.
+fn shortest_round_up(quantity: Decimal, accept: impl Fn(Decimal) -> bool) -> Decimal {
+    (0..=Decimal::MAX_SCALE)
+        .map(|scale| quantity.round_dp_with_strategy(scale, RoundingStrategy::ToPositiveInfinity))
+        .find(|&round| accept(round))
+        .unwrap_or(quantity)
 }

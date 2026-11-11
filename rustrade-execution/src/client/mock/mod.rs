@@ -51,10 +51,12 @@ pub struct MockExecutionConfig {
     pub mocked_exchange: ExchangeId,
     pub initial_state: UnindexedAccountSnapshot,
     pub latency_ms: u64,
-    /// Fee model used by the mock exchange to compute trading fees.
+    /// Fee model used by the mock exchange to compute trading fees, for every kind of instrument
+    /// not in [`fee_model_by_kind`](Self::fee_model_by_kind).
     ///
     /// Defaults to [`FeeModelConfig::Zero`]. Use [`FeeModelConfig::Percentage`]
-    /// for spot/futures simulation (e.g. 0.1% taker fee).
+    /// for spot/futures simulation (e.g. 0.1% taker fee), and [`FeeModelConfig::Composite`] for a
+    /// schedule of several fees, such as a broker's regulatory pass-through fees.
     #[serde(default)]
     pub fee_model: FeeModelConfig,
     /// Fill model used by the mock exchange to compute execution prices.
@@ -151,6 +153,12 @@ pub struct MockExecutionConfig {
     ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_close: Option<SessionCalendarConfig>,
+    /// The fee model for each kind of instrument that is not priced by
+    /// [`fee_model`](Self::fee_model): a venue whose options and shares pay different fees.
+    ///
+    /// Defaults to empty: every instrument pays [`fee_model`](Self::fee_model).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
 }
 
 /// When a simulated venue's trading sessions close: what a
@@ -960,6 +968,7 @@ mod tests {
             amend: AmendConfig::NONE,
             time_in_force: Default::default(),
             session_close: None,
+            fee_model_by_kind: Default::default(),
         };
         let mut json = serde_json::to_value(&config).unwrap();
         assert!(

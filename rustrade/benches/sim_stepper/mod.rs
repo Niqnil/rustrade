@@ -123,6 +123,7 @@ fn session() -> Session {
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     };
     let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
         AssetNameExchange::new("btc"),

@@ -777,6 +777,7 @@ pub(crate) mod fixtures {
             Default::default(),
             Default::default(),
             None,
+            Default::default(),
         )
     }
 
@@ -818,6 +819,7 @@ pub(crate) mod fixtures {
             Default::default(),
             Default::default(),
             None,
+            Default::default(),
         )
     }
 

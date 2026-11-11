@@ -93,8 +93,9 @@ pub mod expiry;
 pub use expiry::LongOptionExpiry;
 pub mod fee;
 pub use fee::{
-    FeeAssetConfig, FeeAssetConfigError, FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel,
-    PercentageFeeModel, SpotFeeAsset, ZeroFeeModel,
+    CompositeFeeModel, FeeAssetConfig, FeeAssetConfigError, FeeBasis, FeeComponent, FeeInput,
+    FeeModel, FeeModelConfig, FeeModelError, Liquidity, PerContractFeeModel, PercentageFeeModel,
+    SpotFeeAsset, ZeroFeeModel,
 };
 pub mod fill;
 pub use fill::{

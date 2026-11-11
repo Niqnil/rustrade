@@ -148,7 +148,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
+- **A composable fee model** (`rustrade-execution`, `rustrade`, #907).
+  - **New `FeeModelConfig::Composite(CompositeFeeModel)`:** a list of `FeeComponent`s whose
+    charges add. A component charges a `FeeBasis`: per contract, per underlying unit, a share of
+    notional, or once per order. It can be limited to one `Side` and to one `Liquidity`, and
+    bounded by a minimum and a maximum per order. This expresses a $0 commission with regulatory
+    pass-through fees (the `CompositeFeeModel` rustdoc has Alpaca's US option fees as an
+    example), a commission with a minimum per order, or a ticket charge per order.
+  - **Bounds and per-order charges are charged by difference** on what the order has filled in
+    total. An order pays the same however it is split into fills, and a rested remainder holds
+    exactly what its fills are charged. The fee is not rounded; a venue that rounds each fee type
+    up to the cent charges up to a cent more per fee type per rounding.
+  - **New `MockExecutionConfig::fee_model_by_kind`:** a fee model per instrument kind, in place of
+    `fee_model`, for a venue whose options and shares pay different fees.
+  - **The engine's `InstrumentState::fee_model`** reads what a fill's order had filled before it
+    from `Trade::order_filled_quantity`. A fill that does not report it is priced as its order's
+    first, so a per-order charge is charged on each such fill.
+  - **The spot margin liquidation** sizes its forced trade by searching on the settlement under a
+    fee model that is not linear in quantity, instead of scaling one unit's price. Without this,
+    a per-order charge would have bought back more or less than the debt.
+
 ### Changed
+- **Breaking: the fee model API** (`rustrade-execution`, #907).
+  - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side and the order's prior
+    filled quantity to the price, quantity, contract size and liquidity it took before. Build one
+    with `FeeInput::new(side, price, quantity, contract_size)`, then `with_liquidity` and
+    `with_prior_filled`.
+  - `FeeModelConfig` is no longer `Copy`, and is `#[non_exhaustive]`: clone it where it was
+    copied, and give a `match` on it a wildcard arm.
+  - `MockExecutionConfig` has a `fee_model_by_kind` field. A struct literal must set it
+    (`Default::default()` for none), and `MockExecutionConfig::new` takes it as a last argument.
 
 - **Breaking: amend in place grows the engine's enums, output and order-tracking traits**
   (`rustrade-execution`, `rustrade`, #892).

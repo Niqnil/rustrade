@@ -141,6 +141,7 @@ fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVe
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,
@@ -208,7 +209,7 @@ fn run(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset, seed: u64) -> Ru
         .underlying
         .base;
 
-    let mut venue = venue(fee_model, spot_fee_asset);
+    let mut venue = venue(fee_model.clone(), spot_fee_asset);
     let mut rng = Rng(seed);
     let mut realised_exited = Decimal::ZERO;
     // Fees of fills that moved no holding on a flat instrument. Such a fill opens no position, so
@@ -327,7 +328,7 @@ fn fee_models() -> [FeeModelConfig; 5] {
 fn under_quote_fees_the_account_and_the_engine_agree_fill_by_fill() {
     for fee_model in fee_models() {
         for seed in [1, 7, 42] {
-            let stats = run(fee_model, SpotFeeAsset::Quote, seed);
+            let stats = run(fee_model.clone(), SpotFeeAsset::Quote, seed);
             assert_eq!(stats.base_fees, 0, "no fee is charged in base");
         }
     }
@@ -339,7 +340,7 @@ fn under_received_fees_the_account_and_the_engine_agree_fill_by_fill() {
     let (mut fees_above_quantity, mut fees_equal_to_quantity) = (0, 0);
     for fee_model in fee_models() {
         for seed in [1, 7, 42] {
-            let stats = run(fee_model, SpotFeeAsset::Received, seed);
+            let stats = run(fee_model.clone(), SpotFeeAsset::Received, seed);
             assert!(stats.base_fees > 0, "{fee_model:?}: some buys pay in base");
             fees_above_quantity += stats.fees_above_quantity;
             fees_equal_to_quantity += stats.fees_equal_to_quantity;
