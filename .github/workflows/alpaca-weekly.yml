@@ -33,7 +33,7 @@ jobs:
   alpaca-tests:
     name: Alpaca full integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -60,6 +60,15 @@ jobs:
         continue-on-error: true
         run: cargo test --locked -p rustrade-data --features alpaca --test alpaca_data -- --ignored --skip sip --skip opra
 
+      # Option orders that fill, so only here: the schedule above falls in US regular trading hours
+      # on a trading day (10:00 or 11:00 AM ET), and each test checks Alpaca's clock first, so a
+      # Wednesday market holiday fails this step with a message saying the market is closed. A test
+      # that fails after placing an order cancels its orders and closes its position before failing.
+      - name: Options paper tests
+        id: options-tests
+        continue-on-error: true
+        run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_options_paper -- --ignored --test-threads=1
+
       - name: Check test results
-        if: steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure'
+        if: steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure' || steps.options-tests.outcome == 'failure'
         run: exit 1
