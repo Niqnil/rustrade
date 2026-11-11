@@ -302,6 +302,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `AtClose` bracket were `OrderError::Rejected(ApiError::OrderRejected(..))`.
     `OrderMappingError::into_order_error` gives the error for a mapping failure.
 
+- **Breaking: the Hyperliquid clients refuse a time in force they cannot honour with
+  `OrderError::UnsupportedTimeInForce`** (`rustrade-execution`, #925).
+  - **`HyperliquidClient` and `HyperliquidSpotClient` take, per order kind:**
+    - a limit order: `GoodUntilCancelled`, post-only (sent as `Alo`) and `ImmediateOrCancel`;
+    - a stop or take-profit order, which places a market order once triggered:
+      `GoodUntilCancelled` and `ImmediateOrCancel`;
+    - a stop-limit or take-profit-limit order: `GoodUntilCancelled` alone. The limit order it
+      places once triggered rests until cancelled, as seen on testnet.
+
+    They refuse anything else before any request. The set is `HyperliquidClient::TIME_IN_FORCE`
+    (also `HyperliquidSpotClient::TIME_IN_FORCE`). A simulated venue standing in for Hyperliquid
+    can take it as its `Perpetual` or `Spot` rule (a rule per instrument kind cannot limit
+    post-only or `ImmediateOrCancel` to some order kinds).
+  - **No time in force is changed or dropped any more.** `FillOrKill` used to go out as `Ioc`,
+    which can fill in part. `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen` and `AtClose` went out
+    as `Gtc`, so the order rested until cancelled. A trigger order carries no time in force, so
+    whatever it was sent with was dropped. Such an order is now refused, and the `warn!`s logged
+    for the changes are gone.
+  - `common::map_tif` is removed. A market, trailing or unresolved order is still refused with
+    `UnsupportedOrderType`, whatever its time in force.
+
 - **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`,
   #917). A struct literal must set it (`None` to hold every long to expiry), and
   `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as

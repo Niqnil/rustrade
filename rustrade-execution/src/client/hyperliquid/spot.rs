@@ -70,7 +70,13 @@
 //! See [`super`] module documentation for conditional order support details.
 //! The same constraints apply to spot:
 //! - Supported: `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit`
-//! - Unsupported: `TrailingStop`, `TrailingStopLimit`, `Market`
+//! - Unsupported: `TrailingStop`, `TrailingStopLimit`, `TrailingStopFixedLimit`, `Market`
+//!
+//! # Time in force
+//!
+//! As for perpetuals ([`HyperliquidSpotClient::TIME_IN_FORCE`]): see the [`super`] module
+//! documentation's [Time in force](super#time-in-force) for what each order kind takes. Any other
+//! is refused unsent with [`OrderError::UnsupportedTimeInForce`].
 //!
 //! # Client order ids
 //!
@@ -79,10 +85,11 @@
 //! [`super`] module documentation for why.
 
 use super::common::{
-    CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrder, OpenOrderListing, UserFill,
-    cancel_outcome, cid_to_cloid, cloid_to_cid, instrument_to_spot_coin, map_tif,
-    millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side, span_millis,
-    spot_balances, spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
+    CLOID_REQUIRED, CancelOnDropStream, HYPERLIQUID_TIME_IN_FORCE, InstrumentFilter, OpenOrder,
+    OpenOrderListing, UserFill, cancel_outcome, cid_to_cloid, classify_order, cloid_to_cid,
+    instrument_to_spot_coin, millis_to_datetime, open_order_to_order, open_orders, parse_decimal,
+    parse_side, span_millis, spot_balances, spot_base_quote, spot_pair_to_instrument,
+    user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error, order_outcome_unanswered, order_rejection};
@@ -107,7 +114,7 @@ use crate::{
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
+        Order, OrderKey, OrderKind, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
@@ -155,6 +162,19 @@ pub struct HyperliquidSpotClient {
 }
 
 impl HyperliquidSpotClient {
+    /// The time in force this client takes: `GoodUntilCancelled` on every order kind it takes,
+    /// `post_only` only on a limit order (sent as `Alo`), and `ImmediateOrCancel` only on a limit,
+    /// stop or take-profit order. It refuses any other with
+    /// [`OrderError::UnsupportedTimeInForce`] before sending the order. See [Time in
+    /// force](crate::client::hyperliquid#time-in-force).
+    ///
+    /// A simulated venue standing in for Hyperliquid can take this set as its rule for `Spot`
+    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
+    /// is per instrument kind, so the simulated venue still takes `post_only` on a trigger order,
+    /// and `ImmediateOrCancel` on a stop-limit or take-profit-limit order, which this client
+    /// refuses.
+    pub const TIME_IN_FORCE: &'static [TimeInForceKind] = HYPERLIQUID_TIME_IN_FORCE;
+
     /// Create a new spot client asynchronously.
     ///
     /// Use this when calling from an async context (e.g., tokio tests).
@@ -811,7 +831,6 @@ impl ExecutionClient for HyperliquidSpotClient {
                 msg,
             )))
         };
-        let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
 
         // Hyperliquid has no order flag for borrowing, and under portfolio margin an order borrows
         // implicitly when it falls short, so the client cannot promise either way: no effect,
@@ -832,40 +851,20 @@ impl ExecutionClient for HyperliquidSpotClient {
         };
         let is_buy = request.state.side == Side::Buy;
 
-        match request.state.kind {
-            OrderKind::Market => {
-                return make_unsupported(
-                    "Hyperliquid does not support market orders; use Limit with IOC time-in-force"
-                        .to_string(),
-                );
+        // What Hyperliquid takes, kind and time in force, is decided in one place for both
+        // clients; see the module docs.
+        let wire_kind = match classify_order(request.state.kind, request.state.time_in_force) {
+            Ok(wire_kind) => wire_kind,
+            Err(refused) => {
+                return make_inactive(refused.into_order_error(request.state.time_in_force));
             }
-            OrderKind::TrailingStop { .. }
-            | OrderKind::TrailingStopLimit { .. }
-            | OrderKind::TrailingStopFixedLimit { .. } => {
-                return make_unsupported(
-                    "Hyperliquid does not support trailing stop orders".to_string(),
-                );
-            }
-            OrderKind::ConditionalUnresolved { .. } => {
-                return make_unsupported(
-                    "an unresolved order kind is only read back from a venue, never placed"
-                        .to_string(),
-                );
-            }
-            OrderKind::Limit
-            | OrderKind::Stop { .. }
-            | OrderKind::StopLimit { .. }
-            | OrderKind::TakeProfit { .. }
-            | OrderKind::TakeProfitLimit { .. } => {}
-        }
+        };
 
         // The venue reports every order under its cloid, so an order placed without one could
         // not be matched to the id the caller tracks it by. See the module docs.
         let Some(cloid) = cid_to_cloid(&request.key.cid) else {
             return make_rejected(CLOID_REQUIRED.to_string());
         };
-
-        let tif = map_tif(&request.state.time_in_force).to_string();
 
         let pair = match self.traded_pair(base, quote).await {
             Ok(pair) => pair,
@@ -897,8 +896,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let coin = format!("{}/{}", pair.base(), pair.quote());
         let wire = match wire_order(
             &precision,
-            request.state.kind,
-            tif,
+            wire_kind,
             request.state.price,
             request.state.quantity,
         ) {
@@ -911,12 +909,6 @@ impl ExecutionClient for HyperliquidSpotClient {
                     "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
                         .to_string(),
                 );
-            }
-            Err(WireOrderError::UnsupportedKind) => {
-                return make_unsupported(format!(
-                    "Hyperliquid does not support {} orders",
-                    request.state.kind
-                ));
             }
         };
 
@@ -936,14 +928,6 @@ impl ExecutionClient for HyperliquidSpotClient {
                 "Spot order below $10 minimum notional value"
             );
             return make_rejected(format!("Spot order notional ${notional} below $10 minimum"));
-        }
-
-        // Logged only for an order about to be sent.
-        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
-            warn!(
-                instrument = %request.key.instrument,
-                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
-            );
         }
 
         let order_request = ClientOrderRequest {
@@ -1611,7 +1595,9 @@ mod tests {
         use super::super::super::spot_coins::TEST_SPOT_META;
         use super::*;
         use crate::error::{ApiError, OrderField, PrecisionLimit, PrecisionViolation};
-        use crate::order::{OrderEvent, request::RequestOpen, state::InactiveOrderState};
+        use crate::order::{
+            OrderEvent, TimeInForce, request::RequestOpen, state::InactiveOrderState,
+        };
         use std::collections::HashMap;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1818,6 +1804,18 @@ mod tests {
             price: Decimal,
             quantity: Decimal,
         ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+            place_with(client, instrument, OrderKind::Limit, gtc, price, quantity).await
+        }
+
+        async fn place_with(
+            client: &HyperliquidSpotClient,
+            instrument: &str,
+            kind: OrderKind,
+            time_in_force: TimeInForce,
+            price: Decimal,
+            quantity: Decimal,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
             let instrument = InstrumentNameExchange::new(instrument);
             client
                 .open_order(OrderEvent {
@@ -1827,13 +1825,7 @@ mod tests {
                         strategy: StrategyId::new("strategy"),
                         cid: ClientOrderId::uuid(),
                     },
-                    state: RequestOpen::new(
-                        Side::Buy,
-                        Some(price),
-                        quantity,
-                        OrderKind::Limit,
-                        TimeInForce::GoodUntilCancelled { post_only: false },
-                    ),
+                    state: RequestOpen::new(Side::Buy, Some(price), quantity, kind, time_in_force),
                 })
                 .await
         }
@@ -2000,6 +1992,73 @@ mod tests {
                 );
             }
             assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        /// A spot order whose time in force Hyperliquid cannot honour for its kind is refused
+        /// unsent; one it honours goes out in its spelling, or with none on a trigger order.
+        #[tokio::test]
+        async fn a_spot_order_goes_out_only_with_a_time_in_force_hyperliquid_honours() {
+            let (server, client) = resting_client().await;
+            let trigger_price = dec!(24);
+
+            for (kind, tif) in [
+                (OrderKind::Limit, TimeInForce::FillOrKill),
+                (
+                    OrderKind::Stop { trigger_price },
+                    TimeInForce::GoodUntilCancelled { post_only: true },
+                ),
+                (
+                    OrderKind::StopLimit { trigger_price },
+                    TimeInForce::ImmediateOrCancel,
+                ),
+            ] {
+                let order =
+                    place_with(&client, "HYPE-USDC-SPOT", kind, tif, dec!(25), dec!(1)).await;
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::UnsupportedTimeInForce { time_in_force, .. }
+                        )) if time_in_force == tif
+                    ),
+                    "{kind} {tif:?}: {:?}",
+                    order.state
+                );
+            }
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+
+            for (kind, tif) in [
+                (
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: true },
+                ),
+                (
+                    OrderKind::Stop { trigger_price },
+                    TimeInForce::ImmediateOrCancel,
+                ),
+            ] {
+                let order =
+                    place_with(&client, "HYPE-USDC-SPOT", kind, tif, dec!(25), dec!(1)).await;
+                assert!(
+                    matches!(order.state, OrderState::Active(_)),
+                    "{kind} {tif:?}: {:?}",
+                    order.state
+                );
+            }
+            let sent: Vec<_> = sent_orders(&server)
+                .await
+                .into_iter()
+                .map(|order| order["t"].clone())
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    serde_json::json!({"limit": {"tif": "Alo"}}),
+                    serde_json::json!({
+                        "trigger": {"isMarket": true, "triggerPx": "24", "tpsl": "sl"}
+                    }),
+                ]
+            );
         }
 
         #[tokio::test]
