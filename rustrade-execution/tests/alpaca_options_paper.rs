@@ -2,8 +2,14 @@
 //!
 //! Kept apart from `alpaca_integration.rs`, which CI runs with `--ignored` on every push: these
 //! place option orders that fill, so they need US regular trading hours (9:30 AM - 4:00 PM ET),
-//! and a paper account approved for options trading. Each test that needs the market open checks
-//! Alpaca's clock first and fails with a message saying so.
+//! and a paper account approved for options trading, with crypto trading enabled for the crypto
+//! check. Each test that needs the market open checks Alpaca's clock first, and fails with a
+//! message saying so when the market is closed or closes within ten minutes.
+//!
+//! The tests that trade an option refuse to start while the account holds a position in the
+//! contract. A check that fails after an order is placed first cancels the open orders on the
+//! contract and closes the position in it, through Alpaca's paper API directly. If that cleanup
+//! reports an error, check the paper account by hand.
 //!
 //! # What they check
 //! - A market `day` buy to open and a market `day` sell to close of one option contract fill, and
@@ -27,7 +33,8 @@
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use futures::FutureExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
@@ -38,7 +45,7 @@ use rustrade_execution::{
     error::OrderError,
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId},
         request::{ReduceOnly, RequestCancel, RequestOpen},
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
@@ -50,7 +57,7 @@ use rustrade_instrument::{
 };
 use serde_json::Value;
 use serial_test::serial;
-use std::time::Duration;
+use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
 
 const PAPER_REST: &str = "https://paper-api.alpaca.markets";
 
@@ -86,8 +93,10 @@ async fn get_json(path: &str) -> Value {
     serde_json::from_str(&body).expect("JSON")
 }
 
-/// Panics unless the US market is open, since an option order fills only then.
-async fn require_market_open() {
+/// Panics unless the US market is open and stays open for ten more minutes, since an option order
+/// fills only then, and a position bought just before the close could not be sold until the next
+/// day. Returns Alpaca's own time, so that the fills are read back free of any local clock skew.
+async fn require_market_open() -> DateTime<Utc> {
     let clock = get_json("/v2/clock").await;
     assert_eq!(
         clock["is_open"],
@@ -95,6 +104,92 @@ async fn require_market_open() {
         "the US market is closed (next open {}): run these during regular trading hours",
         clock["next_open"]
     );
+    let time = |field: &str| {
+        let text = clock[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("clock {field}: {clock}"));
+        DateTime::parse_from_rfc3339(text)
+            .unwrap_or_else(|error| panic!("clock {field} {text}: {error}"))
+            .with_timezone(&Utc)
+    };
+    let now = time("timestamp");
+    assert!(
+        time("next_close") - now >= TimeDelta::minutes(10),
+        "the US market closes at {}: too soon to open and close a position before it",
+        clock["next_close"]
+    );
+    now
+}
+
+/// Panics if the account holds a position in `instrument`: a test that trades it would otherwise
+/// read another position's fills, and its cleanup would close a position it did not open.
+async fn require_no_position(instrument: &InstrumentNameExchange) {
+    let path = format!("/v2/positions/{instrument}");
+    let response = paper_request(reqwest::Method::GET, &path)
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "GET {path}: {status}: the account already holds {instrument}, so close it first"
+    );
+}
+
+/// Cancels every open order on `instrument` and closes any position in it, through Alpaca's paper
+/// API directly: the cleanup a failed check runs. Reports what it could not do rather than
+/// panicking, since it runs while a panic is already on its way.
+async fn flatten(instrument: &InstrumentNameExchange) {
+    let symbol = instrument.name().as_str();
+    match paper_request(
+        reqwest::Method::GET,
+        &format!("/v2/orders?status=open&symbols={symbol}"),
+    )
+    .send()
+    .await
+    {
+        Ok(response) => {
+            let orders: Value = response.json().await.unwrap_or(Value::Null);
+            for id in orders
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|order| order["id"].as_str())
+            {
+                let cancelled = paper_request(reqwest::Method::DELETE, &format!("/v2/orders/{id}"))
+                    .send()
+                    .await;
+                if !cancelled
+                    .as_ref()
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    eprintln!("CLEANUP: could not cancel order {id} on {symbol}: {cancelled:?}");
+                }
+            }
+        }
+        Err(error) => eprintln!("CLEANUP: could not list the open orders on {symbol}: {error}"),
+    }
+    let closed = paper_request(reqwest::Method::DELETE, &format!("/v2/positions/{symbol}"))
+        .send()
+        .await;
+    match closed {
+        Ok(response)
+            if response.status().is_success()
+                || response.status() == reqwest::StatusCode::NOT_FOUND => {}
+        other => eprintln!("CLEANUP: could not close the position in {symbol}: {other:?}"),
+    }
+}
+
+/// Runs `checks`, and if any of them panics, [`flatten`]s `instrument` before passing the panic on.
+async fn flattened_on_failure(
+    instrument: &InstrumentNameExchange,
+    checks: impl Future<Output = ()>,
+) {
+    if let Err(panic) = AssertUnwindSafe(checks).catch_unwind().await {
+        flatten(instrument).await;
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// The option contract to trade: `ALPACA_TEST_OPTION` if set, else one chosen as the module
@@ -134,7 +229,10 @@ async fn option_contract() -> (InstrumentNameExchange, Option<Decimal>) {
         .iter()
         .map(|(_, expiry, _, _)| *expiry)
         .min()
-        .expect("no SPY call between $0.50 and $3.00 expiring in the next 10 days");
+        .expect(
+            "no SPY call between $0.50 and $3.00 expiring in the next 10 days: set \
+             ALPACA_TEST_OPTION to an OCC symbol to trade",
+        );
     let (symbol, _, close, _) = candidates
         .iter()
         .filter(|(_, expiry, _, _)| *expiry == nearest)
@@ -172,8 +270,8 @@ async fn open(
         .await
 }
 
-/// Wait until `instrument` lists no open orders, panicking after 30 seconds. A market order that
-/// filled, or a cancel Alpaca has finished, both leave it so.
+/// Wait until `instrument` lists no open orders, as a cancel Alpaca has finished leaves it,
+/// panicking after 30 seconds.
 async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentNameExchange) {
     let instruments = [instrument.clone()];
     let started = tokio::time::Instant::now();
@@ -190,12 +288,48 @@ async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentName
     }
 }
 
-/// The fills on `instrument` on `side` since `since`, waiting up to 60 seconds for at least one.
+/// The id Alpaca gave the order `placed` reports, which a market order reports either resting or
+/// already filled.
+fn placed_id(placed: &rustrade_execution::order::state::UnindexedOrderState) -> OrderId {
+    match placed {
+        OrderState::Active(ActiveOrderState::Open(open)) => open
+            .id
+            .assigned()
+            .cloned()
+            .unwrap_or_else(|| panic!("Alpaca assigned no order id: {placed:?}")),
+        OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => filled.id.clone(),
+        other => panic!("not placed: {other:?}"),
+    }
+}
+
+/// Waits until Alpaca reports order `id` filled. Panics at once if it ends any other way, or after
+/// 60 seconds.
+async fn await_filled(id: &OrderId) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let order = get_json(&format!("/v2/orders/{id}")).await;
+        match order["status"].as_str() {
+            Some("filled") => return,
+            Some(ended @ ("canceled" | "expired" | "rejected" | "done_for_day")) => {
+                panic!("order {id} ended {ended} without filling: {order}")
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "order {id} not filled after 60 seconds: {order}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The fills of order `id` on `instrument` since `since`, read through the client, waiting up to
+/// 60 seconds for at least one.
 async fn await_fills(
     client: &AlpacaClient,
     instrument: &InstrumentNameExchange,
-    side: Side,
-    since: chrono::DateTime<Utc>,
+    id: &OrderId,
+    since: DateTime<Utc>,
 ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let started = tokio::time::Instant::now();
     loop {
@@ -206,14 +340,14 @@ async fn await_fills(
         let fills: Vec<_> = read
             .trades
             .into_iter()
-            .filter(|trade| trade.instrument == *instrument && trade.side == side)
+            .filter(|trade| trade.order_id == *id)
             .collect();
         if !fills.is_empty() {
             return fills;
         }
         assert!(
             started.elapsed() < Duration::from_secs(60),
-            "no {side} fill on {instrument} read back after 60 seconds"
+            "no fill of order {id} on {instrument} read back after 60 seconds"
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -223,75 +357,78 @@ async fn await_fills(
 #[ignore]
 #[serial]
 async fn option_market_day_buy_to_open_then_sell_to_close() {
-    require_market_open().await;
+    let now = require_market_open().await;
     let client = client();
     let (contract, _) = option_contract().await;
-    let started = Utc::now() - TimeDelta::seconds(5);
+    require_no_position(&contract).await;
+    let since = now - TimeDelta::minutes(1);
 
-    let bought = open(
-        &client,
-        &contract,
-        cid("opt-bto"),
-        RequestOpen::new(
-            Side::Buy,
-            None,
-            dec!(1),
-            OrderKind::Market,
-            TimeInForce::GoodUntilEndOfDay,
-        ),
-    )
-    .await;
-    assert!(
-        matches!(bought.state, OrderState::Active(ActiveOrderState::Open(_))),
-        "buy to open: {:?}",
-        bought.state
-    );
-    await_no_open_orders(&client, &contract).await;
-    let buys = await_fills(&client, &contract, Side::Buy, started).await;
-    let bought_quantity: Decimal = buys.iter().map(|fill| fill.quantity).sum();
-    println!(
-        "Buy to open filled: {:?}",
-        buys.iter()
-            .map(|fill| (fill.quantity, fill.price, &fill.fees))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(bought_quantity, dec!(1));
-
-    let sold = open(
-        &client,
-        &contract,
-        cid("opt-stc"),
-        RequestOpen::new(
-            Side::Sell,
-            None,
-            dec!(1),
-            OrderKind::Market,
-            TimeInForce::GoodUntilEndOfDay,
+    flattened_on_failure(&contract, async {
+        let bought = open(
+            &client,
+            &contract,
+            cid("opt-bto"),
+            RequestOpen::new(
+                Side::Buy,
+                None,
+                dec!(1),
+                OrderKind::Market,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
         )
-        .with_reduce_only(ReduceOnly::Position),
-    )
+        .await;
+        let bought_id = placed_id(&bought.state);
+        await_filled(&bought_id).await;
+        let buys = await_fills(&client, &contract, &bought_id, since).await;
+        println!(
+            "Buy to open filled: {:?}",
+            buys.iter()
+                .map(|fill| (fill.quantity, fill.price, &fill.fees))
+                .collect::<Vec<_>>()
+        );
+        assert!(buys.iter().all(|fill| fill.side == Side::Buy));
+        assert_eq!(
+            buys.iter().map(|fill| fill.quantity).sum::<Decimal>(),
+            dec!(1)
+        );
+
+        let sold = open(
+            &client,
+            &contract,
+            cid("opt-stc"),
+            RequestOpen::new(
+                Side::Sell,
+                None,
+                dec!(1),
+                OrderKind::Market,
+                TimeInForce::GoodUntilEndOfDay,
+            )
+            .with_reduce_only(ReduceOnly::Position),
+        )
+        .await;
+        let sold_id = placed_id(&sold.state);
+        await_filled(&sold_id).await;
+        let sells = await_fills(&client, &contract, &sold_id, since).await;
+        println!(
+            "Sell to close filled: {:?}",
+            sells
+                .iter()
+                .map(|fill| (fill.quantity, fill.price, &fill.fees))
+                .collect::<Vec<_>>()
+        );
+        assert!(sells.iter().all(|fill| fill.side == Side::Sell));
+        assert_eq!(
+            sells.iter().map(|fill| fill.quantity).sum::<Decimal>(),
+            dec!(1)
+        );
+        assert!(
+            buys.iter()
+                .chain(&sells)
+                .all(|fill| fill.price > Decimal::ZERO)
+        );
+    })
     .await;
-    assert!(
-        matches!(sold.state, OrderState::Active(ActiveOrderState::Open(_))),
-        "sell to close: {:?}",
-        sold.state
-    );
-    await_no_open_orders(&client, &contract).await;
-    let sells = await_fills(&client, &contract, Side::Sell, started).await;
-    let sold_quantity: Decimal = sells.iter().map(|fill| fill.quantity).sum();
-    println!(
-        "Sell to close filled: {:?}",
-        sells
-            .iter()
-            .map(|fill| (fill.quantity, fill.price, &fill.fees))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(sold_quantity, dec!(1));
-    assert!(
-        buys.iter()
-            .chain(&sells)
-            .all(|fill| fill.price > Decimal::ZERO)
-    );
+    require_no_position(&contract).await;
 }
 
 #[tokio::test]
@@ -301,47 +438,53 @@ async fn option_day_limit_rests_then_cancels() {
     require_market_open().await;
     let client = client();
     let (contract, close) = option_contract().await;
-    // Far below the market, so it rests: a fifth of the last close, never under a cent.
+    require_no_position(&contract).await;
+    // Far below the market, so it rests: a fifth of the last close, never under a cent, and a cent
+    // when the close is not known.
     let price = close
         .map(|close| (close / dec!(5)).round_dp(2))
-        .unwrap_or(dec!(0.05))
+        .unwrap_or(dec!(0.01))
         .max(dec!(0.01));
 
-    let placed = open(
-        &client,
-        &contract,
-        cid("opt-day-limit"),
-        RequestOpen::new(
-            Side::Buy,
-            Some(price),
-            dec!(1),
-            OrderKind::Limit,
-            TimeInForce::GoodUntilEndOfDay,
-        ),
-    )
-    .await;
-    let OrderState::Active(ActiveOrderState::Open(open_state)) = &placed.state else {
-        panic!("day limit at {price}: {:?}", placed.state);
-    };
-    assert_eq!(open_state.filled_quantity, Decimal::ZERO);
-    println!("Day limit resting at {price}: {:?}", open_state.id);
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let cancelled = client
-        .cancel_order(OrderEvent {
-            key: OrderKey {
-                exchange: ExchangeId::AlpacaBroker,
-                instrument: &contract,
-                strategy: placed.key.strategy.clone(),
-                cid: placed.key.cid.clone(),
-            },
-            state: RequestCancel {
-                id: Some(open_state.id.clone()),
-            },
-        })
+    flattened_on_failure(&contract, async {
+        let placed = open(
+            &client,
+            &contract,
+            cid("opt-day-limit"),
+            RequestOpen::new(
+                Side::Buy,
+                Some(price),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
+        )
         .await;
-    assert!(cancelled.state.is_ok(), "cancel: {:?}", cancelled.state);
-    await_no_open_orders(&client, &contract).await;
+        let OrderState::Active(ActiveOrderState::Open(open_state)) = &placed.state else {
+            panic!("day limit at {price}: {:?}", placed.state);
+        };
+        assert_eq!(open_state.filled_quantity, Decimal::ZERO);
+        println!("Day limit resting at {price}: {:?}", open_state.id);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let cancelled = client
+            .cancel_order(OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::AlpacaBroker,
+                    instrument: &contract,
+                    strategy: placed.key.strategy.clone(),
+                    cid: placed.key.cid.clone(),
+                },
+                state: RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            })
+            .await;
+        assert!(cancelled.state.is_ok(), "cancel: {:?}", cancelled.state);
+        await_no_open_orders(&client, &contract).await;
+    })
+    .await;
+    require_no_position(&contract).await;
 }
 
 /// POSTs `order` to Alpaca's paper `/v2/orders` and returns the HTTP status and body. An order
@@ -355,13 +498,22 @@ async fn post_order_directly(order: Value) -> (reqwest::StatusCode, Value) {
         .await
         .expect("send");
     let status = response.status();
-    let body: Value = serde_json::from_str(&response.text().await.expect("body")).expect("JSON");
+    let text = response.text().await.expect("body");
+    // A body that is not JSON, such as a proxy's error page, is kept as text for the message.
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
     if status.is_success()
         && let Some(id) = body["id"].as_str()
     {
-        let _ = paper_request(reqwest::Method::DELETE, &format!("/v2/orders/{id}"))
+        let cancelled = paper_request(reqwest::Method::DELETE, &format!("/v2/orders/{id}"))
             .send()
             .await;
+        assert!(
+            cancelled
+                .as_ref()
+                .is_ok_and(|response| response.status().is_success()),
+            "Alpaca took order {id} ({status} {body}), and cancelling it failed: {cancelled:?}. \
+             Cancel it by hand"
+        );
     }
     (status, body)
 }
