@@ -169,7 +169,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a per-order charge would have bought back more or less than the debt.
 
 - **The simulated venue sells out a long option the account cannot afford to exercise**
-  (`rustrade-execution`).
+  (`rustrade-execution`, #917).
   - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At
     `before_expiry` before each physically settled option's expiry, a long in the money that the
     account cannot afford to exercise is sold, as a broker sells out an account short of buying
@@ -231,9 +231,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
     argument.
 
-- **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`). A
-  struct literal must set it (`None` to hold every long to expiry), and `MockExecutionConfig::new`
-  takes it as a last argument. A serialized config without it reads as `None`.
+- **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`,
+  #917). A struct literal must set it (`None` to hold every long to expiry), and
+  `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as
+  `None`.
 
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).

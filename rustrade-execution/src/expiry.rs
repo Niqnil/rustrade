@@ -55,11 +55,11 @@ pub enum LongOptionExpiry {
 ///   Without a price for the underlying the venue cannot tell, warns, and sells nothing.
 /// - **Affordable?** Exercising a call pays `strike × quantity × contract_size` of quote: the
 ///   account's free quote, plus on a venue with spot margin what it would lend for a buy (its
-///   leverage limit and the asset's borrow cap). Exercising a put delivers `quantity ×
-///   contract_size` of the underlying, which the account must hold free: shares securing a short
-///   call are not free, and the venue never lends shares to exercise a put. Several longs checked
-///   at one instant share what the account has, by instrument name, and what one sale brings in
-///   does not count towards another's exercise.
+///   leverage limit and the asset's borrow cap; nothing while a liquidation is under way).
+///   Exercising a put delivers `quantity × contract_size` of the underlying, which the account
+///   must hold free: shares securing a short call are not free, and the venue never lends shares
+///   to exercise a put. Several longs checked at one instant share what the account has, by
+///   instrument name, and what one sale brings in does not count towards another's exercise.
 /// - **What is sold:** under [`SellOutAffordability::PerPosition`], the whole position, unless
 ///   all of it is affordable; under [`SellOutAffordability::PerContract`], the contracts beyond
 ///   what is affordable.

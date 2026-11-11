@@ -1,6 +1,7 @@
 //! The expiry sell-out: a long option in the money that the account cannot afford to exercise,
 //! sold before it expires.
 
+use super::super::liquidation::LiquidationState;
 use super::{
     options::{
         STRIKE, balance, buy, driven_instruments, driven_venue, expiry, feed, funds, limit,
@@ -11,6 +12,8 @@ use super::{
 use crate::{
     expiry::{ExpirySellOut, LongOptionExpiry, SellOutAffordability},
     fill::SimFillConfig,
+    margin::SpotMarginLiquidation,
+    slippage::SlippageConfig,
 };
 use rustrade_instrument::instrument::{
     kind::option::{OptionKind, OptionSettlement},
@@ -397,17 +400,17 @@ fn on_a_margin_venue_what_it_would_lend_counts_towards_a_call() {
     assert_eq!(option_position(&venue), Some(d("1")));
 }
 
-/// Two longs checked at one instant share the free cash in name order: the first takes what its
-/// exercise needs, and the second, left short, is sold.
-#[test]
-fn longs_checked_at_one_instant_share_the_free_cash_in_name_order() {
+/// A venue that sells out under [`sell_out`], funded with `usd_balance` and holding one contract
+/// each of two calls bought at 1.5 with SPY at 100, [`option_name`] and the returned second one,
+/// with SPY then at 120 and both calls at 20 before the check.
+fn holding_two_calls(usd_balance: &str) -> (SimulatedVenue, InstrumentNameExchange) {
     let mut second = option_instrument(OptionKind::Call, OptionSettlement::Physical);
     second.name_exchange = InstrumentNameExchange::new("SPY_C100_B");
     second.name_internal = InstrumentNameInternal::new("spy_c100_b");
     let mut instruments = driven_instruments(OptionKind::Call, OptionSettlement::Physical);
     instruments.insert(second.name_exchange.clone(), second.clone());
     let mut config = config_from_balances(Vec::new(), FeeModelConfig::default());
-    selling_out("15000", "0", sell_out())(&mut config);
+    selling_out(usd_balance, "0", sell_out())(&mut config);
     let mut venue = SimulatedVenue::new_market_driven(&config, instruments);
     advance(&mut venue, time(1));
     for (instrument, price, at) in [
@@ -424,14 +427,85 @@ fn longs_checked_at_one_instant_share_the_free_cash_in_name_order() {
             assert!(bought.response.state.is_accepted());
         }
     }
+    (venue, second.name_exchange)
+}
+
+/// A long the check keeps is not priced, so it takes no slippage draw and a seeded run's later
+/// fills are the same as without the check.
+#[test]
+fn a_long_the_check_keeps_takes_no_slippage_draw() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+        selling_out("20000", "0", sell_out())(config);
+        config.slippage = SlippageConfig::uniform(d("0.01"), d("0.025"), 3).unwrap();
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    feed(&mut venue, "120", "20", time(50));
+    let slippage = venue.slippage.clone();
+
+    assert!(trades(&venue.advance_time(check())).is_empty());
+
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert_eq!(venue.slippage, slippage);
+}
+
+/// While a liquidation is under way the venue lends nothing, so what it would otherwise lend
+/// does not count towards a call, and a call the free cash cannot exercise is sold.
+#[test]
+fn during_a_liquidation_what_the_venue_would_lend_does_not_count_towards_a_call() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+        selling_out("10000", "0", sell_out())(config);
+        config.spot_margin = Some(
+            SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow)
+                .unwrap()
+                .with_liquidation(SpotMarginLiquidation::new(d("1.1"), d("0")).unwrap())
+                .unwrap(),
+        );
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    feed(&mut venue, "120", "20", time(50));
+    // As a venue restored from a snapshot taken while a thin book left a liquidation unfinished.
+    venue.liquidation = LiquidationState::restored(true, false);
+
+    let events = venue.advance_time(check());
+
+    assert_eq!(liquidations(&events).len(), 1, "{events:?}");
+    assert_eq!(option_position(&venue), None);
+}
+
+/// Two longs checked at one instant share the free cash in name order: the first takes what its
+/// exercise needs, and the second, left short, is sold.
+#[test]
+fn longs_checked_at_one_instant_share_the_free_cash_in_name_order() {
+    let (mut venue, second) = holding_two_calls("15000");
 
     // 15,000 less 300 of premium pays for one exercise.
     let events = venue.advance_time(check());
 
     let sales = liquidations(&events);
     assert_eq!(sales.len(), 1, "{events:?}");
-    assert_eq!(sales[0].instrument, second.name_exchange);
+    assert_eq!(sales[0].instrument, second);
     assert_eq!(option_position(&venue), Some(d("1")));
+}
+
+/// What the first long's exercise takes is exactly its cost, so free cash that pays for both
+/// exercises keeps both.
+#[test]
+fn longs_checked_at_one_instant_are_both_kept_when_the_free_cash_pays_for_both() {
+    // 20,300 less 300 of premium leaves exactly the 20,000 the two exercises pay.
+    let (mut venue, second) = holding_two_calls("20300");
+
+    let events = venue.advance_time(check());
+
+    assert!(trades(&events).is_empty(), "{events:?}");
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert!(
+        venue
+            .positions
+            .get(&second)
+            .is_some_and(NetPosition::is_long)
+    );
 }
 
 #[test]
@@ -458,6 +532,31 @@ fn a_check_at_expiry_sells_before_settling() {
     let all = trades(&events);
     assert_eq!(all.len(), 1, "{events:?}");
     assert_eq!(all[0].origin, TradeOrigin::Liquidation);
+}
+
+/// A check at the expiry's own instant that keeps the long leaves the expiry to settle it.
+#[test]
+fn a_check_at_expiry_that_keeps_the_long_leaves_it_to_be_exercised() {
+    let mut venue = driven_venue(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        selling_out("20000", "0", ExpirySellOut::new(Duration::ZERO)),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    feed(&mut venue, "120", "20", time(50));
+
+    let events = venue.advance_time(expiry());
+
+    assert_eq!(
+        trades(&events)
+            .iter()
+            .map(|trade| trade.origin)
+            .collect::<Vec<_>>(),
+        vec![TradeOrigin::Exercise, TradeOrigin::Exercise],
+        "{events:?}"
+    );
+    assert_eq!(option_position(&venue), None);
 }
 
 /// One jump past both the check and the expiry still checks first, against the market held.

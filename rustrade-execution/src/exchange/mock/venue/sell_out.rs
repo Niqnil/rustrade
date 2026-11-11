@@ -100,7 +100,8 @@ impl SimulatedVenue {
 
     /// What the account has to exercise an option of `kind` with in `asset`: its free balance,
     /// plus, for a call on a venue with spot margin, what the venue would lend for a buy (its
-    /// leverage limit, and the asset's borrow cap). A put's shares are never lent. Never negative.
+    /// leverage limit, and the asset's borrow cap; nothing while a liquidation is under way). A
+    /// put's shares are never lent. Never negative.
     fn exercise_budget(&self, asset: &AssetNameExchange, kind: OptionKind) -> Decimal {
         let free = self.account.free(asset);
         let lendable = match (kind, self.spot_margin.as_ref()) {
