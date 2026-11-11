@@ -543,6 +543,7 @@ impl SimulatedVenue {
         venue.refresh_next_charge();
         venue.refresh_next_interest();
         venue.refresh_next_option_expiry();
+        venue.refresh_next_sell_out();
         // An option the snapshot still holds past its expiry was waiting for a price to settle at,
         // so it waits again. Rebuilt rather than stored: it is exactly those positions.
         venue.expiry_pending = venue

@@ -363,6 +363,7 @@ fn args_constant()
             time_in_force: Default::default(),
             session_close: None,
             fee_model_by_kind: Default::default(),
+            expiry_sell_out: None,
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,

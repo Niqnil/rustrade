@@ -142,6 +142,7 @@ fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVe
         time_in_force: Default::default(),
         session_close: None,
         fee_model_by_kind: Default::default(),
+        expiry_sell_out: None,
     };
     let spot = Instrument {
         exchange: EXCHANGE,

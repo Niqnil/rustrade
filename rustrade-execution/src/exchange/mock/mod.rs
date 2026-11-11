@@ -778,6 +778,7 @@ pub(crate) mod fixtures {
             Default::default(),
             None,
             Default::default(),
+            None, // expiry_sell_out
         )
     }
 
@@ -820,6 +821,7 @@ pub(crate) mod fixtures {
             Default::default(),
             None,
             Default::default(),
+            None, // expiry_sell_out
         )
     }
 

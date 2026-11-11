@@ -8,7 +8,7 @@ use crate::{
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
-    expiry::LongOptionExpiry,
+    expiry::{ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
@@ -121,6 +121,9 @@ pub struct MockExecutionConfig {
     /// and so [`MockExchange::new`](crate::exchange::mock::MockExchange::new)) has no market feed
     /// to price an underlying at expiry, so it takes an option buy only under
     /// [`LongOptionExpiry::Lapse`].
+    ///
+    /// A long the account cannot afford to exercise can be sold before expiry instead: see
+    /// [`expiry_sell_out`](Self::expiry_sell_out).
     #[serde(default)]
     pub long_option_expiry: LongOptionExpiry,
     /// How much quote a short put holds on the venue: the full strike, the default, or the
@@ -159,6 +162,16 @@ pub struct MockExecutionConfig {
     /// Defaults to empty: every instrument pays [`fee_model`](Self::fee_model).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+    /// Whether the mock exchange sells a long option the account cannot afford to exercise, at a
+    /// set time before it expires, as a broker sells out an account short of the cash or shares.
+    /// See [`ExpirySellOut`].
+    ///
+    /// Defaults to `None`: every long option is held to expiry and settles under
+    /// [`long_option_expiry`](Self::long_option_expiry), an exercise the account cannot cover
+    /// taking its free balance below zero, or borrowing on a venue with
+    /// [`spot_margin`](Self::spot_margin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_sell_out: Option<ExpirySellOut>,
 }
 
 /// When a simulated venue's trading sessions close: what a
@@ -969,6 +982,7 @@ mod tests {
             time_in_force: Default::default(),
             session_close: None,
             fee_model_by_kind: Default::default(),
+            expiry_sell_out: None,
         };
         let mut json = serde_json::to_value(&config).unwrap();
         assert!(

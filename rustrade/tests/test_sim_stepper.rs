@@ -141,6 +141,7 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         time_in_force: Default::default(),
         session_close: None,
         fee_model_by_kind: Default::default(),
+        expiry_sell_out: None,
     }
 }
 

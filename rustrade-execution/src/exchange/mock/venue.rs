@@ -14,7 +14,7 @@ use crate::{
         account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
         orders::{AlreadyResting, NotQueued, OpenOrder, Rank, Reservation, RestingOrder},
     },
-    expiry::LongOptionExpiry,
+    expiry::{ExpirySellOut, LongOptionExpiry, SellOutAffordability},
     fee::{FeeAssetConfig, FeeInput, FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
     fill::{FillContext, FillModel, MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{HeldPosition, HoldingCostModel},
@@ -37,7 +37,7 @@ use crate::{
     slippage::Slippage,
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
 use rust_decimal::Decimal;
@@ -50,7 +50,7 @@ use rustrade_instrument::{
         Instrument,
         kind::{
             InstrumentKind, InstrumentKindDiscriminant,
-            option::{OptionKind, OptionSettlement},
+            option::{OptionContract, OptionKind, OptionSettlement},
         },
         name::InstrumentNameExchange,
     },
@@ -67,6 +67,7 @@ use tracing::warn;
 
 mod liquidation;
 mod price_window;
+mod sell_out;
 mod snapshot;
 mod spot_pairs;
 
@@ -409,6 +410,18 @@ pub enum VenueRegime {
 ///   [`RequestPriced`](VenueRegime::RequestPriced) venue, is never priced, so the position stays
 ///   open; only [`LongOptionExpiry::Lapse`] settles a long, since a lapse needs no price, and
 ///   nothing settles a short.
+///
+/// ## Sold out before expiry
+/// Configured with [`MockExecutionConfig::expiry_sell_out`], the venue also checks each long in a
+/// physically settled option at a set time before its expiry, a boundary like the expiry itself
+/// and included in [`next_deadline`](Self::next_deadline), and first among the boundaries at its
+/// instant. A long in the money that the account cannot afford to exercise (the strike's cash for
+/// a call, free shares for a put) is sold, after the orders working on it are cancelled, as a
+/// market sell fills, less a haircut, reported as `[order.., balance.., trade]` with a
+/// [`TradeOrigin::Liquidation`] trade. What is not sold settles at expiry as above. See
+/// [`ExpirySellOut`] for what is affordable, how much is sold, and what is not modelled. A check
+/// at or before the instant the clock first moves is not run: the venue then holds no market to
+/// sell at.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual) and [`Future`](InstrumentKind::Future) need funding and
 /// futures margin, which this venue does not model. They are **rejected at
@@ -888,6 +901,17 @@ pub struct SimulatedVenue {
     /// price to settle it against. Each input checks whether it can settle them now, a lookup
     /// each, until it can. Ordered, so a run settles them in the same order every time.
     expiry_pending: BTreeSet<InstrumentNameExchange>,
+    /// When and how this venue sells a long option the account cannot afford to exercise, or
+    /// `None` if it holds every long to expiry. Fixed at construction from
+    /// [`MockExecutionConfig::expiry_sell_out`].
+    expiry_sell_out: Option<ExpirySellOut>,
+    /// The instant each physically settled option this venue lists is checked for a sell-out,
+    /// earliest first, and by name at one instant. Empty without an
+    /// [`expiry_sell_out`](Self::expiry_sell_out). Fixed at construction.
+    sell_outs: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
+    /// The first of [`sell_outs`](Self::sell_outs) after `accrued_through`, cached like
+    /// [`next_charge`](Self::next_charge).
+    next_sell_out: Option<DateTime<Utc>>,
 }
 
 impl SimulatedVenue {
@@ -992,6 +1016,10 @@ impl SimulatedVenue {
     ) -> Self {
         let option_expiries = option_expiries(&instruments);
         let option_spots = option_spots(&instruments);
+        let sell_outs = config
+            .expiry_sell_out
+            .map(|sell_out| sell_out_instants(&instruments, sell_out.before_expiry()))
+            .unwrap_or_default();
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model.clone(),
@@ -1038,6 +1066,9 @@ impl SimulatedVenue {
             next_option_expiry: None,
             option_spots,
             expiry_pending: BTreeSet::new(),
+            expiry_sell_out: config.expiry_sell_out,
+            sell_outs,
+            next_sell_out: None,
         }
     }
 
@@ -1181,8 +1212,9 @@ impl SimulatedVenue {
     }
 
     /// The next instant at which this venue has something to do of its own accord: an open order
-    /// reaching its deadline, a holding-cost boundary of a position it holds, or an interest
-    /// boundary of a loan it made.
+    /// reaching its deadline, a holding-cost boundary of a position it holds, an interest
+    /// boundary of a loan it made, an option it lists expiring, or an
+    /// [expiry sell-out](MockExecutionConfig::expiry_sell_out) check.
     ///
     /// For a driver with a timeline of its own, such as `SimRunner`, which moves the clock to this
     /// instant so that an expiry or a charge happens when it is due rather than when the next
@@ -1198,6 +1230,7 @@ impl SimulatedVenue {
             .chain(self.next_charge)
             .chain(self.next_interest)
             .chain(self.next_option_expiry)
+            .chain(self.next_sell_out)
             .min()
     }
 
@@ -1368,6 +1401,10 @@ impl SimulatedVenue {
                 self.refresh_next_charge();
                 self.refresh_next_interest();
                 self.refresh_next_option_expiry();
+                // A sell-out check at or before this instant is not run: the venue holds no
+                // market yet to sell at, as charging starts here.
+                self.refresh_next_sell_out();
+                let mut events = Vec::new();
                 // An option already expired when the clock first moves, held or with orders since
                 // `initial_state`, has its orders retired now, and its position settles on the
                 // first input that can price it, as a late one does.
@@ -1378,7 +1415,6 @@ impl SimulatedVenue {
                     .filter(|(_, name)| self.has_option_exposure(name))
                     .map(|(_, name)| name.clone())
                     .collect();
-                let mut events = Vec::new();
                 for name in expired {
                     self.retire_option_orders(&name, now, &mut events);
                     if self.positions.contains_key(&name) {
@@ -1398,7 +1434,10 @@ impl SimulatedVenue {
         // Nothing falls in `(after, now]`, so the first boundary after `now` is still the first
         // after `after`, and the caches stay right.
         let falls = |next: Option<DateTime<Utc>>| next.is_some_and(|due| due <= now);
-        if !falls(self.next_charge) && !falls(self.next_interest) && !falls(self.next_option_expiry)
+        if !falls(self.next_charge)
+            && !falls(self.next_interest)
+            && !falls(self.next_option_expiry)
+            && !falls(self.next_sell_out)
         {
             return Vec::new();
         }
@@ -1435,13 +1474,33 @@ impl SimulatedVenue {
                 due.push((*expiry, Due::Expiry(name.clone())));
             }
         }
+        let first = self.sell_outs.partition_point(|(check, _)| *check <= after);
+        for (check, name) in &self.sell_outs[first..] {
+            if *check > now {
+                break;
+            }
+            if self.positions.get(name).is_some_and(NetPosition::is_long) {
+                due.push((*check, Due::SellOut(name.clone())));
+            }
+        }
         // Positions and balances are hashed, so their iteration order is arbitrary: sorted, so
         // one run's charges arrive in the same order as another's.
         due.sort_unstable();
 
         let mut events = Vec::with_capacity(due.len() * 2);
-        for (boundary, due) in due {
-            match due {
+        let mut due = due.into_iter().peekable();
+        while let Some((boundary, next)) = due.next() {
+            match next {
+                Due::SellOut(instrument) => {
+                    // Every check at one instant at once, since they share what the account has.
+                    let mut checked = vec![instrument];
+                    while let Some((_, Due::SellOut(instrument))) =
+                        due.next_if(|(at, next)| *at == boundary && matches!(next, Due::SellOut(_)))
+                    {
+                        checked.push(instrument);
+                    }
+                    self.sell_out(boundary, &checked, &mut events);
+                }
                 Due::Holding(instrument, index) => {
                     self.charge_holding_cost(boundary, &instrument, index, &mut events);
                 }
@@ -1456,7 +1515,17 @@ impl SimulatedVenue {
         self.refresh_next_charge();
         self.refresh_next_interest();
         self.refresh_next_option_expiry();
+        self.refresh_next_sell_out();
         events
+    }
+
+    /// Recomputes [`next_sell_out`](Self::next_sell_out): the first sell-out check after the
+    /// instant the clock has reached.
+    fn refresh_next_sell_out(&mut self) {
+        self.next_sell_out = self.accrued_through.and_then(|after| {
+            let first = self.sell_outs.partition_point(|(check, _)| *check <= after);
+            self.sell_outs.get(first).map(|(check, _)| *check)
+        });
     }
 
     /// Recomputes [`next_option_expiry`](Self::next_option_expiry): the first listed option expiry
@@ -1604,6 +1673,21 @@ impl SimulatedVenue {
         Some((spot.clone(), price))
     }
 
+    /// The terms and contract of the option `instrument`, or `None` if this venue lists no option
+    /// by that name.
+    fn option_terms(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Option<(InstrumentTerms, OptionContract<AssetNameExchange>)> {
+        let listed = self.instruments.get(instrument)?;
+        match &listed.kind {
+            InstrumentKind::Option(contract) => {
+                Some((InstrumentTerms::of(listed).ok()?, contract.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Settles the position held in the option `instrument`, stamped `at`, pushing what it moved
     /// onto `events`. Returns `false`, having moved nothing, when settling needs the underlying's
     /// price and it has none; `true` otherwise, including when nothing is held.
@@ -1621,16 +1705,7 @@ impl SimulatedVenue {
         let Some(position) = self.positions.get(instrument).copied() else {
             return true;
         };
-        let Some((terms, contract)) =
-            self.instruments
-                .get(instrument)
-                .and_then(|listed| match &listed.kind {
-                    InstrumentKind::Option(contract) => {
-                        Some((InstrumentTerms::of(listed).ok()?, contract.clone()))
-                    }
-                    _ => None,
-                })
-        else {
+        let Some((terms, contract)) = self.option_terms(instrument) else {
             return true;
         };
         let underlying = terms.underlying.clone();
@@ -1643,10 +1718,7 @@ impl SimulatedVenue {
                 let Some((spot, price)) = self.underlying_price(instrument) else {
                     return false;
                 };
-                let intrinsic = match contract.kind {
-                    OptionKind::Call => price - contract.strike,
-                    OptionKind::Put => contract.strike - price,
-                };
+                let intrinsic = intrinsic(&contract, price);
                 (intrinsic > Decimal::ZERO).then_some((spot, intrinsic))
             }
         };
@@ -3932,6 +4004,36 @@ impl SimulatedVenue {
             interest,
             ..Commitment::from(committed)
         })
+    }
+
+    /// Cancels every open order, resting or held, on an instrument `on` selects, releasing what
+    /// each held, as `[balance, cash flow.., order]` per order, or `[order]` for one that held
+    /// nothing. The cash flows report the interest an order's loan was charged when it was placed,
+    /// if it borrowed. By client order id, so every run cancels in the same order.
+    fn cancel_orders(
+        &mut self,
+        on: impl Fn(&InstrumentNameExchange) -> bool,
+        time_exchange: DateTime<Utc>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) {
+        let mut open = self
+            .account
+            .orders()
+            .iter()
+            .filter(|order| on(&order.key.instrument))
+            .map(|order| order.key.cid.clone())
+            .collect::<Vec<ClientOrderId>>();
+        open.sort_unstable();
+
+        for cid in open {
+            // Collected from the book with nothing in between, so this always finds it.
+            if let Some(resting) = self.account.remove_order(&cid) {
+                let released = resting
+                    .reservation
+                    .map(|reservation| self.release_reservation(reservation, time_exchange));
+                events.extend(self.cancel_unfilled(resting.order, released, time_exchange));
+            }
+        }
     }
 
     /// Cancels an order the venue held and will not fill, and reports it: a resting order whose
@@ -6866,9 +6968,14 @@ fn boundaries_through(
 }
 
 /// One charge that falls due at a boundary, ordered so a run's charges at one instant arrive in
-/// the same order every time: holding costs first, then interest.
+/// the same order every time: sell-out checks first, then holding costs, then interest, then
+/// expiries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Due {
+    /// The [expiry sell-out](MockExecutionConfig::expiry_sell_out) check of a long option this
+    /// account holds. First, so an option checked at its expiry's instant is sold before it
+    /// settles.
+    SellOut(InstrumentNameExchange),
     /// The holding cost of the position in an instrument, by the index of its model.
     Holding(InstrumentNameExchange, usize),
     /// The interest on the principal owed in an asset, with that principal: charging interest
@@ -6876,6 +6983,43 @@ enum Due {
     Interest(AssetNameExchange, Decimal),
     /// The expiry of an option this account holds, or has orders on.
     Expiry(InstrumentNameExchange),
+}
+
+/// What one unit of the underlying of `contract` is worth on exercise with the underlying at
+/// `price`: positive in the money, zero or below out of it.
+fn intrinsic(contract: &OptionContract<AssetNameExchange>, price: Decimal) -> Decimal {
+    match contract.kind {
+        OptionKind::Call => price - contract.strike,
+        OptionKind::Put => contract.strike - price,
+    }
+}
+
+/// The instant each physically settled option in `instruments` is checked for a sell-out,
+/// `before_expiry` before its expiry, earliest first, and by name at one instant. A cash-settled
+/// option is never sold out: exercising it needs no money. An instant before the earliest a
+/// `DateTime` holds is clamped to it.
+fn sell_out_instants(
+    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    before_expiry: Duration,
+) -> Vec<(DateTime<Utc>, InstrumentNameExchange)> {
+    let before = TimeDelta::from_std(before_expiry).unwrap_or(TimeDelta::MAX);
+    let mut instants = instruments
+        .iter()
+        .filter_map(|(name, instrument)| match &instrument.kind {
+            InstrumentKind::Option(contract)
+                if contract.settlement == OptionSettlement::Physical =>
+            {
+                let check = contract
+                    .expiry
+                    .checked_sub_signed(before)
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                Some((check, name.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    instants.sort_unstable();
+    instants
 }
 
 /// The expiry of every option in `instruments`, earliest first, and by name at one instant.
@@ -8932,6 +9076,7 @@ mod tests {
             Default::default(),
             None,
             Default::default(),
+            None, // expiry_sell_out
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -8981,6 +9126,7 @@ mod tests {
             Default::default(),
             None,
             Default::default(),
+            None, // expiry_sell_out
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -19590,6 +19736,7 @@ mod tests {
     mod collateral_ratio;
     mod liquidation;
     mod options;
+    mod sell_out;
     mod session_close;
     mod snapshot;
 }

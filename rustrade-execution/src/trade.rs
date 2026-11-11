@@ -512,7 +512,7 @@ where
 /// | Binance Spot / Margin | `Order` only |
 /// | Hyperliquid | `Order` only |
 /// | Alpaca | `Order` on fills; [`Expiry`](Self::Expiry), [`Exercise`](Self::Exercise), [`Assignment`](Self::Assignment) and [`External`](Self::External) from `AlpacaClient::fetch_option_events` |
-/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | [`Liquidation`](Self::Liquidation) (opt-in), `Order` |
+/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | [`Liquidation`](Self::Liquidation) (opt-in), [`Expiry`](Self::Expiry), [`Exercise`](Self::Exercise), [`Assignment`](Self::Assignment), `Order` |
 /// | The `rustrade` engine's expiry settlement | [`Expiry`](Self::Expiry) |
 ///
 /// - **Interactive Brokers** flags a fill of an IB-initiated liquidation. Another API client's
@@ -525,8 +525,9 @@ where
 /// - **Alpaca** marks no liquidation. Option assignment, exercise and expiry are account
 ///   activities, which this crate does not read.
 /// - The **simulated venue** reports the forced trades of a spot margin liquidation, which
-///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation) opts into, with no client
-///   order id.
+///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation) opts into, and the sale of a
+///   long option the account cannot afford to exercise, which
+///   [`ExpirySellOut`](crate::expiry::ExpirySellOut) opts into, both with no client order id.
 ///
 /// A forced variant takes precedence over [`External`](Self::External): a liquidation is
 /// reported as a liquidation whoever placed the order it closed.
@@ -549,7 +550,8 @@ pub enum TradeOrigin {
     /// a guarantee that this client placed the order.
     #[default]
     Order,
-    /// The venue or broker closed the position because the account fell short of margin.
+    /// The venue or broker closed the position because the account fell short of margin, or, for
+    /// a long option before expiry, of the cash or shares its exercise needs.
     Liquidation,
     /// The venue reduced the position against a counterparty it was liquidating
     /// (auto-deleveraging).
