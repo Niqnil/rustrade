@@ -2,6 +2,7 @@ use crate::execution::{
     AccountStreamEvent,
     backfill::{FillRecoveryConfig, Watermark, backfill},
     error::ExecutionError,
+    order_deadlines::OrderDeadlines,
     request::{ExecutionRequest, RequestFuture, dropped_open},
     unknown_outcome::{
         AmendLookupOutcome, LookupOutcome, UnknownOutcomeLookup, look_up_unknown_amend,
@@ -34,6 +35,7 @@ use rustrade_execution::{
     order::{
         Order, OrderEvent, OrderKey, UnindexedOrderKey,
         amend::Amended,
+        deadline::OrderDeadline,
         id::ClientOrderId,
         request::{
             CancelReplaceAnswer, CancelThenOpen, OnCancelFailure, OrderRequestAmend,
@@ -214,6 +216,13 @@ pub struct ExecutionManager<RequestStream, Client> {
     /// account stream cannot do that — it has no access to the thing it must drain first.
     pub account_stream:
         BoxStream<'static, AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
+
+    /// Where "now" comes from: the time stamped on an
+    /// [`AccountEventKind::OrderDeadline`] when an order's
+    /// [`cancel_after`](rustrade_execution::order::request::RequestOpen::cancel_after) runs out.
+    /// The wait itself is timed on tokio's monotonic clock. See
+    /// [`AccountStreamOptions::clock`].
+    pub clock: Clock,
 }
 
 /// Manual because [`BoxStream`] is not [`Debug`]; every other field is forwarded.
@@ -230,6 +239,7 @@ where
             .field("response_tx", &self.response_tx)
             .field("client", &self.client)
             .field("indexer", &self.indexer)
+            .field("clock", &self.clock)
             .field("account_stream", &"BoxStream<AccountStreamEvent>")
             .finish()
     }
@@ -336,6 +346,7 @@ where
         // reconnect can be one an earlier stream delivered.
         let deduper = AccountEventDeduper::new();
         let watermark = Arc::new(parking_lot::Mutex::new(None::<Watermark>));
+        let manager_clock = clock.clone();
         let account_stream = init_reconnecting_stream(move || {
             let client = client_clone.clone();
             let indexer = indexer_clone.clone();
@@ -484,6 +495,7 @@ where
                 client,
                 indexer,
                 account_stream,
+                manager_clock,
             ),
             response_rx.into_stream(),
         ))
@@ -670,6 +682,8 @@ where
         let mut in_flight_amends = FuturesUnordered::new();
         // Lookups of the orders whose amend came back with its outcome unknown.
         let mut in_flight_amend_lookups = FuturesUnordered::new();
+        // When each order sent with a `cancel_after` falls due.
+        let mut deadlines = OrderDeadlines::default();
 
         // Set once a Shutdown (or a closed request Stream) has been observed. New requests are no
         // longer accepted, but the loop keeps running until nothing is outstanding.
@@ -747,6 +761,11 @@ where
                 Either::Right(in_flight_amend_lookups.select_next_some())
             };
 
+            let next_deadline = match deadlines.next() {
+                Some(due) => Either::Right(tokio::time::sleep_until(due)),
+                None => Either::Left(std::future::pending()),
+            };
+
             tokio::select! {
                 // Process exchange AccountStream events (balances, trades, order updates)
                 event = self.account_stream.next(), if !account_stream_done => match event {
@@ -771,6 +790,9 @@ where
                     // bounded by `request_timeout`.
                     Some(ExecutionRequest::Drain) | None => {
                         draining = true;
+                        // No cancel can be sent from here on, and a deadline must not hold the
+                        // drain open: the drain waits only on what is in flight.
+                        deadlines.close();
                     }
                     Some(ExecutionRequest::Cancel(request)) => {
                         in_flight_cancels.push(Self::send_cancel(
@@ -778,6 +800,7 @@ where
                         ));
                     },
                     Some(ExecutionRequest::Open(request)) => {
+                        deadlines.arm(&request, Instant::now());
                         in_flight_opens.push(Self::send_open(
                             &self.client, &self.indexer, self.request_timeout, request,
                         ));
@@ -801,10 +824,15 @@ where
                         group.opens.iter().for_each(|open| {
                             Self::index_request(&self.indexer, open, "open");
                         });
+                        // Armed only if the group goes as one venue request now; otherwise each
+                        // open is armed when it is sent, once the cancels are answered.
+                        let opens = group.opens.clone();
                         let group = match Self::send_cancel_replace(
                             &self.client, &self.indexer, self.request_timeout, group,
                         ) {
                             Ok(cancel_replace) => {
+                                let sent = Instant::now();
+                                opens.iter().for_each(|open| deadlines.arm(open, sent));
                                 in_flight_cancel_replaces.push(cancel_replace);
                                 continue;
                             }
@@ -823,6 +851,8 @@ where
                                 }));
                             }
                             Hold::Opens(opens) => {
+                                let sent = Instant::now();
+                                opens.iter().for_each(|open| deadlines.arm(open, sent));
                                 in_flight_opens.extend(opens.into_iter().map(|open| {
                                     Self::send_open(
                                         &self.client, &self.indexer, self.request_timeout, open,
@@ -853,6 +883,8 @@ where
                     let Some(opens) = self.release(held_opens.answer(group, cid, failed)) else {
                         break;
                     };
+                    let sent = Instant::now();
+                    opens.iter().for_each(|open| deadlines.arm(open, sent));
                     in_flight_opens.extend(opens.into_iter().map(|open| {
                         Self::send_open(&self.client, &self.indexer, self.request_timeout, open)
                     }));
@@ -860,13 +892,20 @@ where
 
                 // Process the answer to a group sent as one venue request
                 ((cancel, open, sent), answer) = next_cancel_replace => {
+                    let open_key = open.key.clone();
                     let (cancel_event, open_answer) =
                         self.process_cancel_replace_answer(cancel, open, answer);
                     let (open_event, lookup) = match open_answer {
                         NativeOpen::Answered(open, response) => {
+                            if Self::open_ended(&response) {
+                                deadlines.disarm(&open.key);
+                            }
                             self.process_open_answer(open, sent, response)
                         }
-                        NativeOpen::Dropped(dropped) => (dropped, None),
+                        NativeOpen::Dropped(dropped) => {
+                            deadlines.disarm(&open_key);
+                            (dropped, None)
+                        }
                     };
                     // The cancel's answer goes first, as when the group is sequenced here.
                     let mut events = [cancel_event, open_event].into_iter();
@@ -878,6 +917,9 @@ where
 
                 // Process next ExecutionRequest::Open response
                 ((request, sent), response) = next_open_response => {
+                    if Self::open_ended(&response) {
+                        deadlines.disarm(&request.key);
+                    }
                     let (event, lookup) = self.process_open_answer(request, sent, response);
 
                     if self.response_tx.send(event).is_err() {
@@ -912,6 +954,20 @@ where
                     if let Some(event) = self.process_amend_lookup_outcome(request, outcome)
                         && self.response_tx.send(event).is_err()
                     {
+                        break;
+                    }
+                }
+
+                // Report each order whose `cancel_after` ran out, for the engine to cancel
+                () = next_deadline => {
+                    let time = self.clock.now();
+                    let mut events = deadlines.take_due(Instant::now()).into_iter().map(|key| {
+                        AccountStreamEvent::Item(AccountEvent {
+                            exchange: key.exchange,
+                            kind: AccountEventKind::OrderDeadline(OrderDeadline::new(key, time)),
+                        })
+                    });
+                    if events.any(|event| self.response_tx.send(event).is_err()) {
                         break;
                     }
                 }
@@ -1338,6 +1394,18 @@ where
         });
 
         (event, lookup)
+    }
+
+    /// Whether an open's answer says its order has ended, so a deadline has nothing left to
+    /// cancel: refused, filled or cancelled at once. An unknown outcome or a timeout has not: the
+    /// order may be working.
+    fn open_ended(
+        response: &Result<
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> bool {
+        matches!(response, Ok(order) if order.state.has_ended())
     }
 
     /// The key `request` was sent under, as the venue knows it, to look its order up by.
@@ -2009,6 +2077,7 @@ mod tests {
             client: Arc::new(client),
             indexer,
             account_stream: futures::stream::empty().boxed(),
+            clock: Clock::default(),
         }
         .run()
         .await;
@@ -3340,6 +3409,7 @@ mod tests {
                 .unwrap(),
             )),
             account_stream: futures::stream::empty().boxed(),
+            clock: Clock::default(),
         };
         let debug = format!("{manager:?}");
         assert!(debug.starts_with("ExecutionManager"), "{debug}");
@@ -3628,6 +3698,7 @@ mod tests {
             client: Arc::new(client),
             indexer,
             account_stream: futures::stream::empty().boxed(),
+            clock: Clock::default(),
         }
         .run()
         .await;
@@ -3694,6 +3765,7 @@ mod tests {
             client: Arc::new(client),
             indexer,
             account_stream: futures::stream::empty().boxed(),
+            clock: Clock::default(),
         }
         .run()
         .await;
@@ -4404,6 +4476,7 @@ mod tests {
                 client: Arc::new(client.clone()),
                 indexer: AccountEventIndexer::new(Arc::new(map)),
                 account_stream: futures::stream::empty().boxed(),
+                clock: Clock::default(),
             }
             .run()
             .await;
@@ -4855,6 +4928,180 @@ mod tests {
                     format!("snapshot exit {}", dropped("stop")),
                 ]
             );
+        }
+
+        /// `RequestOpen::cancel_after`: each order sent with one is reported to the engine when its
+        /// time runs out, timed from when the manager sends it.
+        mod order_deadlines {
+            use super::*;
+
+            /// `open(cid)` with its remainder cancelled `secs` after it is sent.
+            fn open_after(cid: &str, secs: u64) -> OrderRequestOpen {
+                let mut request = open(cid);
+                request.state = request
+                    .state
+                    .with_cancel_after(std::time::Duration::from_secs(secs));
+                request
+            }
+
+            /// Run `requests` through a manager over `client`, draining after `drain_after`
+            /// seconds, and describe the order snapshots it forwards (`snapshot <cid> <ok|ended>`)
+            /// and the deadlines (`deadline <cid> <seconds>`, stamped on a clock that reads the
+            /// seconds since the run began on tokio's paused clock).
+            async fn run_with<C>(
+                client: C,
+                requests: Vec<ExecutionRequest>,
+                drain_after: u64,
+            ) -> Vec<String>
+            where
+                C: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
+                C::AccountStream: Send,
+            {
+                let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+                let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+                    panic!("the instrument map should build");
+                };
+                let (response_tx, response_rx) = mpsc_unbounded();
+                let start = Instant::now();
+                let clock = Clock::new(move || {
+                    let elapsed = i64::try_from(start.elapsed().as_secs()).unwrap();
+                    DateTime::<Utc>::from_timestamp(elapsed, 0).unwrap()
+                });
+                let drain = futures::stream::once(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(drain_after)).await;
+                    ExecutionRequest::Drain
+                });
+
+                ExecutionManager {
+                    request_stream: futures::stream::iter(requests).chain(drain).boxed(),
+                    request_timeout: std::time::Duration::from_secs(5),
+                    unknown_outcome: UnknownOutcomeLookup::default(),
+                    response_tx,
+                    client: Arc::new(client),
+                    indexer: AccountEventIndexer::new(Arc::new(map)),
+                    account_stream: futures::stream::empty().boxed(),
+                    clock,
+                }
+                .run()
+                .await;
+
+                response_rx
+                    .into_stream()
+                    .filter_map(|event| async move {
+                        match event {
+                            AccountStreamEvent::Item(AccountEvent {
+                                kind: AccountEventKind::OrderDeadline(deadline),
+                                ..
+                            }) => Some(format!(
+                                "deadline {} {}",
+                                deadline.key.cid,
+                                deadline.deadline.timestamp()
+                            )),
+                            AccountStreamEvent::Item(AccountEvent {
+                                kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                                ..
+                            }) => Some(format!(
+                                "snapshot {} {}",
+                                order.key.cid,
+                                if order.state.has_ended() {
+                                    "ended"
+                                } else {
+                                    "ok"
+                                }
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+                    .await
+            }
+
+            /// An open the venue accepts is reported when its time runs out, on the manager's
+            /// clock; one sent without a `cancel_after` is not.
+            #[tokio::test(start_paused = true)]
+            async fn an_accepted_open_is_reported_when_its_time_runs_out() {
+                let events = run_with(
+                    ScriptedClient::new(vec![]),
+                    vec![
+                        ExecutionRequest::Open(open_after("timed", 3)),
+                        ExecutionRequest::Open(open("untimed")),
+                    ],
+                    10,
+                )
+                .await;
+
+                let mut snapshots = events[..2].to_vec();
+                snapshots.sort();
+                assert_eq!(snapshots, ["snapshot timed ok", "snapshot untimed ok"]);
+                assert_eq!(events[2..], ["deadline timed 3"]);
+            }
+
+            /// An open the venue refuses has nothing left to cancel, so its deadline is dropped.
+            #[tokio::test(start_paused = true)]
+            async fn a_refused_open_is_not_reported() {
+                let events = run_with(
+                    RejectingClient::default(),
+                    vec![ExecutionRequest::Open(open_after("refused", 3))],
+                    10,
+                )
+                .await;
+
+                assert_eq!(events, ["snapshot refused ended"]);
+            }
+
+            /// A drain drops the deadlines still to come: no cancel could be sent.
+            #[tokio::test(start_paused = true)]
+            async fn a_drain_drops_the_deadlines_to_come() {
+                let events = run_with(
+                    ScriptedClient::new(vec![]),
+                    vec![ExecutionRequest::Open(open_after("timed", 10))],
+                    5,
+                )
+                .await;
+
+                assert_eq!(events, ["snapshot timed ok"]);
+            }
+
+            /// An open held behind a group's cancel is timed from when it is sent, once the
+            /// cancel has answered.
+            #[tokio::test(start_paused = true)]
+            async fn a_held_open_is_timed_from_when_it_is_sent() {
+                let events = run_with(
+                    ScriptedClient::new(vec![("stop", 2, Answer::Cancelled)]),
+                    vec![ExecutionRequest::CancelThenOpen(CancelThenOpen::new(
+                        vec![cancel("stop")],
+                        vec![open_after("exit", 3)],
+                    ))],
+                    10,
+                )
+                .await;
+
+                assert_eq!(events, ["snapshot exit ok", "deadline exit 5"]);
+            }
+
+            /// A group sent as one venue request times its open from when it is sent, and drops
+            /// the deadline when the open is refused or never attempted.
+            #[tokio::test(start_paused = true)]
+            async fn a_native_group_times_its_open_unless_it_ended() {
+                let native = |native| async move {
+                    run_with(
+                        ScriptedClient::native(native),
+                        vec![ExecutionRequest::CancelThenOpen(CancelThenOpen::new(
+                            vec![cancel("stop")],
+                            vec![open_after("exit", 3)],
+                        ))],
+                        10,
+                    )
+                    .await
+                };
+
+                assert_eq!(
+                    native(Native::Both).await,
+                    ["snapshot exit ok", "deadline exit 3"]
+                );
+                assert_eq!(native(Native::OpenRejected).await, ["snapshot exit ended"]);
+                assert_eq!(native(Native::CancelFailed).await, ["snapshot exit ended"]);
+            }
         }
     }
 }

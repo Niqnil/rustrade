@@ -410,6 +410,10 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::CashFlow(flow) => Some(flow.time_exchange),
                 AccountEventKind::Notice(notice) => Some(notice.time_exchange),
                 AccountEventKind::MarginDebt(update) => Some(update.time_exchange),
+                // Not the venue's time but the driver's, which in a simulation is the simulated
+                // time the deadline fell due: the clock must reach it, or the cancel the engine
+                // sends would be stamped before the deadline it answers.
+                AccountEventKind::OrderDeadline(deadline) => Some(deadline.deadline),
                 _ => None,
             },
             // The corporate action carries its own resolved effective instant, so the

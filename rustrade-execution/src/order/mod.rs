@@ -39,6 +39,11 @@ pub mod bracket;
 /// [`AmendSupport`](amend::AmendSupport) and [`Amended`](amend::Amended).
 pub mod amend;
 
+/// The deadline of an order sent with
+/// [`RequestOpen::cancel_after`](request::RequestOpen::cancel_after):
+/// [`OrderDeadline`](deadline::OrderDeadline).
+pub mod deadline;
+
 /// Convenient type alias for an [`Order`] keyed with [`ExchangeId`] and [`InstrumentNameExchange`].
 pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>;
 
@@ -495,6 +500,7 @@ where
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
                     market: _,      // decision-time provenance; not part of the resulting Order
                     margin_effect: _, // an instruction to the venue; not part of the resulting Order
+                    cancel_after: _, // an instruction to the driver and engine; not part of the Order
                 },
         } = request;
 

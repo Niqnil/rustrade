@@ -31,6 +31,9 @@ pub mod paper;
 /// Defines an `ExecutionRequest` used by the `Engine` to communicate with an `ExecutionManager`.
 pub mod request;
 
+// Documented by its own inner doc comment, which rustdoc would merge with an outer one here.
+mod order_deadlines;
+
 /// Settles an open request whose outcome is unknown, by looking the order up at the venue.
 pub mod unknown_outcome;
 

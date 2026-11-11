@@ -104,6 +104,14 @@ impl<AssetKey, InstrumentKey> OrderState<AssetKey, InstrumentKey> {
             Self::Inactive(InactiveOrderState::OpenFailed(error)) if error.is_outcome_unknown()
         )
     }
+
+    /// Returns `true` if the order is known to have ended: filled, cancelled, expired or refused.
+    ///
+    /// An open whose outcome is unknown has not (see
+    /// [`is_outcome_unknown`](Self::is_outcome_unknown)): it may be working at the venue.
+    pub fn has_ended(&self) -> bool {
+        matches!(self, Self::Inactive(_)) && !self.is_outcome_unknown()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
@@ -367,6 +375,27 @@ mod tests {
             time_exchange: DateTime::<Utc>::MIN_UTC + TimeDelta::seconds(secs),
             filled_quantity: filled,
         }
+    }
+
+    /// Only an inactive state with a known outcome has ended: an active order is working, and an
+    /// open whose outcome is unknown may be.
+    #[test]
+    fn has_ended_excludes_an_active_order_and_an_unknown_outcome() {
+        use crate::error::{ApiError, ConnectivityError, OrderError};
+        let rejected = OrderState::<AssetIndex, InstrumentIndex>::inactive(OrderError::Rejected(
+            ApiError::OrderRejected("refused".into()),
+        ));
+        let unknown = OrderState::<AssetIndex, InstrumentIndex>::inactive(
+            OrderError::Connectivity(ConnectivityError::Timeout),
+        );
+        assert!(
+            unknown.is_outcome_unknown(),
+            "the fixture is an unknown outcome"
+        );
+
+        assert!(rejected.has_ended());
+        assert!(!unknown.has_ended());
+        assert!(!OrderState::<AssetIndex, InstrumentIndex>::active(open(1, dec!(0))).has_ended());
     }
 
     /// An order with an amend in flight keeps working as last reported: its time and fill are

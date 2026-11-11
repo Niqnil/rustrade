@@ -18,7 +18,7 @@ use rustrade_instrument::{
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt;
+use std::{fmt, time::Duration};
 
 pub type OrderRequestOpen<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> =
     OrderEvent<RequestOpen, ExchangeKey, InstrumentKey>;
@@ -183,12 +183,52 @@ pub struct RequestOpen {
     /// `#[serde(default)]` so requests serialised before this field existed still load.
     #[serde(default)]
     pub margin_effect: Option<MarginEffect>,
+
+    /// How long after the open is sent its unfilled remainder is cancelled, or `None` to leave it
+    /// working under its [`time_in_force`](Self::time_in_force).
+    ///
+    /// For a venue that takes no immediate-or-cancel order for an instrument (US options at some
+    /// brokers take only day or good-till-cancelled), send a day limit with a short
+    /// `cancel_after` instead. The venue is not told: this is an instruction to the driver that
+    /// sends the order and to the `rustrade` engine, so it composes with any time in force, and a
+    /// client that sends the request directly ignores it.
+    ///
+    /// # What happens at the deadline
+    ///
+    /// The `rustrade` crate's `ExecutionManager` (live) and `SimRunner` (simulated, on simulated
+    /// time) start the timer when they send the open to the venue, so the time includes the
+    /// request's latency. When it runs out they put an
+    /// [`AccountEventKind::OrderDeadline`](crate::AccountEventKind::OrderDeadline) on the account
+    /// stream, and the engine sends an ordinary cancel for whatever is still working:
+    /// - an open order is cancelled, whatever it has filled so far;
+    /// - an open the venue has not acknowledged yet is cancelled once it is acknowledged, because
+    ///   some venues cancel only by their own order id;
+    /// - an order being amended is cancelled by the id the venue last gave it;
+    /// - an order already being cancelled is left to that cancel, with no second attempt if it
+    ///   fails;
+    /// - an order that has ended is left alone.
+    ///
+    /// A cancel the venue refuses, because the order filled first, is an ordinary refused cancel.
+    /// [`Duration::ZERO`] cancels the order as soon as the venue acknowledges it.
+    ///
+    /// # Known limitations
+    ///
+    /// - The deadline lives in the driver's memory: a restart, or an order first seen in a
+    ///   snapshot, has none. For a bound the venue enforces, use
+    ///   [`TimeInForce::GoodTillDate`] where the venue takes it.
+    /// - An amend does not restart the timer.
+    /// - A simulated run fires no deadline after its last market or auxiliary event.
+    ///
+    /// `#[serde(default)]` so requests serialised before this field existed still load.
+    #[serde(default)]
+    pub cancel_after: Option<Duration>,
 }
 
 impl RequestOpen {
     /// A request with no [`position_id`](Self::position_id), not
-    /// [`reduce_only`](Self::reduce_only), and no [`market`](Self::market) snapshot. Set those
-    /// with the `with_*` methods.
+    /// [`reduce_only`](Self::reduce_only), no [`market`](Self::market) snapshot, no
+    /// [`margin_effect`](Self::margin_effect) and no [`cancel_after`](Self::cancel_after). Set
+    /// those with the `with_*` methods.
     pub fn new(
         side: Side,
         price: Option<Decimal>,
@@ -206,6 +246,7 @@ impl RequestOpen {
             reduce_only: ReduceOnly::No,
             market: None,
             margin_effect: None,
+            cancel_after: None,
         }
     }
 
@@ -243,6 +284,16 @@ impl RequestOpen {
     pub fn with_margin_effect(self, margin_effect: MarginEffect) -> Self {
         Self {
             margin_effect: Some(margin_effect),
+            ..self
+        }
+    }
+
+    /// This request with its unfilled remainder cancelled `cancel_after` after it is sent: see
+    /// [`cancel_after`](Self::cancel_after).
+    #[must_use]
+    pub fn with_cancel_after(self, cancel_after: Duration) -> Self {
+        Self {
+            cancel_after: Some(cancel_after),
             ..self
         }
     }
@@ -603,6 +654,24 @@ mod tests {
         assert_eq!(request.reduce_only, ReduceOnly::No);
         assert_eq!(request.market, None);
         assert_eq!(request.margin_effect, None);
+        assert_eq!(request.cancel_after, None);
+        assert_eq!(
+            request
+                .with_cancel_after(Duration::from_secs(5))
+                .cancel_after,
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+    fn a_request_serialised_without_a_cancel_after_still_loads() {
+        let mut json = serde_json::to_value(limit()).unwrap();
+        json.as_object_mut().unwrap().remove("cancel_after");
+
+        let request: RequestOpen = serde_json::from_value(json).unwrap();
+
+        assert_eq!(request.cancel_after, None);
     }
 
     #[test]

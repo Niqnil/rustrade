@@ -12,6 +12,7 @@ use crate::{
         command::Command,
         execution_tx::ExecutionTxMap,
         in_flight::{InFlightDeadlines, InFlightOverdue, InFlightWatch},
+        order_deadline::{AwaitingAck, OrderDeadlineOutput},
         state::{
             EngineState,
             connectivity::UntrackedExchange,
@@ -91,6 +92,9 @@ pub mod execution_tx;
 // Documented by its own inner doc comment, which rustdoc would merge with an outer one here.
 pub mod in_flight;
 
+// Documented by its own inner doc comment, which rustdoc would merge with an outer one here.
+pub mod order_deadline;
+
 /// Defines all state used by the`Engine` to algorithmically trade.
 ///
 /// eg/ `ConnectivityStates`, `AssetStates`, `InstrumentStates`, `Position`, etc.
@@ -145,6 +149,9 @@ pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
     execution_txs: ExecutionTxs,
     /// Flags orders in flight past their exchange's deadline (see [`InFlightDeadlines`]).
     in_flight: InFlightWatch,
+    /// Orders whose `cancel_after` ran out before the venue acknowledged them (see
+    /// [`order_deadline`]).
+    awaiting_ack: AwaitingAck,
     pub strategy: Strategy,
     pub risk: Risk,
 }
@@ -278,6 +285,21 @@ where
         let mut process_audit = process_audit;
         for overdue in self.flag_overdue_in_flight() {
             process_audit = process_audit.add_output(EngineOutput::InFlightOverdue(overdue));
+        }
+
+        // Also before the drain check: a cancel only takes risk off, so a deadline is acted on
+        // during a drain, and whatever the trading state. An order acknowledged by this event is
+        // cancelled first, then a deadline this event carries.
+        for output in self.cancel_acknowledged_past_deadline() {
+            process_audit = order_deadline::add_to_audit(process_audit, output);
+        }
+        if let EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            kind: AccountEventKind::OrderDeadline(deadline),
+            ..
+        })) = &process_audit.event
+        {
+            let output = self.on_order_deadline(deadline);
+            process_audit = order_deadline::add_to_audit(process_audit, output);
         }
 
         // A drain in progress outranks everything below: no new orders. The run is *not* ended
@@ -1723,6 +1745,7 @@ where
             state,
             execution_txs,
             in_flight: InFlightWatch::new(in_flight_deadlines),
+            awaiting_ack: AwaitingAck::default(),
             strategy,
             risk,
         }
@@ -2057,6 +2080,15 @@ pub enum EngineOutput<
     /// quote, emits none. An unconverted fill is also counted on
     /// [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted).
     FeeConversion(FeeConversion<AssetIndex, InstrumentKey>),
+
+    /// What the engine did about an order whose
+    /// [`cancel_after`](rustrade_execution::order::request::RequestOpen::cancel_after) ran out:
+    /// see [`OrderDeadlineOutput`] and [`order_deadline`].
+    ///
+    /// One for each
+    /// [`AccountEventKind::OrderDeadline`], emitted for that event, and one more on the event that acknowledged an order the deadline
+    /// found unacknowledged.
+    OrderDeadline(OrderDeadlineOutput<ExchangeKey, InstrumentKey>),
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.

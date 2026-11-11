@@ -15,6 +15,7 @@ use crate::{
     notice::AccountNotice,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
+        deadline::OrderDeadline,
         request::{OrderResponseAmend, OrderResponseCancel},
         state::{InactiveOrderState, OrderState, UnindexedOrderState},
     },
@@ -149,6 +150,9 @@ impl AccountEventIndexer {
             AccountEventKind::MarginDebt(update) => {
                 AccountEventKind::MarginDebt(self.margin_debt(update)?)
             }
+            AccountEventKind::OrderDeadline(deadline) => AccountEventKind::OrderDeadline(
+                OrderDeadline::new(self.order_key(deadline.key)?, deadline.deadline),
+            ),
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -1338,6 +1342,56 @@ mod tests {
             .is_err(),
             "an unmapped instrument fails the whole give-up"
         );
+    }
+
+    /// An order deadline indexes its order's key and keeps its time. An unmapped instrument fails
+    /// it.
+    #[test]
+    fn account_event_indexes_an_order_deadline() {
+        use crate::order::id::{ClientOrderId, StrategyId};
+        let indexer = binance_indexer();
+        let deadline = DateTime::<Utc>::MIN_UTC;
+        let event = |instrument: &str| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::OrderDeadline(OrderDeadline::new(
+                    UnindexedOrderKey::new(
+                        ExchangeId::BinanceSpot,
+                        InstrumentNameExchange::new(instrument),
+                        StrategyId::new("s"),
+                        ClientOrderId::new("c"),
+                    ),
+                    deadline,
+                )),
+            )
+        };
+        let Ok(btc) = indexer
+            .map
+            .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+        else {
+            panic!("BTC_USDT is mapped");
+        };
+
+        let Ok(AccountEvent {
+            kind: AccountEventKind::OrderDeadline(indexed),
+            ..
+        }) = indexer.account_event(event("BTC_USDT"))
+        else {
+            panic!("expected an indexed OrderDeadline");
+        };
+        assert_eq!(
+            indexed,
+            OrderDeadline::new(
+                OrderKey::new(
+                    indexer.map.exchange.key,
+                    btc,
+                    StrategyId::new("s"),
+                    ClientOrderId::new("c"),
+                ),
+                deadline,
+            )
+        );
+        assert!(indexer.account_event(event("ETHUSDT")).is_err());
     }
 
     /// A trade amendment indexes its instrument, and a corrected one its replacement as a trade

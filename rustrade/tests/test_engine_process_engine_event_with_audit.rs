@@ -56,7 +56,7 @@ use rustrade_execution::{
     MarketSnapshot, PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     cash_flow::CashFlow,
-    error::AmendRefusal,
+    error::{AmendRefusal, ApiError, OrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         amend::{AmendPatch, AmendTarget, Amended},
@@ -65,7 +65,7 @@ use rustrade_execution::{
             CancelThenOpen, CancelThenOpenError, OrderAmend, OrderRequestCancel, OrderRequestOpen,
             OrderResponseAmend, OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
         },
-        state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
+        state::{ActiveOrderState, Cancelled, Filled, InactiveOrderState, Open, OrderState},
     },
     position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
@@ -9509,5 +9509,330 @@ fn test_contract_expiry_lapse_long_ignores_an_ambiguous_underlying() {
             .instruments
             .instrument_index(&InstrumentIndex(0))
             .expiration_processed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Order deadlines: `RequestOpen::cancel_after` running out
+// ---------------------------------------------------------------------------
+
+/// The account event a driver sends when the `cancel_after` of the order `cid` on btc_usdt runs
+/// out at day `day`.
+fn order_deadline_event(cid: ClientOrderId, day: u64) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderDeadline(
+            rustrade_execution::order::deadline::OrderDeadline::new(
+                OrderKey {
+                    exchange: ExchangeIndex(0),
+                    instrument: InstrumentIndex(0),
+                    strategy: strategy_id(),
+                    cid,
+                },
+                time_plus_days(STARTING_TIMESTAMP, day),
+            ),
+        ),
+    }))
+}
+
+/// The order deadline outputs among `audit`'s outputs.
+fn order_deadline_outputs(
+    audit: AuditTick<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >,
+) -> Vec<rustrade::engine::order_deadline::OrderDeadlineOutput> {
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    audit
+        .outputs
+        .into_iter()
+        .filter_map(|output| match output {
+            EngineOutput::OrderDeadline(output) => Some(output),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The cancels the engine has sent since this was last called.
+fn cancels_sent(execution_rx: &mut UnboundedRx<ExecutionRequest>) -> Vec<OrderRequestCancel> {
+    std::iter::from_fn(|| execution_rx.rx.try_recv().ok())
+        .filter_map(|request| match request {
+            ExecutionRequest::Cancel(cancel) => Some(cancel),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An engine holding the btc_usdt limit buy `gen_cid(0)`, sent at day 0 and, when `acknowledged`,
+/// open at the venue since day 1 under `gen_order_id(0)`. Its open request has been read off the
+/// returned receiver.
+fn engine_with_working_order(acknowledged: bool) -> (TestEngine, UnboundedRx<ExecutionRequest>) {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let mut request = open_request(InstrumentIndex(0), "unused");
+    request.key.cid = gen_cid(0);
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request))),
+    );
+    if acknowledged {
+        process_with_audit(
+            &mut engine,
+            account_event_order_response(0, 1, Side::Buy, 1.0, 0.0),
+        );
+    }
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+    (engine, execution_rx)
+}
+
+fn tracked_order_state(engine: &TestEngine, cid: &ClientOrderId) -> Option<ActiveOrderState> {
+    engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .orders
+        .0
+        .get(cid)
+        .map(|order| order.state.clone())
+}
+
+/// A deadline on a working order sends one ordinary cancel, by the venue's order id, with trading
+/// disabled, and reports it. The deadline moves the engine's clock to it.
+#[test]
+fn test_order_deadline_cancels_a_working_order() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
+
+    assert_eq!(engine.time(), time_plus_days(STARTING_TIMESTAMP, 2));
+    let outputs = order_deadline_outputs(audit);
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    let OrderDeadlineOutput::Cancel(cancel) = &outputs[0] else {
+        panic!("expected a cancel: {outputs:?}");
+    };
+    assert!(cancel.errors.is_none(), "{cancel:?}");
+    let sent = cancels_sent(&mut execution_rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].key.cid, gen_cid(0));
+    assert_eq!(
+        sent[0].state.id,
+        Some(VenueOrderId::Assigned(gen_order_id(0)))
+    );
+    assert_eq!(cancel.sent_iter().cloned().collect::<Vec<_>>(), sent);
+    assert!(matches!(
+        tracked_order_state(&engine, &gen_cid(0)),
+        Some(ActiveOrderState::CancelInFlight(_))
+    ));
+}
+
+/// A deadline reached before the venue acknowledged the open sends nothing then, and cancels the
+/// order on the event that acknowledges it, once.
+#[test]
+fn test_order_deadline_on_an_unacknowledged_open_cancels_it_on_the_ack() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(false);
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 1));
+    assert!(matches!(
+        order_deadline_outputs(audit).as_slice(),
+        [OrderDeadlineOutput::AwaitingAck(key)] if key.cid == gen_cid(0)
+    ));
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+
+    let audit = process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 2, Side::Buy, 1.0, 0.0),
+    );
+    let outputs = order_deadline_outputs(audit);
+    assert!(
+        matches!(outputs.as_slice(), [OrderDeadlineOutput::Cancel(cancel)] if !cancel.sent.is_none()),
+        "{outputs:?}"
+    );
+    let sent = cancels_sent(&mut execution_rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].state.id,
+        Some(VenueOrderId::Assigned(gen_order_id(0)))
+    );
+
+    let audit = process_with_audit(&mut engine, market_event_trade(3, 0, dec!(50_000)));
+    assert!(order_deadline_outputs(audit).is_empty());
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+}
+
+/// An unacknowledged open the venue then refuses is dropped: nothing is ever cancelled.
+#[test]
+fn test_order_deadline_on_an_open_the_venue_refuses_sends_nothing() {
+    let (mut engine, mut execution_rx) = engine_with_working_order(false);
+    process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 1));
+
+    let refused = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: strategy_id(),
+                cid: gen_cid(0),
+            },
+            side: Side::Buy,
+            price: Some(dec!(45_000)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state: OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::OrderRejected("refused".into()),
+            ))),
+        })),
+    }));
+    let audit = process_with_audit(&mut engine, refused);
+    assert!(order_deadline_outputs(audit).is_empty());
+    assert_eq!(tracked_order_state(&engine, &gen_cid(0)), None);
+
+    let audit = process_with_audit(&mut engine, market_event_trade(3, 0, dec!(50_000)));
+    assert!(order_deadline_outputs(audit).is_empty());
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+}
+
+/// A deadline on an order already being cancelled sends nothing, and if that cancel fails the
+/// order is left working: a deadline sends at most one cancel. One on an order the engine does
+/// not track sends nothing either. Each is reported.
+#[test]
+fn test_order_deadline_leaves_a_cancelling_or_untracked_order_alone() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::One(cancel_request(
+            InstrumentIndex(0),
+            gen_cid(0).0.as_str(),
+        )))),
+    );
+    assert_eq!(cancels_sent(&mut execution_rx).len(), 1);
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
+    let outputs = order_deadline_outputs(audit);
+    assert!(
+        matches!(
+            outputs.as_slice(),
+            [OrderDeadlineOutput::AlreadyCancelling(key)] if key.cid == gen_cid(0)
+        ),
+        "{outputs:?} {:?}",
+        tracked_order_state(&engine, &gen_cid(0))
+    );
+
+    // The strategy's cancel fails, so the order is working again.
+    let failed = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderCancelled(OrderResponseCancel {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: strategy_id(),
+                cid: gen_cid(0),
+            },
+            state: Err(OrderError::Rejected(ApiError::OrderRejected("busy".into()))),
+        }),
+    }));
+    process_with_audit(&mut engine, failed);
+    assert!(matches!(
+        tracked_order_state(&engine, &gen_cid(0)),
+        Some(ActiveOrderState::Open(_))
+    ));
+    let audit = process_with_audit(&mut engine, market_event_trade(3, 0, dec!(50_000)));
+    assert!(order_deadline_outputs(audit).is_empty());
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+
+    let audit = process_with_audit(
+        &mut engine,
+        order_deadline_event(ClientOrderId::new("unknown"), 4),
+    );
+    assert!(matches!(
+        order_deadline_outputs(audit).as_slice(),
+        [OrderDeadlineOutput::NotTracked(key)] if key.cid == ClientOrderId::new("unknown")
+    ));
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+}
+
+/// A deadline is acted on during a drain: a cancel only takes risk off.
+#[test]
+fn test_order_deadline_cancels_during_a_drain() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Shutdown(rustrade::shutdown::Shutdown::AfterDrain),
+    );
+    // The drain request to the execution side.
+    let _ = std::iter::from_fn(|| execution_rx.rx.try_recv().ok()).count();
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
+
+    assert!(matches!(
+        order_deadline_outputs(audit).as_slice(),
+        [OrderDeadlineOutput::Cancel(_)]
+    ));
+    assert_eq!(cancels_sent(&mut execution_rx).len(), 1);
+}
+
+/// A deadline comes from the driver's own timer, so it is not evidence the account link is up.
+#[test]
+fn test_order_deadline_does_not_mark_the_account_link_healthy() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let account = |engine: &TestEngine| {
+        engine
+            .state
+            .connectivity
+            .connectivity(&ExchangeId::BinanceSpot)
+            .account()
+    };
+    assert_eq!(account(&engine), Health::Reconnecting);
+
+    process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 1));
+
+    assert_eq!(account(&engine), Health::Reconnecting);
+}
+
+/// A deadline on an order with an amend in flight cancels it at once, by the id the venue last
+/// gave it.
+#[test]
+fn test_order_deadline_cancels_an_order_being_amended() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+    let key = OrderKey {
+        exchange: ExchangeIndex(0),
+        instrument: InstrumentIndex(0),
+        strategy: strategy_id(),
+        cid: gen_cid(0),
+    };
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendAmendRequests(OneOrMany::One(OrderAmend {
+            key,
+            state: AmendPatch::default().with_price(dec!(44_000)),
+        }))),
+    );
+    assert!(matches!(
+        tracked_order_state(&engine, &gen_cid(0)),
+        Some(ActiveOrderState::AmendInFlight(_))
+    ));
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
+
+    assert!(matches!(
+        order_deadline_outputs(audit).as_slice(),
+        [OrderDeadlineOutput::Cancel(_)]
+    ));
+    let sent = cancels_sent(&mut execution_rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].state.id,
+        Some(VenueOrderId::Assigned(gen_order_id(0)))
     );
 }
