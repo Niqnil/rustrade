@@ -137,6 +137,7 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         time_in_force: Default::default(),
         session_close: None,
         fee_model_by_kind: Default::default(),
+        expiry_sell_out: None,
     }
 }
 

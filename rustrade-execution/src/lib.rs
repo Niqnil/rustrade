@@ -90,7 +90,7 @@ pub mod client;
 pub mod error;
 pub mod exchange;
 pub mod expiry;
-pub use expiry::LongOptionExpiry;
+pub use expiry::{ExpirySellOut, ExpirySellOutError, LongOptionExpiry, SellOutAffordability};
 pub mod fee;
 pub use fee::{
     CompositeFeeModel, FeeAssetConfig, FeeAssetConfigError, FeeBasis, FeeComponent, FeeInput,

@@ -9,9 +9,12 @@
 //! the mock execution client, `SimRunner` moving the venue's clock past the expiry, the
 //! account-event indexer, and the engine's positions.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -67,6 +70,7 @@ use rustrade_execution::{
     balance::{AssetBalance, Balance},
     cash_flow::CashFlow,
     client::mock::MockExecutionConfig,
+    expiry::ExpirySellOut,
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
@@ -138,6 +142,7 @@ fn mock_config(balances: Vec<AssetBalance<AssetNameExchange>>) -> MockExecutionC
         time_in_force: Default::default(),
         session_close: None,
         fee_model_by_kind: Default::default(),
+        expiry_sell_out: None,
     }
 }
 
@@ -344,26 +349,42 @@ fn trade(
 /// for 150. SPY trades at 110 an hour before the call expires at 20:00, and again an hour after,
 /// so the run's clock passes the expiry with the underlying priced at 110.
 async fn run(settlement: OptionSettlement) -> BacktestResult<Daily, BacktestState> {
-    run_with(OptionKind::Call, settlement, false, dec!(110)).await
+    run_with(
+        OptionKind::Call,
+        settlement,
+        false,
+        dec!(110),
+        FUNDING,
+        None,
+    )
+    .await
 }
 
 /// A run as [`run`]'s, of an option of `kind`, which the strategy sells when `sell`, with SPY at
-/// `spy_at_expiry` around the expiry.
+/// `spy_at_expiry` around the expiry, on a venue funded with `usd` that sells out under
+/// `sell_out`. With a sell-out, the option also trades at 10 an hour before expiry.
 async fn run_with(
     kind: OptionKind,
     settlement: OptionSettlement,
     sell: bool,
     spy_at_expiry: Decimal,
+    usd: Decimal,
+    sell_out: Option<ExpirySellOut>,
 ) -> BacktestResult<Daily, BacktestState> {
     let instruments = instruments_of(kind, settlement);
     let (spy, call) = (key(&instruments, "SPY"), key(&instruments, "SPY_C100"));
 
-    let market_events = vec![
+    let mut market_events = vec![
         trade("2025-03-24T22:00:00Z", spy, dec!(100)),
         trade("2025-03-24T22:01:00Z", call, dec!(1.5)),
         trade("2025-03-25T19:00:00Z", spy, spy_at_expiry),
-        trade("2025-03-25T21:00:00Z", spy, spy_at_expiry),
     ];
+    if sell_out.is_some() {
+        market_events.push(trade("2025-03-25T19:00:00Z", call, dec!(10)));
+    }
+    market_events.push(trade("2025-03-25T21:00:00Z", spy, spy_at_expiry));
+    let mut config = mock_config(vec![funded("usd", usd), funded("spy", Decimal::ZERO)]);
+    config.expiry_sell_out = sell_out;
 
     let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
@@ -376,10 +397,7 @@ async fn run_with(
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
         venue_options: FnvHashMap::default(),
-        executions: vec![ExecutionConfig::Mock(mock_config(vec![
-            funded("usd", FUNDING),
-            funded("spy", Decimal::ZERO),
-        ]))],
+        executions: vec![ExecutionConfig::Mock(config)],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
         engine_state,
@@ -467,6 +485,31 @@ async fn a_backtest_exercised_call_ends_holding_the_underlying_bought_at_the_str
         FUNDING - dec!(150) - dec!(10_000)
     );
     assert_eq!(balance_end(&result, "spy").total, dec!(100));
+}
+
+/// With only 10,000 to start, the account left with 9,850 after the premium cannot pay the strike,
+/// so a venue that sells out sells the call half an hour before expiry, at its last price of 10.
+/// The engine closes its position on the venue's trade, and the run ends flat with the sale's
+/// 1,000 in cash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_call_the_account_cannot_exercise_is_sold_before_expiry() {
+    let result = run_with(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        false,
+        dec!(110),
+        dec!(10_000),
+        Some(ExpirySellOut::new(Duration::from_secs(30 * 60))),
+    )
+    .await;
+
+    assert_eq!(open_positions(&result), []);
+    assert_eq!(option_pnl(&result), dec!(1_000) - dec!(150));
+    assert_eq!(
+        balance_end(&result, "usd").total,
+        dec!(10_000) - dec!(150) + dec!(1_000)
+    );
+    assert_eq!(balance_end(&result, "spy").total, Decimal::ZERO);
 }
 
 /// Settled in cash, the same call pays its intrinsic value, 10 × 100, and the run ends flat.
@@ -591,7 +634,15 @@ fn a_start_holding_a_long_call_holds_it_on_both_sides_until_the_venue_settles_it
 /// ends holding the shares, and the option's PnL is the premium kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backtest_assigned_short_put_ends_holding_the_shares_bought_at_the_strike() {
-    let result = run_with(OptionKind::Put, OptionSettlement::Physical, true, dec!(90)).await;
+    let result = run_with(
+        OptionKind::Put,
+        OptionSettlement::Physical,
+        true,
+        dec!(90),
+        FUNDING,
+        None,
+    )
+    .await;
 
     assert_eq!(
         open_positions(&result),
@@ -613,7 +664,15 @@ async fn a_backtest_assigned_short_put_ends_holding_the_shares_bought_at_the_str
 /// the cash it held is free again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backtest_short_put_expiring_out_of_the_money_keeps_the_premium() {
-    let result = run_with(OptionKind::Put, OptionSettlement::Physical, true, dec!(110)).await;
+    let result = run_with(
+        OptionKind::Put,
+        OptionSettlement::Physical,
+        true,
+        dec!(110),
+        FUNDING,
+        None,
+    )
+    .await;
 
     assert_eq!(open_positions(&result), []);
     assert_eq!(option_pnl(&result), dec!(150));

@@ -118,6 +118,7 @@ fn venue() -> SimulatedVenue {
         time_in_force: Default::default(),
         session_close: None,
         fee_model_by_kind: Default::default(),
+        expiry_sell_out: None,
     };
     let mut venue = SimulatedVenue::new_market_driven(
         &config,

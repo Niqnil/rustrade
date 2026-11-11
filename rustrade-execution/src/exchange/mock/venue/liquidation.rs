@@ -13,7 +13,7 @@ use crate::{
     fill::FillContext,
     margin::{MarginEffect, SpotMarginLiquidation},
     notice::{AccountNotice, NoticeKind},
-    order::id::{ClientOrderId, StrategyId},
+    order::id::StrategyId,
     trade::{TimeSource, Trade, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
@@ -186,7 +186,7 @@ impl SimulatedVenue {
             events.push(self.notice(NoticeKind::Liquidation, Some(level), time_exchange));
         }
 
-        self.cancel_every_order(time_exchange, events);
+        self.cancel_orders(|_| true, time_exchange, events);
         // Valued after the cancels, so the fee is charged on what the liquidation repaid, not on
         // the loans the cancelled orders gave back.
         let debt_before = self.debt_in();
@@ -236,34 +236,6 @@ impl SimulatedVenue {
                  liquidating, and leaves the rest owed: it continues on later inputs; warned once \
                  per liquidation"
             );
-        }
-    }
-
-    /// Cancels every open order, resting or held, releasing what each held, as `[balance, cash
-    /// flow.., order]` per order, or `[order]` for one that held nothing. The cash flows report the
-    /// interest an order's loan was charged when it was placed, if it borrowed. By client order id,
-    /// so every run cancels in the same order.
-    fn cancel_every_order(
-        &mut self,
-        time_exchange: DateTime<Utc>,
-        events: &mut Vec<UnindexedAccountEvent>,
-    ) {
-        let mut open = self
-            .account
-            .orders()
-            .iter()
-            .map(|order| order.key.cid.clone())
-            .collect::<Vec<ClientOrderId>>();
-        open.sort_unstable();
-
-        for cid in open {
-            // Collected from the book with nothing in between, so this always finds it.
-            if let Some(resting) = self.account.remove_order(&cid) {
-                let released = resting
-                    .reservation
-                    .map(|reservation| self.release_reservation(reservation, time_exchange));
-                events.extend(self.cancel_unfilled(resting.order, released, time_exchange));
-            }
         }
     }
 

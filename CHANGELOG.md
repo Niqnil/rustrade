@@ -168,6 +168,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fee model that is not linear in quantity, instead of scaling one unit's price. Without this,
     a per-order charge would have bought back more or less than the debt.
 
+- **The simulated venue sells out a long option the account cannot afford to exercise**
+  (`rustrade-execution`).
+  - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At
+    `before_expiry` before each physically settled option's expiry, a long in the money that the
+    account cannot afford to exercise is sold, as a broker sells out an account short of buying
+    power (Alpaca sells in the last hour before expiry). A call's exercise needs the strike's cash:
+    free quote, plus on a spot margin venue what it would lend for a buy. A put's needs free shares,
+    which excludes shares securing a short call. Longs checked at one instant share what the account
+    has, in name order.
+  - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
+    it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
+  - **The sale** cancels the orders working on the option, then sells as a market sell fills
+    (fill model, slippage, depth, taker sell-side fee), at a price cut by an optional haircut in
+    `[0, 1)`. It is reported as a `TradeOrigin::Liquidation` trade with no client order id, and
+    `next_deadline` includes each check. What is not sold, because it is affordable or out of the
+    money, or because nothing prices the sale or the underlying, goes on to expiry under
+    `long_option_expiry`. Cash-settled options are never sold.
+  - **Known limitations:** one check at the instant set, against the market held then; no cut-off
+    for orders between the check and expiry; one exercise's proceeds do not fund another.
+  - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
+
 ### Changed
 - **Breaking: the fee model API** (`rustrade-execution`, #907).
   - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side and the order's prior
@@ -209,6 +230,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `MockExecutionConfig` has a `time_in_force` field. A struct literal must set it
     (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
     argument.
+
+- **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`). A
+  struct literal must set it (`None` to hold every long to expiry), and `MockExecutionConfig::new`
+  takes it as a last argument. A serialized config without it reads as `None`.
 
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).

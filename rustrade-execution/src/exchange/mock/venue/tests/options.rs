@@ -21,30 +21,30 @@ use rustrade_instrument::instrument::{
     quote::InstrumentQuoteAsset,
 };
 
-const STRIKE: &str = "100";
+pub(super) const STRIKE: &str = "100";
 
-fn usd() -> AssetNameExchange {
+pub(super) fn usd() -> AssetNameExchange {
     AssetNameExchange::new("usd")
 }
 
-fn spy() -> AssetNameExchange {
+pub(super) fn spy() -> AssetNameExchange {
     AssetNameExchange::new("spy")
 }
 
-fn spy_name() -> InstrumentNameExchange {
+pub(super) fn spy_name() -> InstrumentNameExchange {
     InstrumentNameExchange::new("SPY")
 }
 
-fn option_name() -> InstrumentNameExchange {
+pub(super) fn option_name() -> InstrumentNameExchange {
     InstrumentNameExchange::new("SPY_C100")
 }
 
 /// The instant every option here expires.
-fn expiry() -> DateTime<Utc> {
+pub(super) fn expiry() -> DateTime<Utc> {
     time(100)
 }
 
-fn spy_instrument() -> Instrument<ExchangeId, AssetNameExchange> {
+pub(super) fn spy_instrument() -> Instrument<ExchangeId, AssetNameExchange> {
     Instrument {
         exchange: EXCHANGE,
         name_internal: InstrumentNameInternal::new("spy"),
@@ -61,7 +61,7 @@ fn spy_instrument() -> Instrument<ExchangeId, AssetNameExchange> {
 }
 
 /// A 100-share option on SPY struck at [`STRIKE`], expiring at [`expiry`].
-fn option_instrument(
+pub(super) fn option_instrument(
     kind: OptionKind,
     settlement: OptionSettlement,
 ) -> Instrument<ExchangeId, AssetNameExchange> {
@@ -112,7 +112,7 @@ fn priced_venue(usd_balance: &str, fee_model: FeeModelConfig) -> SimulatedVenue 
 }
 
 /// A market-driven venue listing SPY and the option, with `configure` applied to its config.
-fn driven_venue(
+pub(super) fn driven_venue(
     kind: OptionKind,
     settlement: OptionSettlement,
     configure: impl FnOnce(&mut MockExecutionConfig),
@@ -126,7 +126,7 @@ fn driven_venue(
 }
 
 /// SPY and the option, as [`driven_venue`] lists them.
-fn driven_instruments(
+pub(super) fn driven_instruments(
     kind: OptionKind,
     settlement: OptionSettlement,
 ) -> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
@@ -153,7 +153,7 @@ fn restored(
     .expect("a venue's own snapshot restores")
 }
 
-fn option_request(
+pub(super) fn option_request(
     side: Side,
     quantity: &str,
     market: Option<MarketSnapshot>,
@@ -161,12 +161,12 @@ fn option_request(
     request(option_name(), side, quantity, market)
 }
 
-fn balance(venue: &SimulatedVenue, asset: AssetNameExchange) -> Balance {
+pub(super) fn balance(venue: &SimulatedVenue, asset: AssetNameExchange) -> Balance {
     venue.balances(&[asset]).remove(0).balance
 }
 
 /// The option position the venue reports, `None` while flat.
-fn option_position(venue: &SimulatedVenue) -> Option<Decimal> {
+pub(super) fn option_position(venue: &SimulatedVenue) -> Option<Decimal> {
     let snapshot = venue.account_snapshot();
     let instrument = snapshot
         .instruments
@@ -181,13 +181,13 @@ fn option_position(venue: &SimulatedVenue) -> Option<Decimal> {
 }
 
 /// Feeds SPY at `price` at `at`, and the option at `option` (for its fills).
-fn feed(venue: &mut SimulatedVenue, spy_price: &str, option: &str, at: DateTime<Utc>) {
+pub(super) fn feed(venue: &mut SimulatedVenue, spy_price: &str, option: &str, at: DateTime<Utc>) {
     let _ = venue.apply_market(&spy_name(), MarketObservation::new(traded(spy_price)), at);
     let _ = venue.apply_market(&option_name(), MarketObservation::new(traded(option)), at);
 }
 
 /// Buys `quantity` of the option on a market-driven venue at `price`.
-fn buy(venue: &mut SimulatedVenue, quantity: &str) {
+pub(super) fn buy(venue: &mut SimulatedVenue, quantity: &str) {
     let outcome = venue.open_order(option_request(Side::Buy, quantity, None));
     assert!(
         outcome.response.state.is_accepted(),
@@ -196,7 +196,7 @@ fn buy(venue: &mut SimulatedVenue, quantity: &str) {
     );
 }
 
-fn trades(
+pub(super) fn trades(
     events: &[UnindexedAccountEvent],
 ) -> Vec<&Trade<AssetNameExchange, InstrumentNameExchange>> {
     events
@@ -785,7 +785,7 @@ fn held_option() -> InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, Ins
 }
 
 /// A good-till-cancelled limit order on `instrument`, identified by `cid`.
-fn limit(
+pub(super) fn limit(
     instrument: InstrumentNameExchange,
     side: Side,
     price: &str,
@@ -1156,7 +1156,7 @@ fn a_lapsing_option_expired_before_the_clock_first_moves_lapses_without_a_price(
 // -------------------------------------------------------------------------------------------
 
 /// Sets the account's opening balances to `usd` and `spy`.
-fn funds(usd_balance: &str, spy_balance: &str) -> impl FnOnce(&mut MockExecutionConfig) {
+pub(super) fn funds(usd_balance: &str, spy_balance: &str) -> impl FnOnce(&mut MockExecutionConfig) {
     let balances = vec![funded(usd(), d(usd_balance)), funded(spy(), d(spy_balance))];
     move |config| config.initial_state.balances = balances
 }
