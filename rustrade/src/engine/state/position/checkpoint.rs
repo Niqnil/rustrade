@@ -606,21 +606,6 @@ mod tests {
                 }],
             },
             0,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            Default::default(),
-            None, // expiry_sell_out
         );
         let mut venue = SimulatedVenue::new_market_driven(
             &config,

@@ -119,30 +119,15 @@ fn instruments() -> IndexedInstruments {
 }
 
 fn config(latency_ms: u64) -> MockExecutionConfig {
-    MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![],
             instruments: vec![],
         },
         latency_ms,
-        fee_model: Default::default(),
-        fill_model: Default::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    }
+    )
 }
 
 fn usdt(total: Decimal) -> SimStart {
@@ -724,10 +709,7 @@ fn latency_delays_a_fill_to_the_first_step_that_reaches_it() {
 
 /// A session whose venue holds each market order for its instrument's next bar.
 fn next_bar_session(start: SimStart) -> Session<DefaultStrategy<State>> {
-    let config = MockExecutionConfig {
-        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-        ..config(0)
-    };
+    let config = config(0).with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
     session_configured(config, start, None, DefaultStrategy::default())
 }
 
@@ -797,12 +779,9 @@ fn under_next_bar_an_order_fills_at_the_next_bars_open_before_that_bar_is_shown(
 
 /// A session whose venue holds a market order on a market not observed fresh within a second.
 fn stale_wait_session(start: SimStart) -> Session<DefaultStrategy<State>> {
-    let config = MockExecutionConfig {
-        stale_market: StaleMarketPolicy::Wait {
-            max_age: std::time::Duration::from_secs(1),
-        },
-        ..config(0)
-    };
+    let config = config(0).with_stale_market(StaleMarketPolicy::Wait {
+        max_age: std::time::Duration::from_secs(1),
+    });
     session_configured(config, start, None, DefaultStrategy::default())
 }
 
@@ -1137,8 +1116,9 @@ fn a_corporate_action_effective_at_another_instant_is_refused() {
 #[test]
 fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() {
     let instruments = instruments();
-    let with_balance = MockExecutionConfig {
-        initial_state: AccountSnapshot {
+    let with_balance = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![AssetBalance {
                 asset: AssetNameExchange::new("usdt"),
@@ -1147,10 +1127,11 @@ fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() 
             }],
             instruments: vec![],
         },
-        ..config(0)
-    };
-    let with_instrument = MockExecutionConfig {
-        initial_state: AccountSnapshot {
+        0,
+    );
+    let with_instrument = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![],
             instruments: vec![InstrumentAccountSnapshot {
@@ -1161,8 +1142,8 @@ fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() 
                 isolated: None,
             }],
         },
-        ..config(0)
-    };
+        0,
+    );
 
     for config in [with_balance, with_instrument] {
         assert_eq!(
@@ -1275,17 +1256,14 @@ fn a_start_holding_a_cfd_closes_against_its_entry_and_pays_back_its_margin() {
 
 /// A venue lending spot margin up to `max_leverage`, valued in USDT.
 fn lending(max_leverage: Decimal) -> MockExecutionConfig {
-    MockExecutionConfig {
-        spot_margin: Some(
-            SpotMarginConfig::new(
-                AssetNameExchange::new("usdt"),
-                max_leverage,
-                MarginEffect::Borrow,
-            )
-            .unwrap(),
-        ),
-        ..config(0)
-    }
+    config(0).with_spot_margin(
+        SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            max_leverage,
+            MarginEffect::Borrow,
+        )
+        .unwrap(),
+    )
 }
 
 /// Short 1 BTC at 30000, with 40000 USDT: 10000 of equity owing 30000.
@@ -1442,10 +1420,8 @@ fn a_strategy_routing_interest_to_its_base_puts_a_new_shorts_borrow_charge_on_it
 
 #[test]
 fn under_next_bar_a_routed_borrow_charge_reaches_the_short_its_held_order_opens() {
-    let config = MockExecutionConfig {
-        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-        ..lending(dec!(4))
-    };
+    let config =
+        lending(dec!(4)).with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
     let mut s = session_modelling(
         config,
         SimVenueOptions::default().with_margin_interest(btc_loans_hourly()),
@@ -1565,8 +1541,9 @@ fn an_engine_seeded_at_another_quantity_or_entry_is_refused() {
 #[test]
 fn a_venue_whose_opening_account_it_cannot_index_is_refused() {
     let instruments = instruments();
-    let unknown_asset = MockExecutionConfig {
-        initial_state: AccountSnapshot {
+    let unknown_asset = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![AssetBalance {
                 asset: AssetNameExchange::new("doge"),
@@ -1575,8 +1552,8 @@ fn a_venue_whose_opening_account_it_cannot_index_is_refused() {
             }],
             instruments: vec![],
         },
-        ..config(0)
-    };
+        0,
+    );
     let build = SimExecutionBuilder::new(&instruments)
         .add_venue(unknown_asset)
         .unwrap()

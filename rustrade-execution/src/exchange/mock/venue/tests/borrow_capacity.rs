@@ -40,20 +40,18 @@ fn invalid_reason(venue: &SimulatedVenue, instrument: &InstrumentNameExchange) -
 /// 100,000 USDT held, owing `btc_owed` BTC as principal and `btc_interest` as interest, lending
 /// up to 3x.
 fn owing_btc_config(btc_owed: &str, btc_interest: &str) -> MockExecutionConfig {
-    MockExecutionConfig {
-        spot_margin: Some(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap()),
-        ..config_from_balances(
-            vec![
-                AssetBalance::new(
-                    base(),
-                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d(btc_owed), d(btc_interest)),
-                    Utc::now(),
-                ),
-                funded(quote(), d("100000")),
-            ],
-            FeeModelConfig::default(),
-        )
-    }
+    config_from_balances(
+        vec![
+            AssetBalance::new(
+                base(),
+                Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d(btc_owed), d(btc_interest)),
+                Utc::now(),
+            ),
+            funded(quote(), d("100000")),
+        ],
+        FeeModelConfig::default(),
+    )
+    .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap())
 }
 
 #[test]
@@ -263,10 +261,8 @@ fn an_instrument_the_venue_does_not_trade_is_invalid() {
 
 #[test]
 fn a_cfd_is_invalid_on_a_margin_venue() {
-    let config = MockExecutionConfig {
-        spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
-        ..config_from_balances(vec![funded(usd(), d("10000"))], FeeModelConfig::default())
-    };
+    let config = config_from_balances(vec![funded(usd(), d("10000"))], FeeModelConfig::default())
+        .with_spot_margin(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap());
     let venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
 
     let reason = invalid_reason(&venue, &cfd_instrument_name());

@@ -17,10 +17,8 @@ fn window_config(
     if let Some(window) = window {
         spot_margin = spot_margin.with_borrow_price_window(window).unwrap();
     }
-    MockExecutionConfig {
-        spot_margin: Some(configure(spot_margin)),
-        ..config_from_balances(balances, FeeModelConfig::default())
-    }
+    config_from_balances(balances, FeeModelConfig::default())
+        .with_spot_margin(configure(spot_margin))
 }
 
 /// An hour, which every test's prices fall within unless it says otherwise.

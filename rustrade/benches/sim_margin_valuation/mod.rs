@@ -129,30 +129,16 @@ fn venue(instruments: usize, held: usize, liquidation: bool) -> SimulatedVenue {
         time_exchange: at(0),
     }));
 
-    let config = MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    let config = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances,
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model: Default::default(),
-        fill_model: Default::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: Some(spot_margin),
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    };
+        0,
+    )
+    .with_spot_margin(spot_margin);
     let map: FnvHashMap<_, _> = (0..instruments).map(|i| (name(i), spot(i))).collect();
     let mut venue = SimulatedVenue::new_market_driven(&config, map);
     for i in 0..instruments {

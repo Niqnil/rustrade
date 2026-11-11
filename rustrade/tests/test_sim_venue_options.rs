@@ -71,8 +71,6 @@ use rustrade_execution::{
     cash_flow::CashFlow,
     client::mock::MockExecutionConfig,
     expiry::ExpirySellOut,
-    fee::FeeModelConfig,
-    fill::SimFillConfig,
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -120,30 +118,15 @@ fn funded(asset: &str, amount: Decimal) -> AssetBalance<AssetNameExchange> {
 
 /// A venue opening with `balances`.
 fn mock_config(balances: Vec<AssetBalance<AssetNameExchange>>) -> MockExecutionConfig {
-    MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances,
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model: FeeModelConfig::default(),
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    }
+        0,
+    )
 }
 
 type BacktestState = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;

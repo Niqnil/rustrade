@@ -8497,21 +8497,6 @@ fn test_venue_checkpoint_is_answered_with_the_engine_positions() {
             instruments: vec![],
         },
         0,
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        None,
-        None,
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        None,
-        Default::default(),
-        None, // expiry_sell_out
     );
     let venue_checkpoint = SimulatedVenue::new(&config, FnvHashMap::default()).checkpoint();
     let before = engine.state.clone();

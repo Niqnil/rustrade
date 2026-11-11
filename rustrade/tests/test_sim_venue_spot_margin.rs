@@ -33,7 +33,6 @@ use rustrade_execution::{
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
-    fill::SimFillConfig,
     holding_cost::{DayCount, RateSeries},
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
@@ -118,9 +117,9 @@ fn hourly_interest() -> PeriodicMarginInterest {
 }
 
 fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
-    let config = MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    let config = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![
                 funded(base(), Decimal::ZERO),
@@ -128,23 +127,13 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
             ],
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model: FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.001))),
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset,
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: Some(SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow).unwrap()),
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    };
+        0,
+    )
+    .with_fee_model(FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(
+        0.001
+    ))))
+    .with_spot_fee_asset(spot_fee_asset)
+    .with_spot_margin(SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow).unwrap());
     let spot = Instrument {
         exchange: EXCHANGE,
         name_internal: instrument(EXCHANGE, "btc", "usdt").name_internal,
@@ -426,35 +415,23 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
     );
 
     let template = venue(SpotFeeAsset::Received);
-    let config = MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    let config = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![funded(base(), Decimal::ZERO), funded(quote(), dec!(10000))],
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model: template.fee_model.clone(),
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset: SpotFeeAsset::Received,
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: Some(
-            SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow)
-                .unwrap()
-                .with_liquidation(SpotMarginLiquidation::new(dec!(1.1), dec!(0.02)).unwrap())
-                .unwrap(),
-        ),
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    };
+        0,
+    )
+    .with_fee_model(template.fee_model.clone())
+    .with_spot_fee_asset(SpotFeeAsset::Received)
+    .with_spot_margin(
+        SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow)
+            .unwrap()
+            .with_liquidation(SpotMarginLiquidation::new(dec!(1.1), dec!(0.02)).unwrap())
+            .unwrap(),
+    );
     let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
     let traded = |price| {
         MarketObservation::new(MarketSnapshot {

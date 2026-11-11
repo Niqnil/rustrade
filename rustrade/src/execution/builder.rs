@@ -1048,30 +1048,15 @@ mod tests {
     }
 
     fn mock_config() -> MockExecutionConfig {
-        MockExecutionConfig {
-            mocked_exchange: EXCHANGE,
-            initial_state: AccountSnapshot {
+        MockExecutionConfig::new(
+            EXCHANGE,
+            AccountSnapshot {
                 exchange: EXCHANGE,
                 balances: vec![],
                 instruments: vec![],
             },
-            latency_ms: 0,
-            fee_model: Default::default(),
-            fill_model: Default::default(),
-            spot_fee_asset: Default::default(),
-            slippage: Default::default(),
-            market_order_timing: Default::default(),
-            stale_market: Default::default(),
-            spot_margin: None,
-            fee_asset: None,
-            long_option_expiry: Default::default(),
-            short_put_collateral: Default::default(),
-            amend: Default::default(),
-            time_in_force: Default::default(),
-            session_close: None,
-            fee_model_by_kind: Default::default(),
-            expiry_sell_out: None,
-        }
+            0,
+        )
     }
 
     /// A CFD survives the projection with its multiplier intact and its settlement asset
@@ -1388,12 +1373,9 @@ mod tests {
     #[test]
     fn add_paper_refuses_next_bar_market_orders() {
         let instruments = instruments(InstrumentKind::Spot);
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(
-                rustrade_execution::fill::NextBarPrice::Open,
-            ),
-            ..mock_config()
-        };
+        let config = mock_config().with_market_order_timing(MarketOrderTiming::NextBar(
+            rustrade_execution::fill::NextBarPrice::Open,
+        ));
 
         let message = builder_error(ExecutionBuilder::new(&instruments).add_paper(
             config,

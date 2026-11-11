@@ -16,15 +16,12 @@ fn liquidating_config(
     balances: Vec<AssetBalance<AssetNameExchange>>,
     liquidation: SpotMarginLiquidation,
 ) -> MockExecutionConfig {
-    MockExecutionConfig {
-        spot_margin: Some(
-            SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
-                .unwrap()
-                .with_liquidation(liquidation)
-                .unwrap(),
-        ),
-        ..config_from_balances(balances, FeeModelConfig::default())
-    }
+    config_from_balances(balances, FeeModelConfig::default()).with_spot_margin(
+        SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
+            .unwrap()
+            .with_liquidation(liquidation)
+            .unwrap(),
+    )
 }
 
 /// A fed venue trading BTC at `price` from `time(1)`, holding `balances`.
@@ -601,14 +598,14 @@ fn a_liquidation_the_leverage_limit_could_reach_is_refused() {
 
 #[test]
 fn a_fee_taken_in_base_is_grossed_up_so_the_buy_back_clears_the_loan() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001"))),
-        spot_fee_asset: SpotFeeAsset::Received,
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Percentage(PercentageFeeModel::new(d(
+        "0.001",
+    ))))
+    .with_spot_fee_asset(SpotFeeAsset::Received);
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -636,25 +633,23 @@ fn a_fee_taken_in_base_is_grossed_up_so_the_buy_back_clears_the_loan() {
 fn a_debt_in_a_pairs_quote_is_bought_back_by_selling_the_valuation_asset_as_its_base() {
     // Valued in BTC, the base of BTCUSDT: 1 BTC held against 9,500 USDT owed, worth 0.95 BTC at
     // 10,000, a margin level of 1.05.
-    let config = MockExecutionConfig {
-        spot_margin: Some(
-            SpotMarginConfig::new(base(), d("3"), MarginEffect::Borrow)
-                .unwrap()
-                .with_liquidation(liquidation("1.1", "0.02"))
-                .unwrap(),
-        ),
-        ..config_from_balances(
-            vec![
-                funded(base(), d("1")),
-                AssetBalance::new(
-                    quote(),
-                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("9500"), Decimal::ZERO),
-                    Utc::now(),
-                ),
-            ],
-            FeeModelConfig::default(),
-        )
-    };
+    let config = config_from_balances(
+        vec![
+            funded(base(), d("1")),
+            AssetBalance::new(
+                quote(),
+                Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("9500"), Decimal::ZERO),
+                Utc::now(),
+            ),
+        ],
+        FeeModelConfig::default(),
+    )
+    .with_spot_margin(
+        SpotMarginConfig::new(base(), d("3"), MarginEffect::Borrow)
+            .unwrap()
+            .with_liquidation(liquidation("1.1", "0.02"))
+            .unwrap(),
+    );
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
 
     let events = tick(&mut venue, "10000", 1);
@@ -731,18 +726,16 @@ fn short_one_eth(
     btc: &str,
     usdt: &str,
 ) -> SimulatedVenue {
-    let config = MockExecutionConfig {
-        fee_model,
-        spot_fee_asset,
-        ..liquidating_config(
-            vec![
-                funded(base(), d(btc)),
-                funded(eth(), Decimal::ZERO),
-                funded(quote(), d(usdt)),
-            ],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            funded(base(), d(btc)),
+            funded(eth(), Decimal::ZERO),
+            funded(quote(), d(usdt)),
+        ],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(fee_model)
+    .with_spot_fee_asset(spot_fee_asset);
     let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -976,22 +969,20 @@ fn a_pair_without_a_market_is_passed_over_for_one_with_a_market() {
 #[test]
 fn a_leg_whose_fee_takes_all_it_delivers_is_not_traded() {
     // Owes 11,000 USDT against 2 BTC, and a sale's fee is 6,000 per BTC.
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::PerContract(PerContractFeeModel {
-            commission_per_contract: d("6000"),
-        }),
-        ..liquidating_config(
-            vec![
-                funded(base(), d("2")),
-                AssetBalance::new(
-                    quote(),
-                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("11000"), Decimal::ZERO),
-                    Utc::now(),
-                ),
-            ],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            funded(base(), d("2")),
+            AssetBalance::new(
+                quote(),
+                Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("11000"), Decimal::ZERO),
+                Utc::now(),
+            ),
+        ],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::PerContract(PerContractFeeModel {
+        commission_per_contract: d("6000"),
+    }));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
 
     // At 6,000 a margin level of 1.09, and a sale delivers nothing net of its fee.
@@ -1014,20 +1005,18 @@ fn a_leg_whose_fee_takes_all_it_delivers_is_not_traded() {
 #[test]
 fn held_and_resting_orders_are_all_cancelled_in_client_order_id_order() {
     // Owes 1 BTC and holds 20,000 USDT, on a venue holding market orders for the next bar.
-    let config = MockExecutionConfig {
-        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-        ..liquidating_config(
-            vec![
-                AssetBalance::new(
-                    base(),
-                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
-                    Utc::now(),
-                ),
-                funded(quote(), d("20000")),
-            ],
-            liquidation("1.1", "0"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            AssetBalance::new(
+                base(),
+                Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
+                Utc::now(),
+            ),
+            funded(quote(), d("20000")),
+        ],
+        liquidation("1.1", "0"),
+    )
+    .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(feed_bar(&mut venue, 1, ohlc("10000", "10000", "10000", "10000")).is_empty());
@@ -1137,20 +1126,18 @@ fn while_a_liquidation_is_under_way_the_venue_lends_nothing() {
 #[test]
 fn while_a_liquidation_is_under_way_a_held_order_whose_fill_needs_a_loan_is_cancelled() {
     // Owes 1 BTC and holds 20,000 USDT, on a venue holding market orders for the next bar.
-    let config = MockExecutionConfig {
-        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-        ..liquidating_config(
-            vec![
-                AssetBalance::new(
-                    base(),
-                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
-                    Utc::now(),
-                ),
-                funded(quote(), d("20000")),
-            ],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            AssetBalance::new(
+                base(),
+                Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
+                Utc::now(),
+            ),
+            funded(quote(), d("20000")),
+        ],
+        liquidation("1.1", "0.02"),
+    )
+    .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(feed_bar(&mut venue, 1, ohlc("10000", "10000", "10000", "10000")).is_empty());
@@ -1250,16 +1237,14 @@ fn an_order_a_liquidation_cancels_reports_the_interest_its_loan_was_charged_when
 /// A venue like [`short_one_btc`]'s, whose fills each pay a ticket of 10 USDT per order, and which
 /// takes a fill's fee in quote, or, under `Received`, a buy's in the base it receives.
 fn short_one_btc_paying_a_ticket(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
-        ),
-        spot_fee_asset,
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+    ))
+    .with_spot_fee_asset(spot_fee_asset);
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1374,18 +1359,16 @@ fn a_ticket_per_order_buy_back_takes_only_the_depth_on_offer() {
 /// An account that cannot pay even the ticket buys nothing back.
 #[test]
 fn a_ticket_the_account_cannot_pay_buys_nothing_back() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![
-                FeeComponent::new(FeeBasis::PerOrder(d("30000"))).on_side(Side::Buy),
-            ])
-            .unwrap(),
-        ),
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![
+            FeeComponent::new(FeeBasis::PerOrder(d("30000"))).on_side(Side::Buy),
+        ])
+        .unwrap(),
+    ));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1403,16 +1386,14 @@ fn a_ticket_the_account_cannot_pay_buys_nothing_back() {
 /// scales to: the search climbs past that estimate, and buys back the debt and the ticket exactly.
 #[test]
 fn a_ticket_taken_in_base_buys_back_a_small_debt_and_the_ticket_exactly() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
-        ),
-        spot_fee_asset: SpotFeeAsset::Received,
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("1110"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("1110"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+    ))
+    .with_spot_fee_asset(SpotFeeAsset::Received);
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1446,20 +1427,18 @@ fn a_ticket_taken_in_base_buys_back_a_small_debt_and_the_ticket_exactly() {
 #[test]
 fn a_debt_no_quantity_can_clear_buys_all_the_budget_pays_for() {
     for (price, quantity) in [("20000", "1"), ("30000", "0.6666666666666666666666666666")] {
-        let config = MockExecutionConfig {
-            fee_model: FeeModelConfig::Composite(
-                CompositeFeeModel::new(vec![
-                    FeeComponent::new(FeeBasis::Notional(Decimal::ONE)).on_side(Side::Buy),
-                    FeeComponent::new(FeeBasis::PerOrder(d("-2000"))).on_side(Side::Buy),
-                ])
-                .unwrap(),
-            ),
-            spot_fee_asset: SpotFeeAsset::Received,
-            ..liquidating_config(
-                vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
-                liquidation("1.1", "0.02"),
-            )
-        };
+        let config = liquidating_config(
+            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+            liquidation("1.1", "0.02"),
+        )
+        .with_fee_model(FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![
+                FeeComponent::new(FeeBasis::Notional(Decimal::ONE)).on_side(Side::Buy),
+                FeeComponent::new(FeeBasis::PerOrder(d("-2000"))).on_side(Side::Buy),
+            ])
+            .unwrap(),
+        ))
+        .with_spot_fee_asset(SpotFeeAsset::Received);
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1479,19 +1458,17 @@ fn a_debt_no_quantity_can_clear_buys_all_the_budget_pays_for() {
 /// only what it and the ticket need, not all the collateral the budget pays for.
 #[test]
 fn a_dust_shortfall_sells_only_what_it_and_the_ticket_need() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
-        ),
-        ..liquidating_config(
-            vec![
-                funded(base(), d("0.001")),
-                funded(eth(), Decimal::ZERO),
-                funded(quote(), d("1019.999999999999999999999999")),
-            ],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            funded(base(), d("0.001")),
+            funded(eth(), Decimal::ZERO),
+            funded(quote(), d("1019.999999999999999999999999")),
+        ],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+    ));
     let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "100010", 1).is_empty());
@@ -1523,15 +1500,13 @@ fn a_dust_shortfall_sells_only_what_it_and_the_ticket_need() {
 /// A large debt under a ticket per order is still bought back exactly: the search reaches it.
 #[test]
 fn a_ticket_per_order_buys_back_a_large_debt_exactly() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
-        ),
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("1000000"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("1000000"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+    ));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1558,17 +1533,14 @@ fn a_ticket_per_order_buys_back_a_large_debt_exactly() {
 /// delivers less than nothing.
 #[test]
 fn a_ticket_worth_more_than_one_unit_still_buys_back_the_debt() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("30000")))])
-                .unwrap(),
-        ),
-        spot_fee_asset: SpotFeeAsset::Received,
-        ..liquidating_config(
-            vec![funded(base(), Decimal::ZERO), funded(quote(), d("1000000"))],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("1000000"))],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("30000")))]).unwrap(),
+    ))
+    .with_spot_fee_asset(SpotFeeAsset::Received);
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "10000", 1).is_empty());
@@ -1598,22 +1570,20 @@ fn a_ticket_worth_more_than_one_unit_still_buys_back_the_debt() {
 /// units and buys it back exactly.
 #[test]
 fn a_ticket_worth_millions_of_units_still_buys_back_a_large_debt_exactly() {
-    let config = MockExecutionConfig {
-        fee_model: FeeModelConfig::Composite(
-            CompositeFeeModel::new(vec![
-                FeeComponent::new(FeeBasis::PerOrder(d("50000000"))).on_side(Side::Buy),
-            ])
-            .unwrap(),
-        ),
-        spot_fee_asset: SpotFeeAsset::Received,
-        ..liquidating_config(
-            vec![
-                funded(base(), Decimal::ZERO),
-                funded(quote(), d("1100000000")),
-            ],
-            liquidation("1.1", "0.02"),
-        )
-    };
+    let config = liquidating_config(
+        vec![
+            funded(base(), Decimal::ZERO),
+            funded(quote(), d("1100000000")),
+        ],
+        liquidation("1.1", "0.02"),
+    )
+    .with_fee_model(FeeModelConfig::Composite(
+        CompositeFeeModel::new(vec![
+            FeeComponent::new(FeeBasis::PerOrder(d("50000000"))).on_side(Side::Buy),
+        ])
+        .unwrap(),
+    ))
+    .with_spot_fee_asset(SpotFeeAsset::Received);
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(tick(&mut venue, "1", 1).is_empty());
@@ -1642,20 +1612,17 @@ fn a_ticket_worth_millions_of_units_still_buys_back_a_large_debt_exactly() {
 fn collateral_worth_no_more_than_its_ticket_is_not_sold() {
     // 0.00005 BTC at 100,010 is worth 5.0005, and 0.0001 at 100,000 exactly the ticket of 10.
     for (held, price) in [("0.00005", "100010"), ("0.0001", "100000")] {
-        let config = MockExecutionConfig {
-            fee_model: FeeModelConfig::Composite(
-                CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))])
-                    .unwrap(),
-            ),
-            ..liquidating_config(
-                vec![
-                    funded(base(), d(held)),
-                    funded(eth(), Decimal::ZERO),
-                    funded(quote(), d("500")),
-                ],
-                liquidation("1.1", "0.02"),
-            )
-        };
+        let config = liquidating_config(
+            vec![
+                funded(base(), d(held)),
+                funded(eth(), Decimal::ZERO),
+                funded(quote(), d("500")),
+            ],
+            liquidation("1.1", "0.02"),
+        )
+        .with_fee_model(FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+        ));
         let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments());
         advance(&mut venue, time(1));
         assert!(tick(&mut venue, price, 1).is_empty());
