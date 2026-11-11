@@ -76,7 +76,10 @@ fn client() -> AlpacaClient {
 /// A request to Alpaca's paper trading API, authenticated, without going through the client.
 fn paper_request(method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
     let (key, secret) = credentials();
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("HTTP client")
         .request(method, format!("{PAPER_REST}{path}"))
         .header("APCA-API-KEY-ID", key)
         .header("APCA-API-SECRET-KEY", secret)
@@ -124,39 +127,79 @@ async fn require_market_open() -> DateTime<Utc> {
 /// Panics if the account holds a position in `instrument`: a test that trades it would otherwise
 /// read another position's fills, and its cleanup would close a position it did not open.
 async fn require_no_position(instrument: &InstrumentNameExchange) {
-    let path = format!("/v2/positions/{instrument}");
-    let response = paper_request(reqwest::Method::GET, &path)
-        .send()
-        .await
-        .expect("send");
-    let status = response.status();
     assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_FOUND,
-        "GET {path}: {status}: the account already holds {instrument}, so close it first"
+        holds_position(instrument).await,
+        Ok(false),
+        "the account already holds {instrument}, so close it first"
     );
 }
 
-/// Cancels every open order on `instrument` and closes any position in it, through Alpaca's paper
-/// API directly: the cleanup a failed check runs. Reports what it could not do rather than
-/// panicking, since it runs while a panic is already on its way.
-async fn flatten(instrument: &InstrumentNameExchange) {
+/// The ids of the open orders on `instrument`, read from Alpaca's paper API directly.
+async fn open_order_ids(instrument: &InstrumentNameExchange) -> Result<Vec<String>, String> {
     let symbol = instrument.name().as_str();
-    match paper_request(
+    let response = paper_request(
         reqwest::Method::GET,
         &format!("/v2/orders?status=open&symbols={symbol}"),
     )
     .send()
     .await
-    {
-        Ok(response) => {
-            let orders: Value = response.json().await.unwrap_or(Value::Null);
-            for id in orders
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|order| order["id"].as_str())
-            {
+    .map_err(|error| error.to_string())?;
+    let orders: Value = response.json().await.map_err(|error| error.to_string())?;
+    let orders = orders
+        .as_array()
+        .ok_or_else(|| format!("not a list: {orders}"))?;
+    Ok(orders
+        .iter()
+        .filter_map(|order| order["id"].as_str().map(str::to_owned))
+        .collect())
+}
+
+/// Whether the account holds a position in `instrument`, read from Alpaca's paper API directly.
+async fn holds_position(instrument: &InstrumentNameExchange) -> Result<bool, String> {
+    let path = format!("/v2/positions/{}", instrument.name());
+    let response = paper_request(reqwest::Method::GET, &path)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND => Ok(false),
+        status if status.is_success() => Ok(true),
+        status => Err(format!("GET {path}: {status}")),
+    }
+}
+
+/// Polls `done` every half second for up to ten seconds, returning whether it held.
+async fn within_ten_seconds<F: Future<Output = bool>>(mut done: impl FnMut() -> F) -> bool {
+    let started = tokio::time::Instant::now();
+    loop {
+        if done().await {
+            return true;
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Panics unless the account's position in `instrument` is gone within ten seconds, since Alpaca
+/// may update the position a moment after the order that closed it reports filled.
+async fn await_no_position(instrument: &InstrumentNameExchange) {
+    let gone =
+        within_ten_seconds(|| async { matches!(holds_position(instrument).await, Ok(false)) })
+            .await;
+    assert!(gone, "the account still holds {instrument} after the test");
+}
+
+/// Cancels every open order on `instrument` and closes any position in it, through Alpaca's paper
+/// API directly: the cleanup a failed check runs. It waits for the cancels to land before closing
+/// the position, since an open sell holds the position's quantity. Reports what it could not do
+/// rather than panicking, since it runs while a panic is already on its way.
+async fn flatten(instrument: &InstrumentNameExchange) {
+    let symbol = instrument.name().as_str();
+    match open_order_ids(instrument).await {
+        Ok(ids) => {
+            for id in ids {
                 let cancelled = paper_request(reqwest::Method::DELETE, &format!("/v2/orders/{id}"))
                     .send()
                     .await;
@@ -170,14 +213,35 @@ async fn flatten(instrument: &InstrumentNameExchange) {
         }
         Err(error) => eprintln!("CLEANUP: could not list the open orders on {symbol}: {error}"),
     }
-    let closed = paper_request(reqwest::Method::DELETE, &format!("/v2/positions/{symbol}"))
-        .send()
-        .await;
-    match closed {
-        Ok(response)
-            if response.status().is_success()
-                || response.status() == reqwest::StatusCode::NOT_FOUND => {}
-        other => eprintln!("CLEANUP: could not close the position in {symbol}: {other:?}"),
+    if !within_ten_seconds(|| async {
+        open_order_ids(instrument)
+            .await
+            .is_ok_and(|ids| ids.is_empty())
+    })
+    .await
+    {
+        eprintln!("CLEANUP: {symbol} still lists open orders after cancelling them");
+    }
+
+    let closed = within_ten_seconds(|| async {
+        if matches!(holds_position(instrument).await, Ok(false)) {
+            return true;
+        }
+        let response = paper_request(reqwest::Method::DELETE, &format!("/v2/positions/{symbol}"))
+            .send()
+            .await;
+        if let Ok(response) = &response
+            && response.status().is_success()
+        {
+            // The close is a market order: the next poll sees the position gone once it fills.
+            return false;
+        }
+        eprintln!("CLEANUP: closing the position in {symbol}: {response:?}");
+        false
+    })
+    .await;
+    if !closed {
+        eprintln!("CLEANUP: the account may still hold {symbol}: check the paper account by hand");
     }
 }
 
@@ -334,7 +398,12 @@ async fn await_fills(
     let started = tokio::time::Instant::now();
     loop {
         let read = client
-            .fetch_trades(since, Utc::now(), std::slice::from_ref(instrument))
+            // Alpaca stamps the fills by its own clock, so the end is generous to absorb skew.
+            .fetch_trades(
+                since,
+                Utc::now() + TimeDelta::minutes(5),
+                std::slice::from_ref(instrument),
+            )
             .await
             .expect("fetch_trades");
         let fills: Vec<_> = read
@@ -426,9 +495,9 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
                 .chain(&sells)
                 .all(|fill| fill.price > Decimal::ZERO)
         );
+        await_no_position(&contract).await;
     })
     .await;
-    require_no_position(&contract).await;
 }
 
 #[tokio::test]
@@ -482,9 +551,9 @@ async fn option_day_limit_rests_then_cancels() {
             .await;
         assert!(cancelled.state.is_ok(), "cancel: {:?}", cancelled.state);
         await_no_open_orders(&client, &contract).await;
+        await_no_position(&contract).await;
     })
     .await;
-    require_no_position(&contract).await;
 }
 
 /// POSTs `order` to Alpaca's paper `/v2/orders` and returns the HTTP status and body. An order
@@ -504,13 +573,18 @@ async fn post_order_directly(order: Value) -> (reqwest::StatusCode, Value) {
     if status.is_success()
         && let Some(id) = body["id"].as_str()
     {
+        // 404 or 422: the order already ended, an IOC most likely, so nothing is left working.
         let cancelled = paper_request(reqwest::Method::DELETE, &format!("/v2/orders/{id}"))
             .send()
             .await;
         assert!(
-            cancelled
-                .as_ref()
-                .is_ok_and(|response| response.status().is_success()),
+            cancelled.as_ref().is_ok_and(|response| {
+                response.status().is_success()
+                    || matches!(
+                        response.status(),
+                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                    )
+            }),
             "Alpaca took order {id} ({status} {body}), and cancelling it failed: {cancelled:?}. \
              Cancel it by hand"
         );
