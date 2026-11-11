@@ -159,9 +159,10 @@
 //! | `StopLimit`, `TakeProfitLimit` | `GoodUntilCancelled` |
 //!
 //! They refuse any other unsent with [`OrderError::UnsupportedTimeInForce`], rather than send it
-//! changed or drop it. A trigger order carries no time in force to Hyperliquid. Once triggered, a
-//! stop or take-profit order places a market order, which fills what it can and takes liquidity,
-//! as `GoodUntilCancelled` and `ImmediateOrCancel` allow. A stop-limit or take-profit-limit order
+//! changed or drop it. A trigger order carries no time in force to Hyperliquid, so a stop or
+//! take-profit order goes out the same whether it was given `GoodUntilCancelled` or
+//! `ImmediateOrCancel`. Once triggered, it places a market order, which fills what it can and
+//! takes liquidity, as both allow. A stop-limit or take-profit-limit order
 //! places a limit order that rests until cancelled (seen on testnet: the triggered order rests
 //! under the same id, as `Gtc`), which only `GoodUntilCancelled` describes.
 //!
@@ -1091,12 +1092,6 @@ impl ExecutionClient for HyperliquidClient {
             ))
         };
 
-        let coin = match self.dexes.coin(request.key.instrument) {
-            Ok(coin) => coin.to_owned(),
-            Err(reason) => return make_invalid_instrument(reason),
-        };
-        let is_buy = request.state.side == Side::Buy;
-
         // What Hyperliquid takes, kind and time in force, is decided in one place for both
         // clients; see the module docs.
         let wire_kind = match classify_order(request.state.kind, request.state.time_in_force) {
@@ -1105,6 +1100,12 @@ impl ExecutionClient for HyperliquidClient {
                 return make_inactive(refused.into_order_error(request.state.time_in_force));
             }
         };
+
+        let coin = match self.dexes.coin(request.key.instrument) {
+            Ok(coin) => coin.to_owned(),
+            Err(reason) => return make_invalid_instrument(reason),
+        };
+        let is_buy = request.state.side == Side::Buy;
 
         // The venue reports every order under its cloid, so an order placed without one could
         // not be matched to the id the caller tracks it by. See the module docs.
