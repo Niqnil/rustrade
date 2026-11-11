@@ -88,7 +88,7 @@ pub(super) fn option_instrument(
     }
 }
 
-fn config(usd_balance: &str, fee_model: FeeModelConfig) -> MockExecutionConfig {
+pub(super) fn config(usd_balance: &str, fee_model: FeeModelConfig) -> MockExecutionConfig {
     config_from_balances(
         vec![funded(usd(), d(usd_balance)), funded(spy(), Decimal::ZERO)],
         fee_model,
@@ -764,8 +764,8 @@ fn a_restored_venue_still_waits_to_settle_an_expiry_it_had_no_price_for() {
 }
 
 /// One option contract held long since `initial_state`, bought at 1.50.
-fn held_option() -> InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>
-{
+pub(super) fn held_option()
+-> InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange> {
     InstrumentAccountSnapshot {
         instrument: option_name(),
         orders: Vec::new(),

@@ -1,11 +1,15 @@
 //! The expiry sell-out: a long option in the money that the account cannot afford to exercise,
 //! sold before it expires.
 
-use super::super::liquidation::LiquidationState;
+use super::super::{
+    liquidation::LiquidationState,
+    sell_out::{ExerciseBudget, affordable},
+};
 use super::{
     options::{
-        STRIKE, balance, buy, driven_instruments, driven_venue, expiry, feed, funds, limit,
-        option_instrument, option_name, option_position, spy, spy_name, trades, usd,
+        STRIKE, balance, buy, config as option_config, driven_instruments, driven_venue, expiry,
+        feed, funds, held_option, limit, option_instrument, option_name, option_position, spy,
+        spy_name, trades, usd,
     },
     *,
 };
@@ -404,6 +408,16 @@ fn on_a_margin_venue_what_it_would_lend_counts_towards_a_call() {
 /// each of two calls bought at 1.5 with SPY at 100, [`option_name`] and the returned second one,
 /// with SPY then at 120 and both calls at 20 before the check.
 fn holding_two_calls(usd_balance: &str) -> (SimulatedVenue, InstrumentNameExchange) {
+    holding_two_calls_with(usd_balance, "1", None)
+}
+
+/// As [`holding_two_calls`], with `first_contracts` of [`option_name`], and its market before the
+/// check offering `first_bid_depth` to sell into, unlimited when `None`.
+fn holding_two_calls_with(
+    usd_balance: &str,
+    first_contracts: &str,
+    first_bid_depth: Option<&str>,
+) -> (SimulatedVenue, InstrumentNameExchange) {
     let mut second = option_instrument(OptionKind::Call, OptionSettlement::Physical);
     second.name_exchange = InstrumentNameExchange::new("SPY_C100_B");
     second.name_internal = InstrumentNameInternal::new("spy_c100_b");
@@ -421,13 +435,131 @@ fn holding_two_calls(usd_balance: &str) -> (SimulatedVenue, InstrumentNameExchan
         (option_name(), "20", 50),
         (second.name_exchange.clone(), "20", 50),
     ] {
-        let _ = venue.apply_market(&instrument, MarketObservation::new(traded(price)), time(at));
+        let mut observation = MarketObservation::new(traded(price));
+        if at == 50 && instrument == option_name() {
+            observation = observation.with_depth(MarketDepth::new(first_bid_depth.map(d), None));
+        }
+        let _ = venue.apply_market(&instrument, observation, time(at));
         if at == 2 && instrument != spy_name() {
-            let bought = venue.open_order(request(instrument, Side::Buy, "1", None));
+            let contracts = match instrument == option_name() {
+                true => first_contracts,
+                false => "1",
+            };
+            let bought = venue.open_order(request(instrument, Side::Buy, contracts, None));
             assert!(bought.response.state.is_accepted());
         }
     }
     (venue, second.name_exchange)
+}
+
+/// A sale sells only what the depth on offer takes, and the rest goes on to expiry.
+#[test]
+fn a_sale_sells_only_the_depth_on_offer() {
+    let mut venue = driven_venue(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        selling_out("10000", "0", sell_out()),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "3");
+    let _ = venue.apply_market(&spy_name(), MarketObservation::new(traded("120")), time(50));
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("20")).with_depth(MarketDepth::new(Some(d("1")), None)),
+        time(50),
+    );
+
+    let events = venue.advance_time(check());
+
+    let sales = liquidations(&events);
+    assert_eq!(sales.len(), 1, "{events:?}");
+    assert_eq!(sales[0].quantity, d("1"));
+    assert_eq!(option_position(&venue), Some(d("2")));
+}
+
+/// A sale with no depth to sell into sells nothing and leaves the option's orders working.
+#[test]
+fn a_sale_with_no_depth_sells_nothing_and_cancels_nothing() {
+    let mut venue = driven_venue(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        selling_out("10000", "0", sell_out()),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    let rested = venue.open_order(limit(option_name(), Side::Sell, "50", "1", "ask"));
+    assert!(
+        rested.response.state.is_accepted(),
+        "{:?}",
+        rested.response.state
+    );
+    let _ = venue.apply_market(&spy_name(), MarketObservation::new(traded("120")), time(50));
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("20")).with_depth(MarketDepth::new(Some(d("0")), None)),
+        time(50),
+    );
+
+    let events = venue.advance_time(check());
+
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert_eq!(venue.account.orders_open().count(), 1);
+}
+
+/// A sale whose fee the account cannot pay sells nothing, and the orders it cancelled to sell
+/// stay cancelled.
+#[test]
+fn a_sale_whose_fee_the_account_cannot_pay_sells_nothing_and_leaves_its_orders_cancelled() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+        selling_out("6000", "0", sell_out())(config);
+        config.fee_model = FeeModelConfig::PerContract(crate::fee::PerContractFeeModel {
+            commission_per_contract: d("5000"),
+        });
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    let rested = venue.open_order(limit(option_name(), Side::Sell, "50", "1", "ask"));
+    assert!(
+        rested.response.state.is_accepted(),
+        "{:?}",
+        rested.response.state
+    );
+    feed(&mut venue, "120", "20", time(50));
+
+    // 850 left after the buy, and 2,000 from the sale, pay no 5,000 fee.
+    let events = venue.advance_time(check());
+
+    assert!(trades(&events).is_empty(), "{events:?}");
+    assert!(!events.is_empty(), "the cancel is reported: {events:?}");
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert_eq!(venue.account.orders_open().count(), 0);
+}
+
+/// A check at or before the clock's first move is skipped, as there is no market yet to sell
+/// at: a long held from the start goes on to expiry.
+#[test]
+fn a_check_before_the_clock_first_moves_is_skipped() {
+    let mut config = option_config("0", FeeModelConfig::default());
+    config.expiry_sell_out = Some(sell_out());
+    config.initial_state.instruments.push(held_option());
+    let mut venue = SimulatedVenue::new_market_driven(
+        &config,
+        driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+    );
+
+    // The first move is past the check, ten seconds before expiry.
+    let mut events =
+        venue.apply_market(&spy_name(), MarketObservation::new(traded("120")), time(95));
+    events.extend(venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("20")),
+        time(95),
+    ));
+
+    assert!(trades(&events).is_empty(), "{events:?}");
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert_eq!(venue.next_deadline(), Some(expiry()));
 }
 
 /// A long the check keeps is not priced, so it takes no slippage draw and a seeded run's later
@@ -505,6 +637,73 @@ fn longs_checked_at_one_instant_are_both_kept_when_the_free_cash_pays_for_both()
             .positions
             .get(&second)
             .is_some_and(NetPosition::is_long)
+    );
+}
+
+/// A long whose sale finds no depth goes on to expiry, so its exercise is spent from what the
+/// longs checked at that instant share, and a later long the rest cannot pay for is sold.
+#[test]
+fn a_long_left_unsold_spends_what_the_longs_share_on_its_exercise() {
+    // 15,000 less 450 of premium pays neither the first's two exercises nor both longs'.
+    let (mut venue, second) = holding_two_calls_with("15000", "2", Some("0"));
+
+    let events = venue.advance_time(check());
+
+    let sales = liquidations(&events);
+    assert_eq!(sales.len(), 1, "{events:?}");
+    assert_eq!(sales[0].instrument, second);
+    assert_eq!(option_position(&venue), Some(d("2")));
+}
+
+/// A budget spends its free balance first, and only a call draws on what would be lent.
+#[test]
+fn an_exercise_budget_spends_free_first_and_lends_only_to_a_call() {
+    let mut budget = ExerciseBudget {
+        free: d("100"),
+        lendable: d("50"),
+    };
+    assert_eq!(
+        (
+            budget.available(OptionKind::Call),
+            budget.available(OptionKind::Put)
+        ),
+        (d("150"), d("100"))
+    );
+
+    budget.spend(OptionKind::Call, d("120"));
+    assert_eq!((budget.free, budget.lendable), (d("0"), d("30")));
+
+    let mut put = ExerciseBudget {
+        free: d("100"),
+        lendable: d("50"),
+    };
+    put.spend(OptionKind::Put, d("120"));
+    assert_eq!((put.free, put.lendable), (d("0"), d("50")));
+
+    budget.spend(OptionKind::Call, d("1000"));
+    assert_eq!((budget.free, budget.lendable), (d("0"), d("0")));
+}
+
+#[test]
+fn per_contract_keeps_the_whole_contracts_the_budget_pays_for() {
+    let per_contract = SellOutAffordability::PerContract;
+    // Fractional contracts: a budget for 2 of 2.5 keeps 2.
+    assert_eq!(affordable(per_contract, d("2.5"), d("10"), d("20")), d("2"));
+    // Just short of 3 keeps 2.
+    assert_eq!(
+        affordable(per_contract, d("3"), d("10"), d("29.99")),
+        d("2")
+    );
+    // A contract costing nothing is kept, whatever the budget.
+    assert_eq!(affordable(per_contract, d("3"), d("0"), d("0")), d("3"));
+    assert_eq!(
+        affordable(
+            SellOutAffordability::PerPosition,
+            d("3"),
+            d("10"),
+            d("29.99")
+        ),
+        d("0")
     );
 }
 

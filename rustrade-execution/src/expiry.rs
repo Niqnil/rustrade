@@ -58,8 +58,10 @@ pub enum LongOptionExpiry {
 ///   leverage limit and the asset's borrow cap; nothing while a liquidation is under way).
 ///   Exercising a put delivers `quantity × contract_size` of the underlying, which the account
 ///   must hold free: shares securing a short call are not free, and the venue never lends shares
-///   to exercise a put. Several longs checked at one instant share what the account has, by
-///   instrument name, and what one sale brings in does not count towards another's exercise.
+///   to exercise a put. Cash and shares reserved for orders still working, the option's own
+///   included, are not free. Several longs checked at one instant share what the account has, by
+///   instrument name: each spends on what goes on to expiry, the contracts kept and any its sale
+///   left unsold, and what one sale brings in does not count towards another's exercise.
 /// - **What is sold:** under [`SellOutAffordability::PerPosition`], the whole position, unless
 ///   all of it is affordable; under [`SellOutAffordability::PerContract`], the contracts beyond
 ///   what is affordable.

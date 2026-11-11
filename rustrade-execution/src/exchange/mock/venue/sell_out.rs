@@ -30,9 +30,10 @@ impl SimulatedVenue {
     /// order, pushing what each sale moves onto `events`. Nothing without a configured sell-out,
     /// and nothing for an option the account holds no long in.
     ///
-    /// The options share what the account has to exercise with: each takes what it can exercise
-    /// out of a budget per asset, read when it is first needed, so a later one sees only what an
-    /// earlier one left. A sale's proceeds are not added to it.
+    /// The options share what the account has to exercise with: a budget per asset, read when it
+    /// is first needed. Each option spends on what goes on to expiry, the contracts kept and any
+    /// its sale left unsold, so a later one sees only what an earlier one left. A sale's proceeds
+    /// are not added to it.
     pub(super) fn sell_out(
         &mut self,
         at: DateTime<Utc>,
@@ -42,7 +43,7 @@ impl SimulatedVenue {
         let Some(config) = self.expiry_sell_out else {
             return;
         };
-        let mut budgets = FnvHashMap::<AssetNameExchange, Decimal>::default();
+        let mut budgets = FnvHashMap::<AssetNameExchange, ExerciseBudget>::default();
         for instrument in instruments {
             let Some(contracts) = self
                 .positions
@@ -84,28 +85,35 @@ impl SimulatedVenue {
             let budget = match budgets.get_mut(&asset) {
                 Some(budget) => budget,
                 None => {
-                    let budget = self.exercise_budget(&asset, contract.kind);
+                    let budget = self.exercise_budget(&asset);
                     budgets.entry(asset).or_insert(budget)
                 }
             };
-            let kept = affordable(config.affordability(), contracts, per_contract, *budget);
-            *budget -= kept * per_contract;
+            let kept = affordable(
+                config.affordability(),
+                contracts,
+                per_contract,
+                budget.available(contract.kind),
+            );
 
-            let sold = contracts - kept;
-            if sold > Decimal::ZERO {
-                self.sell_out_option(instrument, &terms, sold, config, at, events);
-            }
+            let to_sell = contracts - kept;
+            let unsold = match to_sell > Decimal::ZERO {
+                true => {
+                    to_sell - self.sell_out_option(instrument, &terms, to_sell, config, at, events)
+                }
+                false => Decimal::ZERO,
+            };
+            budget.spend(contract.kind, (kept + unsold) * per_contract);
         }
     }
 
-    /// What the account has to exercise an option of `kind` with in `asset`: its free balance,
-    /// plus, for a call on a venue with spot margin, what the venue would lend for a buy (its
-    /// leverage limit, and the asset's borrow cap; nothing while a liquidation is under way). A
-    /// put's shares are never lent. Never negative.
-    fn exercise_budget(&self, asset: &AssetNameExchange, kind: OptionKind) -> Decimal {
-        let free = self.account.free(asset);
-        let lendable = match (kind, self.spot_margin.as_ref()) {
-            (OptionKind::Call, Some(config)) if !self.liquidation.under_way() => {
+    /// What the account has to exercise with in `asset`: its free balance, and, on a venue with
+    /// spot margin, what the venue would lend for a buy (its leverage limit, and the asset's
+    /// borrow cap; nothing while a liquidation is under way).
+    fn exercise_budget(&self, asset: &AssetNameExchange) -> ExerciseBudget {
+        let free = self.account.free(asset).max(Decimal::ZERO);
+        let lendable = match self.spot_margin.as_ref() {
+            Some(config) if !self.liquidation.under_way() => {
                 // A debt this venue cannot value could be any size, so it lends nothing more.
                 let room = self
                     .leverage_room(config, asset, None)
@@ -116,14 +124,18 @@ impl SimulatedVenue {
             }
             _ => Decimal::ZERO,
         };
-        (free + lendable).max(Decimal::ZERO)
+        ExerciseBudget {
+            free,
+            lendable: lendable.max(Decimal::ZERO),
+        }
     }
 
     /// Sells `quantity` of the long option `instrument`, or as much as the depth on offer allows,
     /// as a market sell fills, its price cut by `config`'s haircut, after cancelling the orders
-    /// still working on it, as `[order.., balance.., trade]`. A sale that cannot be priced or finds
-    /// no depth sells nothing and cancels nothing, with a WARN. One whose fee the account cannot
-    /// pay, with those orders cancelled, leaves them cancelled and sells nothing, with a WARN.
+    /// still working on it, as `[order.., balance.., trade]`, returning the quantity sold. A sale
+    /// that cannot be priced or finds no depth sells nothing and cancels nothing, with a WARN. One
+    /// whose fee the account cannot pay, with those orders cancelled, leaves them cancelled and
+    /// sells nothing, with a WARN.
     fn sell_out_option(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -132,7 +144,7 @@ impl SimulatedVenue {
         config: ExpirySellOut,
         at: DateTime<Utc>,
         events: &mut Vec<UnindexedAccountEvent>,
-    ) {
+    ) -> Decimal {
         let not_sold = |reason: &str| {
             warn!(
                 instrument = %instrument,
@@ -141,6 +153,7 @@ impl SimulatedVenue {
                 "SimulatedVenue cannot sell out a long option it would sell before expiry: \
                  {reason}. It goes on to expiry"
             );
+            Decimal::ZERO
         };
         let Some(snapshot) = self.market.get(instrument).map(|market| market.snapshot) else {
             return not_sold("the option has no market");
@@ -213,12 +226,44 @@ impl SimulatedVenue {
         };
         self.account.ack_trade(trade.clone());
         self.push_committed(events, commitment, Some(trade));
+        quantity
+    }
+}
+
+/// What the account has to exercise with in one asset, as the options checked at one instant
+/// spend it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExerciseBudget {
+    /// The free balance not yet spent.
+    pub(super) free: Decimal,
+    /// What the venue would still lend for a buy, which only a call's exercise draws on.
+    pub(super) lendable: Decimal,
+}
+
+impl ExerciseBudget {
+    /// What exercising an option of `kind` may take: a call's strike may also be lent, a put's
+    /// shares never are.
+    pub(super) fn available(&self, kind: OptionKind) -> Decimal {
+        match kind {
+            OptionKind::Call => self.free + self.lendable,
+            OptionKind::Put => self.free,
+        }
+    }
+
+    /// Spends `amount` on exercising an option of `kind`, out of the free balance first, then,
+    /// for a call, what would be lent. More than is available leaves nothing.
+    pub(super) fn spend(&mut self, kind: OptionKind, amount: Decimal) {
+        let from_free = amount.min(self.free);
+        self.free -= from_free;
+        if kind == OptionKind::Call {
+            self.lendable = (self.lendable - (amount - from_free)).max(Decimal::ZERO);
+        }
     }
 }
 
 /// How many of `contracts` the account keeps for exercise with `budget`, each taking
 /// `per_contract` of it, under `affordability`.
-fn affordable(
+pub(super) fn affordable(
     affordability: SellOutAffordability,
     contracts: Decimal,
     per_contract: Decimal,
