@@ -3711,7 +3711,8 @@ struct NewOrderAnswer {
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
 /// Refuses what spot refuses: a time in force outside [`BinanceMargin::TIME_IN_FORCE`],
-/// `post_only` on any kind but a limit order, `TrailingStopLimit` and Absolute trailing offsets.
+/// `post_only` on any kind but a limit order, `FillOrKill` on a kind that is not limit-priced,
+/// `TrailingStopLimit` and Absolute trailing offsets.
 /// A `TrailingStop` maps to a `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT`
 /// (with the `trailingDelta` [`build_new_order_params`] adds).
 fn convert_order_kind_tif_margin(
@@ -6942,6 +6943,12 @@ mod tests {
                     trigger_price: Decimal::from(150),
                 },
                 TimeInForce::GoodUntilCancelled { post_only: true },
+            ),
+            (
+                OrderKind::Stop {
+                    trigger_price: Decimal::from(150),
+                },
+                TimeInForce::FillOrKill,
             ),
         ] {
             let mut request = margin_open_request(&btcusdt, "tif");

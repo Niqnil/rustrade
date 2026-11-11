@@ -3205,6 +3205,7 @@ mod tests {
                 None,
                 TimeInForce::AtClose,
             ),
+            (OrderKind::Market, None, TimeInForce::FillOrKill),
         ] {
             let order = client
                 .open_order(OrderRequestOpen {

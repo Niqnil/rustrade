@@ -3846,7 +3846,7 @@ pub(crate) const BINANCE_TIME_IN_FORCE: &[TimeInForceKind] = &[
 
 /// Why the time in force is refused when it is not in [`BINANCE_TIME_IN_FORCE`].
 const TIME_IN_FORCE_NOT_TAKEN: &str = "Binance takes only GoodUntilCancelled, ImmediateOrCancel \
-     or FillOrKill, post_only only on a limit order, and FillOrKill only on a limit-priced order";
+     or FillOrKill, and post_only only on a limit order";
 
 /// Why `post_only` is refused on any kind but a limit order.
 const POST_ONLY_LIMIT_ONLY: &str = "Binance takes post_only only on a limit order (LIMIT_MAKER)";
