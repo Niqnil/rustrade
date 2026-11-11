@@ -88,8 +88,8 @@ fn at(offset_ms: i64) -> DateTime<Utc> {
 enum Step {
     /// A trade printed at this price.
     Trade(Decimal),
-    /// The client sends this order.
-    Order(RequestOpen, &'static str),
+    /// The client sends this order. Boxed: a request is several times a price's size.
+    Order(Box<RequestOpen>, &'static str),
 }
 
 fn script() -> Vec<(i64, Step)> {
@@ -99,24 +99,27 @@ fn script() -> Vec<(i64, Step)> {
         // Rests below the market, then fills when the market trades through it.
         (
             1_500,
-            Step::Order(limit(Side::Buy, dec!(1), dec!(97), gtc()), "rest"),
+            Step::Order(Box::new(limit(Side::Buy, dec!(1), dec!(97), gtc())), "rest"),
         ),
         (2_000, Step::Trade(dec!(98))),
         (3_000, Step::Trade(dec!(95))),
         // Sent at 95, reaches the venue at 3_550, after the market has moved to 96.
-        (3_500, Step::Order(market(Side::Buy, dec!(1)), "market")),
+        (
+            3_500,
+            Step::Order(Box::new(market(Side::Buy, dec!(1))), "market"),
+        ),
         (3_520, Step::Trade(dec!(96))),
         (4_000, Step::Trade(dec!(101))),
         // Rests above the market until its deadline, with nothing arriving after it.
         (
             4_500,
             Step::Order(
-                limit(
+                Box::new(limit(
                     Side::Sell,
                     dec!(1),
                     dec!(110),
                     TimeInForce::GoodTillDate { expiry },
-                ),
+                )),
                 "expires",
             ),
         ),
@@ -273,7 +276,7 @@ async fn paper_run() -> Vec<Booked> {
                         strategy: StrategyId::new("paper"),
                         cid: ClientOrderId::new(cid),
                     },
-                    state: request,
+                    state: *request,
                 }))
                 .unwrap(),
         }
@@ -310,7 +313,7 @@ fn backtest_run() -> Vec<Booked> {
             ),
             Step::Order(request, cid) => (
                 offset_ms + (LATENCY_MS / 2) as i64,
-                Input::Book(request, cid),
+                Input::Book(*request, cid),
             ),
         })
         .collect::<Vec<_>>();

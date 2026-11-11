@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cancel an order's unfilled remainder after a set time** (`rustrade-execution`, `rustrade`,
+  #919).
+  - **New `RequestOpen::cancel_after: Option<Duration>`**, set with `with_cancel_after`. It is an
+    instruction to the driver and the engine, not to the venue, so it composes with any time in
+    force: send a day limit with a short `cancel_after` where a venue takes no immediate-or-cancel
+    order. A client that sends the request directly ignores it.
+  - **The driver times it from when it sends the open**, so the time includes the request's
+    latency: `ExecutionManager` on tokio's monotonic clock, `SimRunner` and `SimStepper` on
+    simulated time. When it runs out, the driver sends a new
+    `AccountEventKind::OrderDeadline(OrderDeadline)` on the account stream. It is not evidence
+    that the account link is up. The deadline is dropped if the open is refused, filled or
+    cancelled at once, and when the manager drains.
+  - **The engine sends an ordinary cancel** and reports it as a new
+    `EngineOutput::OrderDeadline(OrderDeadlineOutput)`: `Cancel`, `AwaitingAck`,
+    `AlreadyCancelling`, `NotTracked` or `Draining`. It does so whatever the trading state, but
+    sends nothing during a drain, when the driver accepts no more requests. An open the venue
+    has not acknowledged yet is cancelled once it is acknowledged. An order being amended is
+    cancelled by the id the venue last gave it. An order already being cancelled is left to that
+    cancel, so a deadline sends at most one. A cancel refused because the order filled first is
+    an ordinary refused cancel.
+  - **In a simulation,** a deadline at an instant follows every account event at that instant
+    and precedes its market data. One shorter than the trip to the venue is delivered when the
+    open arrives. None is delivered after the last source event.
+  - **Known limitations:** a deadline lives in the driver's memory, so a restart loses it and an
+    order first seen in a snapshot has none (use `TimeInForce::GoodTillDate` for a bound the
+    venue enforces). An amend does not restart the timer.
+  - New `OrderState::has_ended`: filled, cancelled, expired or refused, but not an open whose
+    outcome is unknown.
+
 - **Amend in place: change a working order's price, total quantity or trigger price without
   cancelling it** (`rustrade-execution`, `rustrade`, #892). Where the venue allows it, the order
   keeps its identity, and often its place in the queue, instead of being replaced.
@@ -192,6 +221,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
 
 ### Changed
+- **Breaking: `ExecutionManager` has a `clock` field** (`rustrade`, #919). It stamps an
+  `AccountEventKind::OrderDeadline`. `ExecutionManager::new` takes it as its last argument, and a
+  struct literal must set it. `ExecutionManager::init` takes it from `AccountStreamOptions::clock`.
+
 - **Breaking: the fee model API** (`rustrade-execution`, #907).
   - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side and the order's prior
     filled quantity to the price, quantity, contract size and liquidity it took before. Build one

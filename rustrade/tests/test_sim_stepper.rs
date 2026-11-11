@@ -2154,3 +2154,66 @@ async fn stepping_books_what_a_backtest_over_the_same_bars_books() {
         );
     }
 }
+
+/// A limit whose `cancel_after` runs out before a bar crosses it is cancelled by the engine at its
+/// deadline, on simulated time, so the bar that would have filled it fills nothing.
+#[test]
+fn a_limit_whose_cancel_after_runs_out_is_cancelled_before_a_later_bar_can_fill_it() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+
+    let Command::SendOpenRequests(OneOrMany::One(mut request)) =
+        limit_order(BTC, Side::Buy, dec!(1), dec!(95), "timed")
+    else {
+        unreachable!()
+    };
+    request.state = request
+        .state
+        .with_cancel_after(std::time::Duration::from_secs(2));
+    s.engine
+        .action(&Command::SendOpenRequests(OneOrMany::One(request)));
+    let resting = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(fills(events(&resting)).is_empty(), "the limit rests");
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(6), [bar(BTC, 6, dec!(94))])
+        .unwrap();
+
+    let cancels_sent = stepped
+        .iter()
+        .filter_map(|audit| match audit {
+            EngineAudit::Process(process) => Some(process.outputs.iter()),
+            EngineAudit::FeedEnded => None,
+        })
+        .flatten()
+        .filter(|output| {
+            matches!(
+                output,
+                rustrade::engine::EngineOutput::OrderDeadline(
+                    rustrade::engine::order_deadline::OrderDeadlineOutput::Cancel(cancel)
+                ) if !cancel.sent.is_none()
+            )
+        })
+        .count();
+    assert_eq!(cancels_sent, 1, "{stepped:?}");
+    let cancelled_at = events(&stepped).into_iter().find_map(|event| match event {
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            kind: AccountEventKind::OrderCancelled(response),
+            ..
+        })) => response
+            .state
+            .as_ref()
+            .ok()
+            .map(|cancelled| cancelled.time_exchange),
+        _ => None,
+    });
+    assert_eq!(cancelled_at, Some(at(5)), "{stepped:?}");
+    assert!(
+        fills(events(&stepped)).is_empty(),
+        "the bar at 6 fills nothing"
+    );
+    assert_eq!(position(&s.engine, BTC), None);
+}

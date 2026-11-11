@@ -22,7 +22,8 @@ use rustrade_execution::{
     indexer::AccountEventIndexer,
     market::MarketObservation,
     order::{
-        Order, OrderEvent,
+        Order, OrderEvent, UnindexedOrderKey,
+        deadline::OrderDeadline,
         request::{
             CancelThenOpen, OnCancelFailure, OrderRequestAmend, OrderRequestCancel,
             OrderRequestOpen, UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
@@ -313,8 +314,16 @@ const CLASS_AUX: u8 = 1;
 /// Precedence of an account deliverable within one instant.
 const CLASS_ACCOUNT: u8 = 2;
 
+/// Precedence of an order's [`cancel_after`] deadline within one instant: after every account
+/// deliverable, so a fill or acknowledgement stamped at the deadline reaches the `Engine` first,
+/// and before market data, so the cancel the `Engine` sends at the deadline acts before a tick
+/// stamped then can fill the order.
+///
+/// [`cancel_after`]: rustrade_execution::order::request::RequestOpen::cancel_after
+const CLASS_DEADLINE: u8 = 3;
+
 /// Precedence of a market data event within one instant.
-const CLASS_MARKET: u8 = 3;
+const CLASS_MARKET: u8 = 4;
 
 /// Precedence of a source event within one instant. See [`SimRunner`]'s ordering contract.
 fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
@@ -389,7 +398,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// | 0 | venue-bound actions — requests this runner has yet to book, venues' own deadlines |
 /// | 1 | auxiliary and control — corporate actions, contract expiries |
 /// | 2 | account — balances, trades, order responses |
-/// | 3 | market data |
+/// | 3 | order deadlines — an order's `cancel_after` running out |
+/// | 4 | market data |
 ///
 /// Actions leading is the tie-break described above: of the things stamped `T`, a venue acts on
 /// what it was handed before the `Engine` is shown anything. Auxiliary events keeping the next tie
@@ -397,7 +407,10 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// fill stamped at that instant is applied to it. Account events preceding market data at one
 /// instant is the rule this type exists for — a fill stamped at `T` must reach the `Engine` before
 /// the market event at `T` marks the resulting position to that price, or the terminal
-/// `pnl_unrealised` describes a position the run did not hold.
+/// `pnl_unrealised` describes a position the run did not hold. An order deadline follows every
+/// account event at its instant, so the `Engine` has a fill stamped at the deadline before it
+/// decides what is left to cancel, and precedes market data, so the cancel it sends acts before a
+/// tick at that instant could fill the order. See `# An order's cancel_after`.
 ///
 /// `class` is compared inside the queue's own ordering, not only where the queue is weighed against
 /// the source. Comparing it at the peek alone would let the queue hand back a low-priority entry
@@ -407,7 +420,7 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// produced precedes that request's response, so "the `Engine` has the response" implies "the
 /// `Engine` has already seen every account event for that order".
 ///
-/// ## Only three of the four classes are ever emitted
+/// ## Only four of the five classes are ever emitted
 ///
 /// An action is a queue entry, not an event: it is run against its venue and produces the next
 /// entries, and the `Engine` never sees it. It shares the queue because both directions are events
@@ -486,6 +499,24 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///   so a deadline after the last source event is never reached.
 /// - A deadline before the session start, such as that of a seeded order already past it, is
 ///   reached at the session start, so nothing is stamped before the run began.
+///
+/// # An order's `cancel_after`
+/// An open sent with a
+/// [`cancel_after`](rustrade_execution::order::request::RequestOpen::cancel_after) is timed as the
+/// `ExecutionManager` times it live: from when the open is sent, so its deadline falls
+/// `cancel_after` after the open left, on simulated time. When it falls due this runner emits an
+/// [`AccountEventKind::OrderDeadline`], and the `Engine` cancels what is left of the order.
+///
+/// - An open the venue refused, filled or cancelled at once has no deadline, as live.
+/// - A `cancel_after` shorter than `to_venue` falls due before the open arrives. It is emitted
+///   when the open arrives instead; the `Engine` holds the order for its acknowledgement either
+///   way, so the cancel goes at the same instant.
+/// - An open held behind the cancels of a cancel-then-open group is timed from when it is sent,
+///   once their answers are back.
+/// - A deadline counts as an emitted deliverable towards the feedback budget, so a strategy that
+///   reopens on every zero-delay cancel is reported as a cycle.
+/// - Simulated time ends with the source, as for a venue's own deadlines: no order deadline after
+///   the last source event is emitted.
 ///
 /// # Latency is simulated, never slept
 /// A request issued at `T` reaches its venue at `T + to_venue` and its result becomes visible at
@@ -1447,14 +1478,26 @@ fn act(
     );
 
     match action {
-        Action::Open(request) => schedule(
-            pending,
-            seq,
-            exchange,
-            delivers,
-            slot.venue.open_order(request),
-            Deliverable::OpenResponse,
-        ),
+        Action::Open(request) => {
+            let deadline = request
+                .state
+                .cancel_after
+                .map(|after| (request.key.clone(), after));
+            let outcome = slot.venue.open_order(request);
+            if let Some((key, after)) = deadline
+                && !outcome.response.state.has_ended()
+            {
+                schedule_deadline(pending, seq, exchange, time, slot.to_venue, key, after);
+            }
+            schedule(
+                pending,
+                seq,
+                exchange,
+                delivers,
+                outcome,
+                Deliverable::OpenResponse,
+            );
+        }
         Action::Cancel(request) => schedule(
             pending,
             seq,
@@ -1622,6 +1665,43 @@ fn schedule<Response>(
     );
 }
 
+/// Queue the deadline of an open with a `cancel_after`, acted on at `arrived` after `to_venue`.
+///
+/// The `ExecutionManager` starts the timer when it sends the open, so the deadline is
+/// `cancel_after` after the open left, `arrived - to_venue`. One shorter than the trip to the
+/// venue is queued at `arrived` instead, since nothing can be queued before the instant being
+/// acted on. The `Engine` then holds the order for its acknowledgement either way, so it is
+/// cancelled at the same instant. A deadline past what [`DateTime<Utc>`] holds is never reached,
+/// so it is not queued.
+fn schedule_deadline(
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    exchange: ExchangeIndex,
+    arrived: DateTime<Utc>,
+    to_venue: TimeDelta,
+    key: UnindexedOrderKey,
+    cancel_after: std::time::Duration,
+) {
+    let Some(due) = TimeDelta::from_std(cancel_after)
+        .ok()
+        .and_then(|after| after.checked_sub(&to_venue))
+        .and_then(|offset| arrived.checked_add_signed(offset.max(TimeDelta::zero())))
+    else {
+        return;
+    };
+    push(
+        pending,
+        seq,
+        due,
+        CLASS_DEADLINE,
+        exchange,
+        Payload::Deliver(Deliverable::Account(UnindexedAccountEvent {
+            exchange: key.exchange,
+            kind: AccountEventKind::OrderDeadline(OrderDeadline::new(key, due)),
+        })),
+    );
+}
+
 /// Push account events onto the queue, in the order the venue gave them.
 ///
 /// Split out of [`schedule`] because a fill caused by a market event has no response to accompany
@@ -1702,6 +1782,12 @@ fn step<MarketKind>(
                 },
             );
         }
+        // Simulated time ends with the last source event, as for a venue's own deadlines: see
+        // `SimRunner`'s `# Termination`.
+        Payload::Deliver(Deliverable::Account(UnindexedAccountEvent {
+            kind: AccountEventKind::OrderDeadline(_),
+            ..
+        })) if wakeups.stopped => return Ok(Step::Acted),
         Payload::Deliver(payload) => payload,
     };
 
@@ -2001,6 +2087,7 @@ mod tests {
                 AccountEventKind::Trade(_) => "trade",
                 AccountEventKind::OrderSnapshot(_) => "order",
                 AccountEventKind::OrderCancelled(_) => "cancelled",
+                AccountEventKind::OrderDeadline(_) => "deadline",
                 _ => "account_other",
             },
             _ => "other",
@@ -2144,6 +2231,27 @@ mod tests {
             cid
         }
 
+        /// A buy limit at `price` whose remainder is to be cancelled `cancel_after_ms` after it
+        /// is sent.
+        fn send_limit_cancelled_after(&self, price: Decimal, cancel_after_ms: u64) {
+            self.send(ExecutionRequest::Open(OrderRequestOpen {
+                key: OrderKey {
+                    exchange: self.exchange,
+                    instrument: instrument_key(),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::random(),
+                },
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(price),
+                    dec!(0.01),
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                )
+                .with_cancel_after(std::time::Duration::from_millis(cancel_after_ms)),
+            }));
+        }
+
         fn send_cancel(&self, cid: ClientOrderId) {
             self.send(ExecutionRequest::Cancel(OrderRequestCancel {
                 key: OrderKey {
@@ -2283,9 +2391,10 @@ mod tests {
         // them in exactly the reverse of the expected order rather than coincidentally agreeing.
         for (class, seq) in [
             (CLASS_MARKET, 0),
-            (CLASS_ACCOUNT, 1),
-            (CLASS_AUX, 2),
-            (CLASS_ACTION, 3),
+            (CLASS_DEADLINE, 1),
+            (CLASS_ACCOUNT, 2),
+            (CLASS_AUX, 3),
+            (CLASS_ACTION, 4),
         ] {
             heap.push(Reverse(ScheduledEvent {
                 time: at(10),
@@ -2302,8 +2411,15 @@ mod tests {
 
         assert_eq!(
             popped,
-            vec![CLASS_ACTION, CLASS_AUX, CLASS_ACCOUNT, CLASS_MARKET],
-            "at one instant the venue acts first and market data is marked last"
+            vec![
+                CLASS_ACTION,
+                CLASS_AUX,
+                CLASS_ACCOUNT,
+                CLASS_DEADLINE,
+                CLASS_MARKET
+            ],
+            "at one instant the venue acts first, an order deadline follows the account events, \
+             and market data is marked last"
         );
     }
 
@@ -4280,5 +4396,166 @@ mod tests {
                 "after_drain"
             ],
         );
+    }
+
+    /// The instant stamped on each order deadline in `events`, in delivery order.
+    fn deadline_times(events: &[EngineEvent<DataKind>]) -> Vec<DateTime<Utc>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderDeadline(deadline),
+                    ..
+                })) => Some(deadline.deadline),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An order's deadline falls `cancel_after` after it was sent, between ticks if that is
+    /// where it falls, and a tick at the deadline's instant follows it.
+    #[tokio::test]
+    async fn an_order_deadline_falls_cancel_after_the_open_was_sent() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(500, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit_cancelled_after(dec!(1), 490);
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "order",
+                "deadline",
+                "market",
+                "market",
+                "after_drain"
+            ],
+            "the deadline at 500 precedes the tick at 500"
+        );
+        assert_eq!(deadline_times(&events), vec![at(500)]);
+    }
+
+    /// With latency, the deadline still counts from when the open left, not when it arrived;
+    /// one shorter than the trip to the venue is emitted when the open arrives, ahead of the
+    /// venue's answer.
+    #[tokio::test]
+    async fn an_order_deadline_counts_from_when_the_open_left() {
+        let mut harness = Harness::new(200, vec![market(10, dec!(200)), market(900, dec!(200))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        // Sent at 10, at the venue at 110, answered at 210.
+        harness.send_limit_cancelled_after(dec!(1), 300);
+        harness.send_limit_cancelled_after(dec!(1), 50);
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "deadline", // the short one, at the open's arrival
+                "balance",
+                "order",
+                "balance",
+                "order",
+                "deadline",
+                "market",
+                "after_drain"
+            ],
+        );
+        assert_eq!(deadline_times(&events), vec![at(110), at(310)]);
+    }
+
+    /// The venue's answer to an open at the deadline's instant reaches the `Engine` first: a
+    /// zero `cancel_after` falls due as the open is answered, and follows the answer.
+    #[tokio::test]
+    async fn an_answer_at_the_deadlines_instant_precedes_it() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(500, dec!(200))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit_cancelled_after(dec!(1), 0);
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec!["balance", "order", "deadline", "market", "after_drain"],
+        );
+        assert_eq!(deadline_times(&events), vec![at(10)]);
+    }
+
+    /// An open the venue refuses has no deadline, as live.
+    #[tokio::test]
+    async fn a_refused_open_has_no_deadline() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(900, dec!(200))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        // 0.01 at two billion costs twenty million, twice the quote balance.
+        harness.send_limit_cancelled_after(dec!(2_000_000_000), 100);
+
+        let events = harness.rest_events().await;
+        assert!(
+            matches!(last_order_state(&events), OrderState::Inactive(_)),
+            "the open is refused: {events:?}"
+        );
+        assert!(deadline_times(&events).is_empty(), "{events:?}");
+    }
+
+    /// Simulated time ends with the source: a deadline after the last source event is not emitted.
+    #[tokio::test]
+    async fn an_order_deadline_after_the_last_source_event_is_not_emitted() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(100, dec!(200))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit_cancelled_after(dec!(1), 490);
+
+        assert_eq!(
+            harness.rest().await,
+            vec!["balance", "order", "market", "after_drain"],
+        );
+    }
+
+    /// An open held behind a group's cancel is timed from when it is sent, once the cancel's
+    /// answer is back.
+    #[tokio::test]
+    async fn a_groups_open_is_timed_from_when_it_is_sent() {
+        let mut harness = Harness::new(200, vec![market(10, dec!(200)), market(900, dec!(200))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let resting = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+
+        // Sent at 210: the cancel acts at 310 and is answered at 410, when the open leaves.
+        harness.clock.advance_to(at(210));
+        let exit = ClientOrderId::random();
+        let ExecutionRequest::CancelThenOpen(mut group) =
+            cancel_then_open(harness.exchange, &[&resting], &[&exit])
+        else {
+            unreachable!("cancel_then_open builds a group");
+        };
+        group.opens[0].state.cancel_after = Some(std::time::Duration::from_millis(300));
+        harness.send(ExecutionRequest::CancelThenOpen(group));
+
+        let events = harness.rest_events().await;
+        assert_eq!(deadline_times(&events), vec![at(710)], "{events:?}");
     }
 }

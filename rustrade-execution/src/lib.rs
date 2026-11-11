@@ -381,6 +381,14 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// account event feed. See [`MarginDebtUpdate`] for which venues
     /// send it.
     MarginDebt(margin_debt::MarginDebtUpdate<AssetKey, InstrumentKey>),
+
+    /// The [`cancel_after`](order::request::RequestOpen::cancel_after) of an order ran out.
+    ///
+    /// Sent by the driver that sent the order, such as the `rustrade` crate's `ExecutionManager`
+    /// or its simulation runner, never by a venue, so it is not evidence the account link is up.
+    /// The engine cancels what is left of the order, and reports what it did; see
+    /// [`OrderDeadline`](order::deadline::OrderDeadline).
+    OrderDeadline(order::deadline::OrderDeadline<ExchangeKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

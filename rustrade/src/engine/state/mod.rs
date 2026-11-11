@@ -575,10 +575,13 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         InstrumentData: InstrumentDataState,
     {
         // Set exchange account connectivity to Healthy if it was Reconnecting. A failed re-init
-        // or an ended stream reports on the link without showing it is up, so neither counts.
+        // or an ended stream reports on the link without showing it is up, so neither counts, and
+        // an order deadline comes from the driver's own timer, not the venue.
         if !matches!(
             event.kind,
-            AccountEventKind::ReinitFailed(_) | AccountEventKind::StreamTerminated(_)
+            AccountEventKind::ReinitFailed(_)
+                | AccountEventKind::StreamTerminated(_)
+                | AccountEventKind::OrderDeadline(_)
         ) {
             self.connectivity.update_from_account_event(&event.exchange);
         }
@@ -791,6 +794,8 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 }
                 FillsApplied::default()
             }
+            // Changes no state. That includes `OrderDeadline`: the engine acts on it after the
+            // update, in `Engine::process`, because only the engine sends the cancel.
             _ => FillsApplied::default(),
         };
 
