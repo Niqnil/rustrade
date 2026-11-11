@@ -554,7 +554,9 @@ impl BinanceMargin {
     /// as a market order.
     ///
     /// A simulated venue standing in for Binance margin can take this set as its rule for `Spot`
-    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules).
+    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
+    /// is per instrument kind, so the simulated venue still takes `post_only` on an order kind
+    /// other than a limit order, which this client refuses.
     pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
 
     /// Tell the client the kinds of orders it may not know, by client order id, such as after a
@@ -755,6 +757,8 @@ impl BinanceMargin {
     /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
     ///   against 6 for the other effects. Place them accordingly.
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
+    /// - A time in force outside [`BinanceMargin::TIME_IN_FORCE`], or `post_only` on any kind but a
+    ///   limit order, returns [`OrderError::UnsupportedTimeInForce`] before any request.
     /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
     ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
     ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and

@@ -3897,38 +3897,31 @@ pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
 ) -> Result<(BinanceOrderType, Option<BinanceTimeInForce>), Unclassified> {
-    // The wire time in force of a kind that takes one; `None` for post_only, which only a limit
-    // order carries, as its order type.
-    let wire_tif = match tif {
-        TimeInForce::GoodUntilCancelled { post_only: false } => Some(BinanceTimeInForce::Gtc),
-        TimeInForce::GoodUntilCancelled { post_only: true } => None,
-        TimeInForce::ImmediateOrCancel => Some(BinanceTimeInForce::Ioc),
-        TimeInForce::FillOrKill => Some(BinanceTimeInForce::Fok),
-        TimeInForce::GoodUntilEndOfDay
-        | TimeInForce::GoodTillDate { .. }
-        | TimeInForce::AtOpen
-        | TimeInForce::AtClose => {
-            return Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN));
-        }
+    // A kind Binance never takes is refused as a kind before its time in force is looked at, so
+    // the refusal names what has to change. Each taken kind reads the time in force only in its
+    // own arm.
+    let with_tif = |order_type| {
+        wire_time_in_force(tif)?
+            .map(|wire_tif| (order_type, Some(wire_tif)))
+            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
     };
-    let post_only_refused = Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY);
+    let without_tif = |order_type| {
+        wire_time_in_force(tif)?
+            .map(|_| (order_type, None))
+            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
+    };
 
     match kind {
-        OrderKind::Limit => Ok(match wire_tif {
+        OrderKind::Limit => Ok(match wire_time_in_force(tif)? {
             Some(wire_tif) => (BinanceOrderType::Limit, Some(wire_tif)),
             // LIMIT_MAKER is Binance's post-only order type (rejects if it would immediately
             // match as taker).
             None => (BinanceOrderType::LimitMaker, None),
         }),
-        OrderKind::Market | OrderKind::Stop { .. } | OrderKind::TakeProfit { .. }
-            if wire_tif.is_none() =>
-        {
-            Err(post_only_refused)
-        }
-        OrderKind::Market => Ok((BinanceOrderType::Market, None)),
+        OrderKind::Market => without_tif(BinanceOrderType::Market),
         // Conditional orders: stop_price/trailing_delta set separately by the caller.
-        OrderKind::Stop { .. } => Ok((BinanceOrderType::StopLoss, None)),
-        OrderKind::TakeProfit { .. } => Ok((BinanceOrderType::TakeProfit, None)),
+        OrderKind::Stop { .. } => without_tif(BinanceOrderType::StopLoss),
+        OrderKind::TakeProfit { .. } => without_tif(BinanceOrderType::TakeProfit),
         OrderKind::TrailingStopFixedLimit {
             offset_type: TrailingOffsetType::Absolute,
             ..
@@ -3938,19 +3931,17 @@ pub(crate) fn classify_order_kind_tif(
         }
         // A fixed-limit trailing stop is a STOP_LOSS_LIMIT with a trailingDelta, so it takes the
         // time in force a stop-limit order does.
-        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => wire_tif
-            .map(|wire_tif| (BinanceOrderType::StopLossLimit, Some(wire_tif)))
-            .ok_or(post_only_refused),
-        OrderKind::TakeProfitLimit { .. } => wire_tif
-            .map(|wire_tif| (BinanceOrderType::TakeProfitLimit, Some(wire_tif)))
-            .ok_or(post_only_refused),
+        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => {
+            with_tif(BinanceOrderType::StopLossLimit)
+        }
+        OrderKind::TakeProfitLimit { .. } => with_tif(BinanceOrderType::TakeProfitLimit),
         // TrailingStop: Binance uses STOP_LOSS with a trailingDelta parameter. Only
         // BasisPoints and Percentage are supported; Absolute requires manual conversion by
         // the caller: basis_points = (absolute / price) * 10000.
         OrderKind::TrailingStop { offset_type, .. } => match offset_type {
-            TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => wire_tif
-                .map(|_| (BinanceOrderType::StopLoss, None))
-                .ok_or(post_only_refused),
+            TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => {
+                without_tif(BinanceOrderType::StopLoss)
+            }
             TrailingOffsetType::Absolute => {
                 warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
                 Err(Unclassified::OrderKind)
@@ -3966,6 +3957,22 @@ pub(crate) fn classify_order_kind_tif(
             warn!("an unresolved order kind is only read back from a venue, never placed");
             Err(Unclassified::OrderKind)
         }
+    }
+}
+
+/// Binance's `timeInForce` for `tif`, for a kind that sends one; `None` for `post_only`, which
+/// only a limit order carries, as its order type. A time in force outside
+/// [`BINANCE_TIME_IN_FORCE`] is refused.
+fn wire_time_in_force(tif: TimeInForce) -> Result<Option<BinanceTimeInForce>, Unclassified> {
+    match tif {
+        TimeInForce::GoodUntilCancelled { post_only: false } => Ok(Some(BinanceTimeInForce::Gtc)),
+        TimeInForce::GoodUntilCancelled { post_only: true } => Ok(None),
+        TimeInForce::ImmediateOrCancel => Ok(Some(BinanceTimeInForce::Ioc)),
+        TimeInForce::FillOrKill => Ok(Some(BinanceTimeInForce::Fok)),
+        TimeInForce::GoodUntilEndOfDay
+        | TimeInForce::GoodTillDate { .. }
+        | TimeInForce::AtOpen
+        | TimeInForce::AtClose => Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN)),
     }
 }
 
@@ -4482,6 +4489,35 @@ mod tests {
                 expected,
                 "{kind:?}"
             );
+        }
+        // A kind Binance never takes is refused as a kind, whatever its time in force.
+        let refused_kinds = [
+            trailing(TrailingOffsetType::Absolute),
+            OrderKind::TrailingStopFixedLimit {
+                offset: dec!(25),
+                offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
+            },
+            OrderKind::TrailingStopLimit {
+                offset: dec!(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                stop_price: price,
+                limit_offset: dec!(1),
+            },
+        ];
+        let every_tif = taken
+            .map(|(tif, _)| tif)
+            .into_iter()
+            .chain(not_taken)
+            .chain([post_only]);
+        for kind in refused_kinds {
+            for tif in every_tif.clone() {
+                assert_eq!(
+                    classify_order_kind_tif(kind, tif),
+                    Err(Unclassified::OrderKind),
+                    "{kind:?} {tif:?}"
+                );
+            }
         }
         for (tif, _) in taken {
             assert!(BINANCE_TIME_IN_FORCE.contains(&tif.kind()), "{tif:?}");

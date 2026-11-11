@@ -285,7 +285,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `FillOrKill` on every order kind, and post-only on a limit order alone** (sent as
     `LIMIT_MAKER`). They refuse anything else before any request. The set is
     `BinanceSpot::TIME_IN_FORCE` (also `BinanceMargin::TIME_IN_FORCE`). A simulated venue
-    standing in for Binance can take it as its `Spot` rule.
+    standing in for Binance can take it as its `Spot` rule (a rule per instrument kind cannot
+    limit post-only to limit orders).
   - **No time in force is dropped any more.** A market, stop, take-profit or trailing order
     carries no `timeInForce` to Binance. Sent with `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen`,
     `AtClose` or post-only, it used to go out without it. A post-only market order took liquidity,

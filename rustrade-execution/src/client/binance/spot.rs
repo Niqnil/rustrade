@@ -452,7 +452,9 @@ impl BinanceSpot {
     /// as a market order.
     ///
     /// A simulated venue standing in for Binance Spot can take this set as its rule for `Spot`
-    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules).
+    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
+    /// is per instrument kind, so the simulated venue still takes `post_only` on an order kind
+    /// other than a limit order, which this client refuses.
     pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
 
     /// Load the order rules of `instruments` from Binance now, and hold them for
@@ -2937,8 +2939,9 @@ fn convert_account_position(
 
 /// Convert rustrade OrderKind + TimeInForce to Binance SDK order type and TIF.
 ///
-/// Returns `None` for unsupported combinations, which `open_order` converts to
-/// `UnsupportedOrderType` rejection.
+/// Returns `None` for what `SpotOrderFields::new` refuses. `open_order` refuses a time in force
+/// Binance does not take with `UnsupportedTimeInForce`, and an order kind with
+/// `UnsupportedOrderType`.
 ///
 /// # Conditional Orders
 ///
@@ -2958,9 +2961,9 @@ fn convert_account_position(
 /// - `Percentage`: converted to basis points (multiplied by 100)
 ///
 /// **Unsupported:**
-/// - `Absolute`: returns `None` → `UnsupportedOrderType`. The caller (`open_order`)
-///   must surface this so end users can convert absolute offsets to basis points
-///   themselves: `basis_points = (absolute / price) * 10000`
+/// - `Absolute`: returns `None`; `open_order` refuses it with `UnsupportedOrderType`, so end
+///   users can convert absolute offsets to basis points themselves:
+///   `basis_points = (absolute / price) * 10000`
 /// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
 ///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
 ///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
