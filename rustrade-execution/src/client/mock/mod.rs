@@ -72,7 +72,8 @@ pub struct MockExecutionConfig {
     /// [`MockExchange`](crate::exchange::mock::MockExchange)). At `0` the venue books a request at
     /// the instant it is sent, which no live venue does: a strategy can learn to trade on prices it
     /// could not have reached in time. Set it to the latency measured against the live venue. A
-    /// driver that halves it drops an odd millisecond from each half.
+    /// driver that splits it into two equal halves rounds each down to a whole millisecond, so an
+    /// odd value shortens that driver's round trip by one millisecond.
     pub latency_ms: u64,
     /// Fee model used by the mock exchange to compute trading fees, for every kind of instrument
     /// not in [`fee_model_by_kind`](Self::fee_model_by_kind).
