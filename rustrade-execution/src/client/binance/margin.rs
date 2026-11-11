@@ -544,19 +544,21 @@ impl std::fmt::Debug for BinanceMargin {
 }
 
 impl BinanceMargin {
-    /// The time in force this client takes, whatever the order kind: `GoodUntilCancelled`,
-    /// `post_only` only on a limit order (sent as `LIMIT_MAKER`), `ImmediateOrCancel` and
-    /// `FillOrKill`. It refuses any other with [`OrderError::UnsupportedTimeInForce`] before
-    /// sending the order, and `post_only` on any other kind too.
+    /// The time in force this client takes: `GoodUntilCancelled` and `ImmediateOrCancel` on every
+    /// order kind, `post_only` only on a limit order (sent as `LIMIT_MAKER`), and `FillOrKill`
+    /// only on a limit-priced order (limit, stop-limit, take-profit-limit or fixed-limit trailing
+    /// stop). It refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending the
+    /// order.
     ///
     /// A market, stop, take-profit or trailing order goes out without a `timeInForce`, since
     /// Binance takes none for them: it works on arrival, or rests until triggered and then works
-    /// as a market order.
+    /// as a market order, which fills what it can and expires the rest. So it could take
+    /// liquidity or fill in part, and is refused with `post_only` or `FillOrKill`.
     ///
     /// A simulated venue standing in for Binance margin can take this set as its rule for `Spot`
     /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
-    /// is per instrument kind, so the simulated venue still takes `post_only` on an order kind
-    /// other than a limit order, which this client refuses.
+    /// is per instrument kind, so the simulated venue still takes `post_only` and `FillOrKill` on
+    /// the order kinds this client refuses them on.
     pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
 
     /// Tell the client the kinds of orders it may not know, by client order id, such as after a
@@ -757,8 +759,9 @@ impl BinanceMargin {
     /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
     ///   against 6 for the other effects. Place them accordingly.
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
-    /// - A time in force outside [`BinanceMargin::TIME_IN_FORCE`], or `post_only` on any kind but a
-    ///   limit order, returns [`OrderError::UnsupportedTimeInForce`] before any request.
+    /// - A time in force outside [`BinanceMargin::TIME_IN_FORCE`], `post_only` on any kind but a
+    ///   limit order, or `FillOrKill` on a kind that is not limit-priced, returns
+    ///   [`OrderError::UnsupportedTimeInForce`] before any request.
     /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
     ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
     ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and

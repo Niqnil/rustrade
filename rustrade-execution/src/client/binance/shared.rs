@@ -3834,8 +3834,9 @@ pub(crate) enum BinanceTimeInForce {
     Fok,
 }
 
-/// The time in force the Binance spot and margin clients take, for every order kind. `PostOnly`
-/// only on a limit order, which goes out as `LIMIT_MAKER`.
+/// The time in force the Binance spot and margin clients take. `PostOnly` only on a limit order,
+/// which goes out as `LIMIT_MAKER`, and `FillOrKill` only on a limit-priced order (limit,
+/// stop-limit, take-profit-limit or fixed-limit trailing stop).
 pub(crate) const BINANCE_TIME_IN_FORCE: &[TimeInForceKind] = &[
     TimeInForceKind::GoodUntilCancelled,
     TimeInForceKind::PostOnly,
@@ -3845,10 +3846,15 @@ pub(crate) const BINANCE_TIME_IN_FORCE: &[TimeInForceKind] = &[
 
 /// Why the time in force is refused when it is not in [`BINANCE_TIME_IN_FORCE`].
 const TIME_IN_FORCE_NOT_TAKEN: &str = "Binance takes only GoodUntilCancelled, ImmediateOrCancel \
-     or FillOrKill, and post_only only on a limit order";
+     or FillOrKill, post_only only on a limit order, and FillOrKill only on a limit-priced order";
 
 /// Why `post_only` is refused on any kind but a limit order.
 const POST_ONLY_LIMIT_ONLY: &str = "Binance takes post_only only on a limit order (LIMIT_MAKER)";
+
+/// Why `FillOrKill` is refused on an order kind that carries no `timeInForce`.
+const FILL_OR_KILL_LIMIT_PRICED_ONLY: &str = "Binance takes FillOrKill only on a limit-priced \
+     order: a market, stop, take-profit or trailing order carries no timeInForce and can fill in \
+     part";
 
 /// Why [`classify_order_kind_tif`] cannot send an order to Binance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3880,12 +3886,14 @@ impl Unclassified {
 
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
 ///
-/// Refuses a time in force outside [`BINANCE_TIME_IN_FORCE`] whatever the kind, and `post_only` on
-/// any kind but a limit order, rather than dropping it: a market, stop, take-profit or trailing
-/// order goes out with no `timeInForce`, since Binance takes none for them, so any other time in
-/// force on such an order would be dropped without a word. A market order works on
-/// arrival, and a stop or take-profit rests until triggered and then works as a market order,
-/// which `GoodUntilCancelled`, `ImmediateOrCancel` and `FillOrKill` all allow.
+/// Refuses a time in force outside [`BINANCE_TIME_IN_FORCE`] whatever the kind, rather than
+/// dropping it. A market, stop, take-profit or trailing order goes out with no `timeInForce`,
+/// since Binance takes none for them: a market order works on arrival, and a stop or take-profit
+/// rests until triggered and then works as a market order, which fills what it can and expires
+/// the rest. That is what `GoodUntilCancelled` and `ImmediateOrCancel` allow, so they are taken.
+/// `post_only` and `FillOrKill` are not, since such an order could take liquidity or fill in part,
+/// so both are refused on those kinds: `post_only` is taken on a limit order alone, and
+/// `FillOrKill` on a limit-priced one.
 ///
 /// `TrailingStop` classifies to [`BinanceOrderType::StopLoss`] and `TrailingStopFixedLimit` to
 /// [`BinanceOrderType::StopLossLimit`], to which the caller adds a `trailingDelta` from
@@ -3905,10 +3913,11 @@ pub(crate) fn classify_order_kind_tif(
             .map(|wire_tif| (order_type, Some(wire_tif)))
             .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
     };
-    let without_tif = |order_type| {
-        wire_time_in_force(tif)?
+    let without_tif = |order_type| match tif {
+        TimeInForce::FillOrKill => Err(Unclassified::TimeInForce(FILL_OR_KILL_LIMIT_PRICED_ONLY)),
+        _ => wire_time_in_force(tif)?
             .map(|_| (order_type, None))
-            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
+            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY)),
     };
 
     match kind {
@@ -4465,9 +4474,17 @@ mod tests {
 
         for (kind, order_type, sends_tif) in kinds {
             for (tif, wire) in taken {
+                // A kind with no `timeInForce` works as a market order, which can fill in part.
+                let expected = if sends_tif {
+                    Ok((order_type, Some(wire)))
+                } else if tif == TimeInForce::FillOrKill {
+                    Err(Unclassified::TimeInForce(FILL_OR_KILL_LIMIT_PRICED_ONLY))
+                } else {
+                    Ok((order_type, None))
+                };
                 assert_eq!(
                     classify_order_kind_tif(kind, tif),
-                    Ok((order_type, sends_tif.then_some(wire))),
+                    expected,
                     "{kind:?} {tif:?}"
                 );
             }
@@ -4503,6 +4520,10 @@ mod tests {
                 offset_type: TrailingOffsetType::BasisPoints,
                 stop_price: price,
                 limit_offset: dec!(1),
+            },
+            OrderKind::ConditionalUnresolved {
+                family: ConditionalFamily::StopLimit,
+                trigger_price: Some(price),
             },
         ];
         let every_tif = taken

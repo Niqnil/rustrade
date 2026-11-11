@@ -30,12 +30,15 @@
 //!   rules to Binance, for when the loaded rules could be out of date.
 //!
 //! # Time in force
-//! [`BinanceSpot`] and [`BinanceMargin`] take `GoodUntilCancelled`, `ImmediateOrCancel` and
-//! `FillOrKill` on every order kind, and `post_only` on a limit order alone, which goes out as
-//! `LIMIT_MAKER` ([`BinanceSpot::TIME_IN_FORCE`]). They refuse any other unsent with
+//! [`BinanceSpot`] and [`BinanceMargin`] take `GoodUntilCancelled` and `ImmediateOrCancel` on
+//! every order kind, `post_only` on a limit order alone, which goes out as `LIMIT_MAKER`, and
+//! `FillOrKill` on a limit-priced order alone ([`BinanceSpot::TIME_IN_FORCE`]). They refuse any
+//! other unsent with
 //! [`OrderError::UnsupportedTimeInForce`](crate::error::OrderError::UnsupportedTimeInForce),
 //! rather than drop it: a market, stop, take-profit or trailing order carries no `timeInForce` to
-//! Binance, so `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen` or `AtClose` would otherwise be lost.
+//! Binance and works as a market order, which fills what it can and expires the rest. So
+//! `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen` or `AtClose` would otherwise be lost, and
+//! `post_only` or `FillOrKill` broken.
 //!
 //! # Every fill on the account is delivered
 //!

@@ -442,19 +442,21 @@ impl std::fmt::Debug for BinanceSpot {
 }
 
 impl BinanceSpot {
-    /// The time in force this client takes, whatever the order kind: `GoodUntilCancelled`,
-    /// `post_only` only on a limit order (sent as `LIMIT_MAKER`), `ImmediateOrCancel` and
-    /// `FillOrKill`. It refuses any other with [`OrderError::UnsupportedTimeInForce`] before
-    /// sending the order, and `post_only` on any other kind too.
+    /// The time in force this client takes: `GoodUntilCancelled` and `ImmediateOrCancel` on every
+    /// order kind, `post_only` only on a limit order (sent as `LIMIT_MAKER`), and `FillOrKill`
+    /// only on a limit-priced order (limit, stop-limit, take-profit-limit or fixed-limit trailing
+    /// stop). It refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending the
+    /// order.
     ///
     /// A market, stop, take-profit or trailing order goes out without a `timeInForce`, since
     /// Binance takes none for them: it works on arrival, or rests until triggered and then works
-    /// as a market order.
+    /// as a market order, which fills what it can and expires the rest. So it could take
+    /// liquidity or fill in part, and is refused with `post_only` or `FillOrKill`.
     ///
     /// A simulated venue standing in for Binance Spot can take this set as its rule for `Spot`
     /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
-    /// is per instrument kind, so the simulated venue still takes `post_only` on an order kind
-    /// other than a limit order, which this client refuses.
+    /// is per instrument kind, so the simulated venue still takes `post_only` and `FillOrKill` on
+    /// the order kinds this client refuses them on.
     pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
 
     /// Load the order rules of `instruments` from Binance now, and hold them for
