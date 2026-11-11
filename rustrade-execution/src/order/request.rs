@@ -218,6 +218,9 @@ pub struct RequestOpen {
     ///   [`TimeInForce::GoodTillDate`] where the venue takes it.
     /// - An amend does not restart the timer.
     /// - A simulated run fires no deadline after its last market or auxiliary event.
+    /// - A drain (the engine's `Shutdown::AfterDrain`) drops every deadline still to come, and
+    ///   sends no cancel for one that has run out: the driver accepts no more requests. A
+    ///   draining run leaves such an order working.
     ///
     /// `#[serde(default)]` so requests serialised before this field existed still load.
     #[serde(default)]

@@ -221,6 +221,9 @@ where
                 // before the trade that opens the position has necessarily been read — stopping
                 // on it truncated the trade and balance ledgers by a varying amount every run.
                 self.meta.draining = true;
+                // The drivers drop their deadlines too: they accept no more requests, so a cancel
+                // could not reach the venue.
+                self.awaiting_ack = AwaitingAck::default();
                 self.drain_execution();
                 return EngineAudit::process(event);
             }
@@ -287,9 +290,9 @@ where
             process_audit = process_audit.add_output(EngineOutput::InFlightOverdue(overdue));
         }
 
-        // Also before the drain check: a cancel only takes risk off, so a deadline is acted on
-        // during a drain, and whatever the trading state. An order acknowledged by this event is
-        // cancelled first, then a deadline this event carries.
+        // Also before the drain check, so a deadline that reaches a draining engine is reported,
+        // although it sends nothing. Whatever the trading state: a cancel only takes risk off. An
+        // order acknowledged by this event is cancelled first, then a deadline this event carries.
         for output in self.cancel_acknowledged_past_deadline() {
             process_audit = order_deadline::add_to_audit(process_audit, output);
         }

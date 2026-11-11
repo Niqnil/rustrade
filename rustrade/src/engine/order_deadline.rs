@@ -9,6 +9,9 @@
 //!
 //! An open the venue has not acknowledged yet is held here and cancelled once it is, because some
 //! venues cancel only by their own order id, which the acknowledgement brings.
+//!
+//! A drain drops every deadline, as the driver does: it accepts no more requests once draining,
+//! so a cancel could not reach the venue.
 
 use crate::engine::{
     Engine, EngineOutput,
@@ -46,6 +49,9 @@ pub enum OrderDeadlineOutput<ExchangeKey = ExchangeIndex, InstrumentKey = Instru
     AlreadyCancelling(OrderKey<ExchangeKey, InstrumentKey>),
     /// The engine tracks no such order: it ended, or was never tracked. Nothing was sent.
     NotTracked(OrderKey<ExchangeKey, InstrumentKey>),
+    /// The engine is draining, so nothing was sent. A drain drops the deadlines still to come,
+    /// because the driver accepts no more requests and a cancel could not reach the venue.
+    Draining(OrderKey<ExchangeKey, InstrumentKey>),
 }
 
 /// The orders whose deadline ran out before the venue acknowledged them, to cancel once it has.
@@ -67,9 +73,12 @@ where
     ExecutionTxs: ExecutionTxMap,
 {
     /// Act on `deadline`: cancel the order if it is working, hold it for its acknowledgement if
-    /// the venue has not given one, and otherwise send nothing.
+    /// the venue has not given one, and otherwise send nothing. Nothing is sent during a drain.
     pub(crate) fn on_order_deadline(&mut self, deadline: &OrderDeadline) -> OrderDeadlineOutput {
         let key = &deadline.key;
+        if self.meta.draining {
+            return OrderDeadlineOutput::Draining(key.clone());
+        }
         let state = self
             .state
             .instruments

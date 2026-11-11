@@ -9782,25 +9782,64 @@ fn test_order_deadline_leaves_a_cancelling_or_untracked_order_alone() {
     assert!(cancels_sent(&mut execution_rx).is_empty());
 }
 
-/// A deadline is acted on during a drain: a cancel only takes risk off.
-#[test]
-fn test_order_deadline_cancels_during_a_drain() {
-    use rustrade::engine::order_deadline::OrderDeadlineOutput;
-    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+/// Start a drain on `engine`, and read the drain request off `execution_rx`.
+fn start_drain(engine: &mut TestEngine, execution_rx: &mut UnboundedRx<ExecutionRequest>) {
     process_with_audit(
-        &mut engine,
+        engine,
         EngineEvent::Shutdown(rustrade::shutdown::Shutdown::AfterDrain),
     );
-    // The drain request to the execution side.
-    let _ = std::iter::from_fn(|| execution_rx.rx.try_recv().ok()).count();
+    let drained = std::iter::from_fn(|| execution_rx.rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        matches!(drained.as_slice(), [ExecutionRequest::Drain]),
+        "{drained:?}"
+    );
+}
+
+/// A deadline that reaches a draining engine is reported and sends nothing: the driver accepts no
+/// more requests, so a cancel could not reach the venue.
+#[test]
+fn test_order_deadline_during_a_drain_sends_nothing() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(true);
+    start_drain(&mut engine, &mut execution_rx);
 
     let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
 
     assert!(matches!(
         order_deadline_outputs(audit).as_slice(),
-        [OrderDeadlineOutput::Cancel(_)]
+        [OrderDeadlineOutput::Draining(key)] if key.cid == gen_cid(0)
     ));
-    assert_eq!(cancels_sent(&mut execution_rx).len(), 1);
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+    assert!(matches!(
+        tracked_order_state(&engine, &gen_cid(0)),
+        Some(ActiveOrderState::Open(_))
+    ));
+}
+
+/// A drain drops an open held for its acknowledgement: acknowledged during the drain, it is not
+/// cancelled.
+#[test]
+fn test_order_deadline_awaiting_ack_is_dropped_by_a_drain() {
+    use rustrade::engine::order_deadline::OrderDeadlineOutput;
+    let (mut engine, mut execution_rx) = engine_with_working_order(false);
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 1));
+    assert!(matches!(
+        order_deadline_outputs(audit).as_slice(),
+        [OrderDeadlineOutput::AwaitingAck(_)]
+    ));
+    start_drain(&mut engine, &mut execution_rx);
+
+    let audit = process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 1, Side::Buy, 1.0, 0.0),
+    );
+
+    assert!(order_deadline_outputs(audit).is_empty());
+    assert!(cancels_sent(&mut execution_rx).is_empty());
+    assert!(matches!(
+        tracked_order_state(&engine, &gen_cid(0)),
+        Some(ActiveOrderState::Open(_))
+    ));
 }
 
 /// A deadline comes from the driver's own timer, so it is not evidence the account link is up.
