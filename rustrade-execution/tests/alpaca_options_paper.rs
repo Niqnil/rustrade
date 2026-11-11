@@ -24,6 +24,8 @@
 //! to an OCC symbol to use another one.
 //!
 //! # Running
+//! CI runs them in the weekly Alpaca workflow (`alpaca-weekly.yml`), whose schedule falls in
+//! regular trading hours. To run them by hand:
 //! ```bash
 //! (set -a; . ./.env; set +a; cargo test -p rustrade-execution --features alpaca \
 //!     --test alpaca_options_paper -- --ignored --test-threads=1)
