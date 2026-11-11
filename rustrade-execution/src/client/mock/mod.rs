@@ -56,7 +56,7 @@ use tracing::error;
 ///
 /// `#[non_exhaustive]`, so a setting can be added without breaking a caller. Outside this crate,
 /// construct it with [`new`](Self::new) rather than a struct literal. The fields stay public, so a
-/// copy's settings can still be read and changed in place.
+/// built config's settings can still be read and assigned in place.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct MockExecutionConfig {
@@ -71,7 +71,8 @@ pub struct MockExecutionConfig {
     /// each driver documents how it splits the round trip (see
     /// [`MockExchange`](crate::exchange::mock::MockExchange)). At `0` the venue books a request at
     /// the instant it is sent, which no live venue does: a strategy can learn to trade on prices it
-    /// could not have reached in time. Set it to the latency measured against the live venue.
+    /// could not have reached in time. Set it to the latency measured against the live venue. A
+    /// driver that halves it drops an odd millisecond from each half.
     pub latency_ms: u64,
     /// Fee model used by the mock exchange to compute trading fees, for every kind of instrument
     /// not in [`fee_model_by_kind`](Self::fee_model_by_kind).
