@@ -655,6 +655,28 @@ fn a_long_left_unsold_spends_what_the_longs_share_on_its_exercise() {
     assert_eq!(option_position(&venue), Some(d("2")));
 }
 
+/// A long sold in full goes nowhere near expiry, so it spends nothing of what the longs share,
+/// and a later long the free cash pays for is kept.
+#[test]
+fn a_long_sold_in_full_leaves_what_the_longs_share_to_the_next() {
+    // 15,000 less 450 of premium pays one exercise, not the first's two.
+    let (mut venue, second) = holding_two_calls_with("15000", "2", None);
+
+    let events = venue.advance_time(check());
+
+    let sales = liquidations(&events);
+    assert_eq!(sales.len(), 1, "{events:?}");
+    assert_eq!(sales[0].instrument, option_name());
+    assert_eq!(sales[0].quantity, d("2"));
+    assert_eq!(option_position(&venue), None);
+    assert!(
+        venue
+            .positions
+            .get(&second)
+            .is_some_and(NetPosition::is_long)
+    );
+}
+
 /// A budget spends its free balance first, and only a call draws on what would be lent.
 #[test]
 fn an_exercise_budget_spends_free_first_and_lends_only_to_a_call() {
