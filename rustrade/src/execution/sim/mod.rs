@@ -1957,30 +1957,15 @@ mod tests {
     }
 
     fn config(latency_ms: u64) -> MockExecutionConfig {
-        MockExecutionConfig {
-            mocked_exchange: EXCHANGE,
-            initial_state: AccountSnapshot {
+        MockExecutionConfig::new(
+            EXCHANGE,
+            AccountSnapshot {
                 exchange: EXCHANGE,
                 balances: vec![funded("btc", dec!(100)), funded("usdt", dec!(10_000_000))],
                 instruments: vec![],
             },
             latency_ms,
-            fee_model: Default::default(),
-            fill_model: Default::default(),
-            spot_fee_asset: Default::default(),
-            slippage: Default::default(),
-            market_order_timing: Default::default(),
-            stale_market: Default::default(),
-            spot_margin: None,
-            fee_asset: None,
-            long_option_expiry: Default::default(),
-            short_put_collateral: Default::default(),
-            amend: Default::default(),
-            time_in_force: Default::default(),
-            session_close: None,
-            fee_model_by_kind: Default::default(),
-            expiry_sell_out: None,
-        }
+        )
     }
 
     /// A market `Item` at `millis`, priced at `price`.
@@ -2036,21 +2021,15 @@ mod tests {
     /// The fixture's configuration, holding each market order for its instrument's next bar and
     /// filling it at that bar's open.
     fn next_bar_config(latency_ms: u64) -> MockExecutionConfig {
-        MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..config(latency_ms)
-        }
+        config(latency_ms).with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open))
     }
 
     /// The fixture's configuration, holding a market order on a market not observed fresh within
     /// 5ms for its next fresh observation.
     fn stale_wait_config() -> MockExecutionConfig {
-        MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait {
-                max_age: std::time::Duration::from_millis(5),
-            },
-            ..config(0)
-        }
+        config(0).with_stale_market(StaleMarketPolicy::Wait {
+            max_age: std::time::Duration::from_millis(5),
+        })
     }
 
     /// The state the last order snapshot in `events` reports.
@@ -2771,17 +2750,14 @@ mod tests {
             "{refused:?}"
         );
 
-        let margin = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(
-                    AssetNameExchange::new("usdt"),
-                    dec!(3),
-                    MarginEffect::Borrow,
-                )
-                .unwrap(),
-            ),
-            ..config(0)
-        };
+        let margin = config(0).with_spot_margin(
+            SpotMarginConfig::new(
+                AssetNameExchange::new("usdt"),
+                dec!(3),
+                MarginEffect::Borrow,
+            )
+            .unwrap(),
+        );
         assert!(
             SimExecutionBuilder::new(&instruments)
                 .add_venue_with_options(margin, options)
@@ -3752,11 +3728,7 @@ mod tests {
     #[tokio::test]
     async fn an_amend_the_venue_does_not_declare_is_refused_unsent() {
         let mut harness = Harness::with_config(
-            MockExecutionConfig {
-                amend: rustrade_execution::client::mock::AmendConfig::NONE,
-                time_in_force: Default::default(),
-                ..config(0)
-            },
+            config(0).with_amend(rustrade_execution::client::mock::AmendConfig::NONE),
             vec![
                 market(10, dec!(200)),
                 market(100, dec!(200)),

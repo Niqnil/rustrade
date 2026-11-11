@@ -910,10 +910,8 @@ fn on_a_stale_market_an_amend_of_an_order_the_market_crosses_is_refused() {
 
 #[test]
 fn a_market_order_held_for_its_next_bar_is_not_amended() {
-    let config = MockExecutionConfig {
-        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-        ..spot_config("10", "1000000", FeeModelConfig::default())
-    };
+    let config = spot_config("10", "1000000", FeeModelConfig::default())
+        .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, time(1));
     assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());

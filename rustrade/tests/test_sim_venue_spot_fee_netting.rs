@@ -29,7 +29,6 @@ use rustrade_execution::{
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PerContractFeeModel, PercentageFeeModel},
-    fill::SimFillConfig,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
     market::MarketSnapshot,
@@ -120,30 +119,17 @@ fn funded(asset: AssetNameExchange, amount: Decimal) -> AssetBalance<AssetNameEx
 }
 
 fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
-    let config = MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    let config = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![funded(base(), INITIAL_BASE), funded(quote(), INITIAL_QUOTE)],
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model,
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset,
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    };
+        0,
+    )
+    .with_fee_model(fee_model)
+    .with_spot_fee_asset(spot_fee_asset);
     let spot = Instrument {
         exchange: EXCHANGE,
         name_internal: instrument(EXCHANGE, "btc", "usdt").name_internal,

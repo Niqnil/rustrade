@@ -160,10 +160,9 @@ pub(crate) fn market_driven_venue(
     // deadline they are first given.
     let without_close;
     let config = if session_calendar.is_some() && config.session_close.is_some() {
-        without_close = MockExecutionConfig {
-            session_close: None,
-            ..config.clone()
-        };
+        let mut config = config.clone();
+        config.session_close = None;
+        without_close = config;
         &without_close
     } else {
         config

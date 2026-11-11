@@ -15,11 +15,9 @@ fn margin_window_config() -> MockExecutionConfig {
         .unwrap()
         .with_borrow_price_window(TimeDelta::hours(1))
         .unwrap();
-    MockExecutionConfig {
-        spot_margin: Some(spot_margin),
-        slippage: SlippageConfig::uniform(d("0"), d("0.001"), 42).unwrap(),
-        ..spot_config("1", "100000", FeeModelConfig::default())
-    }
+    spot_config("1", "100000", FeeModelConfig::default())
+        .with_spot_margin(spot_margin)
+        .with_slippage(SlippageConfig::uniform(d("0"), d("0.001"), 42).unwrap())
 }
 
 /// `snapshot` written to JSON and read back, as a caller keeping it would.
@@ -391,10 +389,8 @@ fn an_older_snapshot_without_a_later_field_restores_with_its_default() {
 
 #[test]
 fn a_snapshot_of_another_exchange_is_refused() {
-    let config = MockExecutionConfig {
-        mocked_exchange: ExchangeId::Kraken,
-        ..margin_window_config()
-    };
+    let mut config = margin_window_config();
+    config.mocked_exchange = ExchangeId::Kraken;
     let refused =
         SimulatedVenue::from_snapshot(&config, spot_instruments(), venue_mid_run().snapshot());
     assert_eq!(
@@ -473,10 +469,8 @@ fn checkpoints_are_numbered_from_one_across_a_restore() {
 
 #[test]
 fn a_margin_snapshot_restored_without_spot_margin_is_refused_and_the_other_way_round() {
-    let cash = MockExecutionConfig {
-        spot_margin: None,
-        ..margin_window_config()
-    };
+    let mut cash = margin_window_config();
+    cash.spot_margin = None;
     let refused =
         SimulatedVenue::from_snapshot(&cash, spot_instruments(), venue_mid_run().snapshot());
     assert_eq!(
@@ -521,10 +515,8 @@ fn a_snapshot_listing_an_open_order_twice_is_refused() {
 #[test]
 fn a_window_the_configuration_no_longer_sets_is_dropped() {
     let original = venue_mid_run();
-    let without_window = MockExecutionConfig {
-        spot_margin: Some(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap()),
-        ..margin_window_config()
-    };
+    let without_window = margin_window_config()
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
     let (restored, warned) = warnings(|| {
         SimulatedVenue::from_snapshot(&without_window, spot_instruments(), original.snapshot())
             .unwrap()

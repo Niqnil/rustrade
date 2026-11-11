@@ -172,30 +172,18 @@ fn funded(asset: &str, amount: Decimal) -> AssetBalance<AssetNameExchange> {
 }
 
 fn config() -> MockExecutionConfig {
-    MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![funded("btc", dec!(10)), funded("usdt", dec!(100_000))],
             instruments: vec![],
         },
-        latency_ms: LATENCY_MS,
-        fee_model: FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.001))),
-        fill_model: Default::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    }
+        LATENCY_MS,
+    )
+    .with_fee_model(FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(
+        0.001
+    ))))
 }
 
 /// What both runs must agree on: each fill, and each expiry, with its instant.
@@ -397,17 +385,14 @@ fn observe(
 
 /// `config()` on a margin account, lending up to three times its value in usdt.
 fn margin_config() -> MockExecutionConfig {
-    MockExecutionConfig {
-        spot_margin: Some(
-            SpotMarginConfig::new(
-                AssetNameExchange::new("usdt"),
-                dec!(3),
-                MarginEffect::Borrow,
-            )
-            .unwrap(),
-        ),
-        ..config()
-    }
+    config().with_spot_margin(
+        SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap(),
+    )
 }
 
 /// Feeds a paper venue's market.
@@ -715,13 +700,11 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
     >();
     let (_tap, feed) = PaperMarketFeed::tap(market_rx);
 
-    let other_exchange = MockExecutionConfig {
-        mocked_exchange: ExchangeId::Kraken,
-        ..margin_config()
-    };
+    let mut other_exchange = margin_config();
+    other_exchange.mocked_exchange = ExchangeId::Kraken;
     let kraken = IndexedInstruments::new([instrument(ExchangeId::Kraken, "btc", "usdt")]);
     let refused = ExecutionBuilder::new(&kraken).add_paper(
-        other_exchange,
+        other_exchange.clone(),
         PaperOptions::default().with_checkpoint(checkpoint.clone()),
         TokioClock::starting_at(start()),
         &feed,
@@ -734,10 +717,8 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
         "{error}"
     );
 
-    let cash = MockExecutionConfig {
-        spot_margin: None,
-        ..margin_config()
-    };
+    let mut cash = margin_config();
+    cash.spot_margin = None;
     let checkpoint_v1 = checkpoint.clone();
     let refused = ExecutionBuilder::new(&instruments).add_paper(
         cash,
@@ -757,10 +738,7 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
     other_version["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
     let other_version: EngineCheckpoint = serde_json::from_value(other_version).unwrap();
     let refused = ExecutionBuilder::new(&kraken).add_paper(
-        MockExecutionConfig {
-            mocked_exchange: ExchangeId::Kraken,
-            ..margin_config()
-        },
+        other_exchange,
         PaperOptions::default().with_checkpoint(other_version),
         TokioClock::starting_at(start()),
         &feed,

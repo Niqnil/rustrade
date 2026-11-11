@@ -26,7 +26,6 @@ use rustrade_execution::{
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
-    fill::SimFillConfig,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
     market::{MarketObservation, MarketSnapshot},
@@ -89,9 +88,9 @@ fn funded(name: &str, amount: Decimal) -> AssetBalance<AssetNameExchange> {
 /// A fed venue trading `BTCUSDT`, pricing BNB at a 599 / 601 `BNBUSDT` book, and charging a
 /// 10bp fee in BNB at a quarter off.
 fn venue() -> SimulatedVenue {
-    let config = MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    let config = MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![
                 funded("btc", dec!(0)),
@@ -100,26 +99,13 @@ fn venue() -> SimulatedVenue {
             ],
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model: FeeModelConfig::Percentage(PercentageFeeModel::maker_taker(
-            dec!(0.001),
-            dec!(0.001),
-        )),
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: Some(FeeAssetConfig::new(asset("bnb"), dec!(0.25)).unwrap()),
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    };
+        0,
+    )
+    .with_fee_model(FeeModelConfig::Percentage(PercentageFeeModel::maker_taker(
+        dec!(0.001),
+        dec!(0.001),
+    )))
+    .with_fee_asset(FeeAssetConfig::new(asset("bnb"), dec!(0.25)).unwrap());
     let mut venue = SimulatedVenue::new_market_driven(
         &config,
         [spot("btc", "usdt"), spot("bnb", "usdt")]

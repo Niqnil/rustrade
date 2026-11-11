@@ -63,7 +63,7 @@ use rustrade_execution::{
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
-    fill::{FillContext, FillModel, SimFillConfig},
+    fill::{FillContext, FillModel},
     holding_cost::{FundingModel, RateSeries},
     market::MarketSnapshot,
     order::{
@@ -115,30 +115,16 @@ fn funded(amount: Decimal) -> AssetBalance<AssetNameExchange> {
 }
 
 fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecutionConfig {
-    MockExecutionConfig {
-        mocked_exchange: EXCHANGE,
-        initial_state: AccountSnapshot {
+    MockExecutionConfig::new(
+        EXCHANGE,
+        AccountSnapshot {
             exchange: EXCHANGE,
             balances: vec![funded(usd_balance)],
             instruments: vec![],
         },
-        latency_ms: 0,
-        fee_model,
-        fill_model: SimFillConfig::default(),
-        spot_fee_asset: Default::default(),
-        slippage: Default::default(),
-        market_order_timing: Default::default(),
-        stale_market: Default::default(),
-        spot_margin: None,
-        fee_asset: None,
-        long_option_expiry: Default::default(),
-        short_put_collateral: Default::default(),
-        amend: Default::default(),
-        time_in_force: Default::default(),
-        session_close: None,
-        fee_model_by_kind: Default::default(),
-        expiry_sell_out: None,
-    }
+        0,
+    )
+    .with_fee_model(fee_model)
 }
 
 // --- The venue's ledger against the engine's position -------------------------------------------
@@ -514,10 +500,9 @@ async fn try_round_trip_slipped(
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
         venue_options,
-        executions: vec![ExecutionConfig::Mock(MockExecutionConfig {
-            slippage,
-            ..mock_config(margin, FeeModelConfig::default())
-        })],
+        executions: vec![ExecutionConfig::Mock(
+            mock_config(margin, FeeModelConfig::default()).with_slippage(slippage),
+        )],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
         engine_state,

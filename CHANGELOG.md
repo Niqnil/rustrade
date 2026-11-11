@@ -221,6 +221,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
 
 ### Changed
+- **Breaking: `MockExecutionConfig` is built with `new` and `with_*` setters** (`rustrade-execution`,
+  #921). Adding a setting no longer breaks every caller.
+  - It is `#[non_exhaustive]`: outside `rustrade-execution`, a struct literal (including one with
+    `..base`) no longer compiles. The fields stay public, so a built config can still be read and
+    changed in place.
+  - `MockExecutionConfig::new(mocked_exchange, initial_state, latency_ms)` takes only the three
+    settings with no neutral value; every other setting takes its documented default. It replaces
+    the positional `new` that took every field.
+  - Each other setting has a consuming `with_*` setter named after its field. The setters for an
+    optional setting (`with_spot_margin`, `with_fee_asset`, `with_session_close`,
+    `with_expiry_sell_out`) take the value itself. `with_fee_model_for(kind, model)` sets one
+    kind's fee model, and `with_fee_model_by_kind` replaces the whole map.
+  - Serialised configs are unchanged: the same three fields are required and the rest default.
 - **Breaking: `ExecutionManager` has a `clock` field** (`rustrade`, #919). It stamps an
   `AccountEventKind::OrderDeadline`. `ExecutionManager::new` takes it as its last argument, and a
   struct literal must set it. `ExecutionManager::init` takes it from `AccountStreamOptions::clock`.

@@ -41,10 +41,7 @@ fn day() -> TimeInForce {
 }
 
 fn day_config() -> MockExecutionConfig {
-    MockExecutionConfig {
-        session_close: Some(new_york_close()),
-        ..spot_config("10", "1000000", FeeModelConfig::default())
-    }
+    spot_config("10", "1000000", FeeModelConfig::default()).with_session_close(new_york_close())
 }
 
 fn quote_book(venue: &mut SimulatedVenue, bid: &str, ask: &str, at: DateTime<Utc>) {
@@ -353,12 +350,9 @@ fn an_amend_does_not_move_a_day_orders_deadline() {
 /// released to the book, and one still held at the close expires there.
 #[test]
 fn a_held_day_order_keeps_its_deadline_when_released_and_expires_held() {
-    let config = MockExecutionConfig {
-        stale_market: StaleMarketPolicy::Wait {
-            max_age: Duration::from_secs(10),
-        },
-        ..day_config()
-    };
+    let config = day_config().with_stale_market(StaleMarketPolicy::Wait {
+        max_age: Duration::from_secs(10),
+    });
     let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
     advance(&mut venue, tuesday_morning());
     quote_book(&mut venue, "49000", "49100", tuesday_morning());

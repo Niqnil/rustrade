@@ -16,10 +16,8 @@ fn ratio_config(
 ) -> MockExecutionConfig {
     let spot_margin =
         SpotMarginConfig::new(quote(), d(max_leverage), MarginEffect::Borrow).unwrap();
-    MockExecutionConfig {
-        spot_margin: Some(configure(spot_margin).unwrap()),
-        ..config_from_balances(balances, FeeModelConfig::default())
-    }
+    config_from_balances(balances, FeeModelConfig::default())
+        .with_spot_margin(configure(spot_margin).unwrap())
 }
 
 /// A fed venue trading BTCUSDT at `btc` and ETHUSDT at `eth` from `time(1)`.

@@ -9062,21 +9062,6 @@ mod tests {
                 }],
             },
             0,
-            FeeModelConfig::default(),
-            SimFillConfig::default(),
-            SpotFeeAsset::default(),
-            crate::slippage::SlippageConfig::default(),
-            crate::fill::MarketOrderTiming::default(),
-            crate::fill::StaleMarketPolicy::default(),
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            Default::default(),
-            None, // expiry_sell_out
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -9112,21 +9097,6 @@ mod tests {
                 }],
             },
             0,
-            FeeModelConfig::default(),
-            SimFillConfig::default(),
-            SpotFeeAsset::default(),
-            crate::slippage::SlippageConfig::default(),
-            crate::fill::MarketOrderTiming::default(),
-            crate::fill::StaleMarketPolicy::default(),
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            Default::default(),
-            None, // expiry_sell_out
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -9574,10 +9544,7 @@ mod tests {
 
     /// A funded spot config moving every taker fill by `slippage`.
     fn slipped_config(slippage: SlippageConfig) -> MockExecutionConfig {
-        MockExecutionConfig {
-            slippage,
-            ..spot_config("10", "1000000", FeeModelConfig::default())
-        }
+        spot_config("10", "1000000", FeeModelConfig::default()).with_slippage(slippage)
     }
 
     fn last(price: &str) -> Option<MarketSnapshot> {
@@ -9654,10 +9621,7 @@ mod tests {
     /// A resting order is the maker, so it fills at its own limit and leaves the stream alone.
     #[test]
     fn a_resting_fill_is_not_slipped_and_takes_no_draw() {
-        let config = MockExecutionConfig {
-            slippage: uniform(5),
-            ..spot_config("10", "1000000", maker_taker_fee())
-        };
+        let config = spot_config("10", "1000000", maker_taker_fee()).with_slippage(uniform(5));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         let fed = venue.apply_market(
@@ -9730,10 +9694,7 @@ mod tests {
         slippage: SlippageConfig,
         depth: MarketDepth,
     ) -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            slippage,
-            ..spot_config("10", usdt, FeeModelConfig::default())
-        };
+        let config = spot_config("10", usdt, FeeModelConfig::default()).with_slippage(slippage);
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         let fed = venue.apply_market(
@@ -14394,10 +14355,8 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     fn next_bar_config(usdt: &str, price: NextBarPrice) -> MockExecutionConfig {
-        MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(price),
-            ..spot_config("10", usdt, FeeModelConfig::default())
-        }
+        spot_config("10", usdt, FeeModelConfig::default())
+            .with_market_order_timing(MarketOrderTiming::NextBar(price))
     }
 
     fn ohlc(open: &str, high: &str, low: &str, close: &str) -> MarketBar {
@@ -14577,10 +14536,8 @@ mod tests {
 
     #[test]
     fn a_held_order_fills_at_the_bar_price_moved_by_the_configured_slippage() {
-        let config = MockExecutionConfig {
-            slippage: SlippageConfig::fixed(d("0.01")).unwrap(),
-            ..next_bar_config("10000", NextBarPrice::Open)
-        };
+        let config = next_bar_config("10000", NextBarPrice::Open)
+            .with_slippage(SlippageConfig::fixed(d("0.01")).unwrap());
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
@@ -14922,10 +14879,8 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     fn stale_config(max_age: Duration) -> MockExecutionConfig {
-        MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age },
-            ..spot_config("10", "10000", FeeModelConfig::default())
-        }
+        spot_config("10", "10000", FeeModelConfig::default())
+            .with_stale_market(StaleMarketPolicy::Wait { max_age })
     }
 
     /// Ten seconds: a market last observed fresh at `time(1)` is stale from `time(12)`.
@@ -15374,10 +15329,8 @@ mod tests {
     /// A venue holding market orders for the next bar something traded in, fed one at `time(1)`
     /// that closed at 100.
     fn venue_holding_fresh_bars() -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..next_bar_config("10000", NextBarPrice::Open)
-        };
+        let config = next_bar_config("10000", NextBarPrice::Open)
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
@@ -15537,10 +15490,7 @@ mod tests {
 
     #[test]
     fn a_held_limit_order_is_capped_at_its_limit_however_far_the_slippage_moves_it() {
-        let config = MockExecutionConfig {
-            slippage: SlippageConfig::fixed(d("0.1")).unwrap(),
-            ..stale_config(MAX_AGE)
-        };
+        let config = stale_config(MAX_AGE).with_slippage(SlippageConfig::fixed(d("0.1")).unwrap());
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
@@ -15844,13 +15794,9 @@ mod tests {
 
     #[test]
     fn a_held_limit_order_the_account_can_no_longer_afford_is_cancelled_and_hands_back_its_draw() {
-        let config = MockExecutionConfig {
-            slippage: uniform(5),
-            ..MockExecutionConfig {
-                stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-                ..spot_config("10", "100", FeeModelConfig::default())
-            }
-        };
+        let config = spot_config("10", "100", FeeModelConfig::default())
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE })
+            .with_slippage(uniform(5));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
@@ -15904,10 +15850,8 @@ mod tests {
 
     #[test]
     fn a_held_limit_order_paying_its_fee_in_a_third_asset_takes_the_fee_apart_at_its_release() {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..fee_asset_config("10")
-        };
+        let config =
+            fee_asset_config("10").with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = fee_asset_venue_from(&config, true);
         advance(&mut venue, time(12));
         let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "51000"));
@@ -15933,10 +15877,9 @@ mod tests {
     }
 
     fn cfd_venue_with(usd: &str, stale_market: StaleMarketPolicy) -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            stale_market,
-            ..config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default())
-        };
+        let config =
+            config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default())
+                .with_stale_market(stale_market);
         let mut venue =
             SimulatedVenue::new_market_driven(&config, instruments_of(cfd_instrument()));
         advance(&mut venue, time(1));
@@ -16118,10 +16061,8 @@ mod tests {
 
     #[test]
     fn a_held_limit_buy_that_rests_a_remainder_holds_the_loan_left_against_it() {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..margin_config("0", "100", "2")
-        };
+        let config = margin_config("0", "100", "2")
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
@@ -16162,17 +16103,15 @@ mod tests {
     /// its remainder holds, and is charged, only what the whole order adds to them.
     #[test]
     fn a_held_limit_order_filled_in_part_pays_a_per_order_fee_once() {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            fee_model: FeeModelConfig::Composite(
+        let config = margin_config("0", "1000", "2")
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE })
+            .with_fee_model(FeeModelConfig::Composite(
                 CompositeFeeModel::new(vec![
                     FeeComponent::new(FeeBasis::PerOrder(d("5"))),
                     FeeComponent::new(FeeBasis::PerContract(d("1"))).with_min_per_order(d("2")),
                 ])
                 .unwrap(),
-            ),
-            ..margin_config("0", "1000", "2")
-        };
+            ));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
@@ -16208,23 +16147,19 @@ mod tests {
     #[test]
     fn cancelling_a_released_remainder_repays_only_its_own_loan_and_not_one_already_owed() {
         // Owing 20 USDT already, the account has 100 of its own and 120 to spend.
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    funded(base(), Decimal::ZERO),
-                    AssetBalance::new(
-                        quote(),
-                        Balance::new_margin(d("120"), d("120"), d("20"), Decimal::ZERO),
-                        Utc::now(),
-                    ),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                funded(base(), Decimal::ZERO),
+                AssetBalance::new(
+                    quote(),
+                    Balance::new_margin(d("120"), d("120"), d("20"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE })
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
@@ -16261,12 +16196,9 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     fn margin_config(btc: &str, usdt: &str, max_leverage: &str) -> MockExecutionConfig {
-        MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d(max_leverage), MarginEffect::Borrow).unwrap(),
-            ),
-            ..spot_config(btc, usdt, FeeModelConfig::default())
-        }
+        spot_config(btc, usdt, FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(quote(), d(max_leverage), MarginEffect::Borrow).unwrap(),
+        )
     }
 
     /// A venue with no feed of its own, pricing each order from its request.
@@ -16343,12 +16275,11 @@ mod tests {
 
     #[test]
     fn a_margin_sell_of_base_the_account_never_held_borrows_it() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(vec![funded(quote(), d("10000"))], FeeModelConfig::default())
-        };
+        let config =
+            config_from_balances(vec![funded(quote(), d("10000"))], FeeModelConfig::default())
+                .with_spot_margin(
+                    SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+                );
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
@@ -16363,10 +16294,8 @@ mod tests {
     #[test]
     fn a_margin_buy_borrows_quote_valued_through_the_inverse_of_its_pair() {
         // Valued in BTC, so a USDT loan is valued at the inverse of BTCUSDT's price.
-        let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(base(), d("2"), MarginEffect::Borrow).unwrap()),
-            ..spot_config("1", "0", FeeModelConfig::default())
-        };
+        let config = spot_config("1", "0", FeeModelConfig::default())
+            .with_spot_margin(SpotMarginConfig::new(base(), d("2"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         // Equity of 1 BTC at leverage 2 lends up to 1 BTC's worth: 50,000 USDT.
@@ -16443,22 +16372,18 @@ mod tests {
 
     #[test]
     fn a_margin_buy_repays_interest_then_principal_and_frees_the_rest() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(with_effect(
@@ -16475,22 +16400,18 @@ mod tests {
 
     #[test]
     fn a_buy_smaller_than_the_debt_repays_interest_before_principal() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(with_effect(
@@ -16563,22 +16484,20 @@ mod tests {
 
     #[test]
     fn no_side_effect_lends_nothing_and_repays_nothing() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.5"), Decimal::ZERO),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.5"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(
+            SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
+        );
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
@@ -16599,13 +16518,10 @@ mod tests {
     #[test]
     fn an_asset_the_venue_cannot_value_is_not_lent() {
         // No instrument pairs BTC with EUR, so a BTC loan cannot be valued.
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(AssetNameExchange::new("EUR"), d("3"), MarginEffect::Borrow)
-                    .unwrap(),
-            ),
-            ..spot_config("0", "100000", FeeModelConfig::default())
-        };
+        let config = spot_config("0", "100000", FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(AssetNameExchange::new("EUR"), d("3"), MarginEffect::Borrow)
+                .unwrap(),
+        );
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
@@ -16618,10 +16534,11 @@ mod tests {
 
     #[test]
     fn a_cfd_order_is_not_lent_its_margin() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
-            ..config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
-        };
+        let config =
+            config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
+                .with_spot_margin(
+                    SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap(),
+                );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
 
         let outcome = venue.open_order(cfd_request(Side::Sell, "1", market_prices("5000")));
@@ -16646,20 +16563,18 @@ mod tests {
 
     /// A margin account owing 0.75 BTC and 0.01 of interest on it, with `effect` as its default.
     fn config_owing_base(effect: MarginEffect) -> MockExecutionConfig {
-        MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3"), effect).unwrap()),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        }
+        config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), effect).unwrap())
     }
 
     /// A fed venue for `config`, its book at 49,000 / 49,100.
@@ -16707,12 +16622,9 @@ mod tests {
         );
 
         // A venue that borrows nothing by default, told to: the same sell borrows its base.
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
-            ),
-            ..spot_config("0", "100000", FeeModelConfig::default())
-        };
+        let config = spot_config("0", "100000", FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
+        );
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
         let outcome = venue.open_order(with_effect(
             sell_request("1", market_prices("50000")),
@@ -16747,10 +16659,11 @@ mod tests {
 
     #[test]
     fn a_cfd_order_naming_a_borrow_or_repay_is_refused_unsent() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
-            ..config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
-        };
+        let config =
+            config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
+                .with_spot_margin(
+                    SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap(),
+                );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
 
         for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
@@ -16856,14 +16769,11 @@ mod tests {
 
     #[test]
     fn without_auto_repay_at_cancel_a_cancelled_order_leaves_its_loan_owed() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
-                    .unwrap()
-                    .with_auto_repay_at_cancel(false),
-            ),
-            ..spot_config("0", "100000", FeeModelConfig::default())
-        };
+        let config = spot_config("0", "100000", FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
+                .unwrap()
+                .with_auto_repay_at_cancel(false),
+        );
         let mut venue = market_venue_for(&config);
         venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
 
@@ -16958,10 +16868,8 @@ mod tests {
 
     #[test]
     fn a_held_market_sell_borrows_when_accepted_and_keeps_the_loan_when_its_bar_fills_it() {
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..margin_config("0", "1000", "3")
-        };
+        let config = margin_config("0", "1000", "3")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
@@ -16982,10 +16890,8 @@ mod tests {
 
     #[test]
     fn a_held_market_sell_that_expires_repays_its_loan() {
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..margin_config("0", "1000", "3")
-        };
+        let config = margin_config("0", "1000", "3")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
@@ -17002,10 +16908,8 @@ mod tests {
     /// A venue holding market orders for the next bar, on margin, with 100 USDT and no BTC, fed
     /// one bar that closed at 100.
     fn margin_venue_holding() -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..margin_config("0", "100", "2")
-        };
+        let config = margin_config("0", "100", "2")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
         advance(&mut venue, time(1));
         assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
@@ -17075,10 +16979,8 @@ mod tests {
         adjust: impl FnOnce(SpotMarginConfig) -> SpotMarginConfig,
         effect: MarginEffect,
     ) -> SimulatedVenue {
-        let mut config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..margin_config("0", "100", "2")
-        };
+        let mut config = margin_config("0", "100", "2")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
         config.spot_margin = Some(adjust(
             SpotMarginConfig::new(quote(), d("2"), effect).unwrap(),
         ));
@@ -17433,10 +17335,8 @@ mod tests {
     #[test]
     fn a_held_market_sell_lent_the_minimum_that_expires_repays_the_whole_loan() {
         let config = with_min_borrow(
-            MockExecutionConfig {
-                market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-                ..margin_config("0", "1000", "3")
-            },
+            margin_config("0", "1000", "3")
+                .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open)),
             base(),
             "3",
         );
@@ -17543,10 +17443,8 @@ mod tests {
     #[test]
     fn a_held_limit_buy_lent_the_minimum_carries_it_to_the_remainder_it_rests() {
         let config = with_min_borrow(
-            MockExecutionConfig {
-                stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-                ..margin_config("0", "100", "2")
-            },
+            margin_config("0", "100", "2")
+                .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE }),
             quote(),
             "80",
         );
@@ -17587,10 +17485,8 @@ mod tests {
 
     #[test]
     fn a_held_limit_that_rests_untraded_at_its_release_keeps_its_interest_until_its_end() {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..margin_config("0", "100", "2")
-        };
+        let config = margin_config("0", "100", "2")
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
             .with_margin_interest(Arc::new(hourly_interest(quote())));
         advance(&mut venue, time(1));
@@ -17641,10 +17537,8 @@ mod tests {
 
     #[test]
     fn a_held_limit_that_trades_in_part_at_its_release_reports_its_interest_once_after_the_trade() {
-        let config = MockExecutionConfig {
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..margin_config("0", "100", "2")
-        };
+        let config = margin_config("0", "100", "2")
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
             .with_margin_interest(Arc::new(hourly_interest(quote())));
         advance(&mut venue, time(1));
@@ -17712,11 +17606,9 @@ mod tests {
 
     #[test]
     fn a_held_immediate_order_an_idle_bar_cancels_reports_its_interest_with_its_cancel() {
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
-            ..margin_config("0", "100", "2")
-        };
+        let config = margin_config("0", "100", "2")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open))
+            .with_stale_market(StaleMarketPolicy::Wait { max_age: MAX_AGE });
         let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
             .with_margin_interest(Arc::new(hourly_interest(quote())));
         advance(&mut venue, time(1));
@@ -17768,23 +17660,19 @@ mod tests {
 
     /// A margin venue also holding `eth`, which no instrument values, owing `eth_owed` of it.
     fn margin_venue_with_eth(eth: &str, eth_owed: &str) -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    funded(base(), Decimal::ZERO),
-                    funded(quote(), d("10000")),
-                    AssetBalance::new(
-                        AssetNameExchange::new("ETH"),
-                        Balance::new_margin(d(eth), d(eth), d(eth_owed), Decimal::ZERO),
-                        Utc::now(),
-                    ),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                funded(base(), Decimal::ZERO),
+                funded(quote(), d("10000")),
+                AssetBalance::new(
+                    AssetNameExchange::new("ETH"),
+                    Balance::new_margin(d(eth), d(eth), d(eth_owed), Decimal::ZERO),
+                    Utc::now(),
+                ),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap());
         SimulatedVenue::new(&config, spot_instruments())
     }
 
@@ -17815,22 +17703,18 @@ mod tests {
 
     #[test]
     fn interest_owed_counts_as_debt_against_what_the_venue_lends() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.05"), d("0.01")),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("20000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.05"), d("0.01")),
+                    Utc::now(),
+                ),
+                funded(quote(), d("20000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         // 0.06 BTC owed is 3,000: equity 17,000 at leverage 2 lends 17,000, less the 3,000
@@ -17845,15 +17729,11 @@ mod tests {
 
     #[test]
     fn an_asset_a_margin_account_first_receives_reports_its_loan() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![funded(quote(), d("100000"))],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![funded(quote(), d("100000"))],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
         let outcome = venue.open_order(buy_request("1", market_prices("50000")));
@@ -18849,22 +18729,18 @@ mod tests {
 
     #[test]
     fn a_seeded_loan_is_charged_at_boundaries_from_the_clock_s_first_move_only() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments())
             .with_margin_interest(Arc::new(hourly_interest(base())));
         assert_eq!(
@@ -18988,22 +18864,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "which is not after")]
     fn a_model_whose_boundary_is_not_after_the_instant_asked_panics() {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            ..config_from_balances(
-                vec![
-                    AssetBalance::new(
-                        base(),
-                        Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
-                        Utc::now(),
-                    ),
-                    funded(quote(), d("100000")),
-                ],
-                FeeModelConfig::default(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+                funded(quote(), d("100000")),
+            ],
+            FeeModelConfig::default(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap());
         let mut venue = SimulatedVenue::new(&config, spot_instruments())
             .with_margin_interest(Arc::new(Misbehaving));
 
@@ -19050,17 +18922,15 @@ mod tests {
     /// 10 BTC, 100,000 USDT and `bnb` BNB, maker 2bp against taker 10bp, and fees in BNB at a
     /// quarter off.
     fn fee_asset_config(bnb: &str) -> MockExecutionConfig {
-        MockExecutionConfig {
-            fee_asset: Some(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap()),
-            ..config_from_balances(
-                vec![
-                    funded(base(), d("10")),
-                    funded(quote(), d("100000")),
-                    funded(self::bnb(), d(bnb)),
-                ],
-                maker_taker_fee(),
-            )
-        }
+        config_from_balances(
+            vec![
+                funded(base(), d("10")),
+                funded(quote(), d("100000")),
+                funded(self::bnb(), d(bnb)),
+            ],
+            maker_taker_fee(),
+        )
+        .with_fee_asset(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap())
     }
 
     /// A fed venue for `config`, `BTCUSDT` last traded at 50,000, and `BNBUSDT` at a 599 / 601
@@ -19274,10 +19144,7 @@ mod tests {
     /// Under `Received`, a buy paying its fee in BNB receives its whole quantity.
     #[test]
     fn under_received_a_buy_paying_in_the_fee_asset_receives_its_whole_quantity() {
-        let config = MockExecutionConfig {
-            spot_fee_asset: SpotFeeAsset::Received,
-            ..fee_asset_config("1")
-        };
+        let config = fee_asset_config("1").with_spot_fee_asset(SpotFeeAsset::Received);
         let mut venue = fee_asset_venue_from(&config, true);
 
         let outcome = venue.open_order(buy_request("1", None));
@@ -19289,10 +19156,7 @@ mod tests {
 
     #[test]
     fn a_zero_fee_is_charged_without_the_fee_asset() {
-        let config = MockExecutionConfig {
-            fee_model: FeeModelConfig::default(),
-            ..fee_asset_config("1")
-        };
+        let config = fee_asset_config("1").with_fee_model(FeeModelConfig::default());
         let mut venue = fee_asset_venue_from(&config, true);
 
         let outcome = venue.open_order(buy_request("1", None));
@@ -19307,13 +19171,11 @@ mod tests {
     /// A discount of one charges nothing, even to an account that has never held the fee asset.
     #[test]
     fn a_full_discount_charges_nothing_and_needs_no_fee_asset_balance() {
-        let config = MockExecutionConfig {
-            fee_asset: Some(FeeAssetConfig::new(bnb(), Decimal::ONE).unwrap()),
-            ..config_from_balances(
-                vec![funded(base(), d("10")), funded(quote(), d("100000"))],
-                maker_taker_fee(),
-            )
-        };
+        let config = config_from_balances(
+            vec![funded(base(), d("10")), funded(quote(), d("100000"))],
+            maker_taker_fee(),
+        )
+        .with_fee_asset(FeeAssetConfig::new(bnb(), Decimal::ONE).unwrap());
         let mut venue = fee_asset_venue_from(&config, true);
 
         let outcome = venue.open_order(buy_request("1", None));
@@ -19334,10 +19196,8 @@ mod tests {
     /// A market order held for its next bar pays its fee in BNB when the bar fills it.
     #[test]
     fn a_held_market_order_pays_its_fee_in_the_fee_asset() {
-        let config = MockExecutionConfig {
-            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
-            ..fee_asset_config("1")
-        };
+        let config = fee_asset_config("1")
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
         let mut venue = SimulatedVenue::new_market_driven(&config, fee_asset_instruments());
         advance(&mut venue, time(1));
         assert!(
@@ -19375,18 +19235,16 @@ mod tests {
         let eth_bnb = spot_instrument("ETHBNB", "ETH", "BNB");
         instruments.insert(eth_bnb.name_exchange.clone(), eth_bnb);
         let eth = || AssetNameExchange::new("ETH");
-        let config = MockExecutionConfig {
-            fee_asset: Some(FeeAssetConfig::new(bnb(), d("0.25")).unwrap()),
-            ..config_from_balances(
-                vec![
-                    funded(base(), d("10")),
-                    funded(quote(), d("100000")),
-                    funded(bnb(), d("10")),
-                    funded(eth(), d("1")),
-                ],
-                maker_taker_fee(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                funded(base(), d("10")),
+                funded(quote(), d("100000")),
+                funded(bnb(), d("10")),
+                funded(eth(), d("1")),
+            ],
+            maker_taker_fee(),
+        )
+        .with_fee_asset(FeeAssetConfig::new(bnb(), d("0.25")).unwrap());
 
         for (side, eth_after, bnb_after) in [
             // 0.5 BNB plus 0.0005 on top.
@@ -19430,10 +19288,7 @@ mod tests {
     fn a_negative_fee_is_paid_without_the_fee_asset() {
         let rebate =
             FeeModelConfig::Percentage(PercentageFeeModel::maker_taker(d("-0.0001"), d("-0.0001")));
-        let config = MockExecutionConfig {
-            fee_model: rebate,
-            ..fee_asset_config("1")
-        };
+        let config = fee_asset_config("1").with_fee_model(rebate);
         let mut venue = fee_asset_venue_from(&config, true);
 
         let outcome = venue.open_order(buy_request("1", None));
@@ -19529,20 +19384,16 @@ mod tests {
     /// 10,000 USDT on a 3× margin account, BTC flat, paying fees in BNB and charged hourly on
     /// USDT loans, `BTCUSDT` at 50,000 and BNB at 600.
     fn fee_asset_margin_venue(bnb: &str) -> SimulatedVenue {
-        let config = MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
-            ),
-            fee_asset: Some(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap()),
-            ..config_from_balances(
-                vec![
-                    funded(base(), Decimal::ZERO),
-                    funded(quote(), d("10000")),
-                    funded(self::bnb(), d(bnb)),
-                ],
-                maker_taker_fee(),
-            )
-        };
+        let config = config_from_balances(
+            vec![
+                funded(base(), Decimal::ZERO),
+                funded(quote(), d("10000")),
+                funded(self::bnb(), d(bnb)),
+            ],
+            maker_taker_fee(),
+        )
+        .with_spot_margin(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap())
+        .with_fee_asset(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap());
         fee_asset_venue_from(&config, true).with_margin_interest(Arc::new(hourly_interest(quote())))
     }
 
@@ -19673,13 +19524,11 @@ mod tests {
         let mut instruments = instruments_of(cfd_instrument());
         let bnb_usd = spot_instrument("BNBUSD", "BNB", "usd");
         instruments.insert(bnb_usd.name_exchange.clone(), bnb_usd);
-        let config = MockExecutionConfig {
-            fee_asset: Some(FeeAssetConfig::new(bnb(), d("0.25")).unwrap()),
-            ..config_from_balances(
-                vec![funded(usd(), d("1000000")), funded(bnb(), d("10"))],
-                maker_taker_fee(),
-            )
-        };
+        let config = config_from_balances(
+            vec![funded(usd(), d("1000000")), funded(bnb(), d("10"))],
+            maker_taker_fee(),
+        )
+        .with_fee_asset(FeeAssetConfig::new(bnb(), d("0.25")).unwrap());
         let mut venue = SimulatedVenue::new_market_driven(&config, instruments);
         advance(&mut venue, time(1));
         assert!(

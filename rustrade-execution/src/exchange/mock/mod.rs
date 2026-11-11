@@ -687,7 +687,7 @@ pub(crate) mod fixtures {
         InstrumentAccountSnapshot, UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
-        fee::{FeeModelConfig, SpotFeeAsset},
+        fee::FeeModelConfig,
         fill::SimFillConfig,
         market::MarketSnapshot,
         order::{
@@ -763,23 +763,10 @@ pub(crate) mod fixtures {
                 balances,
                 instruments: vec![],
             },
-            0, // latency_ms
-            fee_model,
-            fill_model,
-            SpotFeeAsset::default(),
-            crate::slippage::SlippageConfig::default(),
-            crate::fill::MarketOrderTiming::default(),
-            crate::fill::StaleMarketPolicy::default(),
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            Default::default(),
-            None, // expiry_sell_out
+            0,
         )
+        .with_fee_model(fee_model)
+        .with_fill_model(fill_model)
     }
 
     /// A spot config whose account already holds one open order, as `initial_state` seeds it.
@@ -806,22 +793,7 @@ pub(crate) mod fixtures {
                     isolated: None,
                 }],
             },
-            0, // latency_ms
-            FeeModelConfig::default(),
-            SimFillConfig::default(),
-            SpotFeeAsset::default(),
-            crate::slippage::SlippageConfig::default(),
-            crate::fill::MarketOrderTiming::default(),
-            crate::fill::StaleMarketPolicy::default(),
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            None,
-            Default::default(),
-            None, // expiry_sell_out
+            0,
         )
     }
 
@@ -1128,10 +1100,8 @@ mod tests {
     async fn the_driver_fills_at_the_configured_slippage() {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = broadcast::channel(16);
-        let config = MockExecutionConfig {
-            slippage: crate::slippage::SlippageConfig::fixed(d("0.01")).unwrap(),
-            ..spot_config("100", "10000000", FeeModelConfig::default())
-        };
+        let config = spot_config("100", "10000000", FeeModelConfig::default())
+            .with_slippage(crate::slippage::SlippageConfig::fixed(d("0.01")).unwrap());
         let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
         let driver = tokio::spawn(exchange.run());
 
@@ -1354,12 +1324,9 @@ mod tests {
     async fn a_borrow_capacity_query_is_answered_by_the_venue() {
         use crate::margin::{MarginEffect, SpotMarginConfig};
 
-        let config = crate::client::mock::MockExecutionConfig {
-            spot_margin: Some(
-                SpotMarginConfig::new(quote(), Decimal::from(3), MarginEffect::Borrow).unwrap(),
-            ),
-            ..spot_config("0", "10000", FeeModelConfig::default())
-        };
+        let config = spot_config("0", "10000", FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(quote(), Decimal::from(3), MarginEffect::Borrow).unwrap(),
+        );
 
         let capacity = borrow_capacity_from(config, Side::Buy)
             .await

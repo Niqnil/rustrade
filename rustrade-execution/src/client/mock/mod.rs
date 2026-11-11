@@ -44,12 +44,36 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::error;
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+/// How a simulated venue behaves: which exchange it stands in for, the account it starts with, how
+/// long a request takes to reach it, and the rules it fills, charges and refuses by.
+///
+/// Build one with [`new`](Self::new), which takes the three settings that have no neutral value,
+/// then change any other setting with its `with_*` method. Every other setting defaults to the
+/// simplest venue: no fees, fills at the last price, no slippage, a cash account, and every time in
+/// force it can model accepted. Each field's documentation names its default. Deserialising
+/// applies the same defaults to the fields a stored config leaves out, and requires the three that
+/// [`new`](Self::new) takes.
+///
+/// `#[non_exhaustive]`, so a setting can be added without breaking a caller. Outside this crate,
+/// construct it with [`new`](Self::new) rather than a struct literal. The fields stay public, so a
+/// built config's settings can still be read and assigned in place.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct MockExecutionConfig {
+    /// The exchange the simulated venue stands in for: the [`ExchangeId`] on every event and
+    /// snapshot it reports.
     pub mocked_exchange: ExchangeId,
+    /// The account the venue starts with: its balances, positions and resting orders.
     pub initial_state: UnindexedAccountSnapshot,
+    /// The round trip, in milliseconds, of a request to the venue and its response back.
+    ///
+    /// It is applied by the driver that carries requests to the venue, not by the venue itself;
+    /// each driver documents how it splits the round trip (see
+    /// [`MockExchange`](crate::exchange::mock::MockExchange)). At `0` the venue books a request at
+    /// the instant it is sent, which no live venue does: a strategy can learn to trade on prices it
+    /// could not have reached in time. Set it to the latency measured against the live venue. A
+    /// driver that splits it into two equal halves rounds each down to a whole millisecond, so an
+    /// odd value shortens that driver's round trip by one millisecond.
     pub latency_ms: u64,
     /// Fee model used by the mock exchange to compute trading fees, for every kind of instrument
     /// not in [`fee_model_by_kind`](Self::fee_model_by_kind).
@@ -172,6 +196,187 @@ pub struct MockExecutionConfig {
     /// [`spot_margin`](Self::spot_margin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_sell_out: Option<ExpirySellOut>,
+}
+
+impl MockExecutionConfig {
+    /// A venue standing in for `mocked_exchange`, starting with the account `initial_state`, with
+    /// a round trip of `latency_ms` milliseconds (see [`latency_ms`](Self::latency_ms)).
+    ///
+    /// Every other setting takes its default, named in its field's documentation. Change one with
+    /// its `with_*` method.
+    pub fn new(
+        mocked_exchange: ExchangeId,
+        initial_state: UnindexedAccountSnapshot,
+        latency_ms: u64,
+    ) -> Self {
+        Self {
+            mocked_exchange,
+            initial_state,
+            latency_ms,
+            fee_model: FeeModelConfig::default(),
+            fill_model: SimFillConfig::default(),
+            spot_fee_asset: SpotFeeAsset::default(),
+            slippage: SlippageConfig::default(),
+            market_order_timing: MarketOrderTiming::default(),
+            stale_market: StaleMarketPolicy::default(),
+            spot_margin: None,
+            fee_asset: None,
+            long_option_expiry: LongOptionExpiry::default(),
+            short_put_collateral: ShortPutCollateral::default(),
+            amend: AmendConfig::default(),
+            time_in_force: TimeInForceRules::default(),
+            session_close: None,
+            fee_model_by_kind: BTreeMap::new(),
+            expiry_sell_out: None,
+        }
+    }
+
+    /// This config with its [`fee_model`](Self::fee_model) set to `fee_model`.
+    #[must_use]
+    pub fn with_fee_model(self, fee_model: FeeModelConfig) -> Self {
+        Self { fee_model, ..self }
+    }
+
+    /// This config with its [`fill_model`](Self::fill_model) set to `fill_model`.
+    #[must_use]
+    pub fn with_fill_model(self, fill_model: SimFillConfig) -> Self {
+        Self { fill_model, ..self }
+    }
+
+    /// This config with its [`spot_fee_asset`](Self::spot_fee_asset) set to `spot_fee_asset`.
+    #[must_use]
+    pub fn with_spot_fee_asset(self, spot_fee_asset: SpotFeeAsset) -> Self {
+        Self {
+            spot_fee_asset,
+            ..self
+        }
+    }
+
+    /// This config with its [`slippage`](Self::slippage) set to `slippage`.
+    #[must_use]
+    pub fn with_slippage(self, slippage: SlippageConfig) -> Self {
+        Self { slippage, ..self }
+    }
+
+    /// This config with its [`market_order_timing`](Self::market_order_timing) set to
+    /// `market_order_timing`.
+    #[must_use]
+    pub fn with_market_order_timing(self, market_order_timing: MarketOrderTiming) -> Self {
+        Self {
+            market_order_timing,
+            ..self
+        }
+    }
+
+    /// This config with its [`stale_market`](Self::stale_market) policy set to `stale_market`.
+    #[must_use]
+    pub fn with_stale_market(self, stale_market: StaleMarketPolicy) -> Self {
+        Self {
+            stale_market,
+            ..self
+        }
+    }
+
+    /// This config as a cross margin account that lends spot orders what the account lacks, under
+    /// `spot_margin`: see [`spot_margin`](Self::spot_margin).
+    #[must_use]
+    pub fn with_spot_margin(self, spot_margin: SpotMarginConfig) -> Self {
+        Self {
+            spot_margin: Some(spot_margin),
+            ..self
+        }
+    }
+
+    /// This config charging spot fees in a third asset, under `fee_asset`: see
+    /// [`fee_asset`](Self::fee_asset).
+    #[must_use]
+    pub fn with_fee_asset(self, fee_asset: FeeAssetConfig) -> Self {
+        Self {
+            fee_asset: Some(fee_asset),
+            ..self
+        }
+    }
+
+    /// This config with its [`long_option_expiry`](Self::long_option_expiry) set to
+    /// `long_option_expiry`.
+    #[must_use]
+    pub fn with_long_option_expiry(self, long_option_expiry: LongOptionExpiry) -> Self {
+        Self {
+            long_option_expiry,
+            ..self
+        }
+    }
+
+    /// This config with its [`short_put_collateral`](Self::short_put_collateral) set to
+    /// `short_put_collateral`.
+    #[must_use]
+    pub fn with_short_put_collateral(self, short_put_collateral: ShortPutCollateral) -> Self {
+        Self {
+            short_put_collateral,
+            ..self
+        }
+    }
+
+    /// This config with its [`amend`](Self::amend) support set to `amend`.
+    #[must_use]
+    pub fn with_amend(self, amend: AmendConfig) -> Self {
+        Self { amend, ..self }
+    }
+
+    /// This config with its [`time_in_force`](Self::time_in_force) rules set to `time_in_force`.
+    #[must_use]
+    pub fn with_time_in_force(self, time_in_force: TimeInForceRules) -> Self {
+        Self {
+            time_in_force,
+            ..self
+        }
+    }
+
+    /// This config with trading sessions that close under `session_close`: see
+    /// [`session_close`](Self::session_close).
+    #[must_use]
+    pub fn with_session_close(self, session_close: SessionCalendarConfig) -> Self {
+        Self {
+            session_close: Some(session_close),
+            ..self
+        }
+    }
+
+    /// This config with its whole [`fee_model_by_kind`](Self::fee_model_by_kind) map replaced by
+    /// `fee_model_by_kind`. To set one kind's model, use
+    /// [`with_fee_model_for`](Self::with_fee_model_for).
+    #[must_use]
+    pub fn with_fee_model_by_kind(
+        self,
+        fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+    ) -> Self {
+        Self {
+            fee_model_by_kind,
+            ..self
+        }
+    }
+
+    /// This config charging instruments of `kind` under `fee_model`, replacing any model it had
+    /// for `kind`: see [`fee_model_by_kind`](Self::fee_model_by_kind).
+    #[must_use]
+    pub fn with_fee_model_for(
+        mut self,
+        kind: InstrumentKindDiscriminant,
+        fee_model: FeeModelConfig,
+    ) -> Self {
+        self.fee_model_by_kind.insert(kind, fee_model);
+        self
+    }
+
+    /// This config selling out a long option the account cannot afford to exercise, under
+    /// `expiry_sell_out`: see [`expiry_sell_out`](Self::expiry_sell_out).
+    #[must_use]
+    pub fn with_expiry_sell_out(self, expiry_sell_out: ExpirySellOut) -> Self {
+        Self {
+            expiry_sell_out: Some(expiry_sell_out),
+            ..self
+        }
+    }
 }
 
 /// When a simulated venue's trading sessions close: what a
@@ -958,32 +1163,141 @@ mod tests {
         );
     }
 
+    fn empty_snapshot() -> UnindexedAccountSnapshot {
+        UnindexedAccountSnapshot {
+            exchange: ExchangeId::Mock,
+            balances: Vec::new(),
+            instruments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_new_config_holds_the_defaults_a_stored_config_reads_with() {
+        let built = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40);
+        let read: MockExecutionConfig = serde_json::from_value(serde_json::json!({
+            "mocked_exchange": serde_json::to_value(ExchangeId::Mock).unwrap(),
+            "initial_state": serde_json::to_value(empty_snapshot()).unwrap(),
+            "latency_ms": 40,
+        }))
+        .unwrap();
+        assert_eq!(built, read);
+
+        let missing_latency = serde_json::json!({
+            "mocked_exchange": serde_json::to_value(ExchangeId::Mock).unwrap(),
+            "initial_state": serde_json::to_value(empty_snapshot()).unwrap(),
+        });
+        assert!(
+            serde_json::from_value::<MockExecutionConfig>(missing_latency).is_err(),
+            "a stored config must state its latency"
+        );
+    }
+
+    #[test]
+    fn each_setter_sets_its_own_setting() {
+        use crate::{
+            fee::PercentageFeeModel,
+            fill::{BidAskFillModel, NextBarPrice},
+            margin::MarginEffect,
+        };
+        use chrono::NaiveTime;
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.001)));
+        let option_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.002)));
+        let share_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.003)));
+        let slippage = SlippageConfig::uniform(dec!(0.0001), dec!(0.0002), 7).unwrap();
+        let stale_market = StaleMarketPolicy::Wait {
+            max_age: Duration::from_secs(5),
+        };
+        let spot_margin = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap();
+        let fee_asset = FeeAssetConfig::new(AssetNameExchange::new("bnb"), dec!(0.25)).unwrap();
+        let time_in_force = TimeInForceRules::new().with_accepted(
+            InstrumentKindDiscriminant::Option,
+            &[TimeInForceKind::GoodUntilEndOfDay],
+        );
+        let session_close = SessionCalendarConfig::Daily(DailyClose::new(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            "America/New_York".parse().unwrap(),
+        ));
+        let expiry_sell_out = ExpirySellOut::new(Duration::from_secs(3600));
+
+        let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
+            .with_fee_model(fee_model.clone())
+            .with_fill_model(SimFillConfig::BidAsk(BidAskFillModel))
+            .with_spot_fee_asset(SpotFeeAsset::Received)
+            .with_slippage(slippage)
+            .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open))
+            .with_stale_market(stale_market)
+            .with_spot_margin(spot_margin.clone())
+            .with_fee_asset(fee_asset.clone())
+            .with_long_option_expiry(LongOptionExpiry::Lapse)
+            .with_short_put_collateral(ShortPutCollateral::StrikeLessPremium)
+            .with_amend(AmendConfig::NONE)
+            .with_time_in_force(time_in_force.clone())
+            .with_session_close(session_close.clone())
+            .with_fee_model_for(InstrumentKindDiscriminant::Option, share_fee)
+            .with_fee_model_for(InstrumentKindDiscriminant::Option, option_fee.clone())
+            .with_expiry_sell_out(expiry_sell_out);
+
+        assert_eq!(config.mocked_exchange, ExchangeId::Mock);
+        assert_eq!(config.initial_state, empty_snapshot());
+        assert_eq!(config.latency_ms, 40);
+        assert_eq!(config.fee_model, fee_model);
+        assert_eq!(config.fill_model, SimFillConfig::BidAsk(BidAskFillModel));
+        assert_eq!(config.spot_fee_asset, SpotFeeAsset::Received);
+        assert_eq!(config.slippage, slippage);
+        assert_eq!(
+            config.market_order_timing,
+            MarketOrderTiming::NextBar(NextBarPrice::Open)
+        );
+        assert_eq!(config.stale_market, stale_market);
+        assert_eq!(config.spot_margin, Some(spot_margin));
+        assert_eq!(config.fee_asset, Some(fee_asset));
+        assert_eq!(config.long_option_expiry, LongOptionExpiry::Lapse);
+        assert_eq!(
+            config.short_put_collateral,
+            ShortPutCollateral::StrikeLessPremium
+        );
+        assert_eq!(config.amend, AmendConfig::NONE);
+        assert_eq!(config.time_in_force, time_in_force);
+        assert_eq!(config.session_close, Some(session_close));
+        assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
+        // A later entry for the same kind replaces the earlier one.
+        assert_eq!(
+            config.fee_model_by_kind,
+            BTreeMap::from([(InstrumentKindDiscriminant::Option, option_fee.clone())])
+        );
+
+        // The whole-map setter replaces every entry, including ones set one at a time.
+        let spot_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.004)));
+        let replaced = config.with_fee_model_by_kind(BTreeMap::from([(
+            InstrumentKindDiscriminant::Spot,
+            spot_fee.clone(),
+        )]));
+        assert_eq!(
+            replaced.fee_model_by_kind,
+            BTreeMap::from([(InstrumentKindDiscriminant::Spot, spot_fee)])
+        );
+    }
+
     #[test]
     fn an_amend_config_missing_from_a_serialized_config_is_full() {
-        let config = MockExecutionConfig {
-            mocked_exchange: ExchangeId::Mock,
-            initial_state: UnindexedAccountSnapshot {
+        let config = MockExecutionConfig::new(
+            ExchangeId::Mock,
+            UnindexedAccountSnapshot {
                 exchange: ExchangeId::Mock,
                 balances: Vec::new(),
                 instruments: Vec::new(),
             },
-            latency_ms: 0,
-            fee_model: Default::default(),
-            fill_model: Default::default(),
-            spot_fee_asset: Default::default(),
-            slippage: Default::default(),
-            market_order_timing: Default::default(),
-            stale_market: Default::default(),
-            spot_margin: None,
-            fee_asset: None,
-            long_option_expiry: Default::default(),
-            short_put_collateral: Default::default(),
-            amend: AmendConfig::NONE,
-            time_in_force: Default::default(),
-            session_close: None,
-            fee_model_by_kind: Default::default(),
-            expiry_sell_out: None,
-        };
+            0,
+        )
+        .with_amend(AmendConfig::NONE);
         let mut json = serde_json::to_value(&config).unwrap();
         assert!(
             json.get("time_in_force").is_none(),
