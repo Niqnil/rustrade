@@ -175,8 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     account cannot afford to exercise is sold, as a broker sells out an account short of buying
     power (Alpaca sells in the last hour before expiry). A call's exercise needs the strike's cash:
     free quote, plus on a spot margin venue what it would lend for a buy. A put's needs free shares,
-    which excludes shares securing a short call. Longs checked at one instant share what the account
-    has, in name order.
+    which excludes shares securing a short call, and balances reserved for working orders, the
+    option's own included, are not free. Longs checked at one instant share what the account has,
+    in name order: each spends on what goes on to expiry, the contracts kept and any its sale left
+    unsold.
   - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
     it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
   - **The sale** cancels the orders working on the option, then sells as a market sell fills
