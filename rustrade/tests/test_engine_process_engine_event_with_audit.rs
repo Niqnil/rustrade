@@ -17,7 +17,7 @@ use rustrade::{
         audit::{AuditTick, EngineAudit},
         clock::{EngineClock, EngineInstant, HistoricalClock},
         command::Command,
-        error::{EngineError, RecoverableEngineError},
+        error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
         in_flight::{InFlightDeadlines, InFlightOverdue, InFlightRequest},
         process_with_audit,
@@ -9628,6 +9628,29 @@ fn test_order_deadline_cancels_a_working_order() {
         tracked_order_state(&engine, &gen_cid(0)),
         Some(ActiveOrderState::CancelInFlight(_))
     ));
+}
+
+/// A deadline's cancel that cannot reach the execution link reports that unrecoverable error in
+/// the audit's errors, as a strategy's cancel does, so the engine stops.
+#[test]
+fn test_order_deadline_cancel_on_a_closed_execution_link_is_an_audit_error() {
+    let (mut engine, execution_rx) = engine_with_working_order(true);
+    drop(execution_rx);
+
+    let audit = process_with_audit(&mut engine, order_deadline_event(gen_cid(0), 2));
+
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    let errors = audit.errors.into_iter().collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        matches!(
+            errors[0],
+            UnrecoverableEngineError::ExecutionChannelTerminated(_)
+        ),
+        "{errors:?}"
+    );
 }
 
 /// A deadline reached before the venue acknowledged the open sends nothing then, and cancels the

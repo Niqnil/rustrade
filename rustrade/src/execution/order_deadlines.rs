@@ -150,6 +150,19 @@ mod tests {
     }
 
     #[test]
+    fn orders_due_at_the_same_instant_all_fall_due() {
+        let start = Instant::now();
+        let mut deadlines = OrderDeadlines::default();
+        deadlines.arm(&open("first", Some(2)), start);
+        deadlines.arm(&open("second", Some(2)), start);
+
+        let due = deadlines.take_due(start + Duration::from_secs(2));
+        let cids: Vec<_> = due.iter().map(|key| key.cid.0.as_str()).collect();
+        assert_eq!(cids, ["first", "second"]);
+        assert_eq!(deadlines.next(), None);
+    }
+
+    #[test]
     fn a_disarmed_rearmed_or_closed_order_falls_due_at_most_once() {
         let start = Instant::now();
         let mut deadlines = OrderDeadlines::default();

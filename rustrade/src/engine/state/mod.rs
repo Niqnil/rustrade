@@ -794,9 +794,8 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 }
                 FillsApplied::default()
             }
-            // Changes no state: the engine acts on it after the update, in `Engine::process`,
-            // because only the engine sends the cancel.
-            AccountEventKind::OrderDeadline(_) => FillsApplied::default(),
+            // Changes no state. That includes `OrderDeadline`: the engine acts on it after the
+            // update, in `Engine::process`, because only the engine sends the cancel.
             _ => FillsApplied::default(),
         };
 
