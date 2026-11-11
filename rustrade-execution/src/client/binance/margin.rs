@@ -75,16 +75,16 @@ use super::restatement::{SharedStreamClock, StreamClock, restatement_time};
 use super::rules::RulesLoader;
 use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
-    AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
-    PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache, TrailingOrderError,
-    UnrecoveredFills, WeightPool, WireInt, answer_time, binance_filled_qty,
-    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
-    convert_ended_order, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
-    new_dedup_cache, optional_decimal, placed_order_state, recovered_order_cids,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, rest_read_with_retry,
-    trailing_params, unreadable_answer,
+    AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
+    BinanceTimeInForce, FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
+    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache,
+    TrailingOrderError, Unclassified, UnrecoveredFills, WeightPool, WireInt, answer_time,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    classify_rest_query_error, convert_ended_order, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
+    is_duplicate, is_unknown_order, new_dedup_cache, optional_decimal, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    rest_read_with_retry, trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -104,7 +104,8 @@ use crate::{
     error::{ApiError, OrderError, UnindexedClientError},
     margin::{MarginBorrow, MarginEffect, MarginPlacement, OrderLoan},
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
+        Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
+        UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
@@ -543,6 +544,23 @@ impl std::fmt::Debug for BinanceMargin {
 }
 
 impl BinanceMargin {
+    /// The time in force this client takes: `GoodUntilCancelled` and `ImmediateOrCancel` on every
+    /// order kind, `post_only` only on a limit order (sent as `LIMIT_MAKER`), and `FillOrKill`
+    /// only on a limit-priced order (limit, stop-limit, take-profit-limit or fixed-limit trailing
+    /// stop). It refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending the
+    /// order.
+    ///
+    /// A market, stop, take-profit or trailing order goes out without a `timeInForce`, since
+    /// Binance takes none for them: it works on arrival, or rests until triggered and then works
+    /// as a market order, which fills what it can and expires the rest. So it could take
+    /// liquidity or fill in part, and is refused with `post_only` or `FillOrKill`.
+    ///
+    /// A simulated venue standing in for Binance margin can take this set as its rule for `Spot`
+    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
+    /// is per instrument kind, so the simulated venue still takes `post_only` and `FillOrKill` on
+    /// the order kinds this client refuses them on.
+    pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
+
     /// Tell the client the kinds of orders it may not know, by client order id, such as after a
     /// restart, so that it reports them with these kinds where Binance's reports cannot describe
     /// them.
@@ -741,6 +759,9 @@ impl BinanceMargin {
     /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
     ///   against 6 for the other effects. Place them accordingly.
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
+    /// - A time in force outside [`BinanceMargin::TIME_IN_FORCE`], `post_only` on any kind but a
+    ///   limit order, or `FillOrKill` on a kind that is not limit-priced, returns
+    ///   [`OrderError::UnsupportedTimeInForce`] before any request.
     /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
     ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
     ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
@@ -813,11 +834,11 @@ impl BinanceMargin {
             self.config.is_isolated,
         ) {
             Ok(params) => params,
-            Err(BuildOrderError::Unsupported) => {
-                return inactive(OrderState::inactive(OrderError::UnsupportedOrderType(
-                    format!(
-                        "BinanceMargin does not support OrderKind::{kind:?} with {time_in_force:?}"
-                    ),
+            Err(BuildOrderError::Unsupported(refused)) => {
+                return inactive(OrderState::inactive(refused.into_order_error(
+                    "BinanceMargin",
+                    kind,
+                    time_in_force,
                 )));
             }
             Err(BuildOrderError::Trailing(refused)) => {
@@ -3382,8 +3403,8 @@ fn convert_margin_trade(
 /// Failure modes when constructing [`MarginAccountNewOrderParams`] from a rustrade request.
 #[derive(Debug)]
 enum BuildOrderError {
-    /// The `OrderKind`/`TimeInForce` combination is not supported on Binance margin.
-    Unsupported,
+    /// Binance does not take the order's kind, or its time in force for that kind.
+    Unsupported(Unclassified),
     /// The SDK params builder rejected the inputs (carries the builder's error message).
     Build(String),
     /// A trailing order cannot be sent as asked.
@@ -3491,7 +3512,7 @@ fn build_new_order_params(
     };
 
     let (binance_type, binance_tif) =
-        convert_order_kind_tif_margin(kind, time_in_force).ok_or(BuildOrderError::Unsupported)?;
+        convert_order_kind_tif_margin(kind, time_in_force).map_err(BuildOrderError::Unsupported)?;
 
     // isIsolated is config-driven: "TRUE" for isolated, "FALSE" for cross.
     let mut builder = MarginAccountNewOrderParams::builder(symbol, binance_side, binance_type)
@@ -3689,17 +3710,21 @@ struct NewOrderAnswer {
 /// result onto margin's SDK output types — a [`MarginAccountNewOrderTypeEnum`] and a
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
-/// Returns `None` for unsupported combinations, as spot does: a `TrailingStop` maps to a
-/// `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT` (with the `trailingDelta`
-/// [`build_new_order_params`] adds), and `TrailingStopLimit` and Absolute trailing offsets are
-/// unsupported.
+/// Refuses what spot refuses: a time in force outside [`BinanceMargin::TIME_IN_FORCE`],
+/// `post_only` on any kind but a limit order, `FillOrKill` on a kind that is not limit-priced,
+/// `TrailingStopLimit` and Absolute trailing offsets.
+/// A `TrailingStop` maps to a `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT`
+/// (with the `trailingDelta` [`build_new_order_params`] adds).
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
-) -> Option<(
-    MarginAccountNewOrderTypeEnum,
-    Option<MarginAccountNewOrderTimeInForceEnum>,
-)> {
+) -> Result<
+    (
+        MarginAccountNewOrderTypeEnum,
+        Option<MarginAccountNewOrderTimeInForceEnum>,
+    ),
+    Unclassified,
+> {
     let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
     let margin_type = match binance_type {
         BinanceOrderType::Market => MarginAccountNewOrderTypeEnum::Market,
@@ -3715,7 +3740,7 @@ fn convert_order_kind_tif_margin(
         BinanceTimeInForce::Ioc => MarginAccountNewOrderTimeInForceEnum::Ioc,
         BinanceTimeInForce::Fok => MarginAccountNewOrderTimeInForceEnum::Fok,
     });
-    Some((margin_type, margin_tif))
+    Ok((margin_type, margin_tif))
 }
 
 #[cfg(test)]
@@ -4257,7 +4282,10 @@ mod tests {
             gtc(),
             MarginEffect::NoSideEffect,
         );
-        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
+        assert!(matches!(
+            absolute,
+            Err(BuildOrderError::Unsupported(Unclassified::OrderKind))
+        ));
 
         // Refused unsent: a fixed limit without its price, and an activation price of zero.
         let no_limit = params(
@@ -4309,7 +4337,10 @@ mod tests {
             gtc(),
             MarginEffect::Borrow,
         );
-        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
+        assert!(matches!(
+            absolute,
+            Err(BuildOrderError::Unsupported(Unclassified::OrderKind))
+        ));
 
         let trailing_stop_limit = params(
             Side::Sell,
@@ -4325,7 +4356,7 @@ mod tests {
         );
         assert!(matches!(
             trailing_stop_limit,
-            Err(BuildOrderError::Unsupported)
+            Err(BuildOrderError::Unsupported(Unclassified::OrderKind))
         ));
 
         // Only read back from a venue, never placed.
@@ -4339,7 +4370,10 @@ mod tests {
             gtc(),
             MarginEffect::Borrow,
         );
-        assert!(matches!(unresolved, Err(BuildOrderError::Unsupported)));
+        assert!(matches!(
+            unresolved,
+            Err(BuildOrderError::Unsupported(Unclassified::OrderKind))
+        ));
     }
 
     /// An offset that is not a whole number of basis points is refused, not rounded.
@@ -6881,6 +6915,61 @@ mod tests {
             .await;
         let client = margin_client_at(&server, false);
         assert_eq!(client.load_rules(&[]).await, Ok(HashMap::new()));
+    }
+
+    /// A time in force Binance does not take for the order is refused with
+    /// `UnsupportedTimeInForce` before any request, rather than dropped.
+    #[tokio::test]
+    async fn a_time_in_force_binance_does_not_take_is_refused_unsent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        for (kind, time_in_force) in [
+            (
+                OrderKind::Limit,
+                TimeInForce::GoodTillDate {
+                    expiry: chrono::DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+                },
+            ),
+            (OrderKind::Market, TimeInForce::AtOpen),
+            (
+                OrderKind::TakeProfit {
+                    trigger_price: Decimal::from(150),
+                },
+                TimeInForce::GoodUntilCancelled { post_only: true },
+            ),
+            (
+                OrderKind::Stop {
+                    trigger_price: Decimal::from(150),
+                },
+                TimeInForce::FillOrKill,
+            ),
+        ] {
+            let mut request = margin_open_request(&btcusdt, "tif");
+            request.state.kind = kind;
+            request.state.time_in_force = time_in_force;
+            if kind != OrderKind::Limit {
+                request.state.price = None;
+            }
+
+            let refused = client.open_order(request).await;
+
+            assert!(
+                matches!(
+                    refused.state,
+                    OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedTimeInForce { time_in_force: tif, .. }
+                    )) if tif == time_in_force
+                ),
+                "{refused:?}"
+            );
+        }
     }
 
     /// A cross account refuses a trailing `STOP_LOSS` with `-3111`. The order fails as

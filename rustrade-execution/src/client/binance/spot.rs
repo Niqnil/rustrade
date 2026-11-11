@@ -47,8 +47,8 @@ use super::restatement::{
 use super::rules::RulesLoader;
 use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
-    AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
+    AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
+    BinanceTimeInForce, CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
     FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
     ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SharedDedupCache, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame,
@@ -83,7 +83,8 @@ use crate::{
     },
     margin::MarginEffect,
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
+        Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
+        UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{
             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
@@ -441,6 +442,23 @@ impl std::fmt::Debug for BinanceSpot {
 }
 
 impl BinanceSpot {
+    /// The time in force this client takes: `GoodUntilCancelled` and `ImmediateOrCancel` on every
+    /// order kind, `post_only` only on a limit order (sent as `LIMIT_MAKER`), and `FillOrKill`
+    /// only on a limit-priced order (limit, stop-limit, take-profit-limit or fixed-limit trailing
+    /// stop). It refuses any other with [`OrderError::UnsupportedTimeInForce`] before sending the
+    /// order.
+    ///
+    /// A market, stop, take-profit or trailing order goes out without a `timeInForce`, since
+    /// Binance takes none for them: it works on arrival, or rests until triggered and then works
+    /// as a market order, which fills what it can and expires the rest. So it could take
+    /// liquidity or fill in part, and is refused with `post_only` or `FillOrKill`.
+    ///
+    /// A simulated venue standing in for Binance Spot can take this set as its rule for `Spot`
+    /// instruments, through [`TimeInForceRules`](crate::client::mock::TimeInForceRules). That rule
+    /// is per instrument kind, so the simulated venue still takes `post_only` and `FillOrKill` on
+    /// the order kinds this client refuses them on.
+    pub const TIME_IN_FORCE: &'static [TimeInForceKind] = BINANCE_TIME_IN_FORCE;
+
     /// Load the order rules of `instruments` from Binance now, and hold them for
     /// [`open_order`](ExecutionClient::open_order) to check against.
     ///
@@ -1540,6 +1558,22 @@ impl ExecutionClient for BinanceSpot {
             };
         }
 
+        // A kind or time in force Binance does not take is refused before any request.
+        let fields = match SpotOrderFields::new(kind, time_in_force, price) {
+            Ok(fields) => fields,
+            Err(refused) => {
+                return Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(refused),
+                };
+            }
+        };
+
         if let Err(refused) = self
             .rules
             .check(instrument.name(), side, kind, price, quantity)
@@ -1576,20 +1610,6 @@ impl ExecutionClient for BinanceSpot {
             Side::Sell => OrderPlaceSideEnum::Sell,
         };
 
-        let fields = match SpotOrderFields::new(kind, time_in_force, price) {
-            Ok(fields) => fields,
-            Err(refused) => {
-                return Order {
-                    key: order_key,
-                    side,
-                    price,
-                    quantity,
-                    kind,
-                    time_in_force,
-                    state: OrderState::inactive(refused),
-                };
-            }
-        };
         let (binance_type, binance_tif) = place_enums(fields.order_type, fields.time_in_force);
 
         // market BUY sends base quantity, not quoteOrderQty. Callers must
@@ -2921,8 +2941,9 @@ fn convert_account_position(
 
 /// Convert rustrade OrderKind + TimeInForce to Binance SDK order type and TIF.
 ///
-/// Returns `None` for unsupported combinations, which `open_order` converts to
-/// `UnsupportedOrderType` rejection.
+/// Returns `None` for what `SpotOrderFields::new` refuses. `open_order` refuses a time in force
+/// Binance does not take with `UnsupportedTimeInForce`, and an order kind with
+/// `UnsupportedOrderType`.
 ///
 /// # Conditional Orders
 ///
@@ -2942,9 +2963,9 @@ fn convert_account_position(
 /// - `Percentage`: converted to basis points (multiplied by 100)
 ///
 /// **Unsupported:**
-/// - `Absolute`: returns `None` → `UnsupportedOrderType`. The caller (`open_order`)
-///   must surface this so end users can convert absolute offsets to basis points
-///   themselves: `basis_points = (absolute / price) * 10000`
+/// - `Absolute`: returns `None`; `open_order` refuses it with `UnsupportedOrderType`, so end
+///   users can convert absolute offsets to basis points themselves:
+///   `basis_points = (absolute / price) * 10000`
 /// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
 ///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
 ///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
@@ -2955,8 +2976,8 @@ fn convert_order_kind_tif(
     tif: TimeInForce,
 ) -> Option<(OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>)> {
     // Through the same functions as `open_order`, so these tests read what it sends. The
-    // decision logic (which kind/TIF combinations Binance supports, GTD coercion,
-    // trailing-offset handling) lives in the shared classifier so spot and margin share it.
+    // decision logic (which kind/TIF combinations Binance supports, trailing-offset handling)
+    // lives in the shared classifier so spot and margin share it.
     let price = Some(Decimal::ONE);
     let fields = SpotOrderFields::new(kind, tif, price).ok()?;
     Some(place_enums(fields.order_type, fields.time_in_force))
@@ -2977,18 +2998,16 @@ impl SpotOrderFields {
     /// The fields of an order of `kind`, `time_in_force` and limit `price`.
     ///
     /// # Errors
-    /// [`OrderError::UnsupportedOrderType`] for a kind and time in force Binance Spot does not
-    /// take, and the error of a trailing order that cannot be sent as asked.
+    /// [`OrderError::UnsupportedTimeInForce`] for a time in force Binance Spot does not take for
+    /// `kind` (see [`BinanceSpot::TIME_IN_FORCE`]), [`OrderError::UnsupportedOrderType`] for a
+    /// kind it does not take, and the error of a trailing order that cannot be sent as asked.
     pub(super) fn new(
         kind: OrderKind,
         time_in_force: TimeInForce,
         price: Option<Decimal>,
     ) -> Result<Self, UnindexedOrderError> {
-        let Some((order_type, time_in_force)) = classify_order_kind_tif(kind, time_in_force) else {
-            return Err(OrderError::UnsupportedOrderType(format!(
-                "Binance Spot does not yet support OrderKind::{kind:?}"
-            )));
-        };
+        let (order_type, time_in_force) = classify_order_kind_tif(kind, time_in_force)
+            .map_err(|refused| refused.into_order_error("Binance Spot", kind, time_in_force))?;
         let mut fields = Self {
             order_type,
             time_in_force,
@@ -3130,6 +3149,82 @@ mod tests {
                     OrderState::Inactive(InactiveOrderState::OpenFailed(
                         OrderError::UnsupportedMarginEffect(refused)
                     )) if refused == effect
+                ),
+                "{order:?}"
+            );
+        }
+    }
+
+    /// A time in force Binance does not take for the order is refused with
+    /// `UnsupportedTimeInForce` before any request, rules load included, rather than dropped.
+    #[tokio::test]
+    async fn open_order_refuses_a_time_in_force_binance_does_not_take_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            order::{request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        for (kind, price, time_in_force) in [
+            (
+                OrderKind::Limit,
+                Some(Decimal::from(50_000)),
+                TimeInForce::GoodUntilEndOfDay,
+            ),
+            (
+                OrderKind::Market,
+                None,
+                TimeInForce::GoodUntilCancelled { post_only: true },
+            ),
+            (
+                OrderKind::Stop {
+                    trigger_price: Decimal::from(40_000),
+                },
+                None,
+                TimeInForce::AtClose,
+            ),
+            (OrderKind::Market, None, TimeInForce::FillOrKill),
+        ] {
+            let order = client
+                .open_order(OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("cid"),
+                    ),
+                    state: RequestOpen::new(Side::Buy, price, Decimal::ONE, kind, time_in_force),
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedTimeInForce { time_in_force: refused, .. }
+                    )) if refused == time_in_force
                 ),
                 "{order:?}"
             );
@@ -3546,8 +3641,8 @@ mod tests {
                 Some(OrderPlaceTimeInForceEnum::Ioc)
             ))
         ));
-        // GoodUntilEndOfDay is unsupported on Binance (no native EOD order) — surfaced as
-        // unsupported rather than silently coerced to GTC, which would drop the EOD semantics.
+        // GoodUntilEndOfDay is not taken on Binance (no native EOD order): refused rather than
+        // coerced to GTC, which would drop the EOD semantics.
         assert!(convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay).is_none());
     }
 

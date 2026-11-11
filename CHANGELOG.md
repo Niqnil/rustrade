@@ -279,6 +279,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
     argument.
 
+- **Breaking: the Binance and IBKR clients refuse a time in force they cannot send with
+  `OrderError::UnsupportedTimeInForce`** (`rustrade-execution`, #923).
+  - **`BinanceSpot` and `BinanceMargin` take `GoodUntilCancelled` and `ImmediateOrCancel` on
+    every order kind, post-only on a limit order alone** (sent as `LIMIT_MAKER`), **and
+    `FillOrKill` on a limit-priced order alone** (limit, stop-limit, take-profit-limit or
+    fixed-limit trailing stop). They refuse anything else before any request. The set is
+    `BinanceSpot::TIME_IN_FORCE` (also `BinanceMargin::TIME_IN_FORCE`). A simulated venue
+    standing in for Binance can take it as its `Spot` rule (a rule per instrument kind cannot
+    limit post-only or `FillOrKill` to some order kinds).
+  - **No time in force is dropped any more.** A market, stop, take-profit or trailing order
+    carries no `timeInForce` to Binance and works as a market order, which can fill in part.
+    Sent with `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen`, `AtClose`, post-only or
+    `FillOrKill`, it used to go out without it. A post-only market order took liquidity, a
+    `FillOrKill` one could fill in part, and a `GoodTillDate` stop never expired. Such an order
+    is now refused.
+  - The Binance refusals that were `OrderError::UnsupportedOrderType` for a limit-priced order's
+    time in force are now `UnsupportedTimeInForce`.
+  - `BinanceSpot` checks the order kind and time in force before loading the symbol's rules or
+    connecting, so such a refusal costs no request.
+  - `IbkrClient`: post-only, `AtClose` on an order other than a market or limit order, and an
+    `AtClose` bracket were `OrderError::Rejected(ApiError::OrderRejected(..))`.
+    `OrderMappingError::into_order_error` gives the error for a mapping failure.
+
 - **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`,
   #917). A struct literal must set it (`None` to hold every long to expiry), and
   `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as

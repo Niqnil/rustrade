@@ -29,6 +29,17 @@
 //!   [`PreSendRules::Off`](crate::rules::PreSendRules::Off) to send every order and leave the
 //!   rules to Binance, for when the loaded rules could be out of date.
 //!
+//! # Time in force
+//! [`BinanceSpot`] and [`BinanceMargin`] take `GoodUntilCancelled` and `ImmediateOrCancel` on
+//! every order kind, `post_only` on a limit order alone, which goes out as `LIMIT_MAKER`, and
+//! `FillOrKill` on a limit-priced order alone ([`BinanceSpot::TIME_IN_FORCE`]). They refuse any
+//! other unsent with
+//! [`OrderError::UnsupportedTimeInForce`](crate::error::OrderError::UnsupportedTimeInForce),
+//! rather than drop it: a market, stop, take-profit or trailing order carries no `timeInForce` to
+//! Binance and works as a market order, which fills what it can and expires the rest. So
+//! `GoodUntilEndOfDay`, `GoodTillDate`, `AtOpen` or `AtClose` would otherwise be lost, and
+//! `post_only` or `FillOrKill` broken.
+//!
 //! # Every fill on the account is delivered
 //!
 //! Both clients' account streams report every fill on the account, whoever placed the order:

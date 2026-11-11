@@ -28,8 +28,8 @@ use crate::{
     },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
-        ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
-        UnindexedInactiveOrder, UnindexedOrderKey,
+        ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
+        TrailingOffsetType, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::UnindexedOrderResponseCancel,
         state::{
@@ -3834,120 +3834,154 @@ pub(crate) enum BinanceTimeInForce {
     Fok,
 }
 
+/// The time in force the Binance spot and margin clients take. `PostOnly` only on a limit order,
+/// which goes out as `LIMIT_MAKER`, and `FillOrKill` only on a limit-priced order (limit,
+/// stop-limit, take-profit-limit or fixed-limit trailing stop).
+pub(crate) const BINANCE_TIME_IN_FORCE: &[TimeInForceKind] = &[
+    TimeInForceKind::GoodUntilCancelled,
+    TimeInForceKind::PostOnly,
+    TimeInForceKind::ImmediateOrCancel,
+    TimeInForceKind::FillOrKill,
+];
+
+/// Why the time in force is refused when it is not in [`BINANCE_TIME_IN_FORCE`].
+const TIME_IN_FORCE_NOT_TAKEN: &str = "Binance takes only GoodUntilCancelled, ImmediateOrCancel \
+     or FillOrKill, and post_only only on a limit order";
+
+/// Why `post_only` is refused on any kind but a limit order.
+const POST_ONLY_LIMIT_ONLY: &str = "Binance takes post_only only on a limit order (LIMIT_MAKER)";
+
+/// Why `FillOrKill` is refused on an order kind that carries no `timeInForce`.
+const FILL_OR_KILL_LIMIT_PRICED_ONLY: &str = "Binance takes FillOrKill only on a limit-priced \
+     order: a market, stop, take-profit or trailing order carries no timeInForce and can fill in \
+     part";
+
+/// Why [`classify_order_kind_tif`] cannot send an order to Binance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unclassified {
+    /// Binance does not take the order's time in force for its kind, for the reason given.
+    TimeInForce(&'static str),
+    /// Binance does not take the order kind.
+    OrderKind,
+}
+
+impl Unclassified {
+    /// The error `client` answers an order of `kind` and `time_in_force` with.
+    pub(crate) fn into_order_error(
+        self,
+        client: &str,
+        kind: OrderKind,
+        time_in_force: TimeInForce,
+    ) -> UnindexedOrderError {
+        match self {
+            Self::TimeInForce(reason) => {
+                OrderError::unsupported_time_in_force(time_in_force, reason)
+            }
+            Self::OrderKind => OrderError::UnsupportedOrderType(format!(
+                "{client} does not support OrderKind::{kind:?}"
+            )),
+        }
+    }
+}
+
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
 ///
-/// Returns `None` for combinations Binance does not support (so callers surface
-/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`] and
-/// `TrailingStopFixedLimit` to [`BinanceOrderType::StopLossLimit`], to which the caller adds a
-/// `trailingDelta` from [`trailing_delta_basis_points`] and an activation price as `stopPrice`.
-/// `TrailingStopLimit` classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit
-/// price fixed while the stop trails, where `TrailingStopLimit`'s limit follows the stop.
-/// `ConditionalUnresolved`, which is only read back, classifies to `None` too.
+/// Refuses a time in force outside [`BINANCE_TIME_IN_FORCE`] whatever the kind, rather than
+/// dropping it. A market, stop, take-profit or trailing order goes out with no `timeInForce`,
+/// since Binance takes none for them: a market order works on arrival, and a stop or take-profit
+/// rests until triggered and then works as a market order, which fills what it can and expires
+/// the rest. That is what `GoodUntilCancelled` and `ImmediateOrCancel` allow, so they are taken.
+/// `post_only` and `FillOrKill` are not, since such an order could take liquidity or fill in part,
+/// so both are refused on those kinds: `post_only` is taken on a limit order alone, and
+/// `FillOrKill` on a limit-priced one.
+///
+/// `TrailingStop` classifies to [`BinanceOrderType::StopLoss`] and `TrailingStopFixedLimit` to
+/// [`BinanceOrderType::StopLossLimit`], to which the caller adds a `trailingDelta` from
+/// [`trailing_delta_basis_points`] and an activation price as `stopPrice`. `TrailingStopLimit` is
+/// refused: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while the stop
+/// trails, where `TrailingStopLimit`'s limit follows the stop. `ConditionalUnresolved`, which is
+/// only read back, is refused too.
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
-) -> Option<(BinanceOrderType, Option<BinanceTimeInForce>)> {
+) -> Result<(BinanceOrderType, Option<BinanceTimeInForce>), Unclassified> {
+    // A kind Binance never takes is refused as a kind before its time in force is looked at, so
+    // the refusal names what has to change. Each taken kind reads the time in force only in its
+    // own arm.
+    let with_tif = |order_type| {
+        wire_time_in_force(tif)?
+            .map(|wire_tif| (order_type, Some(wire_tif)))
+            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
+    };
+    let without_tif = |order_type| match tif {
+        TimeInForce::FillOrKill => Err(Unclassified::TimeInForce(FILL_OR_KILL_LIMIT_PRICED_ONLY)),
+        _ => wire_time_in_force(tif)?
+            .map(|_| (order_type, None))
+            .ok_or(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY)),
+    };
+
     match kind {
-        OrderKind::Market => Some((BinanceOrderType::Market, None)),
-        OrderKind::Limit => match tif {
-            TimeInForce::GoodUntilCancelled { post_only: false } => {
-                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Gtc)))
-            }
-            TimeInForce::GoodUntilCancelled { post_only: true } => {
-                // LIMIT_MAKER is Binance's post-only order type (rejects if
-                // it would immediately match as taker)
-                Some((BinanceOrderType::LimitMaker, None))
-            }
-            TimeInForce::FillOrKill => {
-                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Fok)))
-            }
-            TimeInForce::ImmediateOrCancel => {
-                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Ioc)))
-            }
-            // Binance does not support GTD (good-til-end-of-day), GTC-until-date, MOO, or MOC.
-            // Surface as unsupported rather than silently coercing — these have venue-specific
-            // semantics (e.g. an end-of-day auto-cancel) that a GTC coercion would silently drop,
-            // risking an unintended resting/overnight order.
-            TimeInForce::GoodUntilEndOfDay
-            | TimeInForce::GoodTillDate { .. }
-            | TimeInForce::AtOpen
-            | TimeInForce::AtClose => {
-                warn!(time_in_force = ?tif, "Binance does not support this TimeInForce");
-                None
-            }
-        },
+        OrderKind::Limit => Ok(match wire_time_in_force(tif)? {
+            Some(wire_tif) => (BinanceOrderType::Limit, Some(wire_tif)),
+            // LIMIT_MAKER is Binance's post-only order type (rejects if it would immediately
+            // match as taker).
+            None => (BinanceOrderType::LimitMaker, None),
+        }),
+        OrderKind::Market => without_tif(BinanceOrderType::Market),
         // Conditional orders: stop_price/trailing_delta set separately by the caller.
-        OrderKind::Stop { .. } => Some((BinanceOrderType::StopLoss, None)),
+        OrderKind::Stop { .. } => without_tif(BinanceOrderType::StopLoss),
+        OrderKind::TakeProfit { .. } => without_tif(BinanceOrderType::TakeProfit),
         OrderKind::TrailingStopFixedLimit {
             offset_type: TrailingOffsetType::Absolute,
             ..
         } => {
             warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
-            None
+            Err(Unclassified::OrderKind)
         }
         // A fixed-limit trailing stop is a STOP_LOSS_LIMIT with a trailingDelta, so it takes the
         // time in force a stop-limit order does.
-        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => match tif {
-            // StopLimit requires TIF like regular Limit orders.
-            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
-                BinanceOrderType::StopLossLimit,
-                Some(BinanceTimeInForce::Gtc),
-            )),
-            TimeInForce::FillOrKill => Some((
-                BinanceOrderType::StopLossLimit,
-                Some(BinanceTimeInForce::Fok),
-            )),
-            TimeInForce::ImmediateOrCancel => Some((
-                BinanceOrderType::StopLossLimit,
-                Some(BinanceTimeInForce::Ioc),
-            )),
-            _ => {
-                warn!(time_in_force = ?tif, "Binance StopLimit does not support this TimeInForce");
-                None
-            }
-        },
-        OrderKind::TakeProfit { .. } => Some((BinanceOrderType::TakeProfit, None)),
-        OrderKind::TakeProfitLimit { .. } => match tif {
-            // TakeProfitLimit requires TIF like regular Limit orders.
-            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
-                BinanceOrderType::TakeProfitLimit,
-                Some(BinanceTimeInForce::Gtc),
-            )),
-            TimeInForce::FillOrKill => Some((
-                BinanceOrderType::TakeProfitLimit,
-                Some(BinanceTimeInForce::Fok),
-            )),
-            TimeInForce::ImmediateOrCancel => Some((
-                BinanceOrderType::TakeProfitLimit,
-                Some(BinanceTimeInForce::Ioc),
-            )),
-            _ => {
-                warn!(time_in_force = ?tif, "Binance TakeProfitLimit does not support this TimeInForce");
-                None
-            }
-        },
+        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => {
+            with_tif(BinanceOrderType::StopLossLimit)
+        }
+        OrderKind::TakeProfitLimit { .. } => with_tif(BinanceOrderType::TakeProfitLimit),
         // TrailingStop: Binance uses STOP_LOSS with a trailingDelta parameter. Only
         // BasisPoints and Percentage are supported; Absolute requires manual conversion by
         // the caller: basis_points = (absolute / price) * 10000.
         OrderKind::TrailingStop { offset_type, .. } => match offset_type {
             TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => {
-                Some((BinanceOrderType::StopLoss, None))
+                without_tif(BinanceOrderType::StopLoss)
             }
             TrailingOffsetType::Absolute => {
                 warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
-                None
+                Err(Unclassified::OrderKind)
             }
         },
         // Binance's trailing STOP_LOSS_LIMIT has a fixed limit price, not one that follows the
         // stop as TrailingStopLimit's does: that is TrailingStopFixedLimit.
         OrderKind::TrailingStopLimit { .. } => {
             warn!("Binance does not support TrailingStopLimit orders");
-            None
+            Err(Unclassified::OrderKind)
         }
         OrderKind::ConditionalUnresolved { .. } => {
             warn!("an unresolved order kind is only read back from a venue, never placed");
-            None
+            Err(Unclassified::OrderKind)
         }
+    }
+}
+
+/// Binance's `timeInForce` for `tif`, for a kind that sends one; `None` for `post_only`, which
+/// only a limit order carries, as its order type. A time in force outside
+/// [`BINANCE_TIME_IN_FORCE`] is refused.
+fn wire_time_in_force(tif: TimeInForce) -> Result<Option<BinanceTimeInForce>, Unclassified> {
+    match tif {
+        TimeInForce::GoodUntilCancelled { post_only: false } => Ok(Some(BinanceTimeInForce::Gtc)),
+        TimeInForce::GoodUntilCancelled { post_only: true } => Ok(None),
+        TimeInForce::ImmediateOrCancel => Ok(Some(BinanceTimeInForce::Ioc)),
+        TimeInForce::FillOrKill => Ok(Some(BinanceTimeInForce::Fok)),
+        TimeInForce::GoodUntilEndOfDay
+        | TimeInForce::GoodTillDate { .. }
+        | TimeInForce::AtOpen
+        | TimeInForce::AtClose => Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN)),
     }
 }
 
@@ -4354,6 +4388,194 @@ mod tests {
     use super::*;
     use crate::client::reconnect_budget::BackoffLimits;
     use futures::FutureExt as _;
+
+    /// Every time in force outside the set is refused whatever the kind, `post_only` on every kind
+    /// but a limit order, and the kinds that send no `timeInForce` take the rest of the set: none
+    /// is dropped on the way to Binance.
+    #[test]
+    fn a_time_in_force_is_taken_from_the_set_or_refused_whatever_the_kind() {
+        use rust_decimal_macros::dec;
+
+        let price = dec!(100);
+        let trailing = |offset_type| OrderKind::TrailingStop {
+            offset: dec!(25),
+            offset_type,
+            activation_price: None,
+        };
+        // Every kind Binance takes, and what each sends when its time in force is taken.
+        let kinds = [
+            (OrderKind::Market, BinanceOrderType::Market, false),
+            (OrderKind::Limit, BinanceOrderType::Limit, true),
+            (
+                OrderKind::Stop {
+                    trigger_price: price,
+                },
+                BinanceOrderType::StopLoss,
+                false,
+            ),
+            (
+                OrderKind::StopLimit {
+                    trigger_price: price,
+                },
+                BinanceOrderType::StopLossLimit,
+                true,
+            ),
+            (
+                OrderKind::TakeProfit {
+                    trigger_price: price,
+                },
+                BinanceOrderType::TakeProfit,
+                false,
+            ),
+            (
+                OrderKind::TakeProfitLimit {
+                    trigger_price: price,
+                },
+                BinanceOrderType::TakeProfitLimit,
+                true,
+            ),
+            (
+                trailing(TrailingOffsetType::BasisPoints),
+                BinanceOrderType::StopLoss,
+                false,
+            ),
+            (
+                trailing(TrailingOffsetType::Percentage),
+                BinanceOrderType::StopLoss,
+                false,
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
+                },
+                BinanceOrderType::StopLossLimit,
+                true,
+            ),
+        ];
+        let taken = [
+            (
+                TimeInForce::GoodUntilCancelled { post_only: false },
+                BinanceTimeInForce::Gtc,
+            ),
+            (TimeInForce::ImmediateOrCancel, BinanceTimeInForce::Ioc),
+            (TimeInForce::FillOrKill, BinanceTimeInForce::Fok),
+        ];
+        let not_taken = [
+            TimeInForce::GoodUntilEndOfDay,
+            TimeInForce::GoodTillDate {
+                expiry: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+            },
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+        ];
+        let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
+
+        for (kind, order_type, sends_tif) in kinds {
+            for (tif, wire) in taken {
+                // A kind with no `timeInForce` works as a market order, which can fill in part.
+                let expected = if sends_tif {
+                    Ok((order_type, Some(wire)))
+                } else if tif == TimeInForce::FillOrKill {
+                    Err(Unclassified::TimeInForce(FILL_OR_KILL_LIMIT_PRICED_ONLY))
+                } else {
+                    Ok((order_type, None))
+                };
+                assert_eq!(
+                    classify_order_kind_tif(kind, tif),
+                    expected,
+                    "{kind:?} {tif:?}"
+                );
+            }
+            for tif in not_taken {
+                assert!(!BINANCE_TIME_IN_FORCE.contains(&tif.kind()), "{tif:?}");
+                assert_eq!(
+                    classify_order_kind_tif(kind, tif),
+                    Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN)),
+                    "{kind:?} {tif:?}"
+                );
+            }
+            let expected = if kind == OrderKind::Limit {
+                Ok((BinanceOrderType::LimitMaker, None))
+            } else {
+                Err(Unclassified::TimeInForce(POST_ONLY_LIMIT_ONLY))
+            };
+            assert_eq!(
+                classify_order_kind_tif(kind, post_only),
+                expected,
+                "{kind:?}"
+            );
+        }
+        // A kind Binance never takes is refused as a kind, whatever its time in force.
+        let refused_kinds = [
+            trailing(TrailingOffsetType::Absolute),
+            OrderKind::TrailingStopFixedLimit {
+                offset: dec!(25),
+                offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
+            },
+            OrderKind::TrailingStopLimit {
+                offset: dec!(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                stop_price: price,
+                limit_offset: dec!(1),
+            },
+            OrderKind::ConditionalUnresolved {
+                family: ConditionalFamily::StopLimit,
+                trigger_price: Some(price),
+            },
+        ];
+        let every_tif = taken
+            .map(|(tif, _)| tif)
+            .into_iter()
+            .chain(not_taken)
+            .chain([post_only]);
+        for kind in refused_kinds {
+            for tif in every_tif.clone() {
+                assert_eq!(
+                    classify_order_kind_tif(kind, tif),
+                    Err(Unclassified::OrderKind),
+                    "{kind:?} {tif:?}"
+                );
+            }
+        }
+        for (tif, _) in taken {
+            assert!(BINANCE_TIME_IN_FORCE.contains(&tif.kind()), "{tif:?}");
+        }
+        assert!(BINANCE_TIME_IN_FORCE.contains(&post_only.kind()));
+        assert_eq!(BINANCE_TIME_IN_FORCE.len(), 4);
+    }
+
+    /// A refused time in force becomes `UnsupportedTimeInForce` naming it, and a refused kind
+    /// `UnsupportedOrderType` naming the client and the kind.
+    #[test]
+    fn a_refusal_becomes_the_error_for_what_was_refused() {
+        let tif = TimeInForce::AtClose;
+        assert_eq!(
+            Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN).into_order_error(
+                "Binance Spot",
+                OrderKind::Market,
+                tif
+            ),
+            OrderError::unsupported_time_in_force(tif, TIME_IN_FORCE_NOT_TAKEN)
+        );
+        let refused = Unclassified::OrderKind.into_order_error(
+            "BinanceMargin",
+            OrderKind::Stop {
+                trigger_price: Decimal::ONE,
+            },
+            tif,
+        );
+        assert!(
+            matches!(
+                &refused,
+                OrderError::UnsupportedOrderType(msg)
+                    if msg.starts_with("BinanceMargin does not support OrderKind::Stop")
+            ),
+            "{refused:?}"
+        );
+    }
 
     /// Both clients' rustdoc state the REST balance lag allowance as a number, since public docs
     /// cannot link the crate-private constant. Change it only together with those docs.

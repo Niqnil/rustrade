@@ -1,7 +1,10 @@
-use crate::order::{
-    Order as RustradeOrder, OrderKind, TimeInForce, TrailingOffsetType,
-    id::{ClientOrderId, StrategyId},
-    state::UnindexedOrderState,
+use crate::{
+    error::{ApiError, OrderError, UnindexedOrderError},
+    order::{
+        Order as RustradeOrder, OrderKind, TimeInForce, TrailingOffsetType,
+        id::{ClientOrderId, StrategyId},
+        state::UnindexedOrderState,
+    },
 };
 use fnv::{FnvHashMap, FnvHashSet};
 use ibapi::orders::{
@@ -744,6 +747,33 @@ impl std::fmt::Display for OrderMappingError {
     }
 }
 
+impl OrderMappingError {
+    /// The error an order with `time_in_force` is refused with, unsent, for this mapping failure.
+    ///
+    /// [`OrderError::UnsupportedTimeInForce`] for a time in force this client cannot send for the
+    /// order: `post_only`, or `AtClose` on a kind other than market or limit. Every other failure
+    /// is [`OrderError::Rejected`] with this error's message.
+    pub fn into_order_error(self, time_in_force: TimeInForce) -> UnindexedOrderError {
+        match self {
+            Self::PostOnlyNotSupported
+            | Self::UnsupportedOrderKindForAtClose(_)
+            | Self::AtCloseRequiresOrderTypeChange => {
+                OrderError::unsupported_time_in_force(time_in_force, self.to_string())
+            }
+            Self::InvalidPrice(_)
+            | Self::MissingLimitPrice(_)
+            | Self::UnexpectedLimitPrice(_)
+            | Self::NonPositiveStopPrice(_)
+            | Self::UnsupportedOffsetType(_)
+            | Self::UnsupportedOrderKind(_)
+            | Self::InvalidBracketPrices(_)
+            | Self::InvalidClientOrderId(_) => {
+                OrderError::Rejected(ApiError::OrderRejected(self.to_string()))
+            }
+        }
+    }
+}
+
 /// The longest order reference IB echoes back whole, verified on paper. The client order id
 /// travels there, so it is limited to this.
 pub const MAX_ORDER_REF_LEN: usize = 128;
@@ -847,8 +877,12 @@ fn require_limit_price(
 ///
 /// - `AtClose` + `Market` → IB "MOC" (Market-on-Close)
 /// - `AtClose` + `Limit` → IB "LOC" (Limit-on-Close)
-/// - `AtClose` + Stop/Trailing → Error (not supported by IBKR)
+/// - `AtClose` + Stop/Trailing → `Err(UnsupportedOrderKindForAtClose)`
 /// - `GoodTillDate` → Sets both TIF and `good_till_date` field
+/// - `post_only` → `Err(PostOnlyNotSupported)`
+///
+/// [`OrderMappingError::into_order_error`] turns both refusals into
+/// [`OrderError::UnsupportedTimeInForce`].
 pub fn build_ib_order(
     side: rustrade_instrument::Side,
     quantity: f64,
@@ -1107,6 +1141,52 @@ pub fn build_ib_bracket_with_oca(
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+
+    /// A time in force the client cannot send for the order is refused as
+    /// `UnsupportedTimeInForce` naming it, not as a venue rejection; other mapping failures stay
+    /// `Rejected`.
+    #[test]
+    fn a_time_in_force_ib_cannot_take_is_refused_as_unsupported() {
+        let refusal = |kind: OrderKind, price: Option<Decimal>, tif: TimeInForce| {
+            build_ib_order(rustrade_instrument::Side::Buy, 1.0, &kind, price, &tif)
+                .map(|_| ())
+                .map_err(|e| e.into_order_error(tif))
+        };
+        let unsupported = |tif: TimeInForce, result: Result<(), UnindexedOrderError>| {
+            matches!(
+                result,
+                Err(OrderError::UnsupportedTimeInForce { time_in_force, .. })
+                    if time_in_force == tif
+            )
+        };
+
+        let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
+        assert!(unsupported(
+            post_only,
+            refusal(OrderKind::Limit, Some(Decimal::ONE), post_only)
+        ));
+        let stop = OrderKind::Stop {
+            trigger_price: Decimal::ONE,
+        };
+        assert!(unsupported(
+            TimeInForce::AtClose,
+            refusal(stop, None, TimeInForce::AtClose)
+        ));
+        // The bracket path maps the time in force alone.
+        assert!(unsupported(
+            TimeInForce::AtClose,
+            time_in_force_to_ib(&TimeInForce::AtClose)
+                .map(|_| ())
+                .map_err(|e| e.into_order_error(TimeInForce::AtClose))
+        ));
+
+        let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+        assert!(matches!(
+            refusal(OrderKind::Limit, None, gtc),
+            Err(OrderError::Rejected(ApiError::OrderRejected(_)))
+        ));
+        assert_eq!(refusal(OrderKind::Limit, Some(Decimal::ONE), gtc), Ok(()));
+    }
 
     fn test_context() -> OrderContext {
         OrderContext {
