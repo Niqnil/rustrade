@@ -1664,8 +1664,8 @@ fn collateral_worth_no_more_than_its_ticket_is_not_sold() {
         assert_eq!(filled_trade(&sold).fees.fees, d("10"));
 
         // At most 10 of BTC and 1,490 USDT against 2,000 of ETH owed: a margin level of at most
-        // 0.75. Buying the ETH back costs 2,010, so at least 510 is to be raised, and all the BTC
-        // would sell for at most 10, less a ticket of 10.
+        // 0.75. Buying the ETH back costs 2,010, so 520 is to be raised, and all the BTC would
+        // sell for at most 10, less a ticket of 10.
         let (events, _) = warnings(|| eth_tick(&mut venue, "2000", 2));
 
         let legs = traded_legs(&events);
