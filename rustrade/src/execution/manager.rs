@@ -825,14 +825,20 @@ where
                             Self::index_request(&self.indexer, open, "open");
                         });
                         // Armed only if the group goes as one venue request now; otherwise each
-                        // open is armed when it is sent, once the cancels are answered.
-                        let opens = group.opens.clone();
+                        // open is armed when it is sent, once the cancels are answered. The send
+                        // takes the group, so keep the timed opens: only those arm.
+                        let timed: Vec<_> = group
+                            .opens
+                            .iter()
+                            .filter(|open| open.state.cancel_after.is_some())
+                            .cloned()
+                            .collect();
                         let group = match Self::send_cancel_replace(
                             &self.client, &self.indexer, self.request_timeout, group,
                         ) {
                             Ok(cancel_replace) => {
                                 let sent = Instant::now();
-                                opens.iter().for_each(|open| deadlines.arm(open, sent));
+                                timed.iter().for_each(|open| deadlines.arm(open, sent));
                                 in_flight_cancel_replaces.push(cancel_replace);
                                 continue;
                             }

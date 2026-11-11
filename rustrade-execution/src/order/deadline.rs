@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 pub struct OrderDeadline<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
     /// The order whose time ran out.
     pub key: OrderKey<ExchangeKey, InstrumentKey>,
-    /// When it ran out: the instant the open was sent plus its `cancel_after`, on the driver's
-    /// clock (simulated time in a simulation).
+    /// When the driver reported it, on the driver's clock. Live, that is the clock's reading when
+    /// the timer fired, at or after the instant the open was sent plus its `cancel_after`. In a
+    /// simulation, it is that instant exactly, or the open's arrival at the venue if the
+    /// `cancel_after` is shorter than the trip there.
     pub deadline: DateTime<Utc>,
 }
