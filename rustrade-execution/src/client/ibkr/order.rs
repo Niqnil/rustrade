@@ -750,9 +750,15 @@ impl std::fmt::Display for OrderMappingError {
 impl OrderMappingError {
     /// The error an order with `time_in_force` is refused with, unsent, for this mapping failure.
     ///
-    /// [`OrderError::UnsupportedTimeInForce`] for a time in force this client cannot send for the
-    /// order: `post_only`, or `AtClose` on a kind other than market or limit. Every other failure
-    /// is [`OrderError::Rejected`] with this error's message.
+    /// - [`OrderError::UnsupportedTimeInForce`] for a time in force this client cannot send for
+    ///   the order: `post_only`, or `AtClose` on a kind other than market or limit.
+    /// - [`OrderError::UnsupportedOrderType`] for an order kind IB has no order type for
+    ///   ([`UnsupportedOrderKind`](Self::UnsupportedOrderKind)), or a trailing offset type it
+    ///   cannot express ([`UnsupportedOffsetType`](Self::UnsupportedOffsetType)).
+    /// - [`OrderError::Rejected`] with this error's message for every other failure, which is
+    ///   about the request's values rather than its order type or time in force.
+    ///
+    /// Each carries this error's message as its reason.
     pub fn into_order_error(self, time_in_force: TimeInForce) -> UnindexedOrderError {
         match self {
             Self::PostOnlyNotSupported
@@ -760,12 +766,13 @@ impl OrderMappingError {
             | Self::AtCloseRequiresOrderTypeChange => {
                 OrderError::unsupported_time_in_force(time_in_force, self.to_string())
             }
+            Self::UnsupportedOffsetType(_) | Self::UnsupportedOrderKind(_) => {
+                OrderError::UnsupportedOrderType(self.to_string())
+            }
             Self::InvalidPrice(_)
             | Self::MissingLimitPrice(_)
             | Self::UnexpectedLimitPrice(_)
             | Self::NonPositiveStopPrice(_)
-            | Self::UnsupportedOffsetType(_)
-            | Self::UnsupportedOrderKind(_)
             | Self::InvalidBracketPrices(_)
             | Self::InvalidClientOrderId(_) => {
                 OrderError::Rejected(ApiError::OrderRejected(self.to_string()))
@@ -863,7 +870,8 @@ fn require_limit_price(
 /// - `TakeProfitLimit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `TrailingStop` with an `activation_price`, and `TrailingStopFixedLimit` →
 ///   `Err(UnsupportedOrderKind)` (IBKR has neither)
-/// - `BasisPoints` offset type → Error (not supported by IBKR)
+/// - `BasisPoints` offset type → `Err(UnsupportedOffsetType)` (IBKR takes an amount or a
+///   percentage)
 ///
 /// # Price Requirements
 ///
@@ -882,7 +890,8 @@ fn require_limit_price(
 /// - `post_only` → `Err(PostOnlyNotSupported)`
 ///
 /// [`OrderMappingError::into_order_error`] turns both refusals into
-/// [`OrderError::UnsupportedTimeInForce`].
+/// [`OrderError::UnsupportedTimeInForce`], and an unsupported kind or offset type into
+/// [`OrderError::UnsupportedOrderType`].
 pub fn build_ib_order(
     side: rustrade_instrument::Side,
     quantity: f64,
@@ -1186,6 +1195,87 @@ mod tests {
             Err(OrderError::Rejected(ApiError::OrderRejected(_)))
         ));
         assert_eq!(refusal(OrderKind::Limit, Some(Decimal::ONE), gtc), Ok(()));
+    }
+
+    /// An order kind IB has no order type for, or a trailing offset type it cannot express, is
+    /// refused as `UnsupportedOrderType` with the mapping error's message, not as a venue
+    /// rejection.
+    #[test]
+    fn an_order_type_ib_cannot_take_is_refused_as_unsupported() {
+        let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+        let basis_points = TrailingOffsetType::BasisPoints;
+        for (kind, price) in [
+            (
+                OrderKind::TakeProfit {
+                    trigger_price: Decimal::from(150),
+                },
+                None,
+            ),
+            (
+                OrderKind::TakeProfitLimit {
+                    trigger_price: Decimal::from(150),
+                },
+                Some(Decimal::from(149)),
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(2),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: Some(Decimal::from(150)),
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(2),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
+                },
+                Some(Decimal::from(140)),
+            ),
+            (
+                OrderKind::ConditionalUnresolved {
+                    family: crate::order::ConditionalFamily::StopLimit,
+                    trigger_price: Some(Decimal::from(95)),
+                },
+                Some(Decimal::from(94)),
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(50),
+                    offset_type: basis_points,
+                    activation_price: None,
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: Decimal::from(50),
+                    offset_type: basis_points,
+                    stop_price: Decimal::from(95),
+                    limit_offset: Decimal::ONE,
+                },
+                None,
+            ),
+        ] {
+            let mapping = build_ib_order(rustrade_instrument::Side::Sell, 1.0, &kind, price, &gtc)
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(
+                    mapping,
+                    OrderMappingError::UnsupportedOrderKind(_)
+                        | OrderMappingError::UnsupportedOffsetType(_)
+                ),
+                "{kind}: {mapping:?}"
+            );
+            let message = mapping.to_string();
+            assert_eq!(
+                mapping.into_order_error(gtc),
+                OrderError::UnsupportedOrderType(message),
+                "{kind}"
+            );
+        }
     }
 
     fn test_context() -> OrderContext {
