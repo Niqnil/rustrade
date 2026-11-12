@@ -107,9 +107,8 @@ impl CutShortServer {
             // One request per connection: a body cut short leaves the connection unusable, so
             // the client opens a new one for each request.
             while let Ok((mut stream, _)) = listener.accept().await {
-                let mut request = [0_u8; 4096];
-                if matches!(stream.read(&mut request).await, Ok(read) if read > 0) {
-                    counted.fetch_add(1, Ordering::SeqCst);
+                if read_request_head(&mut stream).await {
+                    counted.fetch_add(1, Ordering::Relaxed);
                     let _ = stream
                         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{}")
                         .await;
@@ -126,8 +125,24 @@ impl CutShortServer {
 
     /// How many requests the server has answered.
     pub(crate) fn requests(&self) -> usize {
-        self.requests.load(Ordering::SeqCst)
+        self.requests.load(Ordering::Relaxed)
     }
+}
+
+/// Read a request up to the end of its headers, so that the answer is not sent while part of the
+/// request is still unread: closing a connection with unread input resets it, which the client
+/// would see as a failed request rather than an answer cut short. `false` when the connection
+/// closes or fails first. A request body, which the SDK's requests here do not have, is not read.
+async fn read_request_head(stream: &mut tokio::net::TcpStream) -> bool {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+    }
+    true
 }
 
 /// The error the SDK returns when a successful REST answer's body does not decode into the type

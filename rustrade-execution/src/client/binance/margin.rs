@@ -786,6 +786,10 @@ impl BinanceMargin {
     ///   reports a borrowed amount without its asset or the other way round) returns
     ///   [`OrderError::Connectivity`]: the venue acted on the request, so the order may be live,
     ///   and its outcome is unknown rather than refused.
+    /// - The request is sent once. An answer lost on the way (cut short, or timed out) returns
+    ///   [`OrderError::Connectivity`] instead of the order being sent again, since the venue may
+    ///   have placed it: look the order up by its client order id before placing it again. Only
+    ///   a rate-limit refusal, which Binance answers without placing the order, is sent again.
     /// - The order's time is the answer's `transactTime`. An answer without a readable one is
     ///   still read, at the local time, and logged with a `warn!`.
     /// - The order's kind is known to the client from the moment its request is sent, so a stream
@@ -1045,14 +1049,27 @@ impl BinanceMargin {
     }
 
     /// [`rest_config_builder`](Self::rest_config_builder)'s configuration with the SDK's retries
-    /// off, for the new-order and cancel requests: each is sent once. So a request whose answer
-    /// is lost fails with a transport error, which leaves its outcome unknown for the caller to
-    /// look up, rather than being sent again after the venue may have acted on it.
+    /// off, for the new-order and cancel requests: the SDK sends each once. So a request whose
+    /// answer is lost fails with a transport error, which leaves its outcome unknown for the
+    /// caller to look up, rather than being sent again after the venue may have acted on it.
+    /// [`rest_call_with_retry`] still sends a request again after a rate-limit refusal, which
+    /// Binance answers without acting on it.
     fn order_rest_config_builder(
         config: &BinanceMarginConfig,
         signing: Option<&SigningClock>,
     ) -> ConfigurationRestApiBuilder {
         Self::rest_config_builder(config, signing).retries(0)
+    }
+
+    /// The REST configuration `builder` describes.
+    ///
+    /// # Panics
+    /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
+    fn build_rest_config(builder: ConfigurationRestApiBuilder) -> ConfigurationRestApi {
+        builder
+            .build()
+            .expect("failed to build Binance margin REST configuration")
     }
 
     /// Resolve the per-call effective isolated symbol set (isolated mode only).
@@ -1218,8 +1235,9 @@ impl ExecutionClient for BinanceMargin {
         // `Arc`-backed), avoiding redundant credential clones from building it twice. The order
         // requests get a config of their own, since the SDK's retries are set per config.
         let signing = config.server_time_sync.then(SigningClock::default);
-        let rest_config = build_rest_config(Self::rest_config_builder(&config, signing.as_ref()));
-        let order_rest_config = Arc::new(build_rest_config(Self::order_rest_config_builder(
+        let rest_config =
+            Self::build_rest_config(Self::rest_config_builder(&config, signing.as_ref()));
+        let order_rest_config = Arc::new(Self::build_rest_config(Self::order_rest_config_builder(
             &config,
             signing.as_ref(),
         )));
@@ -1284,6 +1302,11 @@ impl ExecutionClient for BinanceMargin {
     /// A successful answer that cannot be read (one that does not decode, or has no readable `orderId`)
     /// returns [`OrderError::Connectivity`]: the venue acted on the cancel, so whether the order
     /// is still working is unknown.
+    ///
+    /// The request is sent once. An answer lost on the way (cut short, or timed out) also returns
+    /// [`OrderError::Connectivity`], instead of the cancel being sent again, since the venue may
+    /// have cancelled the order: a second cancel would then be refused as an unknown order. Only a
+    /// rate-limit refusal, which Binance answers without acting, is sent again.
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
@@ -3595,17 +3618,6 @@ fn build_new_order_params(
 /// The margin order endpoint, joined onto the REST config's base path: `POST` places an order and
 /// `DELETE` cancels one.
 const ORDER_PATH: &str = "/sapi/v1/margin/order";
-
-/// The REST configuration `builder` describes.
-///
-/// # Panics
-/// Panics if the binance-sdk configuration builder fails (invalid credentials format).
-#[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-fn build_rest_config(builder: ConfigurationRestApiBuilder) -> ConfigurationRestApi {
-    builder
-        .build()
-        .expect("failed to build Binance margin REST configuration")
-}
 
 /// The query of a margin new-order request, built from `params` as the SDK's own
 /// `margin_account_new_order` builds it.
