@@ -361,8 +361,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-sends a request whose answer body it could not read, and a cancel that failed without an
   answer. The venue may have acted by then, so an order could be placed twice, the second answer
   hiding the first order, and a cancel that worked could come back as `-2011` (unknown order).
-  Both requests now go out once. A lost answer leaves the outcome unknown
-  (`OrderError::Connectivity`), as any other transport failure does. Reads keep the retries.
+  Both requests now go out once, on an HTTP client of their own that waits 5 s for the answer
+  (it was the SDK's 1 s), as the spot cancel-replace does. A lost answer, cut short or later
+  than 5 s, leaves the outcome unknown (`OrderError::Connectivity`), as any other transport
+  failure does. Reads keep the retries and the 1 s bound.
 
 ## [0.22.0] - 2026-11-09
 

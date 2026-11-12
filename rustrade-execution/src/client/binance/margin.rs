@@ -77,9 +77,9 @@ use super::server_time::{ServerTime, SigningClock, default_server_time_sync, rea
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
     BinanceTimeInForce, FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache,
-    TrailingOrderError, Unclassified, UnrecoveredFills, WeightPool, WireInt, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    SharedDedupCache, TrailingOrderError, Unclassified, UnrecoveredFills, WeightPool, WireInt,
+    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_unknown_order, new_dedup_cache, optional_decimal, placed_order_state,
@@ -520,11 +520,12 @@ pub struct BinanceMargin {
     // surface, since the SDK's response type cannot decode its answer whole (see
     // `fetch_collateral_ratios`).
     rest_config: Arc<ConfigurationRestApi>,
-    // `rest_config` with the SDK's retries off, for the new-order and cancel requests, also sent
-    // through `send_request` (see `NewOrderAnswer` and `CancelOrderAnswer`). The SDK re-sends a
-    // request whose answer body it could not read, and a GET or DELETE that failed without an
-    // answer. By then the venue may have acted, so a re-sent order could be placed twice, and a
-    // re-sent cancel answered "unknown order" for an order the first one cancelled.
+    // `rest_config` with the SDK's retries off and `ORDER_REST_TIMEOUT_MS`, for the new-order and
+    // cancel requests, also sent through `send_request` (see `NewOrderAnswer` and
+    // `CancelOrderAnswer`). The SDK re-sends a request whose answer body it could not read, and a
+    // GET or DELETE that failed without an answer. By then the venue may have acted, so a re-sent
+    // order could be placed twice, and a re-sent cancel answered "unknown order" for an order the
+    // first one cancelled. Built on its own, so it has its own HTTP client and connection pool.
     order_rest_config: Arc<ConfigurationRestApi>,
     // shared rate-limit tracker across all REST calls
     rate_limiter: Arc<RateLimitTracker>,
@@ -786,7 +787,8 @@ impl BinanceMargin {
     ///   reports a borrowed amount without its asset or the other way round) returns
     ///   [`OrderError::Connectivity`]: the venue acted on the request, so the order may be live,
     ///   and its outcome is unknown rather than refused.
-    /// - The request is sent once. An answer lost on the way (cut short, or timed out) returns
+    /// - The request is sent once. An answer lost on the way (cut short, or not received within
+    ///   5 s) returns
     ///   [`OrderError::Connectivity`] instead of the order being sent again, since the venue may
     ///   have placed it: look the order up by its client order id before placing it again. Only
     ///   a rate-limit refusal, which Binance answers without placing the order, is sent again.
@@ -1048,17 +1050,19 @@ impl BinanceMargin {
         }
     }
 
-    /// [`rest_config_builder`](Self::rest_config_builder)'s configuration with the SDK's retries
-    /// off, for the new-order and cancel requests: the SDK sends each once. So a request whose
-    /// answer is lost fails with a transport error, which leaves its outcome unknown for the
-    /// caller to look up, rather than being sent again after the venue may have acted on it.
-    /// [`rest_call_with_retry`] still sends a request again after a rate-limit refusal, which
-    /// Binance answers without acting on it.
+    /// [`rest_config_builder`](Self::rest_config_builder)'s configuration for the new-order and
+    /// cancel requests: the SDK's retries off, so the SDK sends each once, and each bounded by
+    /// [`ORDER_REST_TIMEOUT_MS`]. A request whose answer is lost so fails with a transport error,
+    /// which leaves its outcome unknown for the caller to look up, rather than being sent again
+    /// after the venue may have acted on it. [`rest_call_with_retry`] still sends a request again
+    /// after a rate-limit refusal, which Binance answers without acting on it.
     fn order_rest_config_builder(
         config: &BinanceMarginConfig,
         signing: Option<&SigningClock>,
     ) -> ConfigurationRestApiBuilder {
-        Self::rest_config_builder(config, signing).retries(0)
+        Self::rest_config_builder(config, signing)
+            .timeout(ORDER_REST_TIMEOUT_MS)
+            .retries(0)
     }
 
     /// The REST configuration `builder` describes.
@@ -1232,8 +1236,9 @@ impl ExecutionClient for BinanceMargin {
         // Built once and shared: one clone is consumed by each SDK `RestApi`, the original is
         // retained for the collateral ratio read via `send_request`.
         // `ConfigurationRestApi: Clone` and is cheap to copy (its `reqwest::Client` is
-        // `Arc`-backed), avoiding redundant credential clones from building it twice. The order
-        // requests get a config of their own, since the SDK's retries are set per config.
+        // `Arc`-backed), so the clones share one HTTP client and connection pool. The order
+        // requests' config is built on its own, with its own client and pool, since the SDK sets
+        // the timeout per client.
         let signing = config.server_time_sync.then(SigningClock::default);
         let rest_config =
             Self::build_rest_config(Self::rest_config_builder(&config, signing.as_ref()));
@@ -1303,7 +1308,8 @@ impl ExecutionClient for BinanceMargin {
     /// returns [`OrderError::Connectivity`]: the venue acted on the cancel, so whether the order
     /// is still working is unknown.
     ///
-    /// The request is sent once. An answer lost on the way (cut short, or timed out) also returns
+    /// The request is sent once. An answer lost on the way (cut short, or not received within 5 s)
+    /// also returns
     /// [`OrderError::Connectivity`], instead of the cancel being sent again, since the venue may
     /// have cancelled the order: a second cancel would then be refused as an unknown order. Only a
     /// rate-limit refusal, which Binance answers without acting, is sent again.
@@ -7706,8 +7712,9 @@ mod tests {
     }
 
     /// Both REST configs sign with the config's credentials, on the signing clock when there is
-    /// one, against production. The order config sends each request once; the other keeps the
-    /// SDK's retries for the reads, which are safe to send again.
+    /// one, against production. The order config sends each request once, bounded by
+    /// `ORDER_REST_TIMEOUT_MS`; the other keeps the SDK's retries for the reads, which are safe to
+    /// send again.
     #[test]
     fn the_margin_rest_configs_sign_alike_and_the_order_config_sends_once() {
         let config = BinanceMarginConfig::cross_margin("key".into(), "secret".into());
@@ -7739,6 +7746,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(order.retries, 0);
+        assert_eq!(order.timeout, ORDER_REST_TIMEOUT_MS);
         let rest = BinanceMargin::rest_config_builder(&config, None)
             .build()
             .unwrap();
