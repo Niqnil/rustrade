@@ -1,10 +1,9 @@
 //! Binance Spot's `POST /api/v3/order/cancelReplace`: a cancel and a new order in one request.
 //!
-//! Sent past `binance-sdk`, through [`SignedRest`], because the SDK keeps only the `code` and
-//! `msg` of an error answer, on REST and on the WS API alike. A cancel-replace that partly failed
-//! answers with an error status, and its `data` carries each leg's own result: the cancel's
-//! details, and the new order's or the cancel's reason for failing. Without it, neither leg could
-//! be answered as it would be if sent alone.
+//! A cancel-replace that partly failed answers with an error status, and the `data` of its error
+//! carries each leg's own result: the cancel's details, and the new order's or the cancel's
+//! reason for failing. [`LegsAnswer::read`] reads each leg from the SDK's answer, so that each is
+//! answered as it would be if sent alone.
 
 use super::{
     shared::{
@@ -23,162 +22,35 @@ use crate::{
 };
 use binance_sdk::{
     common::{
-        config::TimestampProvider,
         errors::ConnectorError,
-        models::RestApiRateLimit,
-        utils::{
-            SignatureGenerator, build_user_agent, get_timestamp_from, parse_rate_limit_headers,
-        },
+        models::{RestApiRateLimit, RestApiResponse},
     },
     spot::rest_api::{
         OrderCancelReplaceCancelReplaceModeEnum, OrderCancelReplaceNewOrderRespTypeEnum,
-        OrderCancelReplaceParams, OrderCancelReplaceSideEnum, OrderCancelReplaceTimeInForceEnum,
-        OrderCancelReplaceTypeEnum,
+        OrderCancelReplaceParams, OrderCancelReplaceResponse,
+        OrderCancelReplaceResponseCancelResponse, OrderCancelReplaceResponseNewOrderResponse,
+        OrderCancelReplaceSideEnum, OrderCancelReplaceTimeInForceEnum, OrderCancelReplaceTypeEnum,
     },
 };
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use smol_str::format_smolstr;
-use std::{collections::BTreeMap, collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
-/// The cancel-replace endpoint's path.
-pub(super) const CANCEL_REPLACE_PATH: &str = "/api/v3/order/cancelReplace";
-
-/// Signed REST requests sent past `binance-sdk`, answered with their whole body whatever the
-/// status.
-///
-/// Signs as the SDK does, with the SDK's own [`SignatureGenerator`] and the client's timestamp
-/// provider, so a request is stamped on the same clock as every other.
-pub(super) struct SignedRest {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    signer: SignatureGenerator,
-    timestamp: Option<TimestampProvider>,
-    user_agent: String,
-}
-
-impl std::fmt::Debug for SignedRest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The key and the signer are left out: they are credentials.
-        f.debug_struct("SignedRest")
-            .field("base_url", &self.base_url)
-            .finish_non_exhaustive()
-    }
-}
-
-impl SignedRest {
-    /// Requests to `base_url`, signed with `api_secret` under `api_key`, each bounded by
-    /// `timeout`.
-    ///
-    /// # Panics
-    /// If the HTTP client cannot be built, which happens only when its TLS backend cannot start.
-    #[allow(clippy::expect_used)] // Documented panic: built once at startup, as the SDK's client is.
-    pub(super) fn new(
-        base_url: String,
-        api_key: String,
-        api_secret: String,
-        timestamp: Option<TimestampProvider>,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("failed to build the Binance REST client"),
-            base_url,
-            api_key,
-            signer: SignatureGenerator::new(Some(api_secret), None, None),
-            timestamp,
-            user_agent: build_user_agent("spot"),
-        }
-    }
-
-    /// Send `query` to `path` with `method`, signed, and return the answer whatever its status.
-    ///
-    /// # Errors
-    /// A [`ConnectorError::ConnectorClientError`] with no code when the request did not complete
-    /// or its body could not be read, worded as `binance-sdk` words those failures, so that the
-    /// classifiers read them as transport failures. Whether the venue acted on it is unknown.
-    pub(super) async fn send(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        mut query: BTreeMap<String, Value>,
-    ) -> anyhow::Result<RawAnswer> {
-        let transport = |msg: String| ConnectorError::ConnectorClientError { msg, code: None };
-        query.insert(
-            "timestamp".to_string(),
-            json!(get_timestamp_from(self.timestamp.as_ref())),
-        );
-        let signature = self.signer.get_signature(&query, None)?;
-
-        let mut url = reqwest::Url::parse(&self.base_url)?.join(path)?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in &query {
-                match value {
-                    Value::String(value) => pairs.append_pair(key, value),
-                    value => pairs.append_pair(key, &value.to_string()),
-                };
-            }
-            pairs.append_pair("signature", &signature);
-        }
-
-        let response = self
-            .client
-            .request(method, url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .send()
-            .await
-            // `without_url`: the URL carries the order and its signature, and this text reaches
-            // events and logs.
-            .map_err(|e| {
-                transport(format!(
-                    "HTTP request failed: {:#}",
-                    anyhow::Error::new(e.without_url())
-                ))
-            })?;
-
-        let status = response.status().as_u16();
-        let headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                Some((
-                    name.as_str().to_ascii_lowercase(),
-                    value.to_str().ok()?.to_owned(),
-                ))
-            })
-            .collect();
-        let rate_limits = parse_rate_limit_headers(&headers);
-        let body = response
-            .text()
-            .await
-            .map_err(|e| transport(format!("Failed to get response bytes: {}", e.without_url())))?;
-        Ok(RawAnswer {
-            status,
-            headers,
-            rate_limits,
-            body,
-        })
-    }
-}
-
-/// A REST answer read whole, whatever its status.
-#[derive(Debug, Clone)]
-pub(super) struct RawAnswer {
-    pub(super) status: u16,
+/// A cancel-replace answer that got as far as the legs: a success, a partial failure, or a
+/// failure of the cancel.
+#[derive(Debug, Clone, Default)]
+pub(super) struct LegsAnswer {
+    rate_limits: Vec<RestApiRateLimit>,
     /// Named in lowercase.
-    pub(super) headers: HashMap<String, String>,
-    pub(super) rate_limits: Vec<RestApiRateLimit>,
-    pub(super) body: String,
+    headers: HashMap<String, String>,
+    /// Each leg's result, `None` when the answer's could not be read.
+    results: Option<LegResults>,
 }
 
-impl RestAnswer for RawAnswer {
+impl RestAnswer for LegsAnswer {
     fn rate_limits(&self) -> &[RestApiRateLimit] {
         &self.rate_limits
     }
@@ -188,144 +60,66 @@ impl RestAnswer for RawAnswer {
     }
 }
 
-impl RawAnswer {
-    /// Whether the venue got as far as the cancel-replace's legs: a success, a partial failure
+impl LegsAnswer {
+    /// The legs of the SDK's `answer` to a cancel-replace, or the SDK's error when the venue
+    /// refused the whole request.
+    ///
+    /// # Errors
+    /// The SDK's error, unchanged, when it is not one [`failed`](Self::failed) reads legs from.
+    pub(super) async fn read(
+        answer: anyhow::Result<RestApiResponse<OrderCancelReplaceResponse>>,
+    ) -> anyhow::Result<Self> {
+        match answer {
+            Ok(response) => {
+                let rate_limits = response.rate_limits.clone().unwrap_or_default();
+                let headers = response.headers.clone();
+                Ok(Self::succeeded(
+                    response.data().await.ok(),
+                    rate_limits,
+                    headers,
+                ))
+            }
+            Err(e) => match Self::failed(&e) {
+                Some(answer) => Ok(answer),
+                None => Err(e),
+            },
+        }
+    }
+
+    /// A success, whose body decoded as `decoded`, or did not decode when `None`: the venue
+    /// answered, so a leg the body does not report readably is unknown.
+    fn succeeded(
+        decoded: Option<OrderCancelReplaceResponse>,
+        rate_limits: Vec<RestApiRateLimit>,
+        headers: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            rate_limits,
+            headers,
+            results: decoded.map(LegResults::from),
+        }
+    }
+
+    /// The legs of a failed cancel-replace, when the venue got as far as them: a partial failure
     /// (409), or an error that is coded as a cancel-replace failure (`-2021`, `-2022`) or carries
-    /// `data`. Such an answer is read leg by leg, and a leg it does not report readably is
-    /// answered as unknown. Any other answer refused the whole request.
-    pub(super) fn reports_legs(&self) -> bool {
-        /// Only the code, so that a `data` of an unexpected shape cannot hide it.
-        #[derive(Deserialize)]
-        struct Coded {
-            code: Option<i64>,
-            data: Option<serde::de::IgnoredAny>,
-        }
-
-        (200..300).contains(&self.status)
-            || self.status == 409
-            || serde_json::from_str::<Coded>(&self.body).is_ok_and(|coded| {
-                coded.data.is_some() || matches!(coded.code, Some(-2021 | -2022))
-            })
+    /// `data`. A leg it does not report readably is answered as unknown. `None` for any other
+    /// error, which refused the whole request.
+    fn failed(e: &anyhow::Error) -> Option<Self> {
+        let error = e.downcast_ref::<ConnectorError>()?;
+        let code = error
+            .body()
+            .and_then(|body| body.get("code"))
+            .and_then(Value::as_i64);
+        let reports_legs = matches!(error, ConnectorError::ConflictError { .. })
+            || error.data().is_some()
+            || matches!(code, Some(-2021 | -2022));
+        reports_legs.then(|| Self {
+            results: error
+                .data()
+                .and_then(|data| LegResults::deserialize(data).ok()),
+            ..Self::default()
+        })
     }
-
-    /// The error `binance-sdk` would have returned for this answer, so that the client's
-    /// classifiers, which read the SDK's errors, read this one alike.
-    pub(super) fn into_connector_error(self) -> ConnectorError {
-        let (msg, code) = match refusal(&self.body) {
-            Some(Refusal {
-                msg: Some(msg),
-                code,
-                ..
-            }) => (msg, code),
-            Some(Refusal { code, .. }) => (self.body, code),
-            None => (self.body, None),
-        };
-        let retry_after = || {
-            self.headers
-                .get("retry-after")
-                .and_then(|secs| secs.trim().parse().ok())
-        };
-        match self.status {
-            400 => ConnectorError::BadRequestError { msg, code },
-            401 => ConnectorError::UnauthorizedError { msg, code },
-            403 => ConnectorError::ForbiddenError { msg, code },
-            404 => ConnectorError::NotFoundError { msg, code },
-            418 => ConnectorError::RateLimitBanError {
-                msg,
-                code,
-                retry_after: retry_after(),
-            },
-            429 => ConnectorError::TooManyRequestsError {
-                msg,
-                code,
-                retry_after: retry_after(),
-            },
-            status @ 500..=599 => ConnectorError::ServerError {
-                msg: format!("Server error: {status}"),
-                status_code: Some(status),
-            },
-            _ => ConnectorError::ConnectorClientError { msg, code },
-        }
-    }
-}
-
-/// The query of a cancel-replace, from the SDK's own parameters.
-///
-/// The destructuring names every field, so a field the SDK adds fails to compile here rather than
-/// go unsent.
-pub(super) fn cancel_replace_query(params: OrderCancelReplaceParams) -> BTreeMap<String, Value> {
-    let OrderCancelReplaceParams {
-        symbol,
-        side,
-        r#type,
-        cancel_replace_mode,
-        time_in_force,
-        quantity,
-        quote_order_qty,
-        price,
-        cancel_new_client_order_id,
-        cancel_orig_client_order_id,
-        cancel_order_id,
-        new_client_order_id,
-        strategy_id,
-        strategy_type,
-        stop_price,
-        trailing_delta,
-        iceberg_qty,
-        new_order_resp_type,
-        self_trade_prevention_mode,
-        cancel_restrictions,
-        order_rate_limit_exceeded_mode,
-        peg_price_type,
-        peg_offset_value,
-        peg_offset_type,
-        recv_window,
-    } = params;
-
-    let mut query = BTreeMap::new();
-    let mut insert = |key: &str, value: Option<Value>| {
-        if let Some(value) = value {
-            query.insert(key.to_string(), value);
-        }
-    };
-    insert("symbol", Some(json!(symbol)));
-    insert("side", Some(json!(side)));
-    insert("type", Some(json!(r#type)));
-    insert("cancelReplaceMode", Some(json!(cancel_replace_mode)));
-    insert("timeInForce", time_in_force.map(|v| json!(v)));
-    insert("quantity", quantity.map(|v| json!(v)));
-    insert("quoteOrderQty", quote_order_qty.map(|v| json!(v)));
-    insert("price", price.map(|v| json!(v)));
-    insert(
-        "cancelNewClientOrderId",
-        cancel_new_client_order_id.map(|v| json!(v)),
-    );
-    insert(
-        "cancelOrigClientOrderId",
-        cancel_orig_client_order_id.map(|v| json!(v)),
-    );
-    insert("cancelOrderId", cancel_order_id.map(|v| json!(v)));
-    insert("newClientOrderId", new_client_order_id.map(|v| json!(v)));
-    insert("strategyId", strategy_id.map(|v| json!(v)));
-    insert("strategyType", strategy_type.map(|v| json!(v)));
-    insert("stopPrice", stop_price.map(|v| json!(v)));
-    insert("trailingDelta", trailing_delta.map(|v| json!(v)));
-    insert("icebergQty", iceberg_qty.map(|v| json!(v)));
-    insert("newOrderRespType", new_order_resp_type.map(|v| json!(v)));
-    insert(
-        "selfTradePreventionMode",
-        self_trade_prevention_mode.map(|v| json!(v)),
-    );
-    insert("cancelRestrictions", cancel_restrictions.map(|v| json!(v)));
-    insert(
-        "orderRateLimitExceededMode",
-        order_rate_limit_exceeded_mode.map(|v| json!(v)),
-    );
-    insert("pegPriceType", peg_price_type.map(|v| json!(v)));
-    insert("pegOffsetValue", peg_offset_value.map(|v| json!(v)));
-    insert("pegOffsetType", peg_offset_type.map(|v| json!(v)));
-    insert("recvWindow", recv_window.map(|v| json!(v)));
-    query
 }
 
 /// What a cancel-replace carries: the order to cancel, and the new order.
@@ -424,22 +218,8 @@ impl CancelReplaceRequest<'_> {
     }
 }
 
-/// An error answer: Binance's code and message, and for a cancel-replace that got as far as its
-/// legs, each leg's result.
-#[derive(Debug, Deserialize)]
-struct Refusal {
-    code: Option<i64>,
-    msg: Option<String>,
-    data: Option<LegResults>,
-}
-
-/// `body` read as an error answer, if it is one.
-fn refusal(body: &str) -> Option<Refusal> {
-    serde_json::from_str(body).ok()
-}
-
 /// Each leg's result: the body of a success, or the `data` of an error answer.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegResults {
     cancel_result: Option<String>,
@@ -448,9 +228,26 @@ struct LegResults {
     new_order_response: Option<Leg>,
 }
 
+impl From<OrderCancelReplaceResponse> for LegResults {
+    fn from(response: OrderCancelReplaceResponse) -> Self {
+        let OrderCancelReplaceResponse {
+            cancel_result,
+            new_order_result,
+            cancel_response,
+            new_order_response,
+        } = response;
+        Self {
+            cancel_result,
+            new_order_result,
+            cancel_response: cancel_response.map(|leg| Leg::from(*leg)),
+            new_order_response: new_order_response.map(|leg| Leg::from(*leg)),
+        }
+    }
+}
+
 /// One leg's response: the order's fields when the leg succeeded, Binance's code and message when
 /// it failed.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Leg {
     code: Option<i64>,
@@ -462,6 +259,34 @@ struct Leg {
     cummulative_quote_qty: Option<String>,
 }
 
+impl From<OrderCancelReplaceResponseCancelResponse> for Leg {
+    fn from(leg: OrderCancelReplaceResponseCancelResponse) -> Self {
+        Self {
+            code: None,
+            msg: None,
+            order_id: leg.order_id,
+            transact_time: leg.transact_time,
+            status: leg.status,
+            executed_qty: leg.executed_qty,
+            cummulative_quote_qty: leg.cummulative_quote_qty,
+        }
+    }
+}
+
+impl From<OrderCancelReplaceResponseNewOrderResponse> for Leg {
+    fn from(leg: OrderCancelReplaceResponseNewOrderResponse) -> Self {
+        Self {
+            code: None,
+            msg: None,
+            order_id: leg.order_id,
+            transact_time: leg.transact_time,
+            status: leg.status,
+            executed_qty: leg.executed_qty,
+            cummulative_quote_qty: leg.cummulative_quote_qty,
+        }
+    }
+}
+
 /// Each leg's answer to a cancel-replace: the cancel's, and the new order's state, `None` when the
 /// venue did not attempt it.
 pub(super) type LegAnswers = (
@@ -469,22 +294,17 @@ pub(super) type LegAnswers = (
     Option<UnindexedOrderState>,
 );
 
-/// Each leg's answer, read from `answer`, which [`RawAnswer::reports_legs`].
+/// Each leg's answer, read from `answer`.
 ///
 /// A leg whose result cannot be read is answered with an error whose outcome is unknown, so that
 /// the order is looked up rather than taken as cancelled, placed or refused.
 pub(super) fn read_legs(
-    answer: &RawAnswer,
+    answer: LegsAnswer,
     instrument: &InstrumentNameExchange,
     quantity: Decimal,
 ) -> LegAnswers {
     let unreadable = |problem: &str| unreadable_answer(ExchangeId::BinanceSpot, problem);
-    let results = if (200..300).contains(&answer.status) {
-        serde_json::from_str::<LegResults>(&answer.body).ok()
-    } else {
-        refusal(&answer.body).and_then(|refusal| refusal.data)
-    };
-    let Some(results) = results else {
+    let Some(results) = answer.results else {
         let problem = "cancel-replace answer has no readable leg results";
         return (
             Err(unreadable(problem)),
@@ -598,22 +418,36 @@ pub(super) fn open_refused_legs(
 mod tests {
     use super::*;
     use crate::{
+        client::binance::sdk_errors::rest_error,
         error::{ApiError, ConnectivityError, OrderError},
         order::{OrderKind, TimeInForce, state::ActiveOrderState},
     };
+    use binance_sdk::common::utils::parse_rate_limit_headers;
     use rust_decimal_macros::dec;
+    use serde_json::json;
+    use std::time::Duration;
 
     fn btcusdt() -> InstrumentNameExchange {
         InstrumentNameExchange::new("BTCUSDT")
     }
 
-    fn answer(status: u16, body: Value) -> RawAnswer {
-        RawAnswer {
-            status,
-            headers: HashMap::new(),
-            rate_limits: Vec::new(),
-            body: body.to_string(),
-        }
+    /// A success whose body is `body`, decoded as the SDK decodes it.
+    fn success(body: Value) -> LegsAnswer {
+        LegsAnswer::succeeded(
+            serde_json::from_value(body).ok(),
+            Vec::new(),
+            HashMap::new(),
+        )
+    }
+
+    /// The legs of the SDK's error for an answer of `status` with `body`, if it reports any.
+    fn failure(status: u16, body: &str) -> Option<LegsAnswer> {
+        LegsAnswer::failed(&anyhow::Error::new(rest_error(status, body, &[])))
+    }
+
+    /// The legs of the SDK's error for an answer of `status` with the JSON `body`.
+    fn failed_legs(status: u16, body: Value) -> LegsAnswer {
+        failure(status, &body.to_string()).expect("the failure reports legs")
     }
 
     fn cancelled_leg() -> Value {
@@ -653,17 +487,24 @@ mod tests {
         assert!(error.is_outcome_unknown(), "{error:?}");
     }
 
+    fn assert_both_unknown((cancel, open): LegAnswers, label: &str) {
+        assert_unknown(cancel.as_ref().expect_err(label));
+        match open {
+            Some(OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                error,
+            ))) => assert_unknown(&error),
+            other => panic!("{label}: expected the new order unknown, got {other:?}"),
+        }
+    }
+
     /// A success answers each leg from its response.
     #[test]
     fn a_success_answers_each_leg_from_its_response() {
         let (cancel, open) = read_legs(
-            &answer(
-                200,
-                json!({
-                    "cancelResult": "SUCCESS", "newOrderResult": "SUCCESS",
-                    "cancelResponse": cancelled_leg(), "newOrderResponse": placed_leg(),
-                }),
-            ),
+            success(json!({
+                "cancelResult": "SUCCESS", "newOrderResult": "SUCCESS",
+                "cancelResponse": cancelled_leg(), "newOrderResponse": placed_leg(),
+            })),
             &btcusdt(),
             dec!(1),
         );
@@ -677,7 +518,7 @@ mod tests {
     #[test]
     fn a_partial_failure_answers_the_new_order_with_its_own_rejection() {
         let (cancel, open) = read_legs(
-            &answer(
+            failed_legs(
                 409,
                 json!({
                     "code": -2021, "msg": "Order cancel-replace partially failed.",
@@ -707,7 +548,7 @@ mod tests {
     #[test]
     fn a_failed_cancel_answers_with_its_reason_and_the_new_order_not_attempted() {
         let (cancel, open) = read_legs(
-            &answer(
+            failed_legs(
                 400,
                 json!({
                     "code": -2022, "msg": "Order cancel-replace failed.",
@@ -737,7 +578,7 @@ mod tests {
     #[test]
     fn a_failed_cancel_with_a_placed_order_answers_each_leg() {
         let (cancel, open) = read_legs(
-            &answer(
+            failed_legs(
                 409,
                 json!({
                     "code": -2021, "msg": "Order cancel-replace partially failed.",
@@ -756,21 +597,45 @@ mod tests {
         assert_placed(open.as_ref());
     }
 
-    /// An answer whose legs cannot be read leaves both outcomes unknown, so the new order is
+    /// A success whose legs cannot be read leaves both outcomes unknown, so the new order is
     /// looked up rather than taken as placed or refused.
     #[test]
-    fn unreadable_legs_leave_both_outcomes_unknown() {
+    fn a_success_with_unreadable_legs_leaves_both_outcomes_unknown() {
         let bodies = [
-            answer(200, json!({})),
-            answer(200, json!("not an object")),
-            answer(
-                200,
-                json!({
-                    "cancelResult": "SUCCESS", "newOrderResult": "SUCCESS",
-                    "cancelResponse": {"status": "CANCELED"}, "newOrderResponse": {"status": "NEW"},
-                }),
+            json!({}),
+            json!("not an object"),
+            json!({
+                "cancelResult": "SUCCESS", "newOrderResult": "SUCCESS",
+                "cancelResponse": {"status": "CANCELED"}, "newOrderResponse": {"status": "NEW"},
+            }),
+            json!({ "cancelResult": "PENDING", "newOrderResult": "PENDING" }),
+        ];
+        for body in bodies {
+            let label = body.to_string();
+            assert_both_unknown(read_legs(success(body), &btcusdt(), dec!(1)), &label);
+        }
+    }
+
+    /// A cancel-replace failure whose leg results are missing or garbled still reports legs, and
+    /// leaves both outcomes unknown: the venue got as far as the legs, so neither is refused.
+    #[test]
+    fn a_failure_without_readable_leg_results_leaves_both_legs_unknown() {
+        let bodies = [
+            (
+                409,
+                json!({"code": -2021, "msg": "Order cancel-replace partially failed."}).to_string(),
             ),
-            answer(
+            (409, json!({"msg": "no code"}).to_string()),
+            (
+                400,
+                json!({"code": -2022, "msg": "Order cancel-replace failed."}).to_string(),
+            ),
+            (400, json!({"code": -2022, "data": "garbled"}).to_string()),
+            (
+                400,
+                json!({"code": -2021, "data": {"cancelResult": 7}}).to_string(),
+            ),
+            (
                 409,
                 json!({
                     "code": -2021,
@@ -778,23 +643,83 @@ mod tests {
                         "cancelResult": "FAILURE", "newOrderResult": "FAILURE",
                         "cancelResponse": {}, "newOrderResponse": {},
                     },
-                }),
+                })
+                .to_string(),
             ),
-            answer(
-                200,
-                json!({ "cancelResult": "PENDING", "newOrderResult": "PENDING" }),
-            ),
+            (409, "<html>".to_string()),
         ];
-        for body in bodies {
-            let (cancel, open) = read_legs(&body, &btcusdt(), dec!(1));
-            assert_unknown(&cancel.expect_err("the cancel cannot be read"));
-            match open {
-                Some(OrderState::Inactive(
-                    crate::order::state::InactiveOrderState::OpenFailed(error),
-                )) => assert_unknown(&error),
-                other => panic!("expected an unknown open for {body:?}, got {other:?}"),
-            }
+        for (status, body) in bodies {
+            let answer = failure(status, &body).unwrap_or_else(|| panic!("{status} {body}"));
+            assert_both_unknown(
+                read_legs(answer, &btcusdt(), dec!(1)),
+                &format!("{status} {body}"),
+            );
         }
+    }
+
+    /// Only a partial failure, or an error coded as a cancel-replace failure or carrying leg
+    /// results, reports legs. Any other error refused the whole request, and reaches the retry
+    /// and the classifiers as the SDK returned it.
+    #[test]
+    fn a_failure_reports_legs_for_a_409_a_leg_code_or_leg_data() {
+        let reports = |status, body: Value| failure(status, &body.to_string()).is_some();
+        assert!(reports(409, json!({"code": -2021, "data": {}})));
+        assert!(reports(
+            400,
+            json!({"code": -2022, "msg": "Order cancel-replace failed."})
+        ));
+        // Any `data` is read leg by leg, whatever the code: a leg it does not report readably is
+        // then unknown, never refused.
+        assert!(reports(400, json!({"code": -1013, "data": {}})));
+        assert!(!reports(
+            400,
+            json!({"code": -1013, "msg": "Filter failure"})
+        ));
+        assert!(!reports(
+            400,
+            json!({"code": -2011, "msg": "Unknown order sent."})
+        ));
+        assert!(!reports(400, json!({"code": -1013, "data": null})));
+        // A throttle refuses the whole request, so it reaches the retry as an error.
+        assert!(!reports(
+            429,
+            json!({"code": -1003, "msg": "Too many requests."})
+        ));
+        assert!(failure(403, "<html>").is_none());
+
+        let not_the_sdks = anyhow::anyhow!("-2021 not a ConnectorError");
+        assert!(LegsAnswer::failed(&not_the_sdks).is_none());
+    }
+
+    /// The weight an answer reports as used reaches the rate limiter, as a plain REST answer's
+    /// does: from its parsed `x-mbx-*` limits for the spot pool, and from its headers for the
+    /// SAPI pool.
+    #[tokio::test(start_paused = true)]
+    async fn an_answers_used_weight_reaches_the_rate_limiter() {
+        use super::super::shared::{RateLimitTracker, RequestKind, WeightPool, unix_ms};
+
+        let near_limit = |name: &str| {
+            let headers = HashMap::from([(name.to_string(), "1000000".to_string())]);
+            LegsAnswer::succeeded(None, parse_rate_limit_headers(&headers), headers)
+        };
+        let pauses = |pool, answer: &LegsAnswer| {
+            let tracker = RateLimitTracker::new(pool);
+            tracker.observe_rest(answer, unix_ms());
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    tracker.wait_if_blocked(RequestKind::Query),
+                )
+                .await
+                .is_err()
+            }
+        };
+
+        let spot = near_limit("x-mbx-used-weight-1m");
+        assert!(!spot.rate_limits.is_empty(), "the header parses as a limit");
+        assert!(pauses(WeightPool::Spot, &spot).await);
+        assert!(pauses(WeightPool::Sapi, &near_limit("x-sapi-used-ip-weight-1m")).await);
+        assert!(!pauses(WeightPool::Sapi, &success(json!({}))).await);
     }
 
     /// A whole request that failed with its outcome unknown leaves the new order unknown too.
@@ -852,193 +777,6 @@ mod tests {
         );
     }
 
-    /// Only a success, a partial failure, or an error coded as a cancel-replace failure or
-    /// carrying leg results, reports legs.
-    #[test]
-    fn reports_legs_for_a_success_a_409_a_leg_code_or_leg_data() {
-        assert!(answer(200, json!({})).reports_legs());
-        assert!(answer(409, json!({"code": -2021, "data": {}})).reports_legs());
-        // Any `data` is read leg by leg, whatever the code: a leg it does not report readably is
-        // then unknown, never refused.
-        assert!(answer(400, json!({"code": -1013, "data": {}})).reports_legs());
-        assert!(!answer(400, json!({"code": -1013, "msg": "Filter failure"})).reports_legs());
-        assert!(!answer(400, json!({"code": -2011, "msg": "Unknown order sent."})).reports_legs());
-        // A throttle refuses the whole request, so it reaches the retry as an error.
-        assert!(!answer(429, json!({"code": -1003, "msg": "Too many requests."})).reports_legs());
-        assert!(
-            !RawAnswer {
-                body: "<html>".to_string(),
-                ..answer(403, json!({}))
-            }
-            .reports_legs()
-        );
-    }
-
-    /// The weight an answer reports as used reaches the rate limiter, as a plain REST answer's
-    /// does: from its parsed `x-mbx-*` limits for the spot pool, and from its headers for the
-    /// SAPI pool.
-    #[tokio::test(start_paused = true)]
-    async fn an_answers_used_weight_reaches_the_rate_limiter() {
-        use super::super::shared::{RateLimitTracker, RequestKind, WeightPool, unix_ms};
-
-        let near_limit = |name: &str| {
-            let headers = HashMap::from([(name.to_string(), "1000000".to_string())]);
-            RawAnswer {
-                rate_limits: parse_rate_limit_headers(&headers),
-                headers,
-                ..answer(200, json!({}))
-            }
-        };
-        let pauses = |pool, answer: &RawAnswer| {
-            let tracker = RateLimitTracker::new(pool);
-            tracker.observe_rest(answer, unix_ms());
-            async move {
-                tokio::time::timeout(
-                    Duration::from_millis(1),
-                    tracker.wait_if_blocked(RequestKind::Query),
-                )
-                .await
-                .is_err()
-            }
-        };
-
-        let spot = near_limit("x-mbx-used-weight-1m");
-        assert!(!spot.rate_limits.is_empty(), "the header parses as a limit");
-        assert!(pauses(WeightPool::Spot, &spot).await);
-        assert!(pauses(WeightPool::Sapi, &near_limit("x-sapi-used-ip-weight-1m")).await);
-        assert!(!pauses(WeightPool::Sapi, &answer(200, json!({}))).await);
-    }
-
-    /// The client's `Debug` names its endpoint, and leaves out its key and secret.
-    #[test]
-    fn signed_rest_debug_hides_the_credentials() {
-        let rest = SignedRest::new(
-            "https://api.example".to_string(),
-            "the-key".to_string(),
-            "the-secret".to_string(),
-            None,
-            Duration::from_secs(5),
-        );
-        let shown = format!("{rest:?}");
-        assert!(shown.contains("https://api.example"), "{shown}");
-        assert!(!shown.contains("the-key"), "{shown}");
-        assert!(!shown.contains("the-secret"), "{shown}");
-    }
-
-    /// A cancel-replace failure whose leg results are missing or garbled still reports legs, and
-    /// leaves both outcomes unknown: the venue got as far as the legs, so neither is refused.
-    #[test]
-    fn a_failure_without_readable_leg_results_leaves_both_legs_unknown() {
-        for unreadable in [
-            answer(
-                409,
-                json!({"code": -2021, "msg": "Order cancel-replace partially failed."}),
-            ),
-            answer(409, json!({"msg": "no code"})),
-            answer(
-                400,
-                json!({"code": -2022, "msg": "Order cancel-replace failed."}),
-            ),
-            answer(400, json!({"code": -2022, "data": "garbled"})),
-            answer(400, json!({"code": -2021, "data": {"cancelResult": 7}})),
-            RawAnswer {
-                body: "<html>".to_string(),
-                ..answer(409, json!({}))
-            },
-        ] {
-            assert!(unreadable.reports_legs(), "{unreadable:?}");
-            let (cancel, open) = read_legs(&unreadable, &btcusdt(), dec!(1));
-            assert_unknown(cancel.as_ref().expect_err("the cancel is unknown"));
-            match open {
-                Some(OrderState::Inactive(
-                    crate::order::state::InactiveOrderState::OpenFailed(error),
-                )) => {
-                    assert_unknown(&error);
-                }
-                other => panic!("expected the new order unknown, got {other:?}"),
-            }
-        }
-    }
-
-    /// An answer refusing the whole request reads as the error `binance-sdk` would return for
-    /// its status, carrying Binance's code and message, and a rate limit's `Retry-After`.
-    #[test]
-    fn a_whole_refusal_reads_as_the_sdks_error_for_its_status() {
-        let refusal = |status| answer(status, json!({"code": -1013, "msg": "Filter failure"}));
-        let msg = || "Filter failure".to_string();
-        let code = Some(-1013);
-
-        assert!(matches!(
-            refusal(400).into_connector_error(),
-            ConnectorError::BadRequestError { msg: m, code: c } if m == msg() && c == code
-        ));
-        assert!(matches!(
-            refusal(401).into_connector_error(),
-            ConnectorError::UnauthorizedError { code: c, .. } if c == code
-        ));
-        assert!(matches!(
-            refusal(403).into_connector_error(),
-            ConnectorError::ForbiddenError { code: c, .. } if c == code
-        ));
-        assert!(matches!(
-            refusal(404).into_connector_error(),
-            ConnectorError::NotFoundError { code: c, .. } if c == code
-        ));
-        assert!(matches!(
-            refusal(422).into_connector_error(),
-            ConnectorError::ConnectorClientError { code: c, .. } if c == code
-        ));
-        assert!(matches!(
-            refusal(503).into_connector_error(),
-            ConnectorError::ServerError {
-                status_code: Some(503),
-                ..
-            }
-        ));
-    }
-
-    /// A rate-limit refusal also carries its `Retry-After`, and a body that is not Binance's
-    /// error object is carried as the message, with no code.
-    #[test]
-    fn a_whole_refusal_carries_its_wait_or_its_raw_body() {
-        let refusal = |status| answer(status, json!({"code": -1013, "msg": "Filter failure"}));
-        let code = Some(-1013);
-
-        let mut throttled = refusal(429);
-        throttled
-            .headers
-            .insert("retry-after".to_string(), "7".to_string());
-        assert!(matches!(
-            throttled.into_connector_error(),
-            ConnectorError::TooManyRequestsError { retry_after: Some(7), code: c, .. } if c == code
-        ));
-        let mut banned = refusal(418);
-        banned
-            .headers
-            .insert("retry-after".to_string(), "60".to_string());
-        assert!(matches!(
-            banned.into_connector_error(),
-            ConnectorError::RateLimitBanError {
-                retry_after: Some(60),
-                ..
-            }
-        ));
-
-        let codeless = RawAnswer {
-            body: "<html>blocked</html>".to_string(),
-            ..refusal(403)
-        };
-        assert!(matches!(
-            codeless.into_connector_error(),
-            ConnectorError::ForbiddenError { msg: m, code: None } if m == "<html>blocked</html>"
-        ));
-        let no_msg = answer(400, json!({"code": -1100}));
-        assert!(matches!(
-            no_msg.into_connector_error(),
-            ConnectorError::BadRequestError { msg: m, code: Some(-1100) } if m == r#"{"code":-1100}"#
-        ));
-    }
-
     /// The order to cancel is named by its numeric venue id when it has one, by its client order
     /// id otherwise, and not at all when its venue id is not a number.
     #[test]
@@ -1062,19 +800,19 @@ mod tests {
         );
     }
 
-    fn request(
+    fn params(
         cancel: CancelTarget,
         kind: OrderKind,
         price: Option<Decimal>,
         on_cancel_failure: OnCancelFailure,
-    ) -> BTreeMap<String, Value> {
+    ) -> OrderCancelReplaceParams {
         let fields = SpotOrderFields::new(
             kind,
             TimeInForce::GoodUntilCancelled { post_only: false },
             price,
         )
         .unwrap();
-        let request = CancelReplaceRequest {
+        CancelReplaceRequest {
             symbol: "BTCUSDT",
             cancel,
             cid: ClientOrderId::new("exit"),
@@ -1082,45 +820,74 @@ mod tests {
             quantity: dec!(0.5),
             fields,
             on_cancel_failure,
-        };
-        cancel_replace_query(request.params().unwrap())
+        }
+        .params()
+        .unwrap()
     }
 
-    fn text(query: &BTreeMap<String, Value>, key: &str) -> Option<String> {
-        query.get(key).map(|value| match value {
-            Value::String(value) => value.clone(),
-            value => value.to_string(),
-        })
+    /// How the SDK writes `value` on the wire.
+    fn wire<T: serde::Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).unwrap()
     }
 
-    /// The query carries the new order as a plain open sends it, the order to cancel, the mode
-    /// the policy asks for, and a `RESULT` answer.
+    /// The parameters carry the new order as a plain open sends it, the order to cancel, the mode
+    /// the policy asks for, and a `RESULT` answer, and nothing else.
+    ///
+    /// The destructuring names every field, so a field the SDK adds fails to compile here and is
+    /// looked at.
     #[test]
-    fn the_query_carries_both_legs_and_the_policys_mode() {
-        let query = request(
+    fn the_params_carry_both_legs_and_the_policys_mode() {
+        let OrderCancelReplaceParams {
+            symbol,
+            side,
+            r#type,
+            cancel_replace_mode,
+            time_in_force,
+            quantity,
+            quote_order_qty,
+            price,
+            cancel_new_client_order_id,
+            cancel_orig_client_order_id,
+            cancel_order_id,
+            new_client_order_id,
+            strategy_id,
+            strategy_type,
+            stop_price,
+            trailing_delta,
+            iceberg_qty,
+            new_order_resp_type,
+            self_trade_prevention_mode,
+            cancel_restrictions,
+            order_rate_limit_exceeded_mode,
+            peg_price_type,
+            peg_offset_value,
+            peg_offset_type,
+            recv_window,
+        } = params(
             CancelTarget::OrderId(11),
             OrderKind::Limit,
             Some(dec!(101.5)),
             OnCancelFailure::DropOpens,
         );
-        let expected = [
-            ("symbol", "BTCUSDT"),
-            ("side", "SELL"),
-            ("type", "LIMIT"),
-            ("cancelReplaceMode", "STOP_ON_FAILURE"),
-            ("timeInForce", "GTC"),
-            ("quantity", "0.5"),
-            ("price", "101.5"),
-            ("cancelOrderId", "11"),
-            ("newClientOrderId", "exit"),
-            ("newOrderRespType", "RESULT"),
-        ];
-        for (key, value) in expected {
-            assert_eq!(text(&query, key).as_deref(), Some(value), "{key}");
-        }
-        assert_eq!(query.len(), expected.len(), "{query:?}");
+        assert_eq!(symbol, "BTCUSDT");
+        assert_eq!(wire(&side), json!("SELL"));
+        assert_eq!(wire(&r#type), json!("LIMIT"));
+        assert_eq!(wire(&cancel_replace_mode), json!("STOP_ON_FAILURE"));
+        assert_eq!(wire(&time_in_force), json!("GTC"));
+        assert_eq!(quantity, Some(dec!(0.5)));
+        assert_eq!(price, Some(dec!(101.5)));
+        assert_eq!(cancel_order_id, Some(11));
+        assert_eq!(new_client_order_id.as_deref(), Some("exit"));
+        assert_eq!(wire(&new_order_resp_type), json!("RESULT"));
+        assert!(quote_order_qty.is_none() && stop_price.is_none() && iceberg_qty.is_none());
+        assert!(cancel_new_client_order_id.is_none() && cancel_orig_client_order_id.is_none());
+        assert!(strategy_id.is_none() && strategy_type.is_none() && trailing_delta.is_none());
+        assert!(self_trade_prevention_mode.is_none() && cancel_restrictions.is_none());
+        assert!(order_rate_limit_exceeded_mode.is_none() && recv_window.is_none());
+        assert!(peg_price_type.is_none() && peg_offset_value.is_none());
+        assert!(peg_offset_type.is_none());
 
-        let query = request(
+        let stop = params(
             CancelTarget::ClientOrderId(ClientOrderId::new("stop")),
             OrderKind::Stop {
                 trigger_price: dec!(95),
@@ -1128,25 +895,19 @@ mod tests {
             None,
             OnCancelFailure::SendOpens,
         );
-        assert_eq!(
-            text(&query, "cancelReplaceMode").as_deref(),
-            Some("ALLOW_FAILURE")
-        );
-        assert_eq!(
-            text(&query, "cancelOrigClientOrderId").as_deref(),
-            Some("stop")
-        );
-        assert_eq!(text(&query, "type").as_deref(), Some("STOP_LOSS"));
-        assert_eq!(text(&query, "stopPrice").as_deref(), Some("95"));
-        assert!(!query.contains_key("cancelOrderId"));
-        assert!(!query.contains_key("price"));
-        assert!(!query.contains_key("timeInForce"));
+        assert_eq!(wire(&stop.cancel_replace_mode), json!("ALLOW_FAILURE"));
+        assert_eq!(stop.cancel_orig_client_order_id.as_deref(), Some("stop"));
+        assert_eq!(wire(&stop.r#type), json!("STOP_LOSS"));
+        assert_eq!(stop.stop_price, Some(dec!(95)));
+        assert!(stop.cancel_order_id.is_none());
+        assert!(stop.price.is_none());
+        assert!(stop.time_in_force.is_none());
     }
 
-    /// A trailing order's delta and activation price reach the query.
+    /// A trailing order's delta and activation price reach the parameters.
     #[test]
-    fn the_query_carries_a_trailing_orders_delta() {
-        let query = request(
+    fn the_params_carry_a_trailing_orders_delta() {
+        let trailing = params(
             CancelTarget::OrderId(11),
             OrderKind::TrailingStop {
                 offset: dec!(1),
@@ -1156,7 +917,7 @@ mod tests {
             None,
             OnCancelFailure::DropOpens,
         );
-        assert_eq!(text(&query, "trailingDelta").as_deref(), Some("100"));
-        assert_eq!(text(&query, "stopPrice").as_deref(), Some("90"));
+        assert_eq!(trailing.trailing_delta, Some(100));
+        assert_eq!(trailing.stop_price, Some(dec!(90)));
     }
 }

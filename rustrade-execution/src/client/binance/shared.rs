@@ -1338,7 +1338,8 @@ fn wait_until_epoch_ms(until_ms: i64, now_ms: u128) -> Duration {
 /// code or wording). All warrant the same backoff response.
 pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
     // A WAF 403 carries none of the texts below; recognise it by type so it is backed off too.
-    if let Some(ConnectorError::ForbiddenError { msg, code }) = e.downcast_ref::<ConnectorError>()
+    if let Some(ConnectorError::ForbiddenError { msg, code, .. }) =
+        e.downcast_ref::<ConnectorError>()
         && is_waf_block(&with_code(msg, *code))
     {
         return true;
@@ -3695,8 +3696,8 @@ where
 
 /// A REST answer, as far as the weight tracker reads one ([`RateLimitTracker::observe_rest`]).
 ///
-/// The SDK's [`RestApiResponse`], and the raw answer of a request sent past the SDK, whose error
-/// bodies the SDK would not keep.
+/// The SDK's [`RestApiResponse`], and a cancel-replace's legs, read from a success or from the
+/// SDK's error alike.
 pub(crate) trait RestAnswer {
     /// The rate limits Binance reported in the answer's `x-mbx-*` headers.
     fn rate_limits(&self) -> &[RestApiRateLimit];
@@ -4225,16 +4226,21 @@ fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
         }
         // Splice the code in so callers can tell auth-failure subtypes apart (e.g. -2014
         // invalid key vs -2015 IP/permission).
-        ConnectorError::UnauthorizedError { msg, code } => {
+        ConnectorError::UnauthorizedError { msg, code, .. } => {
             RequestFailure::Unauthenticated(with_code(msg, *code))
         }
-        ConnectorError::ForbiddenError { msg, code } => classify_forbidden(with_code(msg, *code)),
+        ConnectorError::ForbiddenError { msg, code, .. } => {
+            classify_forbidden(with_code(msg, *code))
+        }
         ConnectorError::ServerError { msg, .. } | ConnectorError::NetworkError(msg) => {
             RequestFailure::Transport(msg.clone())
         }
-        ConnectorError::BadRequestError { msg, code }
-        | ConnectorError::NotFoundError { msg, code }
-        | ConnectorError::ConnectorClientError { msg, code } => {
+        // A 409 is a refusal too. The cancel-replace, whose partial failure answers 409, reads
+        // its legs before it gets here.
+        ConnectorError::BadRequestError { msg, code, .. }
+        | ConnectorError::NotFoundError { msg, code, .. }
+        | ConnectorError::ConflictError { msg, code, .. }
+        | ConnectorError::ConnectorClientError { msg, code, .. } => {
             // A codeless `ConnectorClientError` from the SDK's `http_request` is a transport or
             // response-decode failure, not a venue decision (genuine Binance rejections carry a
             // numeric code). These prefixes are the SDK's codeless transport/decode sites: the
@@ -4260,6 +4266,9 @@ fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
                 RequestFailure::Rejected(with_code(msg, *code))
             }
         }
+        // A kind the SDK has added since: whether the venue acted on the request is unknown, so
+        // an order is looked up rather than taken as refused.
+        _ => RequestFailure::Transport(ce.to_string()),
     }
 }
 
@@ -4386,7 +4395,7 @@ fn order_error_from(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::client::reconnect_budget::BackoffLimits;
+    use crate::client::{binance::sdk_errors, reconnect_budget::BackoffLimits};
     use futures::FutureExt as _;
 
     /// Every time in force outside the set is refused whatever the kind, `post_only` on every kind
@@ -4622,18 +4631,17 @@ mod tests {
     #[test]
     fn a_timestamp_rejection_is_read_from_the_code_of_either_api() {
         let rest = |code| {
-            anyhow::Error::new(ConnectorError::BadRequestError {
-                msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
+            anyhow::Error::new(sdk_errors::rest_refusal(
+                400,
                 code,
-            })
+                "Timestamp for this request is outside of the recvWindow.",
+            ))
         };
         let ws = |code| {
-            anyhow::Error::new(WebsocketError::ResponseError {
+            anyhow::Error::new(sdk_errors::ws_refusal(
                 code,
-                message: "Timestamp for this request was 1000ms ahead of the server's time."
-                    .to_owned(),
-                retry_after: None,
-            })
+                "Timestamp for this request was 1000ms ahead of the server's time.",
+            ))
         };
 
         assert!(is_timestamp_rejection(&rest(Some(-1021))));
@@ -6126,54 +6134,58 @@ mod tests {
         );
     }
 
-    fn classify(
-        msg: &str,
-        code: Option<i64>,
-    ) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
-        let err = anyhow::Error::new(ConnectorError::ConnectorClientError {
-            msg: msg.to_string(),
-            code,
-        });
-        classify_rest_order_error(&err, &InstrumentNameExchange::new("BTCUSDT"))
-    }
-
     #[test]
     fn codeless_transport_failures_map_to_connectivity() {
         // The SDK's codeless transport/decode wrappers (http_request error arm) must classify as
         // Connectivity — venue status unknown — never as a definitive rejection. Misreporting one
         // of these as Rejected risks a phantom position when the order actually reached the engine.
-        // This test also pins the brittle prefix list against silent SDK message-format drift.
-        for msg in [
-            "HTTP request failed: connection reset",
-            "Failed to get response bytes: error reading body",
-            "Failed to decompress gzip response",
-            "Failed to convert response to UTF-8: invalid utf-8 sequence",
+        // Each error is the SDK's own, so this also pins the brittle prefix list against silent
+        // SDK message-format drift.
+        for (ce, which) in [
+            (sdk_errors::rest_transport_error(), "connection refused"),
+            (sdk_errors::rest_truncated_error(), "body cut short"),
+            (
+                sdk_errors::rest_error(200, "not gzip", &[("content-encoding", "gzip")]),
+                "bad gzip",
+            ),
+            (sdk_errors::rest_error(200, [0xff, 0xfe], &[]), "bad UTF-8"),
         ] {
             assert!(
-                matches!(classify(msg, None), OrderError::Connectivity(_)),
-                "expected Connectivity for {msg:?}"
+                matches!(classify_err(ce), OrderError::Connectivity(_)),
+                "expected Connectivity for {which}"
             );
         }
     }
 
     #[test]
     fn coded_error_maps_to_rejection() {
-        // A genuine matching-engine rejection carries a Binance numeric code.
+        // A genuine matching-engine rejection carries a Binance numeric code, whatever the status
+        // the SDK has no variant of its own for.
         assert!(matches!(
-            classify("Account has insufficient balance.", Some(-2010)),
+            classify_err(sdk_errors::rest_refusal(
+                422,
+                Some(-2010),
+                "Account has insufficient balance."
+            )),
             OrderError::Rejected(_)
         ));
     }
 
     #[test]
     fn codeless_non_transport_status_error_maps_to_rejection() {
-        // An unusual HTTP error *status* with no Binance code (SDK's catch-all `_` arm) did reach
-        // the venue, so it must remain a rejection — not be swallowed as connectivity by an
-        // over-broad `code.is_none()` guard. This is the distinction the prefix match preserves.
-        assert!(matches!(
-            classify("Conflict", None),
-            OrderError::Rejected(_)
-        ));
+        // An unusual HTTP error *status* with no Binance code (SDK's catch-all `_` arm), or a 409
+        // (its own variant since binance-sdk 78), did reach the venue, so it must remain a
+        // rejection — not be swallowed as connectivity by an over-broad `code.is_none()` guard.
+        // This is the distinction the prefix match preserves.
+        for status in [409, 422] {
+            assert!(
+                matches!(
+                    classify_err(sdk_errors::rest_error(status, "Conflict", &[])),
+                    OrderError::Rejected(_)
+                ),
+                "{status}"
+            );
+        }
     }
 
     fn classify_err(ce: ConnectorError) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
@@ -6187,16 +6199,8 @@ mod tests {
     fn rate_limit_variants_map_to_rejection_ratelimit() {
         // 429/418 surface as RateLimit so callers can back off; venue did respond.
         for ce in [
-            ConnectorError::TooManyRequestsError {
-                msg: "Too many requests.".to_string(),
-                code: Some(-1003),
-                retry_after: None,
-            },
-            ConnectorError::RateLimitBanError {
-                msg: "IP banned.".to_string(),
-                code: Some(-1003),
-                retry_after: None,
-            },
+            sdk_errors::rest_refusal(429, Some(-1003), "Too many requests."),
+            sdk_errors::rest_refusal(418, Some(-1003), "IP banned."),
         ] {
             assert!(matches!(
                 classify_err(ce),
@@ -6209,14 +6213,12 @@ mod tests {
     fn auth_variants_map_to_unauthenticated() {
         // A 401, or a 403 that is an auth failure, is a definitive auth rejection.
         for ce in [
-            ConnectorError::UnauthorizedError {
-                msg: "bad key".to_string(),
-                code: Some(-2014),
-            },
-            ConnectorError::ForbiddenError {
-                msg: "Invalid API-key, IP, or permissions for action.".to_string(),
-                code: Some(-2015),
-            },
+            sdk_errors::rest_refusal(401, Some(-2014), "bad key"),
+            sdk_errors::rest_refusal(
+                403,
+                Some(-2015),
+                "Invalid API-key, IP, or permissions for action.",
+            ),
         ] {
             assert!(matches!(
                 classify_err(ce),
@@ -6229,10 +6231,7 @@ mod tests {
     fn server_and_network_variants_map_to_connectivity() {
         // 5xx / transport failures leave the order's venue status unknown → Connectivity.
         for ce in [
-            ConnectorError::ServerError {
-                msg: "internal error".to_string(),
-                status_code: Some(503),
-            },
+            sdk_errors::rest_error(503, "internal error", &[]),
             ConnectorError::NetworkError("connection reset".to_string()),
         ] {
             assert!(matches!(classify_err(ce), OrderError::Connectivity(_)));
@@ -6249,10 +6248,7 @@ mod tests {
     }
 
     fn bad_request(code: i64, msg: &str) -> ConnectorError {
-        ConnectorError::BadRequestError {
-            msg: msg.to_string(),
-            code: Some(code),
-        }
+        sdk_errors::rest_refusal(400, Some(code), msg)
     }
 
     #[test]
@@ -6364,14 +6360,8 @@ mod tests {
     #[test]
     fn query_transport_server_and_throttle_failures_classify_like_orders() {
         for ce in [
-            ConnectorError::ConnectorClientError {
-                msg: "HTTP request failed: connection reset".to_string(),
-                code: None,
-            },
-            ConnectorError::ServerError {
-                msg: "Server error: 503".to_string(),
-                status_code: Some(503),
-            },
+            sdk_errors::rest_transport_error(),
+            sdk_errors::rest_error(503, "", &[]),
             ConnectorError::NetworkError("connection reset".to_string()),
         ] {
             let err = classify_query(ce);
@@ -6382,20 +6372,21 @@ mod tests {
             assert!(err.is_transient());
         }
 
-        let err = classify_query(ConnectorError::TooManyRequestsError {
-            msg: "Too many requests.".to_string(),
-            code: Some(-1003),
-            retry_after: None,
-        });
+        let err = classify_query(sdk_errors::rest_refusal(
+            429,
+            Some(-1003),
+            "Too many requests.",
+        ));
         assert!(matches!(
             err,
             UnindexedClientError::Api(ApiError::RateLimit { .. })
         ));
 
-        let err = classify_query(ConnectorError::UnauthorizedError {
-            msg: "API-key format invalid.".to_string(),
-            code: Some(-2014),
-        });
+        let err = classify_query(sdk_errors::rest_refusal(
+            401,
+            Some(-2014),
+            "API-key format invalid.",
+        ));
         let UnindexedClientError::Api(ApiError::Unauthenticated(msg)) = &err else {
             panic!("expected Unauthenticated, got {err:?}");
         };
@@ -6419,10 +6410,7 @@ mod tests {
     fn a_response_body_that_does_not_decode_is_internal() {
         // What binance-sdk's `data()` returns when the body does not fit its model: the
         // `serde_json` error as a codeless `ConnectorClientError`.
-        let err = response_decode_error(ConnectorError::ConnectorClientError {
-            msg: "invalid type: map, expected a sequence at line 1 column 0".to_string(),
-            code: None,
-        });
+        let err = response_decode_error(sdk_errors::rest_decode_error());
         assert!(
             matches!(&err, UnindexedClientError::Internal(msg) if msg.contains("invalid type")),
             "got {err:?}"
@@ -6463,19 +6451,21 @@ mod tests {
     #[test]
     fn a_forbidden_query_is_an_auth_failure_only_when_it_says_so() {
         // Binance documents 403 as its WAF limit: back off and retry.
-        let err = classify_query(ConnectorError::ForbiddenError {
-            msg: "<html>403 Forbidden</html>".to_string(),
-            code: None,
-        });
+        let err = classify_query(sdk_errors::rest_error(
+            403,
+            "<html>403 Forbidden</html>",
+            &[],
+        ));
         assert!(
             matches!(err, UnindexedClientError::Api(ApiError::RateLimit { .. })),
             "got {err:?}"
         );
 
-        let err = classify_query(ConnectorError::ForbiddenError {
-            msg: "Invalid API-key, IP, or permissions for action.".to_string(),
-            code: Some(-2015),
-        });
+        let err = classify_query(sdk_errors::rest_refusal(
+            403,
+            Some(-2015),
+            "Invalid API-key, IP, or permissions for action.",
+        ));
         assert!(
             matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
             "got {err:?}"
@@ -6500,10 +6490,11 @@ mod tests {
     fn an_order_forbidden_by_the_waf_is_a_rate_limit() {
         // Refused at the edge: the order never reached the matching engine.
         assert!(matches!(
-            classify_err(ConnectorError::ForbiddenError {
-                msg: "<html>403 Forbidden</html>".to_string(),
-                code: None,
-            }),
+            classify_err(sdk_errors::rest_error(
+                403,
+                "<html>403 Forbidden</html>",
+                &[]
+            )),
             OrderError::Rejected(ApiError::RateLimit { .. })
         ));
     }
@@ -6512,10 +6503,11 @@ mod tests {
     fn an_order_the_venue_failed_has_an_unknown_status() {
         // Binance: the order may have executed. A definitive rejection would hide a fill.
         for code in [-1000, -1001, -1006, -1007, -1008] {
-            let err = classify_err(ConnectorError::BadRequestError {
-                msg: "Timeout waiting for response from backend server.".to_string(),
-                code: Some(code),
-            });
+            let err = classify_err(sdk_errors::rest_refusal(
+                400,
+                Some(code),
+                "Timeout waiting for response from backend server.",
+            ));
             assert!(
                 matches!(err, OrderError::Connectivity(_)),
                 "{code}: got {err:?}"
@@ -6539,10 +6531,7 @@ mod tests {
             (-1022, "Signature for this request is not valid."),
             (-2014, "API-key format invalid."),
         ] {
-            let err = classify_err(ConnectorError::BadRequestError {
-                msg: msg.to_string(),
-                code: Some(code),
-            });
+            let err = classify_err(sdk_errors::rest_refusal(400, Some(code), msg));
             assert!(
                 matches!(err, OrderError::Rejected(ApiError::Unauthenticated(_))),
                 "{code}: got {err:?}"
@@ -6552,10 +6541,11 @@ mod tests {
 
     #[test]
     fn a_definitive_order_rejection_is_still_a_rejection() {
-        let err = classify_err(ConnectorError::BadRequestError {
-            msg: "Account has insufficient balance for requested action.".to_string(),
-            code: Some(-2010),
-        });
+        let err = classify_err(sdk_errors::rest_refusal(
+            400,
+            Some(-2010),
+            "Account has insufficient balance for requested action.",
+        ));
         assert!(
             matches!(
                 err,
@@ -6596,10 +6586,7 @@ mod tests {
             ),
         ];
         for (msg, expected) in cases {
-            let rest = classify_err(ConnectorError::BadRequestError {
-                msg: msg.to_string(),
-                code: Some(-2010),
-            });
+            let rest = classify_err(sdk_errors::rest_refusal(400, Some(-2010), msg));
             assert!(expected(&rest), "REST {msg:?}: got {rest:?}");
 
             let ws = classify_ws(-2010, msg);
@@ -6642,10 +6629,7 @@ mod tests {
                 BorrowRejectReason::InventoryUnavailable,
             ),
         ] {
-            let rest = classify_err(ConnectorError::BadRequestError {
-                msg: msg.to_string(),
-                code: Some(code),
-            });
+            let rest = classify_err(sdk_errors::rest_refusal(400, Some(code), msg));
             let expected =
                 BorrowReject::new(reason, Some(code.to_string()), format!("{code} {msg}"));
             assert_eq!(
@@ -6674,10 +6658,7 @@ mod tests {
     #[test]
     fn a_trailing_stop_limit_only_refusal_is_an_unsupported_order_type() {
         let msg = "Trailing stop order only supports limit type.";
-        let rest = classify_err(ConnectorError::BadRequestError {
-            msg: msg.to_string(),
-            code: Some(-3111),
-        });
+        let rest = classify_err(sdk_errors::rest_refusal(400, Some(-3111), msg));
         assert_eq!(
             rest,
             OrderError::UnsupportedOrderType(format!("-3111 {msg}"))
@@ -6702,10 +6683,7 @@ mod tests {
     fn a_stop_without_a_limit_refusal_is_an_unsupported_order_type() {
         let msg = "STOP_LOSS and TAKE_PROFIT orders, whether placed standalone or as a leg of an \
                    order list, are not supported for this account.";
-        let rest = classify_err(ConnectorError::BadRequestError {
-            msg: msg.to_string(),
-            code: Some(-3116),
-        });
+        let rest = classify_err(sdk_errors::rest_refusal(400, Some(-3116), msg));
         assert_eq!(
             rest,
             OrderError::UnsupportedOrderType(format!("-3116 {msg}"))
@@ -6794,11 +6772,7 @@ mod tests {
 
     fn classify_ws(code: i64, message: &str) -> Option<UnindexedOrderError> {
         classify_ws_order_error(
-            &anyhow::Error::new(WebsocketError::ResponseError {
-                code,
-                message: message.to_string(),
-                retry_after: None,
-            }),
+            &anyhow::Error::new(sdk_errors::ws_refusal(code, message)),
             &InstrumentNameExchange::new("BTCUSDT"),
         )
     }
@@ -6898,12 +6872,8 @@ mod tests {
     async fn only_a_rate_limit_refusal_of_a_stream_connect_starts_a_cooldown() {
         let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
         let response = |code, retry_after| {
-            anyhow::Error::new(WebsocketError::ResponseError {
-                code,
-                message: "refused".to_string(),
-                retry_after,
-            })
-            .context("subscribing")
+            anyhow::Error::new(ws_refusal_until(code, "refused", retry_after))
+                .context("subscribing")
         };
         let about = |tracker: &RateLimitTracker, wait: Duration| {
             tracker
@@ -7013,11 +6983,10 @@ mod tests {
         );
 
         // A context layer must not hide the code.
-        let wrapped = anyhow::Error::new(WebsocketError::ResponseError {
-            code: -1007,
-            message: "Timeout waiting for response from backend server.".to_string(),
-            retry_after: None,
-        })
+        let wrapped = anyhow::Error::new(sdk_errors::ws_refusal(
+            -1007,
+            "Timeout waiting for response from backend server.",
+        ))
         .context("outer");
         let err = classify_ws_order_error(&wrapped, &InstrumentNameExchange::new("BTCUSDT"));
         assert!(
@@ -7033,16 +7002,18 @@ mod tests {
 
     #[test]
     fn a_waf_403_is_backed_off_as_a_rate_limit_but_an_auth_403_is_not() {
-        let waf = anyhow::Error::new(ConnectorError::ForbiddenError {
-            msg: "<html>403 Forbidden</html>".to_string(),
-            code: None,
-        });
+        let waf = anyhow::Error::new(sdk_errors::rest_error(
+            403,
+            "<html>403 Forbidden</html>",
+            &[],
+        ));
         assert!(is_rate_limit_error(&waf));
 
-        let auth = anyhow::Error::new(ConnectorError::ForbiddenError {
-            msg: "Invalid API-key, IP, or permissions for action.".to_string(),
-            code: Some(-2015),
-        });
+        let auth = anyhow::Error::new(sdk_errors::rest_refusal(
+            403,
+            Some(-2015),
+            "Invalid API-key, IP, or permissions for action.",
+        ));
         assert!(!is_rate_limit_error(&auth));
     }
 
@@ -7261,6 +7232,20 @@ mod tests {
         );
     }
 
+    /// The SDK's error for a WS-API refusal with `code`, `msg` and, when set, the `retryAfter`
+    /// epoch in its `data`. A non-negative `code` is sent as the status, with no code in the
+    /// error, which is when the SDK falls back to the status.
+    fn ws_refusal_until(code: i64, msg: &str, retry_after: Option<i64>) -> WebsocketError {
+        let mut error = match u16::try_from(code) {
+            Ok(_) => serde_json::json!({ "msg": msg }),
+            Err(_) => serde_json::json!({ "code": code, "msg": msg }),
+        };
+        if let Some(until) = retry_after {
+            error["data"] = serde_json::json!({ "retryAfter": until });
+        }
+        sdk_errors::ws_error(u16::try_from(code).unwrap_or(400), error)
+    }
+
     /// A WS-API ban epoch `ms` from now.
     fn epoch_in(ms: u64) -> i64 {
         i64::try_from(unix_ms()).unwrap() + i64::try_from(ms).unwrap()
@@ -7268,11 +7253,11 @@ mod tests {
 
     fn classify_ws_with_retry_after(code: i64, retry_after: Option<i64>) -> UnindexedOrderError {
         classify_ws_order_error(
-            &anyhow::Error::new(WebsocketError::ResponseError {
+            &anyhow::Error::new(ws_refusal_until(
                 code,
-                message: "Way too much request weight used; IP banned.".to_string(),
+                "Way too much request weight used; IP banned.",
                 retry_after,
-            }),
+            )),
             &InstrumentNameExchange::new("BTCUSDT"),
         )
         .expect("a ResponseError is a venue response")
@@ -7323,22 +7308,17 @@ mod tests {
     /// REST's `Retry-After`, in seconds, is the wait on a 429 and a 418, for orders and queries.
     #[test]
     fn a_rest_rate_limit_reports_its_retry_after() {
-        let refusal = |banned: bool, retry_after| {
-            let msg = "Too many requests.".to_string();
-            let code = Some(-1003);
-            if banned {
-                ConnectorError::RateLimitBanError {
-                    msg,
-                    code,
-                    retry_after,
-                }
-            } else {
-                ConnectorError::TooManyRequestsError {
-                    msg,
-                    code,
-                    retry_after,
-                }
-            }
+        let refusal = |banned: bool, retry_after: Option<u32>| {
+            let retry_after = retry_after.map(|secs| secs.to_string());
+            let headers: Vec<(&str, &str)> = retry_after
+                .iter()
+                .map(|secs| ("retry-after", secs.as_str()))
+                .collect();
+            sdk_errors::rest_error(
+                if banned { 418 } else { 429 },
+                r#"{"code":-1003,"msg":"Too many requests."}"#,
+                &headers,
+            )
         };
         // A zero wait names none.
         for (sent, expected) in [
@@ -7377,11 +7357,11 @@ mod tests {
             |_| {
                 calls += 1;
                 Box::pin(async {
-                    Err(anyhow::Error::new(ConnectorError::TooManyRequestsError {
-                        msg: "Too much request weight used.".to_string(),
-                        code: Some(-1003),
-                        retry_after: None,
-                    }))
+                    Err(anyhow::Error::new(sdk_errors::rest_refusal(
+                        429,
+                        Some(-1003),
+                        "Too much request weight used.",
+                    )))
                 })
             },
         )

@@ -350,11 +350,12 @@ impl Drop for ClearOnDrop<'_> {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::binance::sdk_errors;
     use crate::client::binance::shared::{
         RateLimitTracker, RequestKind, WeightPool, is_timestamp_rejection, rest_read_with_retry,
     };
     use binance_sdk::{
-        common::{config::ConfigurationRestApi, errors::ConnectorError},
+        common::config::ConfigurationRestApi,
         spot::{SpotRestApi, rest_api::GetAccountParams},
     };
     use serde_json::json;
@@ -801,10 +802,11 @@ mod tests {
         let (_, server_time) = source(Instant::now(), Duration::ZERO, Arc::clone(&reads));
         let tracker = RateLimitTracker::new(WeightPool::Spot).with_server_time(Some(server_time));
         tracker.wait_if_blocked(RequestKind::Order).await.unwrap();
-        let refused = anyhow::Error::new(ConnectorError::BadRequestError {
-            msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
-            code: Some(-1021),
-        });
+        let refused = anyhow::Error::new(sdk_errors::rest_refusal(
+            400,
+            Some(-1021),
+            "Timestamp for this request is outside of the recvWindow.",
+        ));
 
         tracker.on_rate_limited(Some(Duration::from_secs(60)));
         tokio::time::advance(Duration::from_millis(1)).await;

@@ -37,8 +37,7 @@
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
 use super::cancel_replace::{
-    CANCEL_REPLACE_PATH, CancelReplaceRequest, CancelTarget, SignedRest, cancel_replace_query,
-    open_refused_legs, read_legs, refused_legs,
+    CancelReplaceRequest, CancelTarget, LegsAnswer, open_refused_legs, read_legs, refused_legs,
 };
 use super::commission::{CommissionRates, fetch_commission_rates};
 use super::restatement::{
@@ -98,8 +97,7 @@ use crate::{
 };
 use binance_sdk::{
     common::{
-        config::{ConfigurationRestApi, ConfigurationWebsocketApi},
-        constants::{SPOT_REST_API_PROD_URL, SPOT_REST_API_TESTNET_URL},
+        config::{ConfigurationRestApi, ConfigurationRestApiBuilder, ConfigurationWebsocketApi},
         models::WebsocketEvent,
     },
     spot::{
@@ -429,8 +427,9 @@ pub struct BinanceSpot {
     // The symbols' tick, lot and notional rules, loaded on each symbol's first order. Shared by
     // every clone.
     rules: Arc<RulesLoader>,
-    // Signed REST requests sent past the SDK, for the cancel-replace answers it would cut short.
-    signed_rest: Arc<SignedRest>,
+    // The REST client for cancel-replace, an order request: bounded as the WS-API session bounds
+    // an order's answer, and never sent twice ([`BinanceSpot::build_order_rest`]).
+    order_rest: Arc<RestApi>,
 }
 
 impl std::fmt::Debug for BinanceSpot {
@@ -516,46 +515,57 @@ impl BinanceSpot {
 
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
-    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_rest(config: &BinanceSpotConfig, signing: Option<&SigningClock>) -> Arc<RestApi> {
-        let mut builder = ConfigurationRestApi::builder()
+        Self::rest_client(config, Self::rest_config_builder(config, signing))
+    }
+
+    /// The REST client for order requests sent over REST, a cancel-replace: to the same API as
+    /// [`build_rest`](Self::build_rest)'s and stamped on the same clock.
+    ///
+    /// Each request is bounded by 5 s, the WS-API session's wait for an order's answer, as a
+    /// cancel-replace stands in for two such requests. And none is sent again: the SDK re-sends a
+    /// request whose answer it could not read, which for an order the venue may have acted on.
+    ///
+    /// # Panics
+    /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    fn build_order_rest(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> Arc<RestApi> {
+        let builder = Self::rest_config_builder(config, signing)
+            .timeout(5_000)
+            .retries(0);
+        Self::rest_client(config, builder)
+    }
+
+    /// A REST configuration signed with `config`'s credentials, on `signing`'s clock when set.
+    fn rest_config_builder(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> ConfigurationRestApiBuilder {
+        let builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
             .api_secret(config.secret_key.clone());
-        if let Some(signing) = signing {
-            builder = builder.timestamp_provider(signing.provider());
+        match signing {
+            Some(signing) => builder.timestamp_provider(signing.provider()),
+            None => builder,
         }
+    }
+
+    /// The REST client `builder` configures, on `config`'s network.
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
+    fn rest_client(
+        config: &BinanceSpotConfig,
+        builder: ConfigurationRestApiBuilder,
+    ) -> Arc<RestApi> {
         let rest_config = builder
             .build()
             .expect("failed to build Binance REST configuration");
-
         Arc::new(if config.testnet {
             SpotRestApi::testnet(rest_config)
         } else {
             SpotRestApi::production(rest_config)
         })
-    }
-
-    /// The signed REST requests the client sends past the SDK, to the same API as
-    /// [`build_rest`](Self::build_rest)'s and stamped on the same clock.
-    ///
-    /// Each is bounded by 5 s, the WS-API session's wait for an order's answer: a cancel-replace
-    /// stands in for two such requests.
-    fn build_signed_rest(
-        config: &BinanceSpotConfig,
-        signing: Option<&SigningClock>,
-    ) -> Arc<SignedRest> {
-        let base_url = if config.testnet {
-            SPOT_REST_API_TESTNET_URL
-        } else {
-            SPOT_REST_API_PROD_URL
-        };
-        Arc::new(SignedRest::new(
-            base_url.to_string(),
-            config.api_key.clone(),
-            config.secret_key.clone(),
-            signing.map(SigningClock::provider),
-            Duration::from_secs(5),
-        ))
     }
 
     /// Send `cancel` and `open` as one cancel-replace, which
@@ -609,8 +619,8 @@ impl BinanceSpot {
                 fields,
                 on_cancel_failure,
             };
-            let query = match request.params() {
-                Ok(params) => cancel_replace_query(params),
+            let params = match request.params() {
+                Ok(params) => params,
                 Err(e) => {
                     error!(%e, "BinanceSpot failed to build cancel-replace params");
                     let cancelled = self.cancel_order(cancel).await.state;
@@ -620,26 +630,19 @@ impl BinanceSpot {
             };
 
             let answer = rest_call_with_retry(
-                &self.signed_rest,
+                &self.order_rest,
                 &self.rate_limiter,
                 RequestKind::Order,
                 |rest| {
-                    let query = query.clone();
+                    let params = params.clone();
                     Box::pin(async move {
-                        let answer = rest
-                            .send(reqwest::Method::POST, CANCEL_REPLACE_PATH, query)
-                            .await?;
-                        if answer.reports_legs() {
-                            Ok(answer)
-                        } else {
-                            Err(answer.into_connector_error().into())
-                        }
+                        LegsAnswer::read(rest.order_cancel_replace(params).await).await
                     })
                 },
             )
             .await;
             match answer {
-                Ok(answer) => read_legs(&answer, &instrument, quantity),
+                Ok(answer) => read_legs(answer, &instrument, quantity),
                 Err(e) => refused_legs(
                     classify_rest_order_error(&e, &instrument),
                     on_cancel_failure,
@@ -1089,7 +1092,7 @@ impl ExecutionClient for BinanceSpot {
         let signing = config.server_time_sync.then(SigningClock::default);
         let rest = Self::build_rest(&config, signing.as_ref());
         let ws_handle = Self::build_ws_handle(&config, signing.as_ref());
-        let signed_rest = Self::build_signed_rest(&config, signing.as_ref());
+        let order_rest = Self::build_order_rest(&config, signing.as_ref());
         // `GET /api/v3/time` is unsigned, so the client that signs with the clock reads it.
         let server_time =
             signing.map(|signing| ServerTime::new(signing, read_server_time(Arc::clone(&rest))));
@@ -1108,7 +1111,7 @@ impl ExecutionClient for BinanceSpot {
             rate_limiter,
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceSpot),
             rules,
-            signed_rest,
+            order_rest,
         }
     }
 
@@ -2119,7 +2122,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =77.2.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =78.0.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -2337,7 +2340,7 @@ async fn connection_manager(
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
         // unsubscribe() aborts the callback task without waiting for it (verified against
-        // binance-sdk =77.2.0): a callback already running finishes, and none starts once the
+        // binance-sdk =78.0.0): a callback already running finishes, and none starts once the
         // task sees the abort. That is benign: the callback holds its own clone of the
         // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
         // reaches the consumer through the dedup cache like any other from this connection.
@@ -3076,11 +3079,11 @@ fn place_enums(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::binance::sdk_errors;
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::error::StreamTerminationReason;
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
-    use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
 
     /// No WS-API session could be connected, so an open was never sent: the order was not
@@ -4101,11 +4104,10 @@ mod tests {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
 
         // A ResponseError from binance-sdk (the venue answered with status >= 400) is classified
-        let rejection = anyhow::anyhow!(WebsocketError::ResponseError {
-            code: -2010,
-            message: "Account has insufficient balance for requested action.".into(),
-            retry_after: None,
-        });
+        let rejection = anyhow::anyhow!(sdk_errors::ws_refusal(
+            -2010,
+            "Account has insufficient balance for requested action."
+        ));
         assert!(
             matches!(
                 classify_ws_order_error(&rejection, &instrument),
@@ -5927,11 +5929,7 @@ mod tests {
         // ResponseError wrapped in anyhow context layers is still detected correctly,
         // so SDK-internal context wrapping does not break the rejection check.
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let raw = anyhow::anyhow!(WebsocketError::ResponseError {
-            code: -2010,
-            message: "insufficient balance".into(),
-            retry_after: None,
-        });
+        let raw = anyhow::anyhow!(sdk_errors::ws_refusal(-2010, "insufficient balance"));
         // Unwrapped root: must be detected
         assert!(
             classify_ws_order_error(&raw, &instrument).is_some(),
@@ -7901,21 +7899,12 @@ mod tests {
 
     #[test]
     fn an_unknown_order_or_symbol_is_recognised_by_its_code() {
-        use binance_sdk::common::errors::ConnectorError;
-        let bad = |code| {
-            anyhow::Error::new(ConnectorError::BadRequestError {
-                msg: "no".into(),
-                code: Some(code),
-            })
-        };
+        let bad = |code| anyhow::Error::new(sdk_errors::rest_refusal(400, Some(code), "no"));
         assert!(is_unknown_order(&bad(-2013)));
         assert!(is_unknown_order(&bad(-1121)));
         assert!(!is_unknown_order(&bad(-1100)));
         assert!(is_unknown_order(&anyhow::Error::new(
-            ConnectorError::NotFoundError {
-                msg: "no".into(),
-                code: Some(-2013),
-            }
+            sdk_errors::rest_refusal(404, Some(-2013), "no")
         )));
         assert!(!is_unknown_order(&anyhow::anyhow!("-2013 in text only")));
     }
@@ -8647,12 +8636,14 @@ mod tests {
         /// session goes nowhere, so a cancel sent alone fails at once.
         fn client(server: &wiremock::MockServer) -> BinanceSpot {
             let mut client = client_with_ws_api("ws://127.0.0.1:9".to_string());
-            client.signed_rest = Arc::new(SignedRest::new(
-                server.uri(),
-                "key".to_string(),
-                "secret".to_string(),
-                None,
-                Duration::from_secs(5),
+            client.order_rest = Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .retries(0)
+                    .build()
+                    .unwrap(),
             ));
             client
         }
@@ -8767,6 +8758,60 @@ mod tests {
                 matches!(
                     opened.state,
                     OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(_)))
+                ),
+                "{:?}",
+                opened.state
+            );
+        }
+
+        /// A success, which the SDK decodes into its own model, answers each leg from it: the
+        /// cancel done with its fill, and the new order resting.
+        #[tokio::test]
+        async fn a_success_answers_both_legs_from_the_sdks_model() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("POST"))
+                .and(path("/api/v3/order/cancelReplace"))
+                .and(query_param("newOrderRespType", "RESULT"))
+                .and(query_param("timeInForce", "GTC"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "cancelResult": "SUCCESS", "newOrderResult": "SUCCESS",
+                        "cancelResponse": {
+                            "symbol": "BTCUSDT", "orderId": 11, "status": "CANCELED",
+                            "transactTime": 1_700_000_000_000_i64, "executedQty": "0.1",
+                            "cummulativeQuoteQty": "10.15",
+                        },
+                        "newOrderResponse": {
+                            "symbol": "BTCUSDT", "orderId": 12, "status": "NEW",
+                            "transactTime": 1_700_000_000_001_i64, "executedQty": "0",
+                            "cummulativeQuoteQty": "0", "fills": [],
+                        },
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client(&server);
+            let instrument = btcusdt();
+
+            let answer = client
+                .cancel_replace(
+                    cancel(&instrument, Some("11")),
+                    open(&instrument, limit()),
+                    OnCancelFailure::DropOpens,
+                )
+                .expect("a same-symbol limit order goes as one request")
+                .await;
+
+            let cancelled = answer.cancel.state.expect("the cancel succeeded");
+            assert_eq!(cancelled.id, OrderId::new("11"));
+            assert_eq!(cancelled.filled_quantity, Some(dec!(0.1)));
+            let opened = answer.open.expect("the new order was attempted");
+            assert!(
+                matches!(
+                    &opened.state,
+                    OrderState::Active(crate::order::state::ActiveOrderState::Open(open))
+                        if open.id == VenueOrderId::Assigned(OrderId::new("12"))
                 ),
                 "{:?}",
                 opened.state
