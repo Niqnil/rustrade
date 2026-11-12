@@ -709,7 +709,9 @@ pub enum VenueRegime {
 /// side. A conservative reservation would have to be released and re-debited on the fill,
 /// producing two or three restatements for one fill and reporting balances the account never
 /// held, while [`Balance::used`](crate::balance::Balance::used) misreported for the order's whole
-/// life.
+/// life. The one spot exception is a [`Dated`](FeeModelConfig::Dated) fee schedule that changes
+/// while the order rests: its fill is charged the new fee, so it is costed afresh (see
+/// `settle_resting`).
 ///
 /// A resting CFD order holds only what its fill would cost **net of what the fill pays back**,
 /// computed against the position when it rests. An order that only reduces a position therefore
@@ -3688,7 +3690,8 @@ impl SimulatedVenue {
         // Both sides are the unfilled remainder, priced at the order's own limit as the maker --
         // `rest_order` holds for it and this settles it, so the two agree by construction rather
         // than by two formulas coinciding. Only spot reaches this: what a spot fill costs does not
-        // depend on a position, so nothing can have moved it since the order rested.
+        // depend on a position, so nothing can have moved it since the order rested, except a
+        // dated fee schedule's change, which `fee_schedule_changed` sent afresh above.
         debug_assert!(
             asset == settlement.asset && amount == settlement.amount,
             "resting order {} reserved {amount} of {asset} but its fill settles {} of {}: the \
@@ -3718,6 +3721,11 @@ impl SimulatedVenue {
     /// [`Dated`](FeeModelConfig::Dated) fee schedule changed since the hold was priced. Under any
     /// other model the two agree by construction (see [`settle_resting`](Self::settle_resting)),
     /// and an order that holds nothing has no hold to disagree with.
+    ///
+    /// A [`Reservation`] does not record when it was priced, so this compares what the fill costs
+    /// with what was held rather than the two times. Under a dated model, a disagreement with any
+    /// other cause is therefore costed afresh too, rather than caught by `settle_resting`'s
+    /// debug assertion.
     fn fee_schedule_changed(
         &self,
         terms: &InstrumentTerms,
@@ -10333,6 +10341,58 @@ mod tests {
         );
         assert_eq!(free_quote(&venue), Decimal::ZERO);
         assert_eq!(total_quote(&venue), Decimal::ZERO);
+    }
+
+    /// An order filled in part on arrival holds its remainder at the fee then in effect, and the
+    /// remainder's fill after the change pays the new fee on its own quantity alone.
+    #[test]
+    fn a_remainder_filled_after_a_fee_change_pays_the_new_fee() {
+        let mut venue = make_market_venue_with(
+            "0",
+            "10",
+            fee_change_at_2("1", "2"),
+            SimFillConfig::default(),
+        );
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    MarketObservation::new(book("0.5", "0.9"))
+                        .with_depth(MarketDepth::new(None, Some(d("0.4")))),
+                    time(1)
+                )
+                .is_empty()
+        );
+        let arrival = venue.open_order(limit_request("b", Side::Buy, "1", "1", gtc()));
+        assert_eq!(
+            filled_trade(&arrival).fees.fees,
+            d("0.4"),
+            "0.4 at the old fee"
+        );
+        // 0.4 at 0.9 and its fee of 0.4 spent; 0.6 at 1 and its fee of 0.6 held.
+        assert_eq!(total_quote(&venue), d("10") - d("0.36") - d("0.4"));
+        assert_eq!(free_quote(&venue), total_quote(&venue) - d("1.2"));
+
+        advance(&mut venue, time(3));
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("0.5", "0.6")),
+            time(3),
+        );
+
+        let trade = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::Trade(trade) => Some(trade),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the remainder fills: {events:?}"));
+        assert_eq!(trade.quantity, d("0.6"));
+        assert_eq!(trade.fees.fees, d("1.2"), "0.6 at the new fee of 2");
+        let remaining = d("10") - d("0.36") - d("0.4") - d("0.6") - d("1.2");
+        assert_eq!(free_quote(&venue), remaining);
+        assert_eq!(total_quote(&venue), remaining);
     }
 
     // --- SpotFeeAsset::Received: a buy's fee comes out of the base it receives -----------------
@@ -17005,6 +17065,64 @@ mod tests {
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO)
         );
         assert_eq!(trade_of(&events[2]).quantity, d("1"));
+    }
+
+    /// A resting sell holds the base it borrowed, which a fee change does not alter: its fill
+    /// takes the new fee from its proceeds and keeps its loan.
+    #[test]
+    fn a_resting_sell_across_a_fee_change_pays_the_new_fee_from_its_proceeds() {
+        let mut venue = margin_market_venue("0", "100000");
+        venue.fee_model = fee_change_at_2("10", "20");
+        venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+
+        advance(&mut venue, time(3));
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("50100", "50200")),
+            time(3),
+        );
+
+        let events = sans_debt(&events);
+        assert_eq!(
+            balance_of(events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
+            "the loan stays owed"
+        );
+        assert_eq!(
+            balance_of(events[1]).balance,
+            Balance::new_margin(d("149980"), d("149980"), Decimal::ZERO, Decimal::ZERO),
+            "the proceeds of 50,000 less the new fee of 20"
+        );
+        assert_eq!(trade_of(events[2]).fees.fees, d("20"));
+    }
+
+    /// A resting buy that borrowed part of its hold, then filled after a fee rise, borrows the
+    /// difference the rise adds, as one costed afresh at fill time.
+    #[test]
+    fn a_resting_buy_that_borrowed_borrows_what_a_fee_rise_adds() {
+        let mut venue = margin_market_venue("0", "49055");
+        venue.fee_model = fee_change_at_2("10", "20");
+        let rested = venue.open_order(limit_request("rest", Side::Buy, "1", "49050", gtc()));
+        assert_eq!(
+            balance_of(sans_debt(&rested.events)[0]).balance,
+            Balance::new_margin(d("49060"), Decimal::ZERO, d("5"), Decimal::ZERO),
+            "49,050 and the fee of 10 held, 5 of it borrowed"
+        );
+
+        advance(&mut venue, time(3));
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("48900", "49000")),
+            time(3),
+        );
+
+        let events = sans_debt(&events);
+        assert_eq!(
+            balance_of(events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("15"), Decimal::ZERO),
+            "the new fee of 20 borrows 10 more"
+        );
+        assert_eq!(trade_of(events[2]).fees.fees, d("20"));
     }
 
     #[test]

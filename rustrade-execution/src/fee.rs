@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, asset::name::AssetNameExchange};
 use serde::{Deserialize, Serialize};
@@ -705,7 +705,11 @@ pub enum FeeModelError {
     },
     /// The change at `index` of a [`DatedFeeModel`] takes effect at `from`, which is not after
     /// `previous`, the time of the change before it.
-    #[error("fee change {index}: effective from {from}, which is not after {previous}")]
+    #[error(
+        "fee change {index}: effective from {}, which is not after {}",
+        .from.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        .previous.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    )]
     ChangesNotIncreasing {
         /// The change's position in the list.
         index: usize,
@@ -1630,8 +1634,8 @@ mod tests {
                 from: at(10),
             }
             .to_string(),
-            "fee change 1: effective from 2023-11-14 22:13:30 UTC, which is not after \
-             2023-11-14 22:13:30 UTC"
+            "fee change 1: effective from 2023-11-14T22:13:30Z, which is not after \
+             2023-11-14T22:13:30Z"
         );
     }
 
@@ -1660,6 +1664,10 @@ mod tests {
             {"from":"2024-01-01T00:00:00Z","model":{"Zero":null}}]}}"#;
         let nested = r#"{"Dated":{"initial":{"Dated":{"initial":{"Zero":null},"changes":[]}},
             "changes":[]}}"#;
+        let nested_in_a_change = r#"{"Dated":{"initial":{"Zero":null},"changes":[
+            {"from":"2024-01-01T00:00:00Z","model":{"Zero":null}},
+            {"from":"2024-01-02T00:00:00Z",
+             "model":{"Dated":{"initial":{"Zero":null},"changes":[]}}}]}}"#;
 
         let error = serde_json::from_str::<FeeModelConfig>(out_of_order)
             .unwrap_err()
@@ -1668,7 +1676,11 @@ mod tests {
         let error = serde_json::from_str::<FeeModelConfig>(nested)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("another dated model"), "{error}");
+        assert!(error.contains("its initial model"), "{error}");
+        let error = serde_json::from_str::<FeeModelConfig>(nested_in_a_change)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("(change 1)"), "{error}");
     }
 
     #[test]
