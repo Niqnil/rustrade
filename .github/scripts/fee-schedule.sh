@@ -159,15 +159,16 @@ cmd_report() {
             if [ ! -s "$diff_file" ]; then
                 echo "_No difference in the extracted text: only the checksum or revision differs._"
             else
-                echo '```diff'
+                # A longer fence than any the text could hold, so a line of the diff cannot close it.
+                echo '~~~~diff'
                 if [ "$(wc -c <"$diff_file")" -gt "$DIFF_LIMIT" ]; then
                     head -c "$DIFF_LIMIT" "$diff_file" | sed '$d'
-                    echo '```'
+                    echo '~~~~'
                     echo
                     echo "_The diff is cut short here. Read the document for the rest._"
                 else
                     cat "$diff_file"
-                    echo '```'
+                    echo '~~~~'
                 fi
             fi
         else
@@ -180,7 +181,9 @@ cmd_report() {
         echo "- Check every fee model example and rate that follows this schedule, such as the" \
             "Alpaca example in \`CompositeFeeModel\`'s rustdoc (\`rustrade-execution/src/fee.rs\`)."
         echo "- Set \`revised\` to \`$revised\` and \`words_sha256\` to \`$words_sha256\` in the" \
-            "baseline, \`$baseline\`, then close this issue."
+            "baseline, \`$baseline\`, then close this issue. The scheduled check keeps using the" \
+            "default branch's baseline until the update reaches it, and opens no second issue for" \
+            "this version meanwhile."
     } >"$outdir/issue.md"
 }
 

@@ -6,8 +6,8 @@ name: "Fee Schedule Weekly"
 # date, and venues revise their schedules without notice. Each run downloads the document, extracts
 # its text and compares its revision date and a checksum of its words with the baseline in
 # `.github/fee-schedules/`. The schedule's text is never committed (it is the venue's document);
-# each run keeps it as an artifact for 90 days instead, so a change is shown as a diff against the
-# text the previous run saw.
+# each run on the default branch keeps it as an artifact for 90 days instead, so a change is shown
+# as a diff against the text of an earlier run that matched the baseline.
 #
 # Updating the baseline: set `revised` and `words_sha256` to the values the issue gives (or that
 # `.github/scripts/fee-schedule.sh check` prints), after checking what follows the schedule.
@@ -26,9 +26,12 @@ on:
       - ".github/scripts/fee-schedule.sh"
       - ".github/fee-schedules/**"
 
-# Two runs at once could each open an issue for the same change.
+# The runs that open issues are serialised, since two at once could each open one for the same
+# change. Pull request runs get a group of their own, so a pending one never displaces a pending
+# scheduled run (a group keeps only its newest pending run).
 concurrency:
-  group: fee-schedule-weekly
+  group: >-
+    fee-schedule-weekly-${{ github.event_name == 'pull_request' && github.ref || 'reporting' }}
   cancel-in-progress: false
 
 permissions:
@@ -41,7 +44,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      # Finds and downloads the previous run's extracted text.
+      # Finds and downloads an earlier run's extracted text.
       actions: read
       # Opens the issue reporting a change.
       issues: write
@@ -49,9 +52,17 @@ jobs:
       BASELINE: .github/fee-schedules/alpaca.json
       ARTIFACT: fee-schedule-text-alpaca
       OUT: fee-schedule-out
+      # Only a run on the default branch keeps its text and opens issues. A scheduled run always
+      # is one; a manual run is one when dispatched there. Any other run (a pull request, a manual
+      # run on another branch) fails instead when its baseline does not match the document.
+      REPORTING: >-
+        ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch'
+        && github.ref_name == github.event.repository.default_branch) }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install pdftotext
         run: |
@@ -65,9 +76,8 @@ jobs:
         id: check
         run: .github/scripts/fee-schedule.sh check "$BASELINE" "$OUT"
 
-      # Not on a pull request: the next scheduled run diffs against the default branch's runs only.
-      - name: Keep the extracted text for the next run's diff
-        if: github.event_name != 'pull_request'
+      - name: Keep the extracted text for a later run's diff
+        if: env.REPORTING == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ${{ env.ARTIFACT }}
@@ -81,8 +91,8 @@ jobs:
           REVISED: ${{ steps.check.outputs.revised }}
         run: echo "Alpaca fee schedule unchanged (revised $REVISED)." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail a pull request whose baseline does not match the document
-        if: steps.check.outputs.changed == 'true' && github.event_name == 'pull_request'
+      - name: Fail a run whose baseline does not match the document
+        if: steps.check.outputs.changed == 'true' && env.REPORTING != 'true'
         env:
           REVISED: ${{ steps.check.outputs.revised }}
           WORDS_SHA256: ${{ steps.check.outputs.words_sha256 }}
@@ -93,24 +103,36 @@ jobs:
           exit 1
 
       - name: Open an issue for a changed document
-        if: steps.check.outputs.changed == 'true' && github.event_name != 'pull_request'
+        if: steps.check.outputs.changed == 'true' && env.REPORTING == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          # The most recent earlier successful run on the default branch that still has its text.
+          # Diff against the most recent earlier run whose text matched the baseline, so the diff
+          # shows everything the baseline is missing. Failing that, against the most recent
+          # earlier run that still has its text (each keeps it 90 days).
+          base_sha=$(jq -r .words_sha256 "$BASELINE")
           prev=""
           desc=""
           runs=$(gh run list --repo "$REPO" --workflow fee-schedule-weekly.yml \
-            --branch "$DEFAULT_BRANCH" --status success --limit 30 --json databaseId,event \
+            --branch "$BRANCH" --status success --limit 30 --json databaseId,event \
             --jq '.[] | select(.event != "pull_request") | .databaseId')
           for id in $runs; do
             [ "$id" = "$GITHUB_RUN_ID" ] && continue
             dir="$RUNNER_TEMP/previous-$id"
-            if gh run download "$id" --repo "$REPO" --name "$ARTIFACT" --dir "$dir" 2>/dev/null; then
+            # A failure is logged, not hidden: an expired artifact and an API error both end here.
+            if ! gh run download "$id" --repo "$REPO" --name "$ARTIFACT" --dir "$dir"; then
+              continue
+            fi
+            day=$(gh run view "$id" --repo "$REPO" --json createdAt --jq '.createdAt[0:10]')
+            if [ -z "$prev" ]; then
               prev="$dir/fee-schedule.txt"
-              day=$(gh run view "$id" --repo "$REPO" --json createdAt --jq '.createdAt[0:10]')
+              desc="the text run $id saw on $day"
+            fi
+            if [ "$(.github/scripts/fee-schedule.sh words-sha256 "$dir/fee-schedule.txt")" \
+                 = "$base_sha" ]; then
+              prev="$dir/fee-schedule.txt"
               desc="the text run $id saw on $day"
               break
             fi
@@ -123,12 +145,16 @@ jobs:
           fi
           cat "$OUT/issue.md" >> "$GITHUB_STEP_SUMMARY"
 
-          # One issue per version of the document: its title carries the new checksum.
+          # One issue per version of the document, open or closed: its title carries the new
+          # checksum. Closed ones count because a baseline update merged into the development
+          # branch reaches this branch only at the next release; until then each run here still
+          # sees the change.
           title=$(cat "$OUT/title.txt")
-          open_titles=$(gh issue list --repo "$REPO" --state open --limit 500 --json title \
-            --jq '.[].title')
-          if grep -qxF -- "$title" <<<"$open_titles"; then
-            echo "An open issue already reports this version: $title"
+          words_sha256=$(sed -n 's/^words_sha256=//p' "$OUT/result.env")
+          titles=$(gh issue list --repo "$REPO" --state all --limit 100 \
+            --search "${words_sha256:0:12} in:title" --json title --jq '.[].title')
+          if grep -qxF -- "$title" <<<"$titles"; then
+            echo "An issue already reports this version: $title"
           else
             gh issue create --repo "$REPO" --title "$title" --body-file "$OUT/issue.md"
           fi
