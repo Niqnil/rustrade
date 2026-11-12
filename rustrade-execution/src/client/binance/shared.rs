@@ -573,6 +573,18 @@ pub(crate) fn drop_after<T: BinanceExecutionFields>(page: &mut Vec<T>, end_ms: i
     page.retain(|execution| execution.time().is_none_or(|time| time <= end_ms));
     page.len() < len
 }
+
+/// How long an order request sent over REST waits for its answer, in milliseconds: a margin
+/// order or cancel, or a spot cancel-replace. It matches the WS-API session's wait for an order's
+/// answer (the SDK's default for that session). Such a request is never sent again, so an answer
+/// later than this leaves the order's outcome unknown; the bound is generous so that a slow venue
+/// rarely does. The SDK sets a timeout per HTTP client, so the requests it bounds have a client,
+/// and a connection pool, of their own.
+///
+/// The rustdoc of `BinanceMargin::open_margin_order` and `cancel_order`, which cannot link a
+/// crate-private item, and the CHANGELOG state this value: update them with it.
+pub(crate) const ORDER_REST_TIMEOUT_MS: u64 = 5_000;
+
 /// Timeout for the initial WebSocket API TCP+TLS handshake.
 /// Without this, a network partition holds the write lock for up to 75–127 s
 /// (OS TCP timeout), stalling all concurrent open_order/cancel_order callers.

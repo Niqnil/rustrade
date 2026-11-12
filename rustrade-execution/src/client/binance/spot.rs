@@ -49,17 +49,17 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
     BinanceTimeInForce, CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
     FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
-    ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SharedDedupCache, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame,
-    WeightPool, account_position_time, answer_time, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, classify_ws_order_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, disconnect_lookback,
-    drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order,
-    log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, rest_read_with_retry, retry_or_end, trailing_params, unix_ms,
-    unreadable_answer,
+    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
+    RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
 use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
@@ -522,9 +522,10 @@ impl BinanceSpot {
     /// The REST client for order requests sent over REST, a cancel-replace: to the same API as
     /// [`build_rest`](Self::build_rest)'s and stamped on the same clock.
     ///
-    /// Each request is bounded by 5 s, the WS-API session's wait for an order's answer, as a
-    /// cancel-replace stands in for two such requests. And none is sent again: the SDK re-sends a
-    /// request whose answer it could not read, which for an order the venue may have acted on.
+    /// Each request is bounded by [`ORDER_REST_TIMEOUT_MS`], the WS-API session's wait for an
+    /// order's answer, as a cancel-replace stands in for two such requests. And none is sent
+    /// again: the SDK re-sends a request whose answer it could not read, which for an order the
+    /// venue may have acted on.
     ///
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
@@ -541,7 +542,7 @@ impl BinanceSpot {
         signing: Option<&SigningClock>,
     ) -> ConfigurationRestApiBuilder {
         Self::rest_config_builder(config, signing)
-            .timeout(5_000)
+            .timeout(ORDER_REST_TIMEOUT_MS)
             .retries(0)
     }
 
@@ -7931,7 +7932,7 @@ mod tests {
         let order = BinanceSpot::order_rest_config_builder(&config, None)
             .build()
             .unwrap();
-        assert_eq!(order.timeout, 5_000);
+        assert_eq!(order.timeout, ORDER_REST_TIMEOUT_MS);
         assert_eq!(order.retries, 0);
     }
 
