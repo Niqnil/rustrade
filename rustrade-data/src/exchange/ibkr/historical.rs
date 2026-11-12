@@ -70,17 +70,19 @@ use crate::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ibapi::{
     client::blocking::Client,
-    contracts::{Contract, SecurityType},
+    contracts::{Contract, OptionChain, SecurityType},
     market_data::{
         IgnoreSize, TradingHours,
-        historical::{BarSize, Duration, TickBidAsk, TickLast, WhatToShow},
+        historical::{BarSize, Duration, TickBidAsk, TickLast, TickSubscription, WhatToShow},
     },
+    subscriptions::{Subscription, SubscriptionItem},
 };
 use rust_decimal::Decimal;
 use smol_str::format_smolstr;
 use std::{
     hash::{Hash, Hasher},
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
@@ -102,10 +104,63 @@ pub use ibapi::market_data::historical::ToDuration;
 #[derive(Debug)]
 pub struct IbkrHistoricalData {
     client: Arc<Client>,
+    /// The bound on the requests read from a subscription, which `ibapi`'s `one_shot_timeout`
+    /// does not cover. See [`IbkrHistoricalDataConfig::request_timeout`].
+    request_timeout: Option<StdDuration>,
+}
+
+/// How [`IbkrHistoricalData::connect_with`] sets up its connection.
+///
+/// Build it with [`default`](Self::default) and the `with_*` setters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IbkrHistoricalDataConfig {
+    /// How long each [`IbkrHistoricalData`] request waits for IB's complete answer before it
+    /// fails with [`DataError::RequestTimeout`]. `None` waits without a limit. The requests:
+    /// [`fetch_candles`](IbkrHistoricalData::fetch_candles),
+    /// [`fetch_historical_ticks`](IbkrHistoricalData::fetch_historical_ticks),
+    /// [`fetch_historical_bid_ask`](IbkrHistoricalData::fetch_historical_bid_ask),
+    /// [`calculate_theoretical_greeks`](IbkrHistoricalData::calculate_theoretical_greeks),
+    /// [`calculate_implied_volatility`](IbkrHistoricalData::calculate_implied_volatility) and
+    /// [`fetch_option_chain`](IbkrHistoricalData::fetch_option_chain).
+    ///
+    /// The bound covers the whole call, from when it is made. For the candle and calculator
+    /// requests it also covers a wait for the connection to come back and the request to be
+    /// resent after it drops. A request that runs out of time fails whole: the ticks or chain
+    /// entries received before then are not returned.
+    ///
+    /// Without a bound, a call IB never answers never returns, and a candle or calculator call
+    /// caught by a dropped connection waits through every reconnect attempt. Either way it holds
+    /// a thread of tokio's blocking pool.
+    ///
+    /// Defaults to [`DEFAULT_REQUEST_TIMEOUT`](Self::DEFAULT_REQUEST_TIMEOUT). A long window or a
+    /// cold historical data server can make IB slow to answer, so raise it for large fetches.
+    pub request_timeout: Option<StdDuration>,
+}
+
+impl IbkrHistoricalDataConfig {
+    /// The default [`request_timeout`](Self::request_timeout): two minutes.
+    pub const DEFAULT_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+
+    /// This config with `request_timeout`. `None` waits without a limit. A zero timeout makes
+    /// [`IbkrHistoricalData::connect_with`] fail.
+    #[must_use]
+    pub fn with_request_timeout(self, request_timeout: Option<StdDuration>) -> Self {
+        Self { request_timeout }
+    }
+}
+
+impl Default for IbkrHistoricalDataConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Some(Self::DEFAULT_REQUEST_TIMEOUT),
+        }
+    }
 }
 
 impl IbkrHistoricalData {
-    /// Connect to TWS/Gateway for historical data requests.
+    /// Connect to TWS/Gateway for historical data requests, with the default
+    /// [`IbkrHistoricalDataConfig`].
     ///
     /// # Arguments
     ///
@@ -116,17 +171,63 @@ impl IbkrHistoricalData {
     ///
     /// Returns error if connection fails.
     pub fn connect(url: &str, client_id: i32) -> Result<Self, DataError> {
-        info!(%url, client_id, "Connecting to IB for historical data");
+        Self::connect_with(url, client_id, IbkrHistoricalDataConfig::default())
+    }
 
-        let client = Client::connect(url, client_id)
+    /// Connect to TWS/Gateway for historical data requests, set up by `config`.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - Host and port (e.g., "127.0.0.1:4002" for Gateway paper)
+    /// * `client_id` - Unique client ID (must differ from other connections)
+    /// * `config` - The connection's settings, such as its request timeout
+    ///
+    /// # Errors
+    ///
+    /// [`DataError::Socket`] if the connection fails, or if `config` has a zero
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    pub fn connect_with(
+        url: &str,
+        client_id: i32,
+        config: IbkrHistoricalDataConfig,
+    ) -> Result<Self, DataError> {
+        info!(
+            %url,
+            client_id,
+            request_timeout = ?config.request_timeout,
+            "Connecting to IB for historical data"
+        );
+
+        let builder = Client::builder().address(url).client_id(client_id);
+        let builder = match config.request_timeout {
+            Some(timeout) => builder.one_shot_timeout(timeout),
+            None => builder,
+        };
+        let client = builder
+            .connect()
             .map_err(|e| DataError::Socket(format!("IB connect: {e}")))?;
 
         Ok(Self {
             client: Arc::new(client),
+            request_timeout: config.request_timeout,
         })
     }
 
     /// Create from an existing client connection.
+    ///
+    /// # Request timeout
+    ///
+    /// The caller sets the timeout of the candle and calculator requests
+    /// ([`fetch_candles`](Self::fetch_candles),
+    /// [`calculate_theoretical_greeks`](Self::calculate_theoretical_greeks),
+    /// [`calculate_implied_volatility`](Self::calculate_implied_volatility)): the client's own
+    /// `ibapi` `one_shot_timeout` (`Client::builder().one_shot_timeout(..)`) bounds them. A
+    /// client built without one, such as one from `Client::connect`, leaves them without a
+    /// limit: see [`IbkrHistoricalDataConfig::request_timeout`] for what that risks.
+    ///
+    /// The tick and option chain requests, which `one_shot_timeout` does not cover, are bounded
+    /// by [`IbkrHistoricalDataConfig::DEFAULT_REQUEST_TIMEOUT`]. Use
+    /// [`connect_with`](Self::connect_with) to set one timeout for every request.
     ///
     /// # Shared Connection Hazards
     ///
@@ -141,7 +242,15 @@ impl IbkrHistoricalData {
     ///
     /// [`IbkrMarketStream`]: super::IbkrMarketStream
     pub fn from_client(client: Arc<Client>) -> Self {
-        Self { client }
+        Self {
+            client,
+            request_timeout: Some(IbkrHistoricalDataConfig::DEFAULT_REQUEST_TIMEOUT),
+        }
+    }
+
+    /// When a request made now must be answered by, if it is bounded.
+    fn deadline(&self) -> Option<Instant> {
+        self.request_timeout.map(|timeout| Instant::now() + timeout)
     }
 
     /// Disconnect from IB Gateway.
@@ -176,6 +285,9 @@ impl IbkrHistoricalData {
     /// Returns `DataError::Socket` if:
     /// - IB rejects the request (invalid contract, pacing violation, no data permission)
     /// - Network error during request
+    ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
     ///
     /// Note: `DataError::Socket` is used for all IB API errors because `ibapi`
     /// errors are unstructured strings. Callers cannot distinguish transient
@@ -229,7 +341,7 @@ impl IbkrHistoricalData {
             }
             let historical_data = builder
                 .fetch()
-                .map_err(|e| DataError::Socket(format!("historical data: {e}")))?;
+                .map_err(|e| request_error("historical data", e))?;
 
             let mut candles = Vec::with_capacity(historical_data.bars.len());
             for bar in &historical_data.bars {
@@ -270,6 +382,9 @@ impl IbkrHistoricalData {
     ///
     /// Returns `DataError::Socket` if IB rejects the request or network error occurs.
     ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    ///
     /// # Notes
     ///
     /// - Maximum 1000 ticks per request (IB limit)
@@ -299,6 +414,7 @@ impl IbkrHistoricalData {
             ));
         }
 
+        let deadline = self.deadline();
         let client = self.client.clone();
         let symbol = request.contract.symbol.clone();
 
@@ -333,11 +449,12 @@ impl IbkrHistoricalData {
 
             // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
             // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
-            // them silently). `iter_data()` filters non-fatal notices (ibapi logs
-            // them at `warn!`) and yields `Result<TickLast, Error>`; `collect_ticks`
-            // drains it, stops at the first `Err`, and records the reason.
+            // them silently). `DataUntil` filters non-fatal notices (logged at
+            // `warn!`) and yields `Result<TickLast, Error>` until the deadline;
+            // `collect_ticks` drains it, stops at the first `Err`, and records the reason.
+            let mut data = DataUntil::new(&subscription, deadline, "historical_ticks_trade");
             let fetched = collect_ticks(
-                subscription.iter_data(),
+                &mut data,
                 request.contract.symbol.0.as_str(),
                 request.number_of_ticks,
                 tick_last_to_public_trade,
@@ -350,6 +467,7 @@ impl IbkrHistoricalData {
                     );
                 },
             );
+            data.timed_out()?;
             Ok::<_, DataError>(fetched)
         })
         .await
@@ -390,6 +508,9 @@ impl IbkrHistoricalData {
     ///
     /// Returns `DataError::Socket` if IB rejects the request or network error occurs.
     ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    ///
     /// # Notes
     ///
     /// - Maximum 1000 ticks per request (IB limit)
@@ -414,6 +535,7 @@ impl IbkrHistoricalData {
             ));
         }
 
+        let deadline = self.deadline();
         let client = self.client.clone();
         let symbol = request.contract.symbol.clone();
 
@@ -453,12 +575,13 @@ impl IbkrHistoricalData {
 
             // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
             // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
-            // them silently). `iter_data()` filters non-fatal notices (ibapi logs
-            // them at `warn!`) and yields `Result<TickBidAsk, Error>`; `collect_ticks`
-            // drains it, stops at the first `Err`, and records the reason. The
-            // bid/ask decode needs no sequence index, so `seq` is ignored.
+            // them silently). `DataUntil` filters non-fatal notices (logged at
+            // `warn!`) and yields `Result<TickBidAsk, Error>` until the deadline;
+            // `collect_ticks` drains it, stops at the first `Err`, and records the
+            // reason. The bid/ask decode needs no sequence index, so `seq` is ignored.
+            let mut data = DataUntil::new(&subscription, deadline, "historical_ticks_bid_ask");
             let fetched = collect_ticks(
-                subscription.iter_data(),
+                &mut data,
                 request.contract.symbol.0.as_str(),
                 request.number_of_ticks,
                 |tick, _seq| tick_bid_ask_to_order_book_l1(tick),
@@ -471,6 +594,7 @@ impl IbkrHistoricalData {
                     );
                 },
             );
+            data.timed_out()?;
             Ok::<_, DataError>(fetched)
         })
         .await
@@ -520,6 +644,9 @@ impl IbkrHistoricalData {
     /// Returns `DataError::Socket` if IB rejects the request (invalid contract,
     /// missing subscription, etc.).
     ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -551,7 +678,7 @@ impl IbkrHistoricalData {
         let greeks = tokio::task::spawn_blocking(move || {
             let computation = client
                 .calculate_option_price(&contract, volatility, underlying_price)
-                .map_err(|e| DataError::Socket(format!("calculate_option_price: {e}")))?;
+                .map_err(|e| request_error("calculate_option_price", e))?;
 
             Ok::<_, DataError>(OptionGreeks::from_ib(&computation))
         })
@@ -595,6 +722,9 @@ impl IbkrHistoricalData {
     /// Returns `DataError::Socket` if IB rejects the request or if IV cannot
     /// be computed (e.g., option price is below intrinsic value).
     ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -626,7 +756,7 @@ impl IbkrHistoricalData {
         let greeks = tokio::task::spawn_blocking(move || {
             let computation = client
                 .calculate_implied_volatility(&contract, option_price, underlying_price)
-                .map_err(|e| DataError::Socket(format!("calculate_implied_volatility: {e}")))?;
+                .map_err(|e| request_error("calculate_implied_volatility", e))?;
 
             Ok::<_, DataError>(OptionGreeks::from_ib(&computation))
         })
@@ -678,6 +808,9 @@ impl IbkrHistoricalData {
     ///
     /// Returns `DataError::Socket` if IB rejects the request up front.
     ///
+    /// [`DataError::RequestTimeout`] if IB gives no complete answer within the connection's
+    /// [`request_timeout`](IbkrHistoricalDataConfig::request_timeout).
+    ///
     /// # Notes
     ///
     /// A mid-stream IB error (pacing/permission error, decode failure,
@@ -713,6 +846,7 @@ impl IbkrHistoricalData {
         security_type: SecurityType,
         contract_id: i32,
     ) -> Result<OptionChainResult, DataError> {
+        let deadline = self.deadline();
         let client = self.client.clone();
         let symbol = symbol.to_string();
         let exchange = exchange.map(str::to_string);
@@ -737,7 +871,7 @@ impl IbkrHistoricalData {
                 .subscribe()
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
-            // ibapi: `iter_data()` yields `Result<OptionChain, Error>`,
+            // `DataUntil` yields `Result<OptionChain, Error>` until the deadline,
             // filtering subscription-level notices, so an `Err` here is a
             // genuine mid-stream failure. Option chains use the same
             // Subscription/StreamDecoder machinery as historical ticks (N
@@ -745,8 +879,9 @@ impl IbkrHistoricalData {
             // `EndOfStream`), so mirror the tick methods: keep the entries
             // already decoded — each is a complete, valid message — record the
             // reason, and stop, instead of discarding them with a fail-fast Err.
+            let mut data = DataUntil::new(&subscription, deadline, "option_chain");
             let (entries, _received, truncation_error) = drain_until_error(
-                subscription.iter_data(),
+                &mut data,
                 16,
                 |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
                 |e| {
@@ -758,6 +893,7 @@ impl IbkrHistoricalData {
                     );
                 },
             );
+            data.timed_out()?;
 
             debug!(
                 symbol = %symbol,
@@ -781,6 +917,17 @@ impl IbkrHistoricalData {
         })??;
 
         Ok(chains)
+    }
+}
+
+/// The error for a failed `ibapi` request named `operation`: [`DataError::RequestTimeout`] when it
+/// ran out of time, else [`DataError::Socket`].
+fn request_error(operation: &str, error: ibapi::Error) -> DataError {
+    match error {
+        ibapi::Error::Timeout => DataError::RequestTimeout {
+            operation: operation.to_owned(),
+        },
+        other => DataError::Socket(format!("{operation}: {other}")),
     }
 }
 
@@ -995,6 +1142,122 @@ impl IntoIterator for OptionChainResult {
     }
 }
 
+/// What [`DataUntil`] reads: one of the `ibapi` subscription types the historical requests
+/// return. Their decoder traits are private to `ibapi`, so each concrete type is listed.
+trait TimedItems {
+    type Item;
+    /// The next item, blocking until one arrives or the subscription ends (`None`).
+    fn next_item(&self) -> Option<Result<SubscriptionItem<Self::Item>, ibapi::Error>>;
+    /// The next item, blocking up to `timeout`. `None` when the time is up or the subscription
+    /// ended; [`ended`](Self::ended) tells which.
+    fn next_item_within(
+        &self,
+        timeout: StdDuration,
+    ) -> Option<Result<SubscriptionItem<Self::Item>, ibapi::Error>>;
+    /// Whether the subscription ended, with nothing left to read.
+    fn ended(&self) -> bool;
+}
+
+macro_rules! timed_items {
+    ($subscription:ty, $item:ty) => {
+        impl TimedItems for $subscription {
+            type Item = $item;
+            fn next_item(&self) -> Option<Result<SubscriptionItem<$item>, ibapi::Error>> {
+                self.next()
+            }
+            fn next_item_within(
+                &self,
+                timeout: StdDuration,
+            ) -> Option<Result<SubscriptionItem<$item>, ibapi::Error>> {
+                self.next_timeout(timeout)
+            }
+            fn ended(&self) -> bool {
+                self.is_terminated()
+            }
+        }
+    };
+}
+
+timed_items!(TickSubscription<TickLast>, TickLast);
+timed_items!(TickSubscription<TickBidAsk>, TickBidAsk);
+timed_items!(Subscription<OptionChain>, OptionChain);
+
+/// The data items of a subscription, read until it ends or `deadline` passes.
+///
+/// Notices are logged at `warn!` and skipped, as `ibapi`'s `iter_data()` does. Once `deadline`
+/// passes, the next item is `Err(ibapi::Error::Timeout)` and iteration ends; the caller then fails
+/// the request through [`timed_out`](Self::timed_out). Without a deadline it reads like
+/// `iter_data()`.
+struct DataUntil<'a, S> {
+    subscription: &'a S,
+    deadline: Option<Instant>,
+    operation: &'static str,
+    timed_out: bool,
+}
+
+impl<'a, S: TimedItems> DataUntil<'a, S> {
+    fn new(subscription: &'a S, deadline: Option<Instant>, operation: &'static str) -> Self {
+        Self {
+            subscription,
+            deadline,
+            operation,
+            timed_out: false,
+        }
+    }
+
+    /// [`DataError::RequestTimeout`] naming the request if the deadline passed before the
+    /// subscription ended.
+    fn timed_out(&self) -> Result<(), DataError> {
+        if self.timed_out {
+            Err(DataError::RequestTimeout {
+                operation: self.operation.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<S: TimedItems> Iterator for DataUntil<'_, S> {
+    type Item = Result<S::Item, ibapi::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.timed_out {
+            return None;
+        }
+        loop {
+            let item = match self.deadline {
+                None => self.subscription.next_item(),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let item = if remaining.is_zero() {
+                        None
+                    } else {
+                        self.subscription.next_item_within(remaining)
+                    };
+                    // `None` is either the time running out or the subscription ending.
+                    if item.is_none() && !self.subscription.ended() {
+                        self.timed_out = true;
+                        return Some(Err(ibapi::Error::Timeout));
+                    }
+                    item
+                }
+            };
+            match item? {
+                Ok(SubscriptionItem::Data(data)) => return Some(Ok(data)),
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    warn!(
+                        %notice,
+                        operation = self.operation,
+                        "IB notice during a historical request"
+                    );
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
 /// Drain a subscription iterator, stopping at the first `Err` yielded by
 /// `iter`. Shared by `collect_ticks` and `fetch_option_chain` — both consume
 /// the same `Subscription`/`iter_data()` machinery, whose `Err` is a genuine
@@ -1027,6 +1290,12 @@ fn drain_until_error<Raw, Out>(
     for (seq, item) in iter.enumerate() {
         let raw = match item {
             Ok(raw) => raw,
+            // A timeout is not a truncation: the caller fails the whole request (see
+            // `DataUntil::timed_out`), so it is not reported as one.
+            Err(ibapi::Error::Timeout) => {
+                truncation_error = Some(ibapi::Error::Timeout.to_string());
+                break;
+            }
             Err(e) => {
                 on_error(&e);
                 truncation_error = Some(e.to_string());
@@ -1391,6 +1660,51 @@ mod tests {
             wap: 152.0,
             count: 50_000,
         }
+    }
+
+    /// Requests are bounded by default, and the bound can be changed or removed.
+    #[test]
+    fn the_default_config_bounds_requests_at_two_minutes() {
+        let config = IbkrHistoricalDataConfig::default();
+        assert_eq!(config.request_timeout, Some(StdDuration::from_secs(120)));
+        assert_eq!(
+            config
+                .with_request_timeout(Some(StdDuration::from_secs(5)))
+                .request_timeout,
+            Some(StdDuration::from_secs(5))
+        );
+        assert_eq!(config.with_request_timeout(None).request_timeout, None);
+    }
+
+    /// A zero timeout is refused before any connection is tried.
+    #[test]
+    fn a_zero_request_timeout_fails_connect() {
+        let config =
+            IbkrHistoricalDataConfig::default().with_request_timeout(Some(StdDuration::ZERO));
+        let error = IbkrHistoricalData::connect_with("127.0.0.1:1", 1, config).unwrap_err();
+        assert!(
+            matches!(&error, DataError::Socket(message) if message.contains("one_shot_timeout")),
+            "{error:?}"
+        );
+    }
+
+    /// A request that ran out of time is a timeout naming it; any other `ibapi` error stays a
+    /// socket error.
+    #[test]
+    fn a_timed_out_request_is_a_request_timeout() {
+        assert_eq!(
+            request_error("historical data", ibapi::Error::Timeout),
+            DataError::RequestTimeout {
+                operation: "historical data".to_owned()
+            }
+        );
+        assert_eq!(
+            request_error("historical data", ibapi::Error::Simple("no".to_owned())),
+            DataError::Socket(format!(
+                "historical data: {}",
+                ibapi::Error::Simple("no".to_owned())
+            ))
+        );
     }
 
     #[test]
@@ -1952,5 +2266,131 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(received, 2);
         assert_eq!(truncation_error, None);
+    }
+    /// A timeout ends the drain without being reported as a truncation: the caller fails the
+    /// request instead.
+    #[test]
+    fn drain_until_error_does_not_report_a_timeout_as_truncation() {
+        let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> =
+            vec![Ok(make_option_chain("SMART")), Err(ibapi::Error::Timeout)];
+
+        let (entries, received, truncation_error) = drain_until_error(
+            items.into_iter(),
+            16,
+            |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+            |_e| panic!("on_error must not fire for a timeout"),
+        );
+
+        assert_eq!((entries.len(), received), (1, 1));
+        assert!(truncation_error.is_some());
+    }
+
+    /// A scripted subscription: each read pops the next answer; `None` is "nothing yet" until
+    /// `ended` is set.
+    struct Scripted {
+        answers: std::cell::RefCell<
+            std::collections::VecDeque<Option<Result<SubscriptionItem<u32>, ibapi::Error>>>,
+        >,
+        ended: std::cell::Cell<bool>,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<Option<Result<SubscriptionItem<u32>, ibapi::Error>>>) -> Self {
+            Self {
+                answers: std::cell::RefCell::new(answers.into()),
+                ended: std::cell::Cell::new(false),
+            }
+        }
+
+        fn pop(&self) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
+            let answer = self.answers.borrow_mut().pop_front().flatten();
+            if self.answers.borrow().is_empty() && answer.is_none() {
+                self.ended.set(true);
+            }
+            answer
+        }
+    }
+
+    impl TimedItems for Scripted {
+        type Item = u32;
+        fn next_item(&self) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
+            self.pop()
+        }
+        fn next_item_within(
+            &self,
+            _timeout: StdDuration,
+        ) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
+            self.pop()
+        }
+        fn ended(&self) -> bool {
+            self.ended.get()
+        }
+    }
+
+    fn notice() -> ibapi::Notice {
+        ibapi::Notice {
+            request_id: None,
+            code: 2104,
+            message: "farm ok".to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        }
+    }
+
+    fn far_deadline() -> Option<Instant> {
+        Some(Instant::now() + StdDuration::from_secs(60))
+    }
+
+    /// Data is yielded, notices skipped, and a subscription that ends before the deadline is not
+    /// a timeout.
+    #[test]
+    fn data_until_reads_data_to_the_end() {
+        for deadline in [None, far_deadline()] {
+            let scripted = Scripted::new(vec![
+                Some(Ok(SubscriptionItem::Data(1))),
+                Some(Ok(SubscriptionItem::Notice(notice()))),
+                Some(Ok(SubscriptionItem::Data(2))),
+                None,
+            ]);
+            let mut data = DataUntil::new(&scripted, deadline, "test");
+            let items: Vec<_> = (&mut data).collect::<Result<_, _>>().unwrap();
+            assert_eq!(items, vec![1, 2], "{deadline:?}");
+            assert_eq!(data.timed_out(), Ok(()));
+        }
+    }
+
+    /// Nothing arriving while the subscription is still open is the time running out: one
+    /// `Timeout` item, then the end, and the request fails with `RequestTimeout`.
+    #[test]
+    fn data_until_times_out_when_nothing_arrives_in_time() {
+        let scripted = Scripted::new(vec![Some(Ok(SubscriptionItem::Data(1))), None, None]);
+        let mut data = DataUntil::new(&scripted, far_deadline(), "test");
+        assert!(matches!(data.next(), Some(Ok(1))));
+        assert!(matches!(data.next(), Some(Err(ibapi::Error::Timeout))));
+        assert!(data.next().is_none());
+        assert_eq!(
+            data.timed_out(),
+            Err(DataError::RequestTimeout {
+                operation: "test".to_owned()
+            })
+        );
+    }
+
+    /// A deadline already past times out without reading.
+    #[test]
+    fn data_until_times_out_at_a_passed_deadline() {
+        let scripted = Scripted::new(vec![Some(Ok(SubscriptionItem::Data(1)))]);
+        let mut data = DataUntil::new(&scripted, Some(Instant::now()), "test");
+        assert!(matches!(data.next(), Some(Err(ibapi::Error::Timeout))));
+        assert_eq!(scripted.answers.borrow().len(), 1, "nothing was read");
+    }
+
+    /// A subscription error passes through, and is not a timeout.
+    #[test]
+    fn data_until_passes_a_subscription_error_through() {
+        let scripted = Scripted::new(vec![Some(Err(ibapi::Error::Simple("no".to_owned())))]);
+        let mut data = DataUntil::new(&scripted, far_deadline(), "test");
+        assert!(matches!(data.next(), Some(Err(ibapi::Error::Simple(_)))));
+        assert_eq!(data.timed_out(), Ok(()));
     }
 }

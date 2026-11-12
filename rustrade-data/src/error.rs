@@ -153,6 +153,15 @@ pub enum DataError {
     /// up on a feed that stays silent is the caller's decision.
     #[error("no market event received for {threshold:?}, so the stream is reconnecting")]
     SilenceTimeout { threshold: Duration },
+
+    /// A one-shot request, named by `operation`, got no complete answer within the time set for
+    /// it, so it was given up.
+    ///
+    /// A configured request timeout produces it, such as the `request_timeout` of
+    /// `IbkrHistoricalDataConfig` (`ibkr` feature). It says nothing about whether the venue would
+    /// have answered later: retrying is the caller's decision.
+    #[error("{operation} got no complete answer in time")]
+    RequestTimeout { operation: String },
 }
 
 impl DataError {

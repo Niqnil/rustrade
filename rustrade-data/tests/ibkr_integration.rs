@@ -92,10 +92,14 @@ use ibapi::{
     market_data::historical::{BarSize, WhatToShow},
 };
 use rustrade_data::{
+    error::DataError,
     event::DataKind,
     exchange::ibkr::{
         IbkrMarketStream, IbkrStreamConfig,
-        historical::{HistoricalRequest, HistoricalTickRequest, IbkrHistoricalData, ToDuration},
+        historical::{
+            HistoricalRequest, HistoricalTickRequest, IbkrHistoricalData, IbkrHistoricalDataConfig,
+            ToDuration,
+        },
         subscription::{IbkrSubscription, IbkrSubscriptionKind},
     },
 };
@@ -419,6 +423,47 @@ async fn test_historical_from_shared_client() {
         "Expected at least one candle from shared client"
     );
     println!("Received {} candles from shared client", candles.len());
+}
+
+/// A request IB cannot answer within the connection's request timeout fails with
+/// `RequestTimeout` naming it, instead of waiting: a candle request, bounded by `ibapi`, and a
+/// tick request, bounded by this library. A millisecond is too short for any answer.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_historical_request_timeout() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 40;
+    let config =
+        IbkrHistoricalDataConfig::default().with_request_timeout(Some(Duration::from_millis(1)));
+
+    let client = tokio::task::spawn_blocking(move || {
+        IbkrHistoricalData::connect_with(&url, client_id, config)
+    })
+    .await
+    .expect("task join")
+    .expect("connection failed");
+
+    let request = HistoricalRequest::daily_trades(aapl_contract(), 365);
+    let result = client.fetch_candles(request).await;
+    assert_eq!(
+        result.unwrap_err(),
+        DataError::RequestTimeout {
+            operation: "historical data".to_owned()
+        }
+    );
+
+    // A tick request is read from a subscription, which this library bounds itself.
+    let request = HistoricalTickRequest::recent(aapl_contract(), 1000);
+    let result = client.fetch_historical_ticks(request).await;
+    assert_eq!(
+        result.unwrap_err(),
+        DataError::RequestTimeout {
+            operation: "historical_ticks_trade".to_owned()
+        }
+    );
 }
 
 // ============================================================================

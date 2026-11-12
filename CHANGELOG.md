@@ -350,6 +350,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`IbkrHistoricalData`'s requests no longer wait forever** (`rustrade-data`, `ibkr` feature,
+  #883). Its requests had no deadline: one IB never answered never returned, and a candle or
+  calculator request caught by a dropped connection waited through every reconnect attempt,
+  holding a blocking-pool thread either way.
+  - **Every request now gives up after two minutes by default**, with the new
+    `DataError::RequestTimeout { operation }`: `fetch_candles`, `fetch_historical_ticks`,
+    `fetch_historical_bid_ask`, `calculate_theoretical_greeks`, `calculate_implied_volatility`
+    and `fetch_option_chain`. The bound runs from the call. For the candle and calculator
+    requests it also covers a wait for the connection to come back and the request to be
+    resent. A tick or option chain request that runs out of time fails whole, rather than
+    returning what had arrived as a truncated result.
+  - **New `IbkrHistoricalData::connect_with(url, client_id, IbkrHistoricalDataConfig)`** sets
+    the bound: `IbkrHistoricalDataConfig::default().with_request_timeout(..)`, or `None` for no
+    limit. `connect` uses the default.
+  - With `from_client`, the candle and calculator requests follow the client's own `ibapi`
+    `one_shot_timeout`, and are unbounded without one. The tick and option chain requests use
+    the default bound.
+
 - **A refused option buyback no longer panics the simulated venue when a charge has overdrawn
   the account** (`rustrade-execution`). A buyback of a short option releases the short's
   collateral to pay with. When the account still could not pay, the venue reserved the
