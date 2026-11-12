@@ -11,10 +11,8 @@
 //!
 //! [tick and lot size rules]: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size
 
-use crate::{
-    error::{OrderField, PrecisionLimit, PrecisionViolation},
-    order::OrderKind,
-};
+use super::common::WireKind;
+use crate::error::{OrderField, PrecisionLimit, PrecisionViolation};
 use hyperliquid_rust_sdk::{ClientLimit, ClientOrder, ClientTrigger};
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use std::str::FromStr;
@@ -204,8 +202,6 @@ pub(super) struct WireOrder {
 pub(super) enum WireOrderError {
     /// A limit order, or a limit order a trigger places, with no limit price.
     MissingPrice,
-    /// A kind Hyperliquid does not support. The clients refuse these before building the order.
-    UnsupportedKind,
     /// A value breaks the market's precision rules.
     Precision(PrecisionViolation),
 }
@@ -217,14 +213,14 @@ impl From<PrecisionViolation> for WireOrderError {
 }
 
 /// Check an order's values against `precision`, and put them in the form the SDK places them
-/// in, unchanged.
+/// in, unchanged. `kind` is how [`classify_order`](super::common::classify_order) sends the
+/// order.
 ///
 /// A trigger order that places a market order (`Stop`, `TakeProfit`) sends its trigger price as
 /// its limit price, as the SDK requires.
 pub(super) fn wire_order(
     precision: &OrderPrecision,
-    kind: OrderKind,
-    tif: String,
+    kind: WireKind,
     price: Option<Decimal>,
     quantity: Decimal,
 ) -> Result<WireOrder, WireOrderError> {
@@ -233,40 +229,36 @@ pub(super) fn wire_order(
         let price = price.ok_or(WireOrderError::MissingPrice)?;
         Ok(precision.wire_price(OrderField::Price, price)?)
     };
-    let trigger = |trigger_price, is_market, tpsl: &str| -> Result<_, WireOrderError> {
-        let trigger_px = precision.wire_price(OrderField::TriggerPrice, trigger_price)?;
-        let order_type = ClientOrder::Trigger(ClientTrigger {
-            is_market,
-            trigger_px,
-            tpsl: tpsl.to_owned(),
-        });
-        let limit_px = if is_market {
-            trigger_px
-        } else {
-            limit_price()?
-        };
-        Ok(WireOrder {
-            limit_px,
-            sz,
-            order_type,
-        })
-    };
 
     match kind {
-        OrderKind::Limit => Ok(WireOrder {
+        WireKind::Limit { tif } => Ok(WireOrder {
             limit_px: limit_price()?,
             sz,
-            order_type: ClientOrder::Limit(ClientLimit { tif }),
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: tif.to_owned(),
+            }),
         }),
-        OrderKind::Stop { trigger_price } => trigger(trigger_price, true, "sl"),
-        OrderKind::StopLimit { trigger_price } => trigger(trigger_price, false, "sl"),
-        OrderKind::TakeProfit { trigger_price } => trigger(trigger_price, true, "tp"),
-        OrderKind::TakeProfitLimit { trigger_price } => trigger(trigger_price, false, "tp"),
-        OrderKind::Market
-        | OrderKind::TrailingStop { .. }
-        | OrderKind::TrailingStopLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. }
-        | OrderKind::ConditionalUnresolved { .. } => Err(WireOrderError::UnsupportedKind),
+        WireKind::Trigger {
+            trigger_price,
+            is_market,
+            tpsl,
+        } => {
+            let trigger_px = precision.wire_price(OrderField::TriggerPrice, trigger_price)?;
+            let limit_px = if is_market {
+                trigger_px
+            } else {
+                limit_price()?
+            };
+            Ok(WireOrder {
+                limit_px,
+                sz,
+                order_type: ClientOrder::Trigger(ClientTrigger {
+                    is_market,
+                    trigger_px,
+                    tpsl: tpsl.to_owned(),
+                }),
+            })
+        }
     }
 }
 
@@ -525,10 +517,11 @@ mod tests {
         let precision = OrderPrecision::perp(2);
         let order = wire_order(
             &precision,
-            OrderKind::StopLimit {
+            WireKind::Trigger {
                 trigger_price: dec!(95),
+                is_market: false,
+                tpsl: "sl",
             },
-            "Gtc".to_owned(),
             Some(dec!(94.5)),
             dec!(1.25),
         )
@@ -544,10 +537,11 @@ mod tests {
 
         let market_trigger = wire_order(
             &precision,
-            OrderKind::TakeProfit {
+            WireKind::Trigger {
                 trigger_price: dec!(120),
+                is_market: true,
+                tpsl: "tp",
             },
-            "Gtc".to_owned(),
             None,
             dec!(1),
         )
@@ -556,17 +550,40 @@ mod tests {
             market_trigger.limit_px, 120.0,
             "a market trigger's limit price is its trigger price"
         );
+        let ClientOrder::Trigger(trigger) = market_trigger.order_type else {
+            panic!(
+                "expected a trigger order, got {:?}",
+                market_trigger.order_type
+            );
+        };
+        assert_eq!(
+            (trigger.trigger_px, trigger.is_market, trigger.tpsl.as_str()),
+            (120.0, true, "tp")
+        );
+
+        let limit = wire_order(
+            &precision,
+            WireKind::Limit { tif: "Alo" },
+            Some(dec!(99.5)),
+            dec!(2),
+        )
+        .unwrap();
+        assert_eq!((limit.limit_px, limit.sz), (99.5, 2.0));
+        let ClientOrder::Limit(sent) = limit.order_type else {
+            panic!("expected a limit order, got {:?}", limit.order_type);
+        };
+        assert_eq!(sent.tif, "Alo");
     }
 
     #[test]
     fn a_wire_order_refuses_each_value_that_breaks_the_rules() {
         let precision = OrderPrecision::perp(2);
-        let refused = |kind, price, quantity| {
-            wire_order(&precision, kind, "Gtc".to_owned(), price, quantity).unwrap_err()
-        };
+        let refused =
+            |kind, price, quantity| wire_order(&precision, kind, price, quantity).unwrap_err();
+        let gtc = WireKind::Limit { tif: "Gtc" };
 
         assert_eq!(
-            refused(OrderKind::Limit, Some(dec!(100)), dec!(1.234)),
+            refused(gtc, Some(dec!(100)), dec!(1.234)),
             WireOrderError::Precision(violation(
                 OrderField::Quantity,
                 dec!(1.234),
@@ -574,7 +591,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            refused(OrderKind::Limit, Some(dec!(100.123456)), dec!(1)),
+            refused(gtc, Some(dec!(100.123456)), dec!(1)),
             WireOrderError::Precision(violation(
                 OrderField::Price,
                 dec!(100.123456),
@@ -583,8 +600,10 @@ mod tests {
         );
         assert_eq!(
             refused(
-                OrderKind::Stop {
-                    trigger_price: dec!(1234.56)
+                WireKind::Trigger {
+                    trigger_price: dec!(1234.56),
+                    is_market: true,
+                    tpsl: "sl",
                 },
                 None,
                 dec!(1)
@@ -595,36 +614,19 @@ mod tests {
                 PrecisionLimit::SignificantFigures { max: 5 }
             ))
         );
-        assert_eq!(
-            refused(OrderKind::Limit, None, dec!(1)),
-            WireOrderError::MissingPrice
-        );
-        assert_eq!(
-            refused(OrderKind::Market, None, dec!(1)),
-            WireOrderError::UnsupportedKind
-        );
+        assert_eq!(refused(gtc, None, dec!(1)), WireOrderError::MissingPrice);
         assert_eq!(
             refused(
-                OrderKind::TrailingStopFixedLimit {
-                    offset: dec!(1),
-                    offset_type: crate::order::TrailingOffsetType::Percentage,
-                    activation_price: None,
+                WireKind::Trigger {
+                    trigger_price: dec!(95),
+                    is_market: false,
+                    tpsl: "tp",
                 },
-                Some(dec!(100)),
+                None,
                 dec!(1)
             ),
-            WireOrderError::UnsupportedKind
-        );
-        assert_eq!(
-            refused(
-                OrderKind::ConditionalUnresolved {
-                    family: crate::order::ConditionalFamily::StopLimit,
-                    trigger_price: Some(dec!(95)),
-                },
-                Some(dec!(100)),
-                dec!(1)
-            ),
-            WireOrderError::UnsupportedKind
+            WireOrderError::MissingPrice,
+            "a limit trigger needs the price of the limit order it places"
         );
     }
 }

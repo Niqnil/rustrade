@@ -6,9 +6,9 @@
 //! Error mapping is in the `error` module.
 
 use crate::client::hyperliquid::error::{map_sdk_error, order_rejection};
-use crate::error::{OrderError, UnindexedClientError};
+use crate::error::{OrderError, UnindexedClientError, UnindexedOrderError};
 use crate::order::{
-    Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
+    Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedOrderSnapshot,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
     state::{Cancelled, Filled, Open, OrderState},
 };
@@ -624,20 +624,146 @@ pub fn millis_to_datetime(millis: u64) -> Option<DateTime<Utc>> {
         .single()
 }
 
-/// Map rustrade TimeInForce to Hyperliquid TIF string.
-pub fn map_tif(tif: &TimeInForce) -> &'static str {
-    match tif {
-        TimeInForce::GoodUntilCancelled { post_only: true } => "Alo",
-        TimeInForce::GoodUntilCancelled { post_only: false } => "Gtc",
-        TimeInForce::ImmediateOrCancel => "Ioc",
-        TimeInForce::FillOrKill => "Ioc", // Hyperliquid doesn't have FOK, use IOC
-        TimeInForce::GoodUntilEndOfDay => "Gtc", // No EOD on Hyperliquid
-        // Hyperliquid is a perpetuals DEX with no auction sessions and no native
-        // GTD. Coerce to GTC and surface the loss of semantics so downstream
-        // wrappers can decide whether to reject upstream.
-        TimeInForce::GoodTillDate { .. } | TimeInForce::AtOpen | TimeInForce::AtClose => {
-            warn!(time_in_force = ?tif, "Hyperliquid does not support this TimeInForce; coercing to Gtc");
-            "Gtc"
+/// The time in force the Hyperliquid clients take. `post_only` only on a limit order, which goes
+/// out as `Alo`, and `ImmediateOrCancel` only on a limit order or a trigger order that places a
+/// market order (`Stop`, `TakeProfit`). See [`classify_order`].
+pub(super) const HYPERLIQUID_TIME_IN_FORCE: &[TimeInForceKind] = &[
+    TimeInForceKind::GoodUntilCancelled,
+    TimeInForceKind::PostOnly,
+    TimeInForceKind::ImmediateOrCancel,
+];
+
+/// Why a limit order is refused with a time in force outside [`HYPERLIQUID_TIME_IN_FORCE`].
+const TIME_IN_FORCE_NOT_TAKEN: &str = "Hyperliquid takes only GoodUntilCancelled, post_only (Alo) \
+     or ImmediateOrCancel: it has no fill-or-kill, day, dated or auction orders";
+
+/// Why a stop or take-profit order that places a market order is refused with any time in force
+/// but `GoodUntilCancelled` or `ImmediateOrCancel`.
+const MARKET_TRIGGER_TIME_IN_FORCE: &str = "Hyperliquid takes only GoodUntilCancelled or \
+     ImmediateOrCancel on a stop or take-profit order: it carries no time in force, and once \
+     triggered places a market order, which fills what it can and takes liquidity";
+
+/// Why a stop-limit or take-profit-limit order is refused with any time in force but
+/// `GoodUntilCancelled`.
+const LIMIT_TRIGGER_TIME_IN_FORCE: &str = "Hyperliquid takes only GoodUntilCancelled on a \
+     stop-limit or take-profit-limit order: it carries no time in force, and the limit order it \
+     places once triggered rests until cancelled";
+
+/// Why a market order is refused.
+const MARKET_NOT_TAKEN: &str =
+    "Hyperliquid does not support market orders; use Limit with IOC time-in-force";
+
+/// Why a trailing order is refused.
+const TRAILING_NOT_TAKEN: &str = "Hyperliquid does not support trailing stop orders";
+
+/// Why an unresolved order kind is refused.
+const UNRESOLVED_NOT_PLACED: &str =
+    "an unresolved order kind is only read back from a venue, never placed";
+
+/// How an order of a kind and time in force Hyperliquid takes goes out, before its values are
+/// checked against the market's precision ([`wire_order`](super::precision::wire_order)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WireKind {
+    /// A limit order, with Hyperliquid's time in force: `Gtc`, `Alo` or `Ioc`.
+    Limit { tif: &'static str },
+    /// A trigger order, which carries no time in force. `is_market` when it places a market order
+    /// once triggered, a limit order at the order's price otherwise. `tpsl` is `sl` for a stop and
+    /// `tp` for a take profit.
+    Trigger {
+        trigger_price: Decimal,
+        is_market: bool,
+        tpsl: &'static str,
+    },
+}
+
+/// Why [`classify_order`] cannot send an order to Hyperliquid, each with the reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Unclassified {
+    /// Hyperliquid does not take the order kind.
+    OrderKind(&'static str),
+    /// Hyperliquid does not take the order's time in force for its kind.
+    TimeInForce(&'static str),
+}
+
+impl Unclassified {
+    /// The error an order with `time_in_force` is refused with, unsent.
+    pub(super) fn into_order_error(self, time_in_force: TimeInForce) -> UnindexedOrderError {
+        match self {
+            Self::OrderKind(reason) => OrderError::UnsupportedOrderType(reason.to_owned()),
+            Self::TimeInForce(reason) => {
+                OrderError::unsupported_time_in_force(time_in_force, reason)
+            }
+        }
+    }
+}
+
+/// How an order of `kind` with `tif` goes out to Hyperliquid, or why it cannot.
+///
+/// A kind Hyperliquid never takes (market, trailing, unresolved) is refused as a kind whatever its
+/// time in force, so the refusal names what has to change. Of the kinds it takes:
+/// - A limit order sends its time in force: `GoodUntilCancelled` as `Gtc`, `post_only` as `Alo`,
+///   `ImmediateOrCancel` as `Ioc`.
+/// - A trigger order carries none, so one taken with `GoodUntilCancelled` or `ImmediateOrCancel`
+///   goes out the same. Once triggered, a stop or take-profit order places a market order, which
+///   fills what it can: `GoodUntilCancelled` and `ImmediateOrCancel` are taken. A stop-limit or
+///   take-profit-limit order places a limit order that rests until cancelled, as seen on testnet:
+///   `GoodUntilCancelled` alone is taken.
+///
+/// A time in force outside [`HYPERLIQUID_TIME_IN_FORCE`] is refused on every kind, with a reason
+/// naming what the order's kind takes.
+pub(super) fn classify_order(kind: OrderKind, tif: TimeInForce) -> Result<WireKind, Unclassified> {
+    let trigger = |trigger_price, is_market, tpsl| {
+        let taken = match tif {
+            TimeInForce::GoodUntilCancelled { post_only: false } => true,
+            TimeInForce::ImmediateOrCancel => is_market,
+            TimeInForce::GoodUntilCancelled { post_only: true }
+            | TimeInForce::FillOrKill
+            | TimeInForce::GoodUntilEndOfDay
+            | TimeInForce::GoodTillDate { .. }
+            | TimeInForce::AtOpen
+            | TimeInForce::AtClose => false,
+        };
+        if taken {
+            Ok(WireKind::Trigger {
+                trigger_price,
+                is_market,
+                tpsl,
+            })
+        } else if is_market {
+            Err(Unclassified::TimeInForce(MARKET_TRIGGER_TIME_IN_FORCE))
+        } else {
+            Err(Unclassified::TimeInForce(LIMIT_TRIGGER_TIME_IN_FORCE))
+        }
+    };
+
+    match kind {
+        OrderKind::Limit => {
+            let tif = match tif {
+                TimeInForce::GoodUntilCancelled { post_only: false } => "Gtc",
+                TimeInForce::GoodUntilCancelled { post_only: true } => "Alo",
+                TimeInForce::ImmediateOrCancel => "Ioc",
+                TimeInForce::FillOrKill
+                | TimeInForce::GoodUntilEndOfDay
+                | TimeInForce::GoodTillDate { .. }
+                | TimeInForce::AtOpen
+                | TimeInForce::AtClose => {
+                    return Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN));
+                }
+            };
+            Ok(WireKind::Limit { tif })
+        }
+        OrderKind::Stop { trigger_price } => trigger(trigger_price, true, "sl"),
+        OrderKind::StopLimit { trigger_price } => trigger(trigger_price, false, "sl"),
+        OrderKind::TakeProfit { trigger_price } => trigger(trigger_price, true, "tp"),
+        OrderKind::TakeProfitLimit { trigger_price } => trigger(trigger_price, false, "tp"),
+        OrderKind::Market => Err(Unclassified::OrderKind(MARKET_NOT_TAKEN)),
+        OrderKind::TrailingStop { .. }
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => {
+            Err(Unclassified::OrderKind(TRAILING_NOT_TAKEN))
+        }
+        OrderKind::ConditionalUnresolved { .. } => {
+            Err(Unclassified::OrderKind(UNRESOLVED_NOT_PLACED))
         }
     }
 }
@@ -969,19 +1095,175 @@ mod tests {
         );
     }
 
+    /// Each kind takes the time in force Hyperliquid can honour for it, and refuses the rest
+    /// with the reason; a kind Hyperliquid never takes is refused as a kind, whatever its time in
+    /// force.
     #[test]
-    fn test_map_tif() {
+    fn an_order_goes_out_only_with_a_time_in_force_hyperliquid_honours_for_its_kind() {
+        use crate::order::{ConditionalFamily, TrailingOffsetType};
+
+        let price = dec!(100);
+        let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+        let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
+        let ioc = TimeInForce::ImmediateOrCancel;
+        let not_taken = [
+            TimeInForce::FillOrKill,
+            TimeInForce::GoodUntilEndOfDay,
+            TimeInForce::GoodTillDate {
+                expiry: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+            },
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+        ];
+        let every_tif = [gtc, post_only, ioc].into_iter().chain(not_taken);
+
+        // A limit order sends its time in force.
+        for (tif, wire) in [(gtc, "Gtc"), (post_only, "Alo"), (ioc, "Ioc")] {
+            assert_eq!(
+                classify_order(OrderKind::Limit, tif),
+                Ok(WireKind::Limit { tif: wire }),
+                "{tif:?}"
+            );
+        }
+
+        // A trigger order carries none: one placing a market order takes GTC and IOC, one placing
+        // a limit order GTC alone.
+        let triggers = [
+            (
+                OrderKind::Stop {
+                    trigger_price: price,
+                },
+                true,
+                "sl",
+            ),
+            (
+                OrderKind::TakeProfit {
+                    trigger_price: price,
+                },
+                true,
+                "tp",
+            ),
+            (
+                OrderKind::StopLimit {
+                    trigger_price: price,
+                },
+                false,
+                "sl",
+            ),
+            (
+                OrderKind::TakeProfitLimit {
+                    trigger_price: price,
+                },
+                false,
+                "tp",
+            ),
+        ];
+        for (kind, is_market, tpsl) in triggers {
+            let sent = Ok(WireKind::Trigger {
+                trigger_price: price,
+                is_market,
+                tpsl,
+            });
+            let refused = Err(Unclassified::TimeInForce(if is_market {
+                MARKET_TRIGGER_TIME_IN_FORCE
+            } else {
+                LIMIT_TRIGGER_TIME_IN_FORCE
+            }));
+            assert_eq!(classify_order(kind, gtc), sent, "{kind:?}");
+            assert_eq!(
+                classify_order(kind, ioc),
+                if is_market { sent } else { refused },
+                "{kind:?}"
+            );
+            assert_eq!(classify_order(kind, post_only), refused, "{kind:?}");
+        }
+
+        // A time in force outside the set is refused on every kind Hyperliquid takes, with the
+        // reason naming what the kind takes.
+        let kinds_taken = triggers.map(|(kind, is_market, _)| {
+            let reason = if is_market {
+                MARKET_TRIGGER_TIME_IN_FORCE
+            } else {
+                LIMIT_TRIGGER_TIME_IN_FORCE
+            };
+            (kind, reason)
+        });
+        for (kind, reason) in kinds_taken
+            .into_iter()
+            .chain([(OrderKind::Limit, TIME_IN_FORCE_NOT_TAKEN)])
+        {
+            for tif in not_taken {
+                assert!(!HYPERLIQUID_TIME_IN_FORCE.contains(&tif.kind()), "{tif:?}");
+                assert_eq!(
+                    classify_order(kind, tif),
+                    Err(Unclassified::TimeInForce(reason)),
+                    "{kind:?} {tif:?}"
+                );
+            }
+        }
+
+        let trailing = |offset_type| OrderKind::TrailingStop {
+            offset: dec!(1),
+            offset_type,
+            activation_price: None,
+        };
+        let refused_kinds = [
+            (OrderKind::Market, MARKET_NOT_TAKEN),
+            (trailing(TrailingOffsetType::Percentage), TRAILING_NOT_TAKEN),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: dec!(1),
+                    offset_type: TrailingOffsetType::Absolute,
+                    stop_price: price,
+                    limit_offset: dec!(1),
+                },
+                TRAILING_NOT_TAKEN,
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(1),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
+                },
+                TRAILING_NOT_TAKEN,
+            ),
+            (
+                OrderKind::ConditionalUnresolved {
+                    family: ConditionalFamily::StopLimit,
+                    trigger_price: Some(price),
+                },
+                UNRESOLVED_NOT_PLACED,
+            ),
+        ];
+        for (kind, reason) in refused_kinds {
+            for tif in every_tif.clone() {
+                assert_eq!(
+                    classify_order(kind, tif),
+                    Err(Unclassified::OrderKind(reason)),
+                    "{kind:?} {tif:?}"
+                );
+            }
+        }
+
         assert_eq!(
-            map_tif(&TimeInForce::GoodUntilCancelled { post_only: false }),
-            "Gtc"
+            HYPERLIQUID_TIME_IN_FORCE,
+            &[gtc.kind(), post_only.kind(), ioc.kind()]
+        );
+    }
+
+    /// A refused time in force becomes `UnsupportedTimeInForce` naming it, and a refused kind
+    /// `UnsupportedOrderType`, each with the reason.
+    #[test]
+    fn a_refusal_becomes_the_error_for_what_was_refused() {
+        let tif = TimeInForce::FillOrKill;
+        assert_eq!(
+            Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN).into_order_error(tif),
+            OrderError::unsupported_time_in_force(tif, TIME_IN_FORCE_NOT_TAKEN)
         );
         assert_eq!(
-            map_tif(&TimeInForce::GoodUntilCancelled { post_only: true }),
-            "Alo"
+            Unclassified::OrderKind(MARKET_NOT_TAKEN).into_order_error(tif),
+            OrderError::UnsupportedOrderType(MARKET_NOT_TAKEN.to_owned())
         );
-        assert_eq!(map_tif(&TimeInForce::ImmediateOrCancel), "Ioc");
-        assert_eq!(map_tif(&TimeInForce::FillOrKill), "Ioc");
-        assert_eq!(map_tif(&TimeInForce::GoodUntilEndOfDay), "Gtc");
     }
 
     #[test]

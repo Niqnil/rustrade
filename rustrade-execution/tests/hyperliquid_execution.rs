@@ -1469,3 +1469,131 @@ async fn test_boundary_precision_orders_rest() {
         );
     }
 }
+
+/// The venue's open orders of `wallet`, from `frontendOpenOrders`, as raw JSON. Unlike the open
+/// orders the client reads, each carries its time in force and whether it waits on a trigger.
+async fn frontend_open_orders(
+    info: &hyperliquid_rust_sdk::InfoClient,
+    wallet: &str,
+) -> Vec<serde_json::Value> {
+    let body = serde_json::json!({ "type": "frontendOpenOrders", "user": wallet });
+    let text = info
+        .http_client
+        .post("/info", body.to_string())
+        .await
+        .expect("frontendOpenOrders answers");
+    serde_json::from_str(&text).expect("frontendOpenOrders is a JSON array")
+}
+
+/// A stop-limit or take-profit-limit order carries no time in force, and once triggered places a
+/// limit order that rests until cancelled, as `Gtc`. This is why the clients take only
+/// `GoodUntilCancelled` on those kinds.
+///
+/// Each order is a buy whose trigger the market has already crossed, so it triggers at once, with
+/// its limit 15% below the market, so the triggered order rests unfilled. Each is cancelled.
+#[tokio::test]
+#[ignore]
+async fn test_a_triggered_limit_order_rests_until_cancelled() {
+    use rust_decimal::{Decimal, RoundingStrategy};
+
+    init_logging();
+    let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+    let wallet = client.wallet_address();
+    let info =
+        hyperliquid_rust_sdk::InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Testnet))
+            .await
+            .expect("Failed to create InfoClient");
+    let mids = info.all_mids().await.expect("Failed to read allMids");
+    let mid: Decimal = mids
+        .get("ETH")
+        .expect("allMids has an ETH mid")
+        .parse()
+        .expect("mid is a decimal");
+
+    let eth = eth_instrument();
+    let precision = client.order_precision(&eth).expect("ETH is listed");
+    let round = |price| precision.round_price(price, RoundingStrategy::ToZero);
+    let limit = round(mid * dec!(0.85));
+    // About $12, above the $10 minimum.
+    let quantity = precision.round_quantity(dec!(12) / limit, RoundingStrategy::AwayFromZero);
+
+    // A buy stop triggers once the price is above its trigger, a buy take profit once it is below.
+    for kind in [
+        OrderKind::StopLimit {
+            trigger_price: round(mid * dec!(0.9)),
+        },
+        OrderKind::TakeProfitLimit {
+            trigger_price: round(mid * dec!(1.1)),
+        },
+    ] {
+        let cid = ClientOrderId::uuid();
+        let cloid = format!("0x{}", cid.0.replace('-', ""));
+        let key = OrderKey {
+            exchange: ExchangeId::HyperliquidPerp,
+            instrument: &eth,
+            strategy: StrategyId::new("test-triggered-limit"),
+            cid,
+        };
+        println!("Placing {kind} BUY {quantity} {eth} @ {limit}");
+        let response = client
+            .open_order(rustrade_execution::order::OrderEvent {
+                key: key.clone(),
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(limit),
+                    quantity,
+                    kind,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
+            })
+            .await;
+        assert!(
+            matches!(response.state, OrderState::Active(_)),
+            "{kind} was not placed: {:?}",
+            response.state
+        );
+
+        // The venue reports the triggered order still open, under the same cloid.
+        let mut triggered = None;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            triggered = frontend_open_orders(&info, &wallet)
+                .await
+                .into_iter()
+                .find(|open| open["cloid"] == cloid.as_str() && open["isTrigger"] == false);
+            if triggered.is_some() {
+                break;
+            }
+        }
+
+        let cancelled = client
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(VenueOrderId::ClientAssigned),
+                },
+            })
+            .await;
+
+        let triggered = triggered.unwrap_or_else(|| panic!("{kind} did not trigger and rest"));
+        println!(
+            "  triggered: tif={} triggerCondition={} orderType={}",
+            triggered["tif"], triggered["triggerCondition"], triggered["orderType"]
+        );
+        assert_eq!(triggered["tif"], "Gtc", "{kind}");
+        assert_eq!(triggered["triggerCondition"], "Triggered", "{kind}");
+        assert!(
+            cancelled.state.is_ok(),
+            "cancel of {kind}: {:?}",
+            cancelled.state
+        );
+    }
+}
