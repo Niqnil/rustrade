@@ -788,10 +788,10 @@ impl BinanceMargin {
     ///   [`OrderError::Connectivity`]: the venue acted on the request, so the order may be live,
     ///   and its outcome is unknown rather than refused.
     /// - The request is sent once. An answer lost on the way (cut short, or not received within
-    ///   5 s) returns
-    ///   [`OrderError::Connectivity`] instead of the order being sent again, since the venue may
-    ///   have placed it: look the order up by its client order id before placing it again. Only
-    ///   a rate-limit refusal, which Binance answers without placing the order, is sent again.
+    ///   5 s) returns [`OrderError::Connectivity`] instead of the order being sent again, since
+    ///   the venue may have placed it: look the order up by its client order id before placing it
+    ///   again. Only a rate-limit refusal, which Binance answers without placing the order, is
+    ///   sent again.
     /// - The order's time is the answer's `transactTime`. An answer without a readable one is
     ///   still read, at the local time, and logged with a `warn!`.
     /// - The order's kind is known to the client from the moment its request is sent, so a stream
@@ -1052,10 +1052,10 @@ impl BinanceMargin {
 
     /// [`rest_config_builder`](Self::rest_config_builder)'s configuration for the new-order and
     /// cancel requests: the SDK's retries off, so the SDK sends each once, and each bounded by
-    /// [`ORDER_REST_TIMEOUT_MS`]. A request whose answer is lost so fails with a transport error,
-    /// which leaves its outcome unknown for the caller to look up, rather than being sent again
-    /// after the venue may have acted on it. [`rest_call_with_retry`] still sends a request again
-    /// after a rate-limit refusal, which Binance answers without acting on it.
+    /// [`ORDER_REST_TIMEOUT_MS`]. A request whose answer is lost therefore fails with a transport
+    /// error, which leaves its outcome unknown for the caller to look up, rather than being sent
+    /// again after the venue may have acted on it. [`rest_call_with_retry`] still sends a request
+    /// again after a rate-limit refusal, which Binance answers without acting on it.
     fn order_rest_config_builder(
         config: &BinanceMarginConfig,
         signing: Option<&SigningClock>,
@@ -1309,10 +1309,9 @@ impl ExecutionClient for BinanceMargin {
     /// is still working is unknown.
     ///
     /// The request is sent once. An answer lost on the way (cut short, or not received within 5 s)
-    /// also returns
-    /// [`OrderError::Connectivity`], instead of the cancel being sent again, since the venue may
-    /// have cancelled the order: a second cancel would then be refused as an unknown order. Only a
-    /// rate-limit refusal, which Binance answers without acting, is sent again.
+    /// also returns [`OrderError::Connectivity`], instead of the cancel being sent again, since the
+    /// venue may have cancelled the order: a second cancel would then be refused as an unknown
+    /// order. Only a rate-limit refusal, which Binance answers without acting, is sent again.
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
