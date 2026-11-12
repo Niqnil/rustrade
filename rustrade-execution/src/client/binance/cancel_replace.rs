@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use smol_str::format_smolstr;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// A cancel-replace answer that got as far as the legs: a success, a partial failure, or a
 /// failure of the cancel.
@@ -70,14 +71,17 @@ impl LegsAnswer {
         answer: anyhow::Result<RestApiResponse<OrderCancelReplaceResponse>>,
     ) -> anyhow::Result<Self> {
         match answer {
-            Ok(response) => {
-                let rate_limits = response.rate_limits.clone().unwrap_or_default();
-                let headers = response.headers.clone();
-                Ok(Self::succeeded(
-                    response.data().await.ok(),
-                    rate_limits,
-                    headers,
-                ))
+            Ok(mut response) => {
+                let rate_limits = response.rate_limits.take().unwrap_or_default();
+                let headers = std::mem::take(&mut response.headers);
+                let decoded = response
+                    .data()
+                    .await
+                    .inspect_err(|e| {
+                        warn!(%e, "BinanceSpot cancel-replace answer did not decode; legs unknown");
+                    })
+                    .ok();
+                Ok(Self::succeeded(decoded, rate_limits, headers))
             }
             Err(e) => match Self::failed(&e) {
                 Some(answer) => Ok(answer),
@@ -104,6 +108,9 @@ impl LegsAnswer {
     /// (409), or an error that is coded as a cancel-replace failure (`-2021`, `-2022`) or carries
     /// `data`. A leg it does not report readably is answered as unknown. `None` for any other
     /// error, which refused the whole request.
+    ///
+    /// Its headers, and so the weight and order count it reports, are not kept: the SDK's error
+    /// carries neither.
     fn failed(e: &anyhow::Error) -> Option<Self> {
         let error = e.downcast_ref::<ConnectorError>()?;
         let code = error

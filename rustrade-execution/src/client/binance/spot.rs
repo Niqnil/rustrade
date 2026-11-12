@@ -7941,9 +7941,16 @@ mod tests {
         assert!(is_unknown_order(&bad(-2013)));
         assert!(is_unknown_order(&bad(-1121)));
         assert!(!is_unknown_order(&bad(-1100)));
-        assert!(is_unknown_order(&anyhow::Error::new(
-            sdk_errors::rest_refusal(404, Some(-2013), "no")
-        )));
+        for status in [404, 409, 422] {
+            assert!(
+                is_unknown_order(&anyhow::Error::new(sdk_errors::rest_refusal(
+                    status,
+                    Some(-2013),
+                    "no"
+                ))),
+                "{status}"
+            );
+        }
         assert!(!is_unknown_order(&anyhow::anyhow!("-2013 in text only")));
     }
 

@@ -3614,6 +3614,9 @@ pub(crate) fn is_unknown_order(e: &anyhow::Error) -> bool {
             } | ConnectorError::NotFoundError {
                 code: Some(-2013 | -1121),
                 ..
+            } | ConnectorError::ConflictError {
+                code: Some(-2013 | -1121),
+                ..
             } | ConnectorError::ConnectorClientError {
                 code: Some(-2013 | -1121),
                 ..
@@ -4322,6 +4325,7 @@ pub(crate) fn is_timestamp_rejection(e: &anyhow::Error) -> bool {
                 | ConnectorError::UnauthorizedError { code, .. }
                 | ConnectorError::ForbiddenError { code, .. }
                 | ConnectorError::NotFoundError { code, .. }
+                | ConnectorError::ConflictError { code, .. }
                 | ConnectorError::ConnectorClientError { code, .. }
         ) if *code == Some(INVALID_TIMESTAMP)
     )
@@ -4653,6 +4657,17 @@ mod tests {
         ));
         assert!(!is_timestamp_rejection(&rest(Some(-1022))));
         assert!(!is_timestamp_rejection(&rest(None)));
+        // Whatever the status the SDK has a variant for.
+        for status in [401, 403, 404, 409, 422] {
+            assert!(
+                is_timestamp_rejection(&anyhow::Error::new(sdk_errors::rest_refusal(
+                    status,
+                    Some(-1021),
+                    "Timestamp for this request is outside of the recvWindow.",
+                ))),
+                "{status}"
+            );
+        }
         assert!(!is_timestamp_rejection(&ws(-1022)));
         assert!(!is_timestamp_rejection(&anyhow::Error::new(
             ConnectorError::NetworkError("-1021".to_owned())
@@ -6142,7 +6157,10 @@ mod tests {
         // Each error is the SDK's own, so this also pins the brittle prefix list against silent
         // SDK message-format drift.
         for (ce, which) in [
-            (sdk_errors::rest_transport_error(), "connection refused"),
+            (
+                sdk_errors::rest_transport_error(),
+                "connection closed unanswered",
+            ),
             (sdk_errors::rest_truncated_error(), "body cut short"),
             (
                 sdk_errors::rest_error(200, "not gzip", &[("content-encoding", "gzip")]),

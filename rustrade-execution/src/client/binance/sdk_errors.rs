@@ -50,15 +50,20 @@ pub(crate) fn rest_refusal(status: u16, code: Option<i64>, msg: &str) -> Connect
     rest_error(status, body.to_string(), &[])
 }
 
-/// The error the SDK returns when a REST request does not complete: here, the connection is
-/// refused.
+/// The error the SDK returns when a REST request does not complete: here, the server closes the
+/// connection without answering.
 pub(crate) fn rest_transport_error() -> ConnectorError {
     on_own_runtime(|| async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a local port");
         let url = format!("http://{}", listener.local_addr().expect("local address"));
-        drop(listener);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a connection");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            // Dropped unanswered.
+        });
         post(&url).await
     })
 }
@@ -161,13 +166,15 @@ pub(crate) fn ws_refusal(code: i64, msg: &str) -> WebsocketError {
     ws_error(400, json!({ "code": code, "msg": msg }))
 }
 
-/// A REST config whose requests go to `base`, each sent once.
+/// A REST config whose requests go to `base`, each sent once, with a timeout no loaded test
+/// host reaches: an answer read late would come back as a transport error instead.
 fn rest_config(base: &str) -> ConfigurationRestApi {
     ConfigurationRestApi::builder()
         .api_key("key")
         .api_secret("secret")
         .base_path(base)
         .retries(0)
+        .timeout(30_000)
         .build()
         .expect("a REST config")
 }
@@ -193,7 +200,8 @@ async fn post(base: &str) -> ConnectorError {
 }
 
 /// Run the future `make` builds to completion on a runtime of its own, on a thread of its own, so
-/// that a helper serves sync tests and async ones alike.
+/// that a helper serves sync tests and async ones alike, a paused clock included. It blocks the
+/// calling thread until done, and a panic in it is raised again here with its own message.
 fn on_own_runtime<F, T>(make: impl FnOnce() -> F + Send) -> T
 where
     F: Future<Output = T>,
@@ -209,6 +217,6 @@ where
                     .block_on(make())
             })
             .join()
-            .expect("the helper's thread panicked")
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }

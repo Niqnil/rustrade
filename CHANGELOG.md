@@ -344,9 +344,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `data` of the SDK's error, which 77.2.0 dropped and which the client therefore fetched with
     its own signed HTTP request. Each leg is answered as before. The request keeps its 5 s bound,
     and is never sent twice: the SDK re-sends a request whose answer it could not read, which
-    for an order the venue may already have acted on. The weight reported by a refused
-    cancel-replace no longer reaches the rate limiter, as for every other REST request the SDK
-    refuses.
+    for an order the venue may already have acted on. The weight reported by an error answer,
+    a partial failure included, no longer reaches the rate limiter, as for every other REST
+    request the SDK fails: the SDK's error does not keep the answer's headers.
 
 ### Fixed
 
