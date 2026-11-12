@@ -260,14 +260,18 @@ async fn flatten(instrument: &InstrumentNameExchange) {
     }
 }
 
-/// Runs `checks`, and if any of them panics, [`flatten`]s `instrument` before passing the panic on.
-async fn flattened_on_failure(
+/// Runs `checks` and returns what they return. If any of them panics, [`flatten`]s `instrument`
+/// before passing the panic on.
+async fn flattened_on_failure<T>(
     instrument: &InstrumentNameExchange,
-    checks: impl Future<Output = ()>,
-) {
-    if let Err(panic) = AssertUnwindSafe(checks).catch_unwind().await {
-        flatten(instrument).await;
-        std::panic::resume_unwind(panic);
+    checks: impl Future<Output = T>,
+) -> T {
+    match AssertUnwindSafe(checks).catch_unwind().await {
+        Ok(output) => output,
+        Err(panic) => {
+            flatten(instrument).await;
+            std::panic::resume_unwind(panic)
+        }
     }
 }
 
@@ -486,7 +490,8 @@ impl Drop for StampedAccountStream {
     }
 }
 
-/// How long one order took to fill, and for its fill to reach the client.
+/// How long one order took to fill, and for its fill to reach the client. Alpaca's column ends at
+/// the order's last fill, the others at its first: the same fill for a contract filled at once.
 struct FillLatency {
     order: &'static str,
     /// From sending the order to the response placing it.
@@ -494,7 +499,8 @@ struct FillLatency {
     /// Alpaca's own time from accepting the order to filling it (`submitted_at` to `filled_at`),
     /// read from one clock.
     venue: TimeDelta,
-    /// From sending the order to `fetch_trades` first listing its fill.
+    /// From sending the order to the return of the first `fetch_trades` call listing its fill. An
+    /// upper bound: the fill may have been listed up to one poll interval and one request sooner.
     fetch_trades: Duration,
     /// From sending the order to its fill arriving on the account stream.
     stream: Duration,
@@ -554,8 +560,9 @@ fn report_fill_latency(contract: &InstrumentNameExchange, readings: &[FillLatenc
     }
     table.push_str(
         "\nTimed from sending the order, by the runner's clock, except Alpaca's column, which is \
-         its own `submitted_at` to `filled_at`. `fetch_trades` is polled every 500 ms. Paper fills \
-         are Alpaca's simulation, so live routing may differ.\n\n",
+         its own `submitted_at` to `filled_at`. `fetch_trades` is polled every 500 ms, so its \
+         reading can overstate by up to that interval plus one request. Paper fills are Alpaca's \
+         simulation, so live routing may differ.\n\n",
     );
     println!("{table}");
     if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
@@ -579,7 +586,7 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
     let since = now - TimeDelta::minutes(1);
     let mut stream = StampedAccountStream::open(&client, &contract).await;
 
-    flattened_on_failure(&contract, async {
+    let latency = flattened_on_failure(&contract, async {
         let (buys, buy_latency) = place_and_time(
             &client,
             &mut stream,
@@ -625,7 +632,6 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
             since,
         )
         .await;
-        report_fill_latency(&contract, &[buy_latency, sell_latency]);
         println!(
             "Sell to close filled: {:?}",
             sells
@@ -644,8 +650,12 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
                 .all(|fill| fill.price > Decimal::ZERO)
         );
         await_no_position(&contract).await;
+        [buy_latency, sell_latency]
     })
     .await;
+    // Reported once the position is closed, so a failure to write the summary fails the test
+    // without setting off the cleanup.
+    report_fill_latency(&contract, &latency);
 }
 
 #[tokio::test]
