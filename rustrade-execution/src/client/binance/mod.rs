@@ -199,6 +199,9 @@ mod commission;
 mod margin;
 mod restatement;
 mod rules;
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Test helpers: a failure to set up the canned answer should panic.
+mod sdk_errors;
 mod server_time;
 mod shared;
 mod spot;

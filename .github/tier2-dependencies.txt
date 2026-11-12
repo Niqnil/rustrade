@@ -587,10 +587,13 @@ ibapi=5.7.0  # 2026-11-08 | Financial protocol, community-maintained, no officia
 #     TickType::ComboImpliedBid/Ask (TickType is not #[non_exhaustive]; our matches have wildcards),
 #     blocking `is_terminated()` on subscriptions, `HistoricalScheduleBuilder::trading_hours`.
 #   rustrade compiles unchanged: `cargo check --locked --workspace --all-targets --all-features` is warning-free.
-binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
-#   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
-#   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
-#   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST, which the SDK binds no endpoint for; and the margin new-order POST, decoded into our own answer type)
+binance-sdk=78.0.0  # 2026-11-12 | Exchange SDK, signing/IO. PINNED: the clients couple to `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify each still in use before merge:
+#   1. common::websocket::WebsocketApi::send_message      — RETIRED: no production caller since #761 moved the margin account stream to the v2 listen key (typed REST + our own WS connection). Re-verify only if a caller returns.
+#   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path: the spot account stream's `subscribe_on_ws_events` (spot.rs), whose callback relies on sequential delivery
+#   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (the margin new-order and cancel requests, decoded into our own answer types; the collateral-ratio read)
+# Since 78.0.0, ALSO re-verify the SDK's REST error mapping (status -> `ConnectorError` variant, `body`/`data`):
+# the classifiers in client/binance/shared.rs and the cancel-replace legs (cancel_replace.rs) read it, and their
+# tests get their errors from the SDK itself (client/binance/sdk_errors.rs), so a changed mapping fails a test.
 # Since 75.0.0, ALSO re-verify that a disconnected connection stays closed (DisconnectOnDrop's rustdoc relies
 # on it). Since 76.0.0 a test pins it: `a_disconnected_connection_leaves_no_task_behind` (client/binance/
 # shared.rs) disconnects a spot session and a margin connection on a local WS server and requires every SDK
@@ -1082,6 +1085,56 @@ binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user
 # `[features]` identical). Our Cargo.lock delta is binance-sdk's version + checksum alone.
 # CONSUMER-SIDE API CHURN: NONE (we use the configuration builders only, so the new pub field breaks no
 # struct literal).
+#
+# Re-verified against the =78.0.0 crates.io source on 2026-11-12 (77.2.0 -> 78.0.0). .crate sha256
+# 5d2ea2a8dbfc75f96e4dd9263a504f3ee206f88ae62503fa46a97f09d1e9e0e8 matches the index; publisher unchanged
+# (solutionsGH); published from git 6ffea724c98fba61d5dbf2236740983b3042dd6a. No CHANGELOG ships in the crate.
+# In `src/common/`, only errors.rs, utils.rs (`http_request` and its tests) and websocket.rs (the WS-API
+# response handler, ~:2438-2470, and tests) changed. In `src/spot/` and `src/margin_trading/`, only
+# `rest_api/mod.rs` doc lines and `rest_api/apis/*` changed (`body: None` in error literals, raw-string test
+# noise); no model, websocket_api or websocket_streams file changed, so no spot or margin field type changed.
+# The internals in use HOLD:
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:138-157) unchanged, and websocket.rs:60-160 is
+#      byte-identical to 77.2.0: one task, one unbounded channel, sequential
+#      `while let Some(event) = rx.recv().await { callback(event) }`; `Subscription::unsubscribe` still
+#      `handle.abort()` (:83-85). `subscribe_on_ws_events` (spot/websocket_api/mod.rs:96) still calls it.
+#   3. `send_request` (utils.rs:1014) same 7 args; still injects `timestamp` when signed (:1032-1035), signs
+#      via `signature_gen.get_signature` (:1038-1050), appends `signature` (:1065-1067) and sets
+#      `X-MBX-APIKEY` (:1097). Callers margin.rs:881, :1304 and margin/collateral.rs:275 compile unchanged.
+#   (1. `send_message`, websocket.rs:2121, unchanged in signature and options; no caller.)
+# The disconnected-connection property holds: `begin_reconnect` rejects a close-initiated connection
+# (websocket.rs:308, :316), `init_connect` skips renewal and reconnect once close is initiated (:1255-1263),
+# and the retry path never retries after a close (:601). Still pinned by
+# `a_disconnected_connection_leaves_no_task_behind` (client/binance/shared.rs).
+# What changed, and why it matters to us (binance-connector-rust#121, which we filed):
+#   - `ConnectorError` (errors.rs:103) and every struct variant are `#[non_exhaustive]`; each response variant
+#     gains `body: Option<serde_json::Value>`, the parsed error body. New `body()` (:198) and `data()` (:218,
+#     the body's non-null `data`). New `ConflictError` for HTTP 409 (utils.rs:905), which 77.2.0 answered as
+#     `ConnectorClientError`. Other statuses map as before; codeless transport/decode messages unchanged.
+#   - `WebsocketError` is `#[non_exhaustive]`; `ResponseError` too, gaining `data` (the error object's
+#     non-null `data`); `retry_after` is read from `data.retryAfter` (websocket.rs:2457-2462).
+#   - No constructors: a consumer can no longer build these errors. Our tests now get them from the SDK by
+#     serving canned answers (client/binance/sdk_errors.rs).
+#   - Spot `order_cancel_replace` (spot/rest_api/mod.rs:2473) can now report a partial failure's legs through
+#     `ConnectorError::data()`, so the hand-rolled signed cancel-replace request is gone; it goes through the SDK
+#     on its own REST client (5 s timeout, `retries(0)`).
+# SDK HAZARD (unchanged since at least 77.2.0, recorded so the next bump rechecks it): `http_request` re-sends a
+# request whose response body it could not read (utils.rs:819-825, `attempt <= retries`, ANY method), so a
+# POST the venue already acted on is sent again. Only GET/DELETE are retried on a transport error
+# (`should_retry_request`, :670-685). The cancel-replace client sets `retries(0)` for this reason.
+# Outside the compiled modules: generated changes across stocks, staking, simple_earn, wallet, sub_account,
+# derivatives, w3w_prediction, fiat, crypto_loan, vip_loan and others (two new models), none compiled under
+# `spot` + `margin_trading`.
+# Security: PASS. `unsafe` is the same 10 test-only blocks in utils.rs (all after `#[cfg(test)]` at :1467);
+# build.rs identical; the set of URL literals is identical to 77.2.0; env read still only
+# `BINANCE_CONNECTOR_RUST_USER_AGENT` (utils.rs:458); no new filesystem, process, signing or encoded-blob sites.
+# Both standing caveats carry forward unchanged (the full signed WS API request at DEBUG, websocket.rs:2156;
+# the UA env read). No OSV/RUSTSEC advisory.
+# Dependency surface: Cargo.toml differs only in `version` (32 direct deps, `[features]` identical). Our
+# Cargo.lock delta is binance-sdk's version + checksum alone.
+# CONSUMER-SIDE API CHURN: patterns on the error variants need `..`, and `classify_connector_error` a wildcard
+# arm (a future variant is read as outcome-unknown) plus `ConflictError` with the refusals; ~75 test
+# constructions moved to SDK-made errors.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
