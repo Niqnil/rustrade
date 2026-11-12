@@ -27,7 +27,8 @@ pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
 /// the order rested — rather than recomputing an amount that a changed fee model or contract size
 /// could make disagree with the one the client was told about. A CFD fill is the exception: what
 /// it costs depends on the position it trades against, which can move while the order rests, so
-/// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances).
+/// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances). So
+/// is a fill under a dated fee model whose schedule changed while the order rested.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.

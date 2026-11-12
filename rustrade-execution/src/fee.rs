@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, asset::name::AssetNameExchange};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,8 @@ pub enum Liquidity {
     Maker,
 }
 
-/// What a [`FeeModel`] prices: one fill, and how much of its order had filled before it.
+/// What a [`FeeModel`] prices: one fill, when it happened, and how much of its order had filled
+/// before it.
 ///
 /// Build one with [`new`](Self::new), which assumes a taker fill that is its order's first, and
 /// set the rest with [`with_liquidity`](Self::with_liquidity) and
@@ -50,11 +52,20 @@ pub struct FeeInput {
     /// A fee charged once per order, or bounded per order, is charged on the order's first fill
     /// and by difference on later ones, so this is what tells the two apart.
     pub prior_filled: Decimal,
+    /// When the fill happened, on the venue's clock. A [`DatedFeeModel`] charges the schedule in
+    /// effect at this time.
+    pub time: DateTime<Utc>,
 }
 
 impl FeeInput {
-    /// A taker fill of `quantity` at `price`, the first of its order.
-    pub fn new(side: Side, price: Decimal, quantity: Decimal, contract_size: Decimal) -> Self {
+    /// A taker fill of `quantity` at `price` at `time`, the first of its order.
+    pub fn new(
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        contract_size: Decimal,
+        time: DateTime<Utc>,
+    ) -> Self {
         Self {
             side,
             price,
@@ -62,6 +73,7 @@ impl FeeInput {
             contract_size,
             liquidity: Liquidity::Taker,
             prior_filled: Decimal::ZERO,
+            time,
         }
     }
 
@@ -84,12 +96,15 @@ impl FeeInput {
 /// Computes the trading fee for a single fill, in the instrument's quote asset.
 ///
 /// # Implementer obligations
-/// A fill's fee must not depend on how its order's quantity was split into fills at one price:
-/// the fee of `q1` after `p` filled plus the fee of `q2` after `p + q1` filled must equal the fee
-/// of `q1 + q2` after `p` filled. The simulated venue relies on this. It reserves an order's
-/// remaining fee in one amount when the order rests, and charges it fill by fill. Every model in
-/// this module meets it at one price. A bounded [`Notional`](FeeBasis::Notional) component, with
-/// an order that fills at several prices, only approximates it (see [`FeeComponent`]).
+/// A fill's fee must not depend on how its order's quantity was split into fills at one price and
+/// one time: the fee of `q1` after `p` filled plus the fee of `q2` after `p + q1` filled must equal
+/// the fee of `q1 + q2` after `p` filled. The simulated venue relies on this. It reserves an
+/// order's remaining fee in one amount when the order rests, and charges it fill by fill. Every
+/// model in this module meets it at one price and one time. A bounded
+/// [`Notional`](FeeBasis::Notional) component, with an order that fills at several prices, only
+/// approximates it (see [`FeeComponent`]). A [`DatedFeeModel`] whose schedule changes while an
+/// order rests charges the order's later fills by the new schedule; the simulated venue then costs
+/// such a fill afresh rather than settling what it reserved.
 pub trait FeeModel {
     /// The fee of the fill `input` describes. Negative is a rebate.
     fn compute_fee(&self, input: &FeeInput) -> Decimal;
@@ -496,6 +511,183 @@ impl FeeModel for CompositeFeeModel {
     }
 }
 
+/// A fee schedule that changes over time: each fill is charged by the model in effect at its
+/// [`time`](FeeInput::time).
+///
+/// Venues revise their fees. Regulatory rates are reset by the bodies that charge them, and
+/// brokers publish revised schedules, each from a date. A backtest that spans a revision with one
+/// fixed model charges every past fill today's fees. This model holds the whole schedule at each
+/// date instead: an [`initial`](Self::initial) model, then a list of [`FeeChange`]s, each a model
+/// that takes effect at its [`from`](FeeChange::from) time.
+///
+/// The model in effect at a time is the last change whose `from` is at or before it, or `initial`
+/// before the first change, so `initial` covers all time before the first change. A change takes
+/// effect at its `from` instant: a fill at exactly that time pays the new model.
+///
+/// [`new`](Self::new) refuses, and so does deserialising:
+/// - changes whose times are not strictly increasing ([`FeeModelError::ChangesNotIncreasing`]);
+/// - a dated model as `initial` or as a change's model ([`FeeModelError::NestedDated`]): any such
+///   schedule can be written as one flat list.
+///
+/// An empty list of changes is accepted, and charges as `initial` does.
+///
+/// Serialised, it is `{"initial": <model>, "changes": [{"from": <RFC 3339 time>, "model":
+/// <model>}, ...]}`.
+///
+/// # Orders resting across a change
+/// The simulated venue holds a resting order's fee by the model in effect when the order rested,
+/// and charges each fill by the model in effect when it fills. When the two differ, the fill is
+/// costed afresh, and an order the account can no longer afford is cancelled, as a venue
+/// re-checking the order's cost at fill time would cancel it.
+///
+/// # Example: a commission cut
+/// The rates here are illustrative.
+///
+/// ```
+/// use chrono::{TimeZone, Utc};
+/// use rust_decimal_macros::dec;
+/// use rustrade_execution::fee::{
+///     DatedFeeModel, FeeChange, FeeModelConfig, PerContractFeeModel,
+/// };
+///
+/// let per_contract = |commission_per_contract| {
+///     FeeModelConfig::PerContract(PerContractFeeModel { commission_per_contract })
+/// };
+/// let schedule = DatedFeeModel::new(
+///     per_contract(dec!(0.70)),
+///     vec![FeeChange::new(
+///         Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+///         per_contract(dec!(0.65)),
+///     )],
+/// )
+/// .expect("one change, and no dated model inside");
+///
+/// assert_eq!(
+///     schedule.model_at(Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap()),
+///     &per_contract(dec!(0.70)),
+/// );
+/// assert_eq!(
+///     schedule.model_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()),
+///     &per_contract(dec!(0.65)),
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(try_from = "DatedFeeModelRepr", into = "DatedFeeModelRepr")]
+pub struct DatedFeeModel {
+    initial: Box<FeeModelConfig>,
+    changes: Vec<FeeChange>,
+}
+
+/// One revision of a [`DatedFeeModel`]: the [`model`](Self::model) charged from
+/// [`from`](Self::from) until the next change.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct FeeChange {
+    /// The instant the model takes effect, inclusive.
+    pub from: DateTime<Utc>,
+    /// The whole schedule in effect from then.
+    pub model: FeeModelConfig,
+}
+
+impl FeeChange {
+    /// `model`, in effect from `from`.
+    pub fn new(from: DateTime<Utc>, model: FeeModelConfig) -> Self {
+        Self { from, model }
+    }
+}
+
+/// [`DatedFeeModel`]'s serialised form, validated on the way in.
+#[derive(Deserialize, Serialize)]
+struct DatedFeeModelRepr {
+    initial: FeeModelConfig,
+    changes: Vec<FeeChange>,
+}
+
+impl DatedFeeModel {
+    /// A schedule charging `initial` until the first of `changes`, and each change's model from
+    /// its time until the next.
+    ///
+    /// # Errors
+    /// - [`FeeModelError::ChangesNotIncreasing`] if a change's time is not after the one before.
+    /// - [`FeeModelError::NestedDated`] if `initial` or a change's model is itself dated.
+    pub fn new(initial: FeeModelConfig, changes: Vec<FeeChange>) -> Result<Self, FeeModelError> {
+        Self::try_from(DatedFeeModelRepr { initial, changes })
+    }
+
+    /// The model in effect before the first change.
+    pub fn initial(&self) -> &FeeModelConfig {
+        &self.initial
+    }
+
+    /// The changes, in time order.
+    pub fn changes(&self) -> &[FeeChange] {
+        &self.changes
+    }
+
+    /// The model in effect at `time`: the last change whose time is at or before it, else
+    /// [`initial`](Self::initial).
+    pub fn model_at(&self, time: DateTime<Utc>) -> &FeeModelConfig {
+        let in_effect = self.changes.partition_point(|change| change.from <= time);
+        match in_effect
+            .checked_sub(1)
+            .and_then(|index| self.changes.get(index))
+        {
+            Some(change) => &change.model,
+            None => &self.initial,
+        }
+    }
+
+    /// Whether every model in the schedule is linear; see [`FeeModelConfig::is_linear`].
+    fn is_linear(&self) -> bool {
+        self.initial.is_linear() && self.changes.iter().all(|change| change.model.is_linear())
+    }
+}
+
+impl TryFrom<DatedFeeModelRepr> for DatedFeeModel {
+    type Error = FeeModelError;
+
+    fn try_from(repr: DatedFeeModelRepr) -> Result<Self, Self::Error> {
+        let DatedFeeModelRepr { initial, changes } = repr;
+        if matches!(initial, FeeModelConfig::Dated(_)) {
+            return Err(FeeModelError::NestedDated { index: None });
+        }
+        for (index, change) in changes.iter().enumerate() {
+            if matches!(change.model, FeeModelConfig::Dated(_)) {
+                return Err(FeeModelError::NestedDated { index: Some(index) });
+            }
+        }
+        for (index, pair) in changes.windows(2).enumerate() {
+            if let [previous, change] = pair
+                && change.from <= previous.from
+            {
+                return Err(FeeModelError::ChangesNotIncreasing {
+                    index: index + 1,
+                    previous: previous.from,
+                    from: change.from,
+                });
+            }
+        }
+        Ok(Self {
+            initial: Box::new(initial),
+            changes,
+        })
+    }
+}
+
+impl From<DatedFeeModel> for DatedFeeModelRepr {
+    fn from(model: DatedFeeModel) -> Self {
+        Self {
+            initial: *model.initial,
+            changes: model.changes,
+        }
+    }
+}
+
+impl FeeModel for DatedFeeModel {
+    fn compute_fee(&self, input: &FeeInput) -> Decimal {
+        self.model_at(input.time).compute_fee(input)
+    }
+}
+
 /// Why a fee model was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -510,6 +702,27 @@ pub enum FeeModelError {
         min: Decimal,
         /// Its maximum per order.
         max: Decimal,
+    },
+    /// The change at `index` of a [`DatedFeeModel`] takes effect at `from`, which is not after
+    /// `previous`, the time of the change before it.
+    #[error("fee change {index}: effective from {from}, which is not after {previous}")]
+    ChangesNotIncreasing {
+        /// The change's position in the list.
+        index: usize,
+        /// The time of the change before it.
+        previous: DateTime<Utc>,
+        /// Its own time.
+        from: DateTime<Utc>,
+    },
+    /// A [`DatedFeeModel`] holds another dated model: as its initial model when `index` is
+    /// `None`, else as the model of the change at `index`.
+    #[error("a dated fee model holds another dated model ({})", match .index {
+        Some(index) => format!("change {index}"),
+        None => "its initial model".to_owned(),
+    })]
+    NestedDated {
+        /// The change's position in the list, or `None` for the initial model.
+        index: Option<usize>,
     },
 }
 
@@ -534,6 +747,8 @@ pub enum FeeModelError {
 /// - [`Composite`](FeeModelConfig::Composite): Several components that add, each limited to a
 ///   side or a liquidity and optionally bounded per order (a $0 commission with regulatory fees,
 ///   a commission with a minimum per order).
+/// - [`Dated`](FeeModelConfig::Dated): A schedule that changes over time, charging each fill by
+///   the model in effect at its time.
 ///
 /// `#[non_exhaustive]`: further models may be added.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -543,6 +758,7 @@ pub enum FeeModelConfig {
     PerContract(PerContractFeeModel),
     Percentage(PercentageFeeModel),
     Composite(CompositeFeeModel),
+    Dated(DatedFeeModel),
 }
 
 impl Default for FeeModelConfig {
@@ -554,12 +770,18 @@ impl Default for FeeModelConfig {
 impl FeeModelConfig {
     /// Whether a fill's fee is its quantity times the fee of one unit, whatever its order filled
     /// before: true unless a [`Composite`](Self::Composite) charges per order or bounds a
-    /// component per order.
+    /// component per order, or a [`Dated`](Self::Dated) schedule holds such a model at any time.
     pub(crate) fn is_linear(&self) -> bool {
         match self {
             Self::Zero(_) | Self::PerContract(_) | Self::Percentage(_) => true,
             Self::Composite(model) => model.0.iter().all(FeeComponent::is_linear),
+            Self::Dated(model) => model.is_linear(),
         }
+    }
+
+    /// Whether the fee can depend on the fill's time: true for a [`Dated`](Self::Dated) schedule.
+    pub(crate) fn is_dated(&self) -> bool {
+        matches!(self, Self::Dated(_))
     }
 }
 
@@ -712,6 +934,7 @@ impl FeeModel for FeeModelConfig {
             FeeModelConfig::PerContract(model) => model.compute_fee(input),
             FeeModelConfig::Percentage(model) => model.compute_fee(input),
             FeeModelConfig::Composite(model) => model.compute_fee(input),
+            FeeModelConfig::Dated(model) => model.compute_fee(input),
         }
     }
 }
@@ -725,6 +948,11 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A fixed fill time, for models that do not depend on it.
+    fn t0() -> DateTime<Utc> {
+        DateTime::UNIX_EPOCH
+    }
+
     /// A buy that is its order's first fill.
     fn input(
         price: Decimal,
@@ -732,7 +960,7 @@ mod tests {
         contract_size: Decimal,
         liquidity: Liquidity,
     ) -> FeeInput {
-        FeeInput::new(Side::Buy, price, quantity, contract_size).with_liquidity(liquidity)
+        FeeInput::new(Side::Buy, price, quantity, contract_size, t0()).with_liquidity(liquidity)
     }
 
     #[test]
@@ -1027,11 +1255,11 @@ mod tests {
     // --- Composite ---
 
     fn sell(price: &str, quantity: &str, contract_size: &str) -> FeeInput {
-        FeeInput::new(Side::Sell, d(price), d(quantity), d(contract_size))
+        FeeInput::new(Side::Sell, d(price), d(quantity), d(contract_size), t0())
     }
 
     fn buy(price: &str, quantity: &str, contract_size: &str) -> FeeInput {
-        FeeInput::new(Side::Buy, d(price), d(quantity), d(contract_size))
+        FeeInput::new(Side::Buy, d(price), d(quantity), d(contract_size), t0())
     }
 
     /// Each basis prices what its rustdoc says, for an order's first fill.
@@ -1266,5 +1494,201 @@ mod tests {
                 .components(),
             &[component]
         );
+    }
+
+    // --- DatedFeeModel ------------------------------------------------------------------------
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap()
+    }
+
+    fn per_contract(commission: &str) -> FeeModelConfig {
+        FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d(commission),
+        })
+    }
+
+    /// 1 per contract, then 2 from `at(10)`, then 3 from `at(20)`.
+    fn two_changes() -> DatedFeeModel {
+        DatedFeeModel::new(
+            per_contract("1"),
+            vec![
+                FeeChange::new(at(10), per_contract("2")),
+                FeeChange::new(at(20), per_contract("3")),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_dated_model_charges_the_model_in_effect_at_the_fill_time() {
+        let model = two_changes();
+        let fee_at = |seconds| {
+            model.compute_fee(&FeeInput::new(
+                Side::Buy,
+                d("5"),
+                d("2"),
+                d("100"),
+                at(seconds),
+            ))
+        };
+
+        assert_eq!(fee_at(-1_000_000), d("2"), "initial covers all time before");
+        assert_eq!(fee_at(9), d("2"));
+        assert_eq!(
+            fee_at(10),
+            d("4"),
+            "a change takes effect at its own instant"
+        );
+        assert_eq!(fee_at(19), d("4"));
+        assert_eq!(fee_at(20), d("6"));
+        assert_eq!(fee_at(1_000_000), d("6"), "the last change stays in effect");
+    }
+
+    #[test]
+    fn a_dated_model_reports_what_it_was_built_with() {
+        let model = two_changes();
+
+        assert_eq!(model.initial(), &per_contract("1"));
+        assert_eq!(
+            model.changes(),
+            &[
+                FeeChange::new(at(10), per_contract("2")),
+                FeeChange::new(at(20), per_contract("3")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dated_model_with_no_changes_charges_its_initial_model() {
+        let model = DatedFeeModel::new(per_contract("1"), vec![]).unwrap();
+
+        assert_eq!(model.model_at(at(0)), &per_contract("1"));
+        assert_eq!(
+            model.compute_fee(&FeeInput::new(Side::Sell, d("5"), d("3"), d("1"), at(0))),
+            d("3")
+        );
+    }
+
+    #[test]
+    fn a_dated_model_refuses_changes_not_strictly_increasing() {
+        for second in [10, 5] {
+            let refused = DatedFeeModel::new(
+                per_contract("1"),
+                vec![
+                    FeeChange::new(at(0), per_contract("2")),
+                    FeeChange::new(at(10), per_contract("3")),
+                    FeeChange::new(at(second), per_contract("4")),
+                ],
+            );
+
+            assert_eq!(
+                refused,
+                Err(FeeModelError::ChangesNotIncreasing {
+                    index: 2,
+                    previous: at(10),
+                    from: at(second),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_dated_model_refuses_a_dated_model_inside_it() {
+        let dated = || FeeModelConfig::Dated(two_changes());
+
+        assert_eq!(
+            DatedFeeModel::new(dated(), vec![]),
+            Err(FeeModelError::NestedDated { index: None })
+        );
+        assert_eq!(
+            DatedFeeModel::new(
+                per_contract("1"),
+                vec![
+                    FeeChange::new(at(0), per_contract("2")),
+                    FeeChange::new(at(10), dated()),
+                ],
+            ),
+            Err(FeeModelError::NestedDated { index: Some(1) })
+        );
+    }
+
+    #[test]
+    fn a_refused_dated_model_says_why() {
+        assert_eq!(
+            FeeModelError::NestedDated { index: None }.to_string(),
+            "a dated fee model holds another dated model (its initial model)"
+        );
+        assert_eq!(
+            FeeModelError::NestedDated { index: Some(3) }.to_string(),
+            "a dated fee model holds another dated model (change 3)"
+        );
+        assert_eq!(
+            FeeModelError::ChangesNotIncreasing {
+                index: 1,
+                previous: at(10),
+                from: at(10),
+            }
+            .to_string(),
+            "fee change 1: effective from 2023-11-14 22:13:30 UTC, which is not after \
+             2023-11-14 22:13:30 UTC"
+        );
+    }
+
+    #[test]
+    fn a_dated_model_serialises_as_its_initial_model_and_changes() {
+        let cfg = FeeModelConfig::Dated(
+            DatedFeeModel::new(
+                FeeModelConfig::default(),
+                vec![FeeChange::new(at(0), per_contract("0.65"))],
+            )
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"Dated":{"initial":{"Zero":null},"changes":[{"from":"2023-11-14T22:13:20Z","model":{"PerContract":{"commission_per_contract":"0.65"}}}]}}"#
+        );
+        assert_eq!(serde_json::from_str::<FeeModelConfig>(&json).unwrap(), cfg);
+    }
+
+    #[test]
+    fn deserialising_a_dated_model_validates_it() {
+        let out_of_order = r#"{"Dated":{"initial":{"Zero":null},"changes":[
+            {"from":"2024-01-02T00:00:00Z","model":{"Zero":null}},
+            {"from":"2024-01-01T00:00:00Z","model":{"Zero":null}}]}}"#;
+        let nested = r#"{"Dated":{"initial":{"Dated":{"initial":{"Zero":null},"changes":[]}},
+            "changes":[]}}"#;
+
+        let error = serde_json::from_str::<FeeModelConfig>(out_of_order)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fee change 1"), "{error}");
+        let error = serde_json::from_str::<FeeModelConfig>(nested)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another dated model"), "{error}");
+    }
+
+    #[test]
+    fn a_dated_model_is_linear_only_if_every_model_in_it_is() {
+        let per_order = || {
+            FeeModelConfig::Composite(
+                CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("1")))])
+                    .unwrap(),
+            )
+        };
+        let dated = |initial, change| {
+            FeeModelConfig::Dated(
+                DatedFeeModel::new(initial, vec![FeeChange::new(at(0), change)]).unwrap(),
+            )
+        };
+
+        assert!(dated(per_contract("1"), per_contract("2")).is_linear());
+        assert!(!dated(per_order(), per_contract("2")).is_linear());
+        assert!(!dated(per_contract("1"), per_order()).is_linear());
+        assert!(dated(per_contract("1"), per_contract("2")).is_dated());
+        assert!(!per_contract("1").is_dated());
     }
 }

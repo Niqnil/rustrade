@@ -813,7 +813,9 @@ pub struct InstrumentState<
     /// on. What its order had filled before it is read from
     /// [`Trade::order_filled_quantity`](rustrade_execution::trade::Trade::order_filled_quantity);
     /// a fill that does not report it is priced as its order's first, so a fee charged once per
-    /// order (see [`FeeModelConfig::Composite`]) is charged on each such fill.
+    /// order (see [`FeeModelConfig::Composite`]) is charged on each such fill. Each fill is priced
+    /// at its [`time_exchange`](rustrade_execution::trade::Trade::time_exchange), which selects the
+    /// schedule in effect under [`FeeModelConfig::Dated`].
     ///
     /// Only enable [`FeeModelConfig::PerContract`] when the `ExecutionClient` reports
     /// `Trade.fees.fees = 0` (i.e., commission is not already embedded in fill reports).
@@ -2695,10 +2697,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         let prior_filled = trade.order_filled_quantity.map_or(Decimal::ZERO, |filled| {
             (filled - trade.quantity.abs()).max(Decimal::ZERO)
         });
+        // At the trade's exchange time, so a fee schedule that changes over time charges the
+        // schedule in effect when the trade filled.
         let computed_fee = self.fee_model.compute_fee(
-            &FeeInput::new(trade.side, trade.price, trade.quantity, contract_size)
-                .with_liquidity(Liquidity::Taker)
-                .with_prior_filled(prior_filled),
+            &FeeInput::new(
+                trade.side,
+                trade.price,
+                trade.quantity,
+                contract_size,
+                trade.time_exchange,
+            )
+            .with_liquidity(Liquidity::Taker)
+            .with_prior_filled(prior_filled),
         );
 
         let augmented;
@@ -5722,6 +5732,44 @@ mod tests {
             dec!(10),
             "a fill that does not say what its order filled is priced as the order's first"
         );
+    }
+
+    /// The engine's fee model prices a fill at the fill's exchange time, so a schedule that changes
+    /// over time charges each fill the fee in effect when it filled.
+    #[test]
+    fn an_engine_fee_model_charges_the_fee_in_effect_at_the_fill_time() {
+        use rustrade_execution::{DatedFeeModel, FeeChange, PerContractFeeModel};
+
+        let per_contract = |commission_per_contract| {
+            FeeModelConfig::PerContract(PerContractFeeModel {
+                commission_per_contract,
+            })
+        };
+        let mut state = instrument_state(OmsMode::Netting);
+        state.fee_model = FeeModelConfig::Dated(
+            DatedFeeModel::new(
+                per_contract(dec!(1)),
+                vec![FeeChange::new(
+                    TIME + chrono::TimeDelta::seconds(1),
+                    per_contract(dec!(3)),
+                )],
+            )
+            .unwrap(),
+        );
+        let fees = |state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>| {
+            -netting_position(state).unwrap().pnl_realised
+        };
+
+        let mut before = fill(OrderId::new("a"), Side::Buy, dec!(1));
+        before.id = TradeId::new("a1");
+        let _ = state.update_from_trade(&before);
+        assert_eq!(fees(&state), dec!(1), "before the change");
+
+        let mut after = fill(OrderId::new("b"), Side::Buy, dec!(1));
+        after.id = TradeId::new("b1");
+        after.time_exchange = TIME + chrono::TimeDelta::seconds(1);
+        let _ = state.update_from_trade(&after);
+        assert_eq!(fees(&state), dec!(4), "from the change");
     }
 
     /// Only a fee in the base asset is a change in the holding. One in quote, or in a third asset

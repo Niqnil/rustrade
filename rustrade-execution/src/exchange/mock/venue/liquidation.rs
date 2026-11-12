@@ -398,7 +398,7 @@ impl SimulatedVenue {
                 side,
                 quantity,
                 price,
-                FeePricing::first(Liquidity::Taker),
+                FeePricing::first(Liquidity::Taker, self.time_exchange()),
             )
         };
         let mut quantity = Decimal::ONE;
@@ -492,6 +492,9 @@ impl SimulatedVenue {
     }
 
     /// What filling `quantity` of `leg` costs and delivers, as its own order's only fill.
+    ///
+    /// Priced at the venue's clock, as every leg is: [`check_margin`](Self::check_margin) moves the
+    /// clock to its `time_exchange` before it liquidates, so that is the fill's time.
     fn price_leg(&self, leg: &Leg, quantity: Decimal) -> Settlement {
         self.fill_settlement(
             &leg.terms,
@@ -499,7 +502,7 @@ impl SimulatedVenue {
             leg.side,
             quantity,
             leg.price,
-            FeePricing::first(Liquidity::Taker),
+            FeePricing::first(Liquidity::Taker, self.time_exchange()),
         )
     }
 
