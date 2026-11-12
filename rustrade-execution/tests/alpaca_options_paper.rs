@@ -13,11 +13,18 @@
 //!
 //! # What they check
 //! - A market `day` buy to open and a market `day` sell to close of one option contract fill, and
-//!   the fills are read back.
+//!   the fills are read back, both through `fetch_trades` and on the account stream.
 //! - A `day` limit option order rests and cancels.
 //! - Alpaca itself rejects the time in force `AlpacaClient` refuses unsent: `ioc` on an option
 //!   and `day` on crypto. These send the request directly rather than through the client, since
 //!   the client never sends them.
+//!
+//! # Fill latency
+//! The market `day` test also reports how long each order took to fill and for the fill to reach
+//! the client, as a table printed to stdout (shown with `--nocapture`) and, when
+//! `GITHUB_STEP_SUMMARY` is set, appended to the GitHub Actions job summary. These are readings,
+//! not checks: they help pick a timeout such as `RequestOpen::cancel_after` on a venue without
+//! `ioc`. Paper fills are Alpaca's simulation, so live routing may differ.
 //!
 //! The contract is chosen at run time: a tradable SPY call with the nearest expiry from tomorrow
 //! on, a last close between $0.50 and $3.00, and the most open interest. Set `ALPACA_TEST_OPTION`
@@ -36,10 +43,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
+    AccountEventKind, UnindexedAccountEvent,
     client::{
         ExecutionClient,
         alpaca::{AlpacaClient, AlpacaConfig},
@@ -59,7 +67,10 @@ use rustrade_instrument::{
 };
 use serde_json::Value;
 use serial_test::serial;
-use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
+use std::{
+    fmt::Write as _, future::Future, io::Write as _, panic::AssertUnwindSafe, time::Duration,
+};
+use tokio::{sync::mpsc, time::Instant};
 
 const PAPER_REST: &str = "https://paper-api.alpaca.markets";
 
@@ -98,6 +109,16 @@ async fn get_json(path: &str) -> Value {
     serde_json::from_str(&body).expect("JSON")
 }
 
+/// The RFC 3339 time in `value[field]`, panicking if it is missing or malformed.
+fn json_time(value: &Value, field: &str) -> DateTime<Utc> {
+    let text = value[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("{field} missing: {value}"));
+    DateTime::parse_from_rfc3339(text)
+        .unwrap_or_else(|error| panic!("{field} {text}: {error}"))
+        .with_timezone(&Utc)
+}
+
 /// Panics unless the US market is open and stays open for ten more minutes, since an option order
 /// fills only then, and a position bought just before the close could not be sold until the next
 /// day. Returns Alpaca's own time, so that the fills are read back free of any local clock skew.
@@ -109,17 +130,9 @@ async fn require_market_open() -> DateTime<Utc> {
         "the US market is closed (next open {}): run these during regular trading hours",
         clock["next_open"]
     );
-    let time = |field: &str| {
-        let text = clock[field]
-            .as_str()
-            .unwrap_or_else(|| panic!("clock {field}: {clock}"));
-        DateTime::parse_from_rfc3339(text)
-            .unwrap_or_else(|error| panic!("clock {field} {text}: {error}"))
-            .with_timezone(&Utc)
-    };
-    let now = time("timestamp");
+    let now = json_time(&clock, "timestamp");
     assert!(
-        time("next_close") - now >= TimeDelta::minutes(10),
+        json_time(&clock, "next_close") - now >= TimeDelta::minutes(10),
         "the US market closes at {}: too soon to open and close a position before it",
         clock["next_close"]
     );
@@ -368,14 +381,14 @@ fn placed_id(placed: &rustrade_execution::order::state::UnindexedOrderState) -> 
     }
 }
 
-/// Waits until Alpaca reports order `id` filled. Panics at once if it ends any other way, or after
-/// 60 seconds.
-async fn await_filled(id: &OrderId) {
+/// Waits until Alpaca reports order `id` filled, and returns the order as Alpaca reports it.
+/// Panics at once if it ends any other way, or after 60 seconds.
+async fn await_filled(id: &OrderId) -> Value {
     let started = tokio::time::Instant::now();
     loop {
         let order = get_json(&format!("/v2/orders/{id}")).await;
         match order["status"].as_str() {
-            Some("filled") => return,
+            Some("filled") => return order,
             Some(ended @ ("canceled" | "expired" | "rejected" | "done_for_day")) => {
                 panic!("order {id} ended {ended} without filling: {order}")
             }
@@ -389,14 +402,17 @@ async fn await_filled(id: &OrderId) {
     }
 }
 
-/// The fills of order `id` on `instrument` since `since`, read through the client, waiting up to
-/// 60 seconds for at least one.
+/// The fills of order `id` on `instrument` since `since`, read through the client every 500 ms
+/// until at least one is listed, and when that read returned. Panics after 60 seconds.
 async fn await_fills(
     client: &AlpacaClient,
     instrument: &InstrumentNameExchange,
     id: &OrderId,
     since: DateTime<Utc>,
-) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+) -> (
+    Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    Instant,
+) {
     let started = tokio::time::Instant::now();
     loop {
         let read = client
@@ -414,13 +430,141 @@ async fn await_fills(
             .filter(|trade| trade.order_id == *id)
             .collect();
         if !fills.is_empty() {
-            return fills;
+            return (fills, Instant::now());
         }
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "no fill of order {id} on {instrument} read back after 60 seconds"
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Account stream events, each stamped by the local clock as it arrived. A task reads the stream
+/// as events come, so a test busy polling elsewhere still learns when each one arrived.
+struct StampedAccountStream {
+    events: mpsc::UnboundedReceiver<(Instant, UnindexedAccountEvent)>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl StampedAccountStream {
+    async fn open(client: &AlpacaClient, instrument: &InstrumentNameExchange) -> Self {
+        let mut stream = client
+            .account_stream(&[], std::slice::from_ref(instrument))
+            .await
+            .expect("account_stream");
+        let (sender, events) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                if sender.send((Instant::now(), event)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { events, reader }
+    }
+
+    /// When the first fill of order `id` arrived, panicking if none arrives within 60 seconds.
+    async fn fill_arrival(&mut self, id: &OrderId) -> Instant {
+        let first_fill = async {
+            while let Some((arrived, event)) = self.events.recv().await {
+                if matches!(&event.kind, AccountEventKind::Trade(trade) if trade.order_id == *id) {
+                    return arrived;
+                }
+            }
+            panic!("the account stream ended before a fill of order {id}")
+        };
+        tokio::time::timeout(Duration::from_secs(60), first_fill)
+            .await
+            .unwrap_or_else(|_| panic!("no fill of order {id} on the account stream in 60 seconds"))
+    }
+}
+
+impl Drop for StampedAccountStream {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// How long one order took to fill, and for its fill to reach the client.
+struct FillLatency {
+    order: &'static str,
+    /// From sending the order to the response placing it.
+    placed: Duration,
+    /// Alpaca's own time from accepting the order to filling it (`submitted_at` to `filled_at`),
+    /// read from one clock.
+    venue: TimeDelta,
+    /// From sending the order to `fetch_trades` first listing its fill.
+    fetch_trades: Duration,
+    /// From sending the order to its fill arriving on the account stream.
+    stream: Duration,
+}
+
+/// Places `request` for one contract of `contract` as a market `day` order, waits until it fills,
+/// and returns its fills (read through `fetch_trades` since `since`) and how long each step took.
+async fn place_and_time(
+    client: &AlpacaClient,
+    stream: &mut StampedAccountStream,
+    contract: &InstrumentNameExchange,
+    order: &'static str,
+    cid: ClientOrderId,
+    request: RequestOpen,
+    since: DateTime<Utc>,
+) -> (
+    Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    FillLatency,
+) {
+    let sent = Instant::now();
+    let placed = open(client, contract, cid, request).await;
+    let placed_after = sent.elapsed();
+    let id = placed_id(&placed.state);
+    let (reported, (fills, listed)) =
+        tokio::join!(await_filled(&id), await_fills(client, contract, &id, since));
+    let arrived = stream.fill_arrival(&id).await;
+    let latency = FillLatency {
+        order,
+        placed: placed_after,
+        venue: json_time(&reported, "filled_at") - json_time(&reported, "submitted_at"),
+        fetch_trades: listed.duration_since(sent),
+        stream: arrived.duration_since(sent),
+    };
+    (fills, latency)
+}
+
+/// Prints the fill latency readings as a Markdown table, and appends it to the GitHub Actions job
+/// summary when `GITHUB_STEP_SUMMARY` names one.
+fn report_fill_latency(contract: &InstrumentNameExchange, readings: &[FillLatency]) {
+    let mut table = format!(
+        "### Alpaca option fill latency\n\n{contract}, {}\n\n\
+         | Market `day` order | Order placed | Alpaca: submitted to filled | Fill listed by \
+         `fetch_trades` | Fill on the account stream |\n|---|---:|---:|---:|---:|\n",
+        Utc::now().format("%Y-%m-%d %H:%M UTC")
+    );
+    for reading in readings {
+        writeln!(
+            table,
+            "| {} | {} ms | {} ms | {} ms | {} ms |",
+            reading.order,
+            reading.placed.as_millis(),
+            reading.venue.num_milliseconds(),
+            reading.fetch_trades.as_millis(),
+            reading.stream.as_millis(),
+        )
+        .expect("write to a String");
+    }
+    table.push_str(
+        "\nTimed from sending the order, by the runner's clock, except Alpaca's column, which is \
+         its own `submitted_at` to `filled_at`. `fetch_trades` is polled every 500 ms. Paper fills \
+         are Alpaca's simulation, so live routing may differ.\n\n",
+    );
+    println!("{table}");
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut summary| summary.write_all(table.as_bytes()))
+            .unwrap_or_else(|error| panic!("append to the job summary {path:?}: {error}"));
     }
 }
 
@@ -433,11 +577,14 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
     let (contract, _) = option_contract().await;
     require_no_position(&contract).await;
     let since = now - TimeDelta::minutes(1);
+    let mut stream = StampedAccountStream::open(&client, &contract).await;
 
     flattened_on_failure(&contract, async {
-        let bought = open(
+        let (buys, buy_latency) = place_and_time(
             &client,
+            &mut stream,
             &contract,
+            "Buy to open",
             cid("opt-bto"),
             RequestOpen::new(
                 Side::Buy,
@@ -446,11 +593,9 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
                 OrderKind::Market,
                 TimeInForce::GoodUntilEndOfDay,
             ),
+            since,
         )
         .await;
-        let bought_id = placed_id(&bought.state);
-        await_filled(&bought_id).await;
-        let buys = await_fills(&client, &contract, &bought_id, since).await;
         println!(
             "Buy to open filled: {:?}",
             buys.iter()
@@ -463,9 +608,11 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
             dec!(1)
         );
 
-        let sold = open(
+        let (sells, sell_latency) = place_and_time(
             &client,
+            &mut stream,
             &contract,
+            "Sell to close",
             cid("opt-stc"),
             RequestOpen::new(
                 Side::Sell,
@@ -475,11 +622,10 @@ async fn option_market_day_buy_to_open_then_sell_to_close() {
                 TimeInForce::GoodUntilEndOfDay,
             )
             .with_reduce_only(ReduceOnly::Position),
+            since,
         )
         .await;
-        let sold_id = placed_id(&sold.state);
-        await_filled(&sold_id).await;
-        let sells = await_fills(&client, &contract, &sold_id, since).await;
+        report_fill_latency(&contract, &[buy_latency, sell_latency]);
         println!(
             "Sell to close filled: {:?}",
             sells
