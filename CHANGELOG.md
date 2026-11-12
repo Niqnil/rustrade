@@ -337,9 +337,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and `AccountState::hold`, take a `RestingOrder` instead of an order and its reservation.
   - `rustrade-instrument` depends on `chrono-tz`.
 
-- **`binance-sdk` 77.2.0 → 78.0.0** (`rustrade-execution`, `binance` feature). The SDK now keeps
-  the body of a REST error answer, and answers HTTP 409 with its own `ConflictError`, which the
-  clients read as a refusal, as they read a 409 before.
+- **`binance-sdk` 77.2.0 → 78.0.0** (`rustrade-execution`, `binance` feature, #931). The SDK now
+  keeps the body of a REST error answer, and answers HTTP 409 with its own `ConflictError`, which
+  the clients read as a refusal, as they read a 409 before.
   - **Binance spot's cancel-replace is sent through the SDK.** Its legs are read from the
     `data` of the SDK's error, which 77.2.0 dropped and which the client therefore fetched with
     its own signed HTTP request. Each leg is answered as before. The request keeps its 5 s bound,
