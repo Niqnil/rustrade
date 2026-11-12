@@ -6230,11 +6230,21 @@ mod tests {
     #[test]
     fn server_and_network_variants_map_to_connectivity() {
         // 5xx / transport failures leave the order's venue status unknown → Connectivity.
-        for ce in [
-            sdk_errors::rest_error(503, "internal error", &[]),
-            ConnectorError::NetworkError("connection reset".to_string()),
+        // Each carries its own message, not the SDK's `Display` of the error.
+        for (ce, msg) in [
+            (
+                sdk_errors::rest_error(503, "internal error", &[]),
+                "Server error: 503",
+            ),
+            (
+                ConnectorError::NetworkError("connection reset".to_string()),
+                "connection reset",
+            ),
         ] {
-            assert!(matches!(classify_err(ce), OrderError::Connectivity(_)));
+            assert_eq!(
+                classify_err(ce),
+                OrderError::Connectivity(ConnectivityError::Socket(msg.to_string()))
+            );
         }
     }
 

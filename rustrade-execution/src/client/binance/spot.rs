@@ -532,10 +532,17 @@ impl BinanceSpot {
         config: &BinanceSpotConfig,
         signing: Option<&SigningClock>,
     ) -> Arc<RestApi> {
-        let builder = Self::rest_config_builder(config, signing)
+        Self::rest_client(config, Self::order_rest_config_builder(config, signing))
+    }
+
+    /// [`build_order_rest`](Self::build_order_rest)'s configuration.
+    fn order_rest_config_builder(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> ConfigurationRestApiBuilder {
+        Self::rest_config_builder(config, signing)
             .timeout(5_000)
-            .retries(0);
-        Self::rest_client(config, builder)
+            .retries(0)
     }
 
     /// A REST configuration signed with `config`'s credentials, on `signing`'s clock when set.
@@ -7895,6 +7902,37 @@ mod tests {
         let mut no_side = order_row("a", "FILLED");
         no_side["side"] = serde_json::Value::Null;
         assert_eq!(ended_state(&key, no_side), None);
+    }
+
+    /// Both REST clients sign with the config's credentials, on the signing clock when there is
+    /// one. The order client's requests are bounded by 5 s and never sent twice.
+    #[test]
+    fn the_rest_clients_sign_alike_and_the_order_client_sends_once() {
+        let config = BinanceSpotConfig::new("key".into(), "secret".into());
+        let signing = SigningClock::default();
+        for signing in [None, Some(&signing)] {
+            for (built, label) in [
+                (BinanceSpot::rest_config_builder(&config, signing), "rest"),
+                (
+                    BinanceSpot::order_rest_config_builder(&config, signing),
+                    "order",
+                ),
+            ] {
+                let built = built.build().unwrap();
+                assert_eq!(built.api_key.as_deref(), Some("key"), "{label}");
+                assert_eq!(built.api_secret.as_deref(), Some("secret"), "{label}");
+                assert_eq!(
+                    built.timestamp_provider.is_some(),
+                    signing.is_some(),
+                    "{label}"
+                );
+            }
+        }
+        let order = BinanceSpot::order_rest_config_builder(&config, None)
+            .build()
+            .unwrap();
+        assert_eq!(order.timeout, 5_000);
+        assert_eq!(order.retries, 0);
     }
 
     #[test]
