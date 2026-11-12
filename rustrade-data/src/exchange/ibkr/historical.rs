@@ -248,11 +248,6 @@ impl IbkrHistoricalData {
         }
     }
 
-    /// When a request made now must be answered by, if it is bounded.
-    fn deadline(&self) -> Option<Instant> {
-        self.request_timeout.map(|timeout| Instant::now() + timeout)
-    }
-
     /// Disconnect from IB Gateway.
     ///
     /// Signals the ibapi client to shut down and releases the client ID for reuse.
@@ -414,7 +409,7 @@ impl IbkrHistoricalData {
             ));
         }
 
-        let deadline = self.deadline();
+        let deadline = deadline(self.request_timeout);
         let client = self.client.clone();
         let symbol = request.contract.symbol.clone();
 
@@ -535,7 +530,7 @@ impl IbkrHistoricalData {
             ));
         }
 
-        let deadline = self.deadline();
+        let deadline = deadline(self.request_timeout);
         let client = self.client.clone();
         let symbol = request.contract.symbol.clone();
 
@@ -846,7 +841,7 @@ impl IbkrHistoricalData {
         security_type: SecurityType,
         contract_id: i32,
     ) -> Result<OptionChainResult, DataError> {
-        let deadline = self.deadline();
+        let deadline = deadline(self.request_timeout);
         let client = self.client.clone();
         let symbol = symbol.to_string();
         let exchange = exchange.map(str::to_string);
@@ -918,6 +913,11 @@ impl IbkrHistoricalData {
 
         Ok(chains)
     }
+}
+
+/// When a request made now must be answered by, if `request_timeout` bounds it.
+fn deadline(request_timeout: Option<StdDuration>) -> Option<Instant> {
+    request_timeout.map(|timeout| Instant::now() + timeout)
 }
 
 /// The error for a failed `ibapi` request named `operation`: [`DataError::RequestTimeout`] when it
@@ -1686,6 +1686,16 @@ mod tests {
             matches!(&error, DataError::Socket(message) if message.contains("one_shot_timeout")),
             "{error:?}"
         );
+    }
+
+    /// A bounded request's deadline is its timeout from now; an unbounded one has none.
+    #[test]
+    fn a_requests_deadline_is_its_timeout_from_now() {
+        let before = Instant::now();
+        let deadline = deadline(Some(StdDuration::from_secs(60))).unwrap();
+        assert!(deadline >= before + StdDuration::from_secs(60));
+        assert!(deadline <= Instant::now() + StdDuration::from_secs(60));
+        assert_eq!(super::deadline(None), None);
     }
 
     /// A request that ran out of time is a timeout naming it; any other `ibapi` error stays a
