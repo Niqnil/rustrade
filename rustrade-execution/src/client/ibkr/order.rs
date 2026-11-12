@@ -1189,11 +1189,27 @@ mod tests {
                 .map_err(|e| e.into_order_error(TimeInForce::AtClose))
         ));
 
+        // A failure about the request's values is a rejection, not an unsupported type.
         let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
-        assert!(matches!(
-            refusal(OrderKind::Limit, None, gtc),
-            Err(OrderError::Rejected(ApiError::OrderRejected(_)))
-        ));
+        let rejected = |result| {
+            matches!(
+                result,
+                Err(OrderError::Rejected(ApiError::OrderRejected(_)))
+            )
+        };
+        assert!(rejected(refusal(OrderKind::Limit, None, gtc)));
+        let trailing_limit = |stop_price| OrderKind::TrailingStopLimit {
+            offset: Decimal::ONE,
+            offset_type: TrailingOffsetType::Absolute,
+            stop_price,
+            limit_offset: Decimal::ONE,
+        };
+        assert!(rejected(refusal(trailing_limit(Decimal::ZERO), None, gtc)));
+        assert!(rejected(refusal(
+            trailing_limit(Decimal::from(95)),
+            Some(Decimal::ONE),
+            gtc
+        )));
         assert_eq!(refusal(OrderKind::Limit, Some(Decimal::ONE), gtc), Ok(()));
     }
 
