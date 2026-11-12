@@ -93,7 +93,9 @@
 //! # Limitations
 //!
 //! - **Order types**: Market, Limit, Stop, StopLimit, TrailingStop, TrailingStopLimit,
-//!   and Bracket (entry + take-profit + stop-loss) supported. No Algo orders.
+//!   and Bracket (entry + take-profit + stop-loss) supported. No Algo orders. The client
+//!   refuses any other kind, a trailing stop with an activation price, and a `BasisPoints`
+//!   trailing offset unsent with [`OrderError::UnsupportedOrderType`]
 //! - **TimeInForce**: No `post_only` (IB has no maker-only orders), and `AtClose` only on a
 //!   market or limit order (sent as market- or limit-on-close), never on a bracket. The client
 //!   refuses these unsent with [`OrderError::UnsupportedTimeInForce`]; IB decides the rest

@@ -323,6 +323,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `common::map_tif` is removed. A market, trailing or unresolved order is still refused with
     `UnsupportedOrderType`, whatever its time in force.
 
+- **Breaking: `IbkrClient` refuses an order type IB does not take with
+  `OrderError::UnsupportedOrderType`** (`rustrade-execution`, #926). It was
+  `OrderError::Rejected(ApiError::OrderRejected(..))`, the error for a venue's refusal, although
+  the order was never sent.
+  - The order kinds: `TakeProfit`, `TakeProfitLimit`, `TrailingStopFixedLimit`, a `TrailingStop`
+    with an `activation_price`, and `ConditionalUnresolved`.
+  - The trailing offset type: `TrailingOffsetType::BasisPoints` on a `TrailingStop` or
+    `TrailingStopLimit` (IB takes an amount or a percentage).
+  - A caller matching on the old error for these cases must match the new variant. A mapping
+    failure about the request's values (a missing or unexpected limit price,
+    a non-positive stop price, a price that does not convert, bracket prices, the client order
+    id) stays `Rejected(OrderRejected)`.
+
 - **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`,
   #917). A struct literal must set it (`None` to hold every long to expiry), and
   `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as
