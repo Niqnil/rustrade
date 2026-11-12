@@ -159,7 +159,7 @@ cmd_report() {
             if [ ! -s "$diff_file" ]; then
                 echo "_No difference in the extracted text: only the checksum or revision differs._"
             else
-                # A longer fence than any the text could hold, so a line of the diff cannot close it.
+                # A tilde fence, which a line of backticks in the text cannot close.
                 echo '~~~~diff'
                 if [ "$(wc -c <"$diff_file")" -gt "$DIFF_LIMIT" ]; then
                     head -c "$DIFF_LIMIT" "$diff_file" | sed '$d'
