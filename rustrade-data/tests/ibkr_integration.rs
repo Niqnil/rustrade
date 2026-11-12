@@ -451,7 +451,7 @@ async fn test_historical_request_timeout() {
     assert_eq!(
         result.unwrap_err(),
         DataError::RequestTimeout {
-            operation: "historical data".to_owned()
+            operation: "fetch_candles".to_owned()
         }
     );
 
@@ -461,7 +461,7 @@ async fn test_historical_request_timeout() {
     assert_eq!(
         result.unwrap_err(),
         DataError::RequestTimeout {
-            operation: "historical_ticks_trade".to_owned()
+            operation: "fetch_historical_ticks".to_owned()
         }
     );
 }

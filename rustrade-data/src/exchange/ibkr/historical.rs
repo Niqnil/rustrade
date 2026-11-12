@@ -336,7 +336,7 @@ impl IbkrHistoricalData {
             }
             let historical_data = builder
                 .fetch()
-                .map_err(|e| request_error("historical data", e))?;
+                .map_err(|e| request_error("fetch_candles", e))?;
 
             let mut candles = Vec::with_capacity(historical_data.bars.len());
             for bar in &historical_data.bars {
@@ -348,9 +348,9 @@ impl IbkrHistoricalData {
         .await
         .map_err(|e| {
             if e.is_panic() {
-                DataError::Socket(format!("historical_data task panicked: {e}"))
+                DataError::Socket(format!("fetch_candles task panicked: {e}"))
             } else {
-                DataError::Socket(format!("historical_data task cancelled: {e}"))
+                DataError::Socket(format!("fetch_candles task cancelled: {e}"))
             }
         })??;
 
@@ -440,14 +440,14 @@ impl IbkrHistoricalData {
             }
             let subscription = builder
                 .trade()
-                .map_err(|e| DataError::Socket(format!("historical_ticks_trade: {e}")))?;
+                .map_err(|e| DataError::Socket(format!("fetch_historical_ticks: {e}")))?;
 
             // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
             // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
             // them silently). `DataUntil` filters non-fatal notices (logged at
             // `warn!`) and yields `Result<TickLast, Error>` until the deadline;
             // `collect_ticks` drains it, stops at the first `Err`, and records the reason.
-            let mut data = DataUntil::new(&subscription, deadline, "historical_ticks_trade");
+            let mut data = DataUntil::new(&subscription, deadline, "fetch_historical_ticks");
             let fetched = collect_ticks(
                 &mut data,
                 request.contract.symbol.0.as_str(),
@@ -468,9 +468,9 @@ impl IbkrHistoricalData {
         .await
         .map_err(|e| {
             if e.is_panic() {
-                DataError::Socket(format!("historical_ticks_trade task panicked: {e}"))
+                DataError::Socket(format!("fetch_historical_ticks task panicked: {e}"))
             } else {
-                DataError::Socket(format!("historical_ticks_trade task cancelled: {e}"))
+                DataError::Socket(format!("fetch_historical_ticks task cancelled: {e}"))
             }
         })??;
 
@@ -566,7 +566,7 @@ impl IbkrHistoricalData {
             };
             let subscription = builder
                 .bid_ask(ignore_size)
-                .map_err(|e| DataError::Socket(format!("historical_ticks_bid_ask: {e}")))?;
+                .map_err(|e| DataError::Socket(format!("fetch_historical_bid_ask: {e}")))?;
 
             // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
             // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
@@ -574,7 +574,7 @@ impl IbkrHistoricalData {
             // `warn!`) and yields `Result<TickBidAsk, Error>` until the deadline;
             // `collect_ticks` drains it, stops at the first `Err`, and records the
             // reason. The bid/ask decode needs no sequence index, so `seq` is ignored.
-            let mut data = DataUntil::new(&subscription, deadline, "historical_ticks_bid_ask");
+            let mut data = DataUntil::new(&subscription, deadline, "fetch_historical_bid_ask");
             let fetched = collect_ticks(
                 &mut data,
                 request.contract.symbol.0.as_str(),
@@ -595,9 +595,9 @@ impl IbkrHistoricalData {
         .await
         .map_err(|e| {
             if e.is_panic() {
-                DataError::Socket(format!("historical_ticks_bid_ask task panicked: {e}"))
+                DataError::Socket(format!("fetch_historical_bid_ask task panicked: {e}"))
             } else {
-                DataError::Socket(format!("historical_ticks_bid_ask task cancelled: {e}"))
+                DataError::Socket(format!("fetch_historical_bid_ask task cancelled: {e}"))
             }
         })??;
 
@@ -673,16 +673,16 @@ impl IbkrHistoricalData {
         let greeks = tokio::task::spawn_blocking(move || {
             let computation = client
                 .calculate_option_price(&contract, volatility, underlying_price)
-                .map_err(|e| request_error("calculate_option_price", e))?;
+                .map_err(|e| request_error("calculate_theoretical_greeks", e))?;
 
             Ok::<_, DataError>(OptionGreeks::from_ib(&computation))
         })
         .await
         .map_err(|e| {
             if e.is_panic() {
-                DataError::Socket(format!("calculate_option_price task panicked: {e}"))
+                DataError::Socket(format!("calculate_theoretical_greeks task panicked: {e}"))
             } else {
-                DataError::Socket(format!("calculate_option_price task cancelled: {e}"))
+                DataError::Socket(format!("calculate_theoretical_greeks task cancelled: {e}"))
             }
         })??;
 
@@ -864,7 +864,7 @@ impl IbkrHistoricalData {
             };
             let subscription = builder
                 .subscribe()
-                .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
+                .map_err(|e| DataError::Socket(format!("fetch_option_chain: {e}")))?;
 
             // `DataUntil` yields `Result<OptionChain, Error>` until the deadline,
             // filtering subscription-level notices, so an `Err` here is a
@@ -874,7 +874,7 @@ impl IbkrHistoricalData {
             // `EndOfStream`), so mirror the tick methods: keep the entries
             // already decoded — each is a complete, valid message — record the
             // reason, and stop, instead of discarding them with a fail-fast Err.
-            let mut data = DataUntil::new(&subscription, deadline, "option_chain");
+            let mut data = DataUntil::new(&subscription, deadline, "fetch_option_chain");
             let (entries, _received, truncation_error) = drain_until_error(
                 &mut data,
                 16,
@@ -905,9 +905,9 @@ impl IbkrHistoricalData {
         .await
         .map_err(|e| {
             if e.is_panic() {
-                DataError::Socket(format!("option_chain task panicked: {e}"))
+                DataError::Socket(format!("fetch_option_chain task panicked: {e}"))
             } else {
-                DataError::Socket(format!("option_chain task cancelled: {e}"))
+                DataError::Socket(format!("fetch_option_chain task cancelled: {e}"))
             }
         })??;
 
@@ -1186,8 +1186,12 @@ timed_items!(Subscription<OptionChain>, OptionChain);
 ///
 /// Notices are logged at `warn!` and skipped, as `ibapi`'s `iter_data()` does. Once `deadline`
 /// passes, the next item is `Err(ibapi::Error::Timeout)` and iteration ends; the caller then fails
-/// the request through [`timed_out`](Self::timed_out). Without a deadline it reads like
-/// `iter_data()`.
+/// the request through [`timed_out`](Self::timed_out).
+///
+/// A subscription whose channel closes before IB's end marker (the connection dropped, or the
+/// request was cancelled from elsewhere) yields `Err(ibapi::Error::UnexpectedEndOfStream)`, with
+/// or without a deadline, so the caller records a truncation instead of a complete result.
+/// `iter_data()` ends quietly there.
 struct DataUntil<'a, S> {
     subscription: &'a S,
     deadline: Option<Instant>,
@@ -1230,20 +1234,30 @@ impl<S: TimedItems> Iterator for DataUntil<'_, S> {
                 None => self.subscription.next_item(),
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    let item = if remaining.is_zero() {
+                    if remaining.is_zero() {
                         None
                     } else {
                         self.subscription.next_item_within(remaining)
-                    };
-                    // `None` is either the time running out or the subscription ending.
-                    if item.is_none() && !self.subscription.ended() {
-                        self.timed_out = true;
-                        return Some(Err(ibapi::Error::Timeout));
                     }
-                    item
                 }
             };
-            match item? {
+            // `ibapi` answers `None` for three things: the end marker (the subscription has
+            // ended), the time running out, and a closed channel. A closed channel answers at
+            // once, so only a `None` at or after the deadline is the time running out.
+            let Some(item) = item else {
+                if self.subscription.ended() {
+                    return None;
+                }
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.timed_out = true;
+                    return Some(Err(ibapi::Error::Timeout));
+                }
+                return Some(Err(ibapi::Error::UnexpectedEndOfStream));
+            };
+            match item {
                 Ok(SubscriptionItem::Data(data)) => return Some(Ok(data)),
                 Ok(SubscriptionItem::Notice(notice)) => {
                     warn!(
@@ -1290,8 +1304,9 @@ fn drain_until_error<Raw, Out>(
     for (seq, item) in iter.enumerate() {
         let raw = match item {
             Ok(raw) => raw,
-            // A timeout is not a truncation: the caller fails the whole request (see
-            // `DataUntil::timed_out`), so it is not reported as one.
+            // A timeout stops the drain without `on_error`'s truncation message. The reason is
+            // still recorded, so `collect_ticks` skips its short-fetch warning, but no caller
+            // returns it: each fails the whole request through `DataUntil::timed_out`.
             Err(ibapi::Error::Timeout) => {
                 truncation_error = Some(ibapi::Error::Timeout.to_string());
                 break;
@@ -1703,15 +1718,15 @@ mod tests {
     #[test]
     fn a_timed_out_request_is_a_request_timeout() {
         assert_eq!(
-            request_error("historical data", ibapi::Error::Timeout),
+            request_error("fetch_candles", ibapi::Error::Timeout),
             DataError::RequestTimeout {
-                operation: "historical data".to_owned()
+                operation: "fetch_candles".to_owned()
             }
         );
         assert_eq!(
-            request_error("historical data", ibapi::Error::Simple("no".to_owned())),
+            request_error("fetch_candles", ibapi::Error::Simple("no".to_owned())),
             DataError::Socket(format!(
-                "historical data: {}",
+                "fetch_candles: {}",
                 ibapi::Error::Simple("no".to_owned())
             ))
         );
@@ -2277,10 +2292,11 @@ mod tests {
         assert_eq!(received, 2);
         assert_eq!(truncation_error, None);
     }
-    /// A timeout ends the drain without being reported as a truncation: the caller fails the
-    /// request instead.
+    /// A timeout ends the drain without `on_error`'s truncation message. Its reason is still
+    /// recorded, which keeps `collect_ticks` from warning of a short fetch; the caller then fails
+    /// the request instead of returning it.
     #[test]
-    fn drain_until_error_does_not_report_a_timeout_as_truncation() {
+    fn drain_until_error_stops_at_a_timeout_without_on_error() {
         let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> =
             vec![Ok(make_option_chain("SMART")), Err(ibapi::Error::Timeout)];
 
@@ -2295,42 +2311,62 @@ mod tests {
         assert!(truncation_error.is_some());
     }
 
-    /// A scripted subscription: each read pops the next answer; `None` is "nothing yet" until
-    /// `ended` is set.
+    /// One answer of a [`Scripted`] subscription.
+    enum Answer {
+        Item(Result<SubscriptionItem<u32>, ibapi::Error>),
+        /// Nothing arrives: a bounded read waits out its timeout, then answers `None`.
+        Silent,
+        /// The channel closed before the end marker: `None` at once, not ended.
+        Closed,
+        /// The end marker: `None`, ended.
+        End,
+    }
+
+    /// A scripted subscription: each read pops the next answer, and the end once they run out.
     struct Scripted {
-        answers: std::cell::RefCell<
-            std::collections::VecDeque<Option<Result<SubscriptionItem<u32>, ibapi::Error>>>,
-        >,
+        answers: std::cell::RefCell<std::collections::VecDeque<Answer>>,
         ended: std::cell::Cell<bool>,
     }
 
     impl Scripted {
-        fn new(answers: Vec<Option<Result<SubscriptionItem<u32>, ibapi::Error>>>) -> Self {
+        fn new(answers: Vec<Answer>) -> Self {
             Self {
                 answers: std::cell::RefCell::new(answers.into()),
                 ended: std::cell::Cell::new(false),
             }
         }
 
-        fn pop(&self) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
-            let answer = self.answers.borrow_mut().pop_front().flatten();
-            if self.answers.borrow().is_empty() && answer.is_none() {
-                self.ended.set(true);
+        fn read(
+            &self,
+            timeout: Option<StdDuration>,
+        ) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
+            let answer = self.answers.borrow_mut().pop_front().unwrap_or(Answer::End);
+            match answer {
+                Answer::Item(item) => Some(item),
+                Answer::Silent => {
+                    let timeout = timeout.expect("an unbounded read of silence never returns");
+                    std::thread::sleep(timeout);
+                    None
+                }
+                Answer::Closed => None,
+                Answer::End => {
+                    self.ended.set(true);
+                    None
+                }
             }
-            answer
         }
     }
 
     impl TimedItems for Scripted {
         type Item = u32;
         fn next_item(&self) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
-            self.pop()
+            self.read(None)
         }
         fn next_item_within(
             &self,
-            _timeout: StdDuration,
+            timeout: StdDuration,
         ) -> Option<Result<SubscriptionItem<u32>, ibapi::Error>> {
-            self.pop()
+            self.read(Some(timeout))
         }
         fn ended(&self) -> bool {
             self.ended.get()
@@ -2357,10 +2393,10 @@ mod tests {
     fn data_until_reads_data_to_the_end() {
         for deadline in [None, far_deadline()] {
             let scripted = Scripted::new(vec![
-                Some(Ok(SubscriptionItem::Data(1))),
-                Some(Ok(SubscriptionItem::Notice(notice()))),
-                Some(Ok(SubscriptionItem::Data(2))),
-                None,
+                Answer::Item(Ok(SubscriptionItem::Data(1))),
+                Answer::Item(Ok(SubscriptionItem::Notice(notice()))),
+                Answer::Item(Ok(SubscriptionItem::Data(2))),
+                Answer::End,
             ]);
             let mut data = DataUntil::new(&scripted, deadline, "test");
             let items: Vec<_> = (&mut data).collect::<Result<_, _>>().unwrap();
@@ -2373,8 +2409,12 @@ mod tests {
     /// `Timeout` item, then the end, and the request fails with `RequestTimeout`.
     #[test]
     fn data_until_times_out_when_nothing_arrives_in_time() {
-        let scripted = Scripted::new(vec![Some(Ok(SubscriptionItem::Data(1))), None, None]);
-        let mut data = DataUntil::new(&scripted, far_deadline(), "test");
+        let scripted = Scripted::new(vec![
+            Answer::Item(Ok(SubscriptionItem::Data(1))),
+            Answer::Silent,
+        ]);
+        let deadline = Instant::now() + StdDuration::from_millis(20);
+        let mut data = DataUntil::new(&scripted, Some(deadline), "test");
         assert!(matches!(data.next(), Some(Ok(1))));
         assert!(matches!(data.next(), Some(Err(ibapi::Error::Timeout))));
         assert!(data.next().is_none());
@@ -2389,16 +2429,37 @@ mod tests {
     /// A deadline already past times out without reading.
     #[test]
     fn data_until_times_out_at_a_passed_deadline() {
-        let scripted = Scripted::new(vec![Some(Ok(SubscriptionItem::Data(1)))]);
+        let scripted = Scripted::new(vec![Answer::Item(Ok(SubscriptionItem::Data(1)))]);
         let mut data = DataUntil::new(&scripted, Some(Instant::now()), "test");
         assert!(matches!(data.next(), Some(Err(ibapi::Error::Timeout))));
         assert_eq!(scripted.answers.borrow().len(), 1, "nothing was read");
     }
 
+    /// A channel that closes before the end marker, well before any deadline, is an unexpected
+    /// end, not a timeout: the caller records a truncation and the request does not fail.
+    #[test]
+    fn data_until_reports_a_closed_channel_as_an_unexpected_end() {
+        for deadline in [None, far_deadline()] {
+            let scripted = Scripted::new(vec![
+                Answer::Item(Ok(SubscriptionItem::Data(1))),
+                Answer::Closed,
+            ]);
+            let mut data = DataUntil::new(&scripted, deadline, "test");
+            assert!(matches!(data.next(), Some(Ok(1))), "{deadline:?}");
+            assert!(
+                matches!(data.next(), Some(Err(ibapi::Error::UnexpectedEndOfStream))),
+                "{deadline:?}"
+            );
+            assert_eq!(data.timed_out(), Ok(()), "{deadline:?}");
+        }
+    }
+
     /// A subscription error passes through, and is not a timeout.
     #[test]
     fn data_until_passes_a_subscription_error_through() {
-        let scripted = Scripted::new(vec![Some(Err(ibapi::Error::Simple("no".to_owned())))]);
+        let scripted = Scripted::new(vec![Answer::Item(Err(ibapi::Error::Simple(
+            "no".to_owned(),
+        )))]);
         let mut data = DataUntil::new(&scripted, far_deadline(), "test");
         assert!(matches!(data.next(), Some(Err(ibapi::Error::Simple(_)))));
         assert_eq!(data.timed_out(), Ok(()));
