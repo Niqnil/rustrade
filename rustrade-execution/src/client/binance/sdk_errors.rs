@@ -13,7 +13,14 @@ use binance_sdk::common::{
 };
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
@@ -72,20 +79,55 @@ pub(crate) fn rest_transport_error() -> ConnectorError {
 /// announced.
 pub(crate) fn rest_truncated_error() -> ConnectorError {
     on_own_runtime(|| async {
+        let server = CutShortServer::start().await;
+        post(server.url()).await
+    })
+}
+
+/// A local server that answers every request with a 200 whose body ends before the length its
+/// header announced, then closes the connection, and counts the requests it answered. The SDK
+/// fails such an answer with a codeless `ConnectorClientError`, after the server has answered,
+/// as when a venue acted on a request and its answer was lost.
+///
+/// It serves on the runtime it is started on, until that runtime shuts down.
+pub(crate) struct CutShortServer {
+    url: String,
+    requests: Arc<AtomicUsize>,
+}
+
+impl CutShortServer {
+    pub(crate) async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a local port");
         let url = format!("http://{}", listener.local_addr().expect("local address"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("a connection");
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{}")
-                .await;
+            // One request per connection: a body cut short leaves the connection unusable, so
+            // the client opens a new one for each request.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 4096];
+                if matches!(stream.read(&mut request).await, Ok(read) if read > 0) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{}")
+                        .await;
+                }
+            }
         });
-        post(&url).await
-    })
+        Self { url, requests }
+    }
+
+    /// The base URL to send requests to.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// How many requests the server has answered.
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
 }
 
 /// The error the SDK returns when a successful REST answer's body does not decode into the type

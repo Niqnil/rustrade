@@ -115,7 +115,10 @@ use crate::{
     trade::{AssetFees, TimeSource, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
-    common::{config::ConfigurationRestApi, constants::MARGIN_TRADING_REST_API_PROD_URL},
+    common::{
+        config::{ConfigurationRestApi, ConfigurationRestApiBuilder},
+        constants::MARGIN_TRADING_REST_API_PROD_URL,
+    },
     margin_trading::{
         MarginTradingRestApi,
         rest_api::{
@@ -509,13 +512,20 @@ impl BinanceMarginConfig {
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
-    // REST client for cancels and queries (account snapshots, balances, trades).
+    // REST client for queries (account snapshots, balances, trades) and the account stream's
+    // listen key.
     rest: Arc<RestApi>,
-    // Production-configured REST config (credentials + base path) for the new-order and cancel
-    // requests, and the collateral ratio read, sent through the SDK's `common::utils::send_request`
-    // rather than the typed `RestApi` surface, since the SDK's response types cannot decode their
-    // answers whole (see `NewOrderAnswer`, `CancelOrderAnswer` and `fetch_collateral_ratios`).
+    // Production-configured REST config (credentials + base path) for the collateral ratio read,
+    // sent through the SDK's `common::utils::send_request` rather than the typed `RestApi`
+    // surface, since the SDK's response type cannot decode its answer whole (see
+    // `fetch_collateral_ratios`).
     rest_config: Arc<ConfigurationRestApi>,
+    // `rest_config` with the SDK's retries off, for the new-order and cancel requests, also sent
+    // through `send_request` (see `NewOrderAnswer` and `CancelOrderAnswer`). The SDK re-sends a
+    // request whose answer body it could not read, and a GET or DELETE that failed without an
+    // answer. By then the venue may have acted, so a re-sent order could be placed twice, and a
+    // re-sent cancel answered "unknown order" for an order the first one cancelled.
+    order_rest_config: Arc<ConfigurationRestApi>,
     // shared rate-limit tracker across all REST calls
     rate_limiter: Arc<RateLimitTracker>,
     // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
@@ -871,7 +881,7 @@ impl BinanceMargin {
             // `NewOrderAnswer` (see there) rather than the SDK's response type.
             let query = new_order_query(params);
             let response = match rest_call_with_retry(
-                &self.rest_config,
+                &self.order_rest_config,
                 &self.rate_limiter,
                 RequestKind::Order,
                 |cfg| {
@@ -1014,30 +1024,35 @@ impl BinanceMargin {
         }
     }
 
-    /// Build the production-configured margin REST configuration (credentials + base path).
+    /// The production-configured margin REST configuration (credentials + base path), signed on
+    /// `signing`'s clock when set.
     ///
     /// The base path is pinned to production (`https://api.binance.com`): margin/SAPI has no
-    /// testnet, and the config is reused both for the SDK `RestApi` and the requests sent through
-    /// `send_request` (the new-order, cancel and collateral ratio requests, which join their paths
-    /// onto this base).
-    ///
-    /// # Panics
-    /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
-    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_rest_config(
+    /// testnet. The config serves the SDK `RestApi`s (margin and spot) and the collateral ratio
+    /// read sent through `send_request`, which joins its path onto this base.
+    fn rest_config_builder(
         config: &BinanceMarginConfig,
         signing: Option<&SigningClock>,
-    ) -> ConfigurationRestApi {
-        let mut builder = ConfigurationRestApi::builder()
+    ) -> ConfigurationRestApiBuilder {
+        let builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
             .api_secret(config.secret_key.clone())
             .base_path(MARGIN_TRADING_REST_API_PROD_URL);
-        if let Some(signing) = signing {
-            builder = builder.timestamp_provider(signing.provider());
+        match signing {
+            Some(signing) => builder.timestamp_provider(signing.provider()),
+            None => builder,
         }
-        builder
-            .build()
-            .expect("failed to build Binance margin REST configuration")
+    }
+
+    /// [`rest_config_builder`](Self::rest_config_builder)'s configuration with the SDK's retries
+    /// off, for the new-order and cancel requests: each is sent once. So a request whose answer
+    /// is lost fails with a transport error, which leaves its outcome unknown for the caller to
+    /// look up, rather than being sent again after the venue may have acted on it.
+    fn order_rest_config_builder(
+        config: &BinanceMarginConfig,
+        signing: Option<&SigningClock>,
+    ) -> ConfigurationRestApiBuilder {
+        Self::rest_config_builder(config, signing).retries(0)
     }
 
     /// Resolve the per-call effective isolated symbol set (isolated mode only).
@@ -1197,12 +1212,17 @@ impl ExecutionClient for BinanceMargin {
             !(config.is_isolated && config.isolated_symbols.is_empty()),
             "BinanceMarginConfig: is_isolated = true requires a non-empty isolated_symbols"
         );
-        // Built once and shared: one clone is consumed by the SDK `RestApi`, the original is retained
-        // for the new-order, cancel and collateral ratio requests via `send_request`.
+        // Built once and shared: one clone is consumed by each SDK `RestApi`, the original is
+        // retained for the collateral ratio read via `send_request`.
         // `ConfigurationRestApi: Clone` and is cheap to copy (its `reqwest::Client` is
-        // `Arc`-backed), avoiding redundant credential clones from building it twice.
+        // `Arc`-backed), avoiding redundant credential clones from building it twice. The order
+        // requests get a config of their own, since the SDK's retries are set per config.
         let signing = config.server_time_sync.then(SigningClock::default);
-        let rest_config = Self::build_rest_config(&config, signing.as_ref());
+        let rest_config = build_rest_config(Self::rest_config_builder(&config, signing.as_ref()));
+        let order_rest_config = Arc::new(build_rest_config(Self::order_rest_config_builder(
+            &config,
+            signing.as_ref(),
+        )));
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
         // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool,
         // and the commission rates from the spot account. Their tracker is this client's own: a
@@ -1228,6 +1248,7 @@ impl ExecutionClient for BinanceMargin {
             config: Arc::new(config),
             rest,
             rest_config,
+            order_rest_config,
             rate_limiter: Arc::new(
                 RateLimitTracker::new(WeightPool::Sapi).with_server_time(server_time),
             ),
@@ -1295,7 +1316,7 @@ impl ExecutionClient for BinanceMargin {
         // `CancelOrderAnswer` (see there) rather than the SDK's response type.
         let query = cancel_order_query(params);
         let response = match rest_call_with_retry(
-            &self.rest_config,
+            &self.order_rest_config,
             &self.rate_limiter,
             RequestKind::Order,
             |cfg| {
@@ -3575,6 +3596,17 @@ fn build_new_order_params(
 /// `DELETE` cancels one.
 const ORDER_PATH: &str = "/sapi/v1/margin/order";
 
+/// The REST configuration `builder` describes.
+///
+/// # Panics
+/// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+#[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
+fn build_rest_config(builder: ConfigurationRestApiBuilder) -> ConfigurationRestApi {
+    builder
+        .build()
+        .expect("failed to build Binance margin REST configuration")
+}
+
 /// The query of a margin new-order request, built from `params` as the SDK's own
 /// `margin_account_new_order` builds it.
 ///
@@ -3747,6 +3779,7 @@ fn convert_order_kind_tif_margin(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::binance::sdk_errors;
     use crate::client::binance::shared::convert_open_order;
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
@@ -5961,6 +5994,17 @@ mod tests {
             .unwrap()
     }
 
+    /// The client's own order config for `config`, with its requests sent to `base`.
+    fn margin_order_rest_config_at(
+        config: &BinanceMarginConfig,
+        base: &str,
+    ) -> ConfigurationRestApi {
+        BinanceMargin::order_rest_config_builder(config, None)
+            .base_path(base)
+            .build()
+            .unwrap()
+    }
+
     fn margin_rest_at(server: &wiremock::MockServer) -> Arc<RestApi> {
         Arc::new(MarginTradingRestApi::from_config(margin_rest_config_at(
             server,
@@ -5986,6 +6030,8 @@ mod tests {
             <BinanceMargin as ExecutionClient>::new(config.with_server_time_sync(false));
         client.rest = margin_rest_at(server);
         client.rest_config = Arc::new(margin_rest_config_at(server));
+        client.order_rest_config =
+            Arc::new(margin_order_rest_config_at(&client.config, &server.uri()));
         client.spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::from_config(
             margin_rest_config_at(server),
         ));
@@ -7645,6 +7691,92 @@ mod tests {
             cancelled.time_exchange >= before && cancelled.time_exchange <= Utc::now(),
             "{cancelled:?}"
         );
+    }
+
+    /// Both REST configs sign with the config's credentials, on the signing clock when there is
+    /// one, against production. The order config sends each request once; the other keeps the
+    /// SDK's retries for the reads, which are safe to send again.
+    #[test]
+    fn the_margin_rest_configs_sign_alike_and_the_order_config_sends_once() {
+        let config = BinanceMarginConfig::cross_margin("key".into(), "secret".into());
+        let signing = SigningClock::default();
+        for signing in [None, Some(&signing)] {
+            for (built, label) in [
+                (BinanceMargin::rest_config_builder(&config, signing), "rest"),
+                (
+                    BinanceMargin::order_rest_config_builder(&config, signing),
+                    "order",
+                ),
+            ] {
+                let built = built.build().unwrap();
+                assert_eq!(built.api_key.as_deref(), Some("key"), "{label}");
+                assert_eq!(built.api_secret.as_deref(), Some("secret"), "{label}");
+                assert_eq!(
+                    built.base_path.as_deref(),
+                    Some(MARGIN_TRADING_REST_API_PROD_URL),
+                    "{label}"
+                );
+                assert_eq!(
+                    built.timestamp_provider.is_some(),
+                    signing.is_some(),
+                    "{label}"
+                );
+            }
+        }
+        let order = BinanceMargin::order_rest_config_builder(&config, None)
+            .build()
+            .unwrap();
+        assert_eq!(order.retries, 0);
+        let rest = BinanceMargin::rest_config_builder(&config, None)
+            .build()
+            .unwrap();
+        assert_ne!(rest.retries, 0);
+    }
+
+    /// A margin order or cancel whose answer is cut short, after the venue has acted on it, is
+    /// sent once rather than again, and its outcome is left unknown.
+    #[tokio::test]
+    async fn a_margin_order_or_cancel_whose_answer_is_cut_short_is_sent_once() {
+        let server = wiremock::MockServer::start().await;
+        let cut_short = sdk_errors::CutShortServer::start().await;
+        let mut client = margin_client_at(&server, false);
+        client.rules = rules_over(&client, PreSendRules::Off);
+        client.order_rest_config =
+            Arc::new(margin_order_rest_config_at(&client.config, cut_short.url()));
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let placed = client
+            .open_order(margin_open_request(&btcusdt, "placed"))
+            .await;
+        assert!(
+            matches!(
+                placed.state,
+                OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                    OrderError::Connectivity(_)
+                ))
+            ),
+            "{placed:?}"
+        );
+        assert_eq!(cut_short.requests(), 1, "the order is sent once");
+
+        let cancelled = client
+            .cancel_order(OrderRequestCancel {
+                key: OrderKey::new(
+                    ExchangeId::BinanceMargin,
+                    &btcusdt,
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("placed"),
+                ),
+                state: crate::order::request::RequestCancel {
+                    id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
+                },
+            })
+            .await;
+        assert!(
+            matches!(cancelled.state, Err(OrderError::Connectivity(_))),
+            "{cancelled:?}"
+        );
+        assert_eq!(cut_short.requests(), 2, "the cancel is sent once");
     }
 
     /// The cancel query is the one the SDK's own call sends, field for field, with every optional

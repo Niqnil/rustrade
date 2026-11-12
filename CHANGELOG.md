@@ -356,6 +356,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collateral again, and that reserve panicked if `free` had been below zero before the release,
   as a CFD holding cost can leave it. The venue now undoes the release exactly, as it already did
   for a resting order's hold, so the buyback is refused and the collateral stays held.
+- **A Binance margin order or cancel is sent once** (`rustrade-execution`, `binance` feature,
+  #930). The new-order and cancel requests used the SDK's default of 3 retries, and the SDK
+  re-sends a request whose answer body it could not read, and a cancel that failed without an
+  answer. The venue may have acted by then, so an order could be placed twice, the second answer
+  hiding the first order, and a cancel that worked could come back as `-2011` (unknown order).
+  Both requests now go out once. A lost answer leaves the outcome unknown
+  (`OrderError::Connectivity`), as any other transport failure does. Reads keep the retries.
 
 ## [0.22.0] - 2026-11-09
 
