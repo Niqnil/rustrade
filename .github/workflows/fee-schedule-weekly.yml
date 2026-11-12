@@ -148,11 +148,13 @@ jobs:
           # One issue per version of the document, open or closed: its title carries the new
           # checksum. Closed ones count because a baseline update merged into the development
           # branch reaches this branch only at the next release; until then each run here still
-          # sees the change.
+          # sees the change. Only this workflow's own issues count: anyone can open an issue, and one
+          # with the expected title must not silence the report.
           title=$(cat "$OUT/title.txt")
           words_sha256=$(sed -n 's/^words_sha256=//p' "$OUT/result.env")
           titles=$(gh issue list --repo "$REPO" --state all --limit 100 \
-            --search "${words_sha256:0:12} in:title" --json title --jq '.[].title')
+            --search "${words_sha256:0:12} in:title author:app/github-actions" \
+            --json title --jq '.[].title')
           if grep -qxF -- "$title" <<<"$titles"; then
             echo "An issue already reports this version: $title"
           else
