@@ -234,6 +234,14 @@ pub enum PricingError {
     /// The model does not price this exercise style.
     #[error("exercise style {0} is not supported")]
     UnsupportedExercise(OptionExercise),
+    /// The inputs are valid but too extreme for the model to represent in `f64`: for example a
+    /// volatility or time to expiry so large that the grid's stock prices overflow, or so small
+    /// that its nodes coincide. Returned instead of a non-finite or meaningless result.
+    #[error("inputs outside the model's range: {reason}")]
+    OutsideModelRange {
+        /// What could not be represented.
+        reason: &'static str,
+    },
 }
 
 #[cfg(test)]

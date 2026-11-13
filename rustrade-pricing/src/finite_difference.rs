@@ -165,34 +165,53 @@ impl FiniteDifferenceModel {
         self.std_devs
     }
 
-    /// Lays out the grid for `volatility` and solves at `volatility` and `rate` on it.
-    fn solve_at(&self, problem: &Problem, volatility: f64, rate: f64, grid: &Grid) -> Valuation {
-        Solver {
+    /// Solves at `volatility` and `rate` on `grid`, refusing a non-finite result.
+    fn solve_at(
+        &self,
+        problem: &Problem,
+        volatility: f64,
+        rate: f64,
+        grid: &Grid,
+    ) -> Result<Valuation, PricingError> {
+        let valuation = Solver {
             problem,
             grid,
             volatility,
             rate,
             model: self,
         }
-        .solve()
+        .solve();
+        let Valuation {
+            price,
+            delta,
+            gamma,
+            theta,
+        } = valuation;
+        if [price, delta, gamma, theta].iter().all(|x| x.is_finite()) {
+            Ok(valuation)
+        } else {
+            Err(PricingError::OutsideModelRange {
+                reason: "the solve produced a non-finite value",
+            })
+        }
     }
 }
 
 impl OptionModel for FiniteDifferenceModel {
     fn value(&self, inputs: &OptionInputs, volatility: f64) -> Result<Valuation, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
-        let grid = Grid::new(&problem, volatility, self);
-        Ok(self.solve_at(&problem, volatility, problem.rate, &grid))
+        let grid = Grid::new(&problem, volatility, self)?;
+        self.solve_at(&problem, volatility, problem.rate, &grid)
     }
 
     /// Central difference over volatility ± 1e-4 (or half the volatility, when smaller), both
     /// solved on the grid laid out for `volatility`.
     fn vega(&self, inputs: &OptionInputs, volatility: f64) -> Result<f64, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
-        let grid = Grid::new(&problem, volatility, self);
+        let grid = Grid::new(&problem, volatility, self)?;
         let bump = volatility_bump(volatility);
-        let up = self.solve_at(&problem, volatility + bump, problem.rate, &grid);
-        let down = self.solve_at(&problem, volatility - bump, problem.rate, &grid);
+        let up = self.solve_at(&problem, volatility + bump, problem.rate, &grid)?;
+        let down = self.solve_at(&problem, volatility - bump, problem.rate, &grid)?;
         Ok((up.price - down.price) / (2.0 * bump))
     }
 
@@ -200,9 +219,9 @@ impl OptionModel for FiniteDifferenceModel {
     /// grid laid out for `volatility`.
     fn rho(&self, inputs: &OptionInputs, volatility: f64) -> Result<f64, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
-        let grid = Grid::new(&problem, volatility, self);
-        let up = self.solve_at(&problem, volatility, problem.rate + RATE_BUMP, &grid);
-        let down = self.solve_at(&problem, volatility, problem.rate - RATE_BUMP, &grid);
+        let grid = Grid::new(&problem, volatility, self)?;
+        let up = self.solve_at(&problem, volatility, problem.rate + RATE_BUMP, &grid)?;
+        let down = self.solve_at(&problem, volatility, problem.rate - RATE_BUMP, &grid)?;
         Ok((up.price - down.price) / (2.0 * RATE_BUMP))
     }
 }
@@ -256,7 +275,11 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(problem: &Problem, volatility: f64, model: &FiniteDifferenceModel) -> Self {
+    fn new(
+        problem: &Problem,
+        volatility: f64,
+        model: &FiniteDifferenceModel,
+    ) -> Result<Self, PricingError> {
         let expiry = problem.expiry;
         let variance = volatility * volatility;
         let drift = problem.rate - problem.dividend_yield - 0.5 * variance;
@@ -310,15 +333,26 @@ impl Grid {
             y_min += y_strike - (y_min + node * dy);
         }
 
-        let exp_y = (0..=model.space_steps)
+        let exp_y: Vec<f64> = (0..=model.space_steps)
             .map(|node| libm::exp(y_min + node as f64 * dy))
             .collect();
-        Self {
+        // Every node's stock price must be a positive, finite number, distinct from its
+        // neighbours', and the spacing must keep the fitted coefficients finite.
+        let representable = exp_y.first().is_some_and(|&low| low > 0.0)
+            && exp_y.last().is_some_and(|high| high.is_finite())
+            && exp_y.windows(2).all(|pair| pair[0] < pair[1])
+            && libm::sinh(0.5 * dy) > 0.0;
+        if !representable {
+            return Err(PricingError::OutsideModelRange {
+                reason: "the grid's stock prices cannot be represented",
+            });
+        }
+        Ok(Self {
             y_min,
             dy,
             shift,
             exp_y,
-        }
+        })
     }
 
     fn len(&self) -> usize {
@@ -614,12 +648,32 @@ impl Solver<'_> {
         let gamma = (d2_dy2 - d_dy) / (spot * spot);
 
         // Where immediate exercise is optimal the value is the exercise value, which does not
-        // change with time; the interpolation's last-digit error around it is dropped. Elsewhere
-        // the price is floored at zero (and an American option's at its exercise value) and the
-        // Black-Scholes equation gives theta from the others.
+        // change with time. Inside that region the solve leaves each node at its exercise value,
+        // so the spot is inside it when both nodes around it are: the valuation is then the
+        // exercise value's own, free of the cubic's interpolation error. Where the spot is only
+        // at the region's edge, its price is the exercise value (the cubic's last-digit error
+        // around it dropped) and theta zero. Elsewhere the price is floored at zero (and an
+        // American option's at its exercise value) and the Black-Scholes equation gives theta
+        // from the others.
         let intrinsic = self.exercise_value(spot);
-        let exercising =
-            problem.american && value - intrinsic <= EXERCISE_TOLERANCE * problem.strike;
+        let tolerance = EXERCISE_TOLERANCE * problem.strike;
+        let factor = self.stock_factor(problem.expiry);
+        let exercised = |node: usize| {
+            values[node] - self.exercise_value(grid.exp_y[node] * factor) <= tolerance
+        };
+        if problem.american && exercised(node) && exercised(node + 1) {
+            let exercise_delta = match problem.kind {
+                OptionKind::Call => 1.0,
+                OptionKind::Put => -1.0,
+            };
+            return Valuation {
+                price: intrinsic,
+                delta: exercise_delta,
+                gamma: 0.0,
+                theta: 0.0,
+            };
+        }
+        let exercising = problem.american && value - intrinsic <= tolerance;
         let (price, theta) = if exercising {
             (intrinsic, 0.0)
         } else {
@@ -1051,12 +1105,54 @@ mod tests {
 
     #[test]
     fn deep_in_the_money_put_is_exercised_now() {
-        let inputs = OptionInputs::new(Put, American, 50.0, 100.0, 0.05, 0.05);
-        let valuation = model().value(&inputs, 0.2).unwrap();
-        assert_eq!(valuation.price, 50.0);
-        assert_eq!(valuation.theta, 0.0);
-        assert_close(valuation.delta, -1.0, 1e-6, "delta");
-        assert_close(valuation.gamma, 0.0, 1e-6, "gamma");
+        // Inside the exercise region the option is its exercise value: K - S, delta -1, no gamma
+        // and no time decay. A long life and a high volatility give a wide grid, whose cubic read
+        // of the exercise value errs in the ninth digit; the valuation must not carry that.
+        for (spot, expiry, volatility) in [(50.0, 0.05, 0.2), (50.0, 0.5, 0.3), (70.0, 0.5, 0.3)] {
+            let inputs = OptionInputs::new(Put, American, spot, 100.0, expiry, 0.05);
+            let valuation = model().value(&inputs, volatility).unwrap();
+            let expected = Valuation {
+                price: 100.0 - spot,
+                delta: -1.0,
+                gamma: 0.0,
+                theta: 0.0,
+            };
+            assert_eq!(valuation, expected, "S {spot} T {expiry} vol {volatility}");
+        }
+    }
+
+    #[test]
+    fn inputs_beyond_the_grids_range_are_refused() {
+        // Valid but extreme: the grid's stock prices would overflow, underflow or coincide.
+        let base = OptionInputs::new(Put, American, 100.0, 100.0, 0.5, 0.05);
+        let long = OptionInputs {
+            time_to_expiry: 1e8,
+            ..base.clone()
+        };
+        let instant = OptionInputs {
+            time_to_expiry: 1e-320,
+            ..base.clone()
+        };
+        for (inputs, volatility) in [
+            (&base, 1e-300),
+            (&base, 1e200),
+            (&long, 0.2),
+            (&instant, 0.2),
+        ] {
+            let label = format!("T {} vol {volatility}", inputs.time_to_expiry);
+            for result in [
+                model()
+                    .value(inputs, volatility)
+                    .map(|valuation| valuation.price),
+                model().vega(inputs, volatility),
+                model().rho(inputs, volatility),
+            ] {
+                assert!(
+                    matches!(result, Err(PricingError::OutsideModelRange { .. })),
+                    "{label}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1310,7 +1406,7 @@ mod tests {
     fn with_solver(inputs: &OptionInputs, volatility: f64, check: impl FnOnce(&Solver<'_>)) {
         let model = model();
         let problem = Problem::new(inputs, volatility).unwrap();
-        let grid = Grid::new(&problem, volatility, &model);
+        let grid = Grid::new(&problem, volatility, &model).unwrap();
         check(&Solver {
             problem: &problem,
             grid: &grid,
