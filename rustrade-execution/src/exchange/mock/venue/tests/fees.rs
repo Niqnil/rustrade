@@ -140,6 +140,12 @@ fn an_override_no_instrument_matches_is_found_except_by_kind() {
             spx_usd.clone(),
             per_contract("1"),
         )
+        // SPY trades here, but only as spot: a key matches on kind and underlying together.
+        .with_underlying(
+            InstrumentKindDiscriminant::Future,
+            spy_usd(),
+            per_contract("1"),
+        )
         .with_kind(InstrumentKindDiscriminant::Future, per_contract("1"));
 
     assert_eq!(
@@ -147,6 +153,7 @@ fn an_override_no_instrument_matches_is_found_except_by_kind() {
         vec![
             UnmatchedFeeOverride::Name(&InstrumentNameExchange::new("SPX_C100")),
             UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Spot, &spx_usd),
+            UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Future, &spy_usd()),
             UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Option, &spy_eur),
         ]
     );
