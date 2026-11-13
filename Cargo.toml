@@ -6,7 +6,8 @@ members = [
     "rustrade-execution",
     "rustrade-integration",
     "rustrade-macro",
-    "rustrade-instrument"
+    "rustrade-instrument",
+    "rustrade-pricing"
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ rustrade-instrument = { path = "./rustrade-instrument", version = "0.22.0" }
 rustrade-data = { path = "./rustrade-data", version = "0.22.0" }
 rustrade-execution = { path = "./rustrade-execution", version = "0.22.0" }
 rustrade-macro = { path = "./rustrade-macro", version = "0.22.0" }
+rustrade-pricing = { path = "./rustrade-pricing", version = "0.22.0" }
 
 # Logging
 tracing = { version = "0.1.41" }

@@ -4658,6 +4658,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustrade-pricing"
+version = "0.22.0"
+dependencies = [
+ "chrono",
+ "libm",
+ "rustrade-instrument",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"

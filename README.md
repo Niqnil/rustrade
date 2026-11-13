@@ -37,12 +37,14 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 | [`rustrade-execution`][rustrade-execution-crate] | Stream account data and execute orders |
 | [`rustrade-instrument`][rustrade-instrument-crate] | Exchange, instrument, and asset data structures |
 | [`rustrade-integration`][rustrade-integration-crate] | Low-level REST/WebSocket integration framework |
+| [`rustrade-pricing`][rustrade-pricing-crate] | Option pricing: American and European prices, implied volatility and Greeks |
 
 [rustrade-crate]: https://crates.io/crates/rustrade
 [rustrade-data-crate]: https://crates.io/crates/rustrade-data
 [rustrade-execution-crate]: https://crates.io/crates/rustrade-execution
 [rustrade-instrument-crate]: https://crates.io/crates/rustrade-instrument
 [rustrade-integration-crate]: https://crates.io/crates/rustrade-integration
+[rustrade-pricing-crate]: https://crates.io/crates/rustrade-pricing
 
 ### Supported Exchanges
 
