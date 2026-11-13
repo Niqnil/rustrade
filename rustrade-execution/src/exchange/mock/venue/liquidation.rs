@@ -398,7 +398,7 @@ impl SimulatedVenue {
                 side,
                 quantity,
                 price,
-                FeePricing::first(Liquidity::Taker, self.time_exchange()),
+                FeePricing::first(Liquidity::Taker, quantity, self.time_exchange()),
             )
         };
         let mut quantity = Decimal::ONE;
@@ -502,7 +502,7 @@ impl SimulatedVenue {
             leg.side,
             quantity,
             leg.price,
-            FeePricing::first(Liquidity::Taker, self.time_exchange()),
+            FeePricing::first(Liquidity::Taker, quantity, self.time_exchange()),
         )
     }
 
@@ -520,7 +520,9 @@ impl SimulatedVenue {
     }
 
     /// The least quantity of `leg` that delivers `want`, bisected on the settlement, or `None` if
-    /// none up to its [search limit](Leg::search_limit) does.
+    /// none up to its [search limit](Leg::search_limit) does. Under a fee charged only from an
+    /// order size it delivers `want` but may not be the least; see
+    /// [`searched_leg_quantity`](Self::searched_leg_quantity).
     fn needed_leg_quantity(&self, leg: &Leg, want: Decimal) -> Option<Decimal> {
         let delivers = |quantity| delivered(&self.price_leg(leg, quantity).credit) >= want;
         bracket(want / leg.delivered_per_unit, leg.search_limit(), delivers)
@@ -573,14 +575,22 @@ impl SimulatedVenue {
     }
 
     /// As [`linear_leg_quantity`](Self::linear_leg_quantity), under a fee model that is not linear
-    /// in quantity: one charging per order, or bounded per order.
+    /// in quantity: one charging per order, bounded per order, or charging only from an order
+    /// size.
     ///
-    /// What a fill costs and delivers both grow with its quantity, so each is found by bisecting
-    /// on the settlement itself: the least quantity that delivers `want`, else the most that
-    /// `budget` pays for, within the `depth` on offer. Bisection lands a digit from the bound, so
-    /// the result is then rounded up to the fewest decimal places that still meet it: a quantity
-    /// that delivers exactly `want`, or one `budget` still pays for. `None` also when what
-    /// `budget` pays for delivers nothing, its fee outweighing it.
+    /// What a fill costs grows with its quantity, and so, but for an order size threshold, does
+    /// what it delivers, so each is found by bisecting on the settlement itself: the least
+    /// quantity that delivers `want`, else the most that `budget` pays for, within the `depth` on
+    /// offer. Bisection lands a digit from the bound, so the result is then rounded up to the
+    /// fewest decimal places that still meet it: a quantity that delivers exactly `want`, or one
+    /// `budget` still pays for. `None` also when what `budget` pays for delivers nothing, its fee
+    /// outweighing it.
+    ///
+    /// A fee charged only from an order size, taken from what a sale receives, makes what the
+    /// sale delivers drop where its quantity reaches the threshold. The search for the quantity
+    /// that delivers `want` keeps one that delivers it throughout, so the leg still delivers it,
+    /// but the quantity found may lie past the threshold when a smaller one below it would have
+    /// done: the sale is then larger than it needed to be, and pays the fee.
     fn searched_leg_quantity(
         &self,
         leg: &Leg,
@@ -700,7 +710,8 @@ fn bracket(start: Decimal, limit: Decimal, reached: impl Fn(Decimal) -> bool) ->
 }
 
 /// The least quantity in `(0, high]` of which `holds` holds, to `Decimal`'s precision, given that
-/// it holds of `high` and of every quantity above the least.
+/// it holds of `high` and of every quantity above the least. Without the second, it is still a
+/// quantity of which `holds` holds, though perhaps not the least.
 fn least(high: Decimal, holds: impl Fn(Decimal) -> bool) -> Decimal {
     let (mut low, mut high) = (Decimal::ZERO, high);
     for _ in 0..256 {

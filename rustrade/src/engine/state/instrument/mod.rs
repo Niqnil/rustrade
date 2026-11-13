@@ -813,8 +813,11 @@ pub struct InstrumentState<
     /// on. What its order had filled before it is read from
     /// [`Trade::order_filled_quantity`](rustrade_execution::trade::Trade::order_filled_quantity);
     /// a fill that does not report it is priced as its order's first, so a fee charged once per
-    /// order (see [`FeeModelConfig::Composite`]) is charged on each such fill. Each fill is priced
-    /// at its [`time_exchange`](rustrade_execution::trade::Trade::time_exchange), which selects the
+    /// order (see [`FeeModelConfig::Composite`]) is charged on each such fill. Its order's whole
+    /// quantity, for a fee charged only from an order size, is read from the order this state
+    /// tracks; a fill of an order it does not track, or no longer tracks because the order's
+    /// terminal update arrived first, is charged such a fee. Each fill is priced at its
+    /// [`time_exchange`](rustrade_execution::trade::Trade::time_exchange), which selects the
     /// schedule in effect under [`FeeModelConfig::Dated`].
     ///
     /// Only enable [`FeeModelConfig::PerContract`] when the `ExecutionClient` reports
@@ -1356,6 +1359,55 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.reduce_only
             .lookup_ids(cid, &trade.order_id)
             .filter(|order| order.reduce_only.is_reduce_only())
+    }
+
+    /// The fee [`fee_model`](Self::fee_model) charges `trade`, of `contract_size`.
+    fn engine_fee(
+        &self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        contract_size: Decimal,
+    ) -> Decimal {
+        // Taker, because a `Trade` does not say which side of the book it was on. Every execution
+        // client reports fills without a maker/taker flag, so there is nothing here to read one
+        // from, and guessing taker is the conservative direction: it overstates cost rather than
+        // inventing profit. A venue that reports its own fees is the accurate path — see the
+        // double-counting warning on `FeeModelConfig`.
+        //
+        // What the order had filled before this trade comes from the order's cumulative fill
+        // quantity, where the venue reports it. Where it does not, the trade is priced as its
+        // order's first fill, so a fee charged once per order is charged on every such fill: an
+        // overstatement again, never an understatement.
+        let prior_filled = trade.order_filled_quantity.map_or(Decimal::ZERO, |filled| {
+            (filled - trade.quantity.abs()).max(Decimal::ZERO)
+        });
+        // At the trade's exchange time, so a fee schedule that changes over time charges the
+        // schedule in effect when the trade filled.
+        let mut input = FeeInput::new(
+            trade.side,
+            trade.price,
+            trade.quantity,
+            contract_size,
+            trade.time_exchange,
+        )
+        .with_liquidity(Liquidity::Taker)
+        .with_prior_filled(prior_filled);
+        // The order's whole quantity, for a fee charged only from an order size, comes from the
+        // order this state tracks. One it no longer tracks, such as an order whose terminal
+        // update arrived before this fill, or one it never sent, leaves the size unknown, and
+        // such a fee is then charged: an overstatement once more.
+        input.order_quantity = self.tracked_order_quantity(trade);
+        self.fee_model.compute_fee(&input)
+    }
+
+    /// The whole quantity of the tracked order `trade` is a fill of, found by the fill's
+    /// [`Trade::client_order_id`], or failing that by its venue order id, or `None` if this state
+    /// does not track it.
+    fn tracked_order_quantity(&self, trade: &Trade<AssetKey, InstrumentKey>) -> Option<Decimal> {
+        let cid = trade
+            .client_order_id
+            .as_ref()
+            .or_else(|| self.tracked_order_cid(&trade.order_id))?;
+        self.orders.0.get(cid).map(|order| order.quantity)
     }
 
     /// The client order id of the tracked order the venue knows as `order_id`: O(1) through the
@@ -2684,32 +2736,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // For spot instruments this is 1. Used for both fee computation and PnL calculation.
         let contract_size = self.instrument.kind.contract_size();
 
-        // Taker, because a `Trade` does not say which side of the book it was on. Every execution
-        // client reports fills without a maker/taker flag, so there is nothing here to read one
-        // from, and guessing taker is the conservative direction: it overstates cost rather than
-        // inventing profit. A venue that reports its own fees is the accurate path — see the
-        // double-counting warning on `FeeModelConfig`.
-        //
-        // What the order had filled before this trade comes from the order's cumulative fill
-        // quantity, where the venue reports it. Where it does not, the trade is priced as its
-        // order's first fill, so a fee charged once per order is charged on every such fill: an
-        // overstatement again, never an understatement.
-        let prior_filled = trade.order_filled_quantity.map_or(Decimal::ZERO, |filled| {
-            (filled - trade.quantity.abs()).max(Decimal::ZERO)
-        });
-        // At the trade's exchange time, so a fee schedule that changes over time charges the
-        // schedule in effect when the trade filled.
-        let computed_fee = self.fee_model.compute_fee(
-            &FeeInput::new(
-                trade.side,
-                trade.price,
-                trade.quantity,
-                contract_size,
-                trade.time_exchange,
-            )
-            .with_liquidity(Liquidity::Taker)
-            .with_prior_filled(prior_filled),
-        );
+        let computed_fee = self.engine_fee(trade, contract_size);
 
         let augmented;
         let effective_trade = if computed_fee.is_zero() {
@@ -5770,6 +5797,57 @@ mod tests {
         after.time_exchange = TIME + chrono::TimeDelta::seconds(1);
         let _ = state.update_from_trade(&after);
         assert_eq!(fees(&state), dec!(4), "from the change");
+    }
+
+    /// The engine's fee model reads the order's whole quantity from the order it tracks, so a fee
+    /// charged only from an order size charges a small fill of a large order, and not a fill of a
+    /// smaller one. A fill of an order it does not track is charged it.
+    #[test]
+    fn an_engine_fee_model_reads_the_order_size_from_the_tracked_order() {
+        use rustrade_execution::{CompositeFeeModel, FeeBasis, FeeComponent};
+
+        let fees_from = |threshold, order_id: &str, cid: Option<&str>| {
+            let mut state = instrument_state(OmsMode::Netting);
+            state.fee_model = FeeModelConfig::Composite(
+                CompositeFeeModel::new(vec![
+                    FeeComponent::new(FeeBasis::PerContract(dec!(1)))
+                        .from_order_quantity(threshold),
+                ])
+                .unwrap(),
+            );
+            // A tracked order of 10, the venue's `ex-1`.
+            rest_order_at_exchange(
+                &mut state,
+                &ClientOrderId::new("cid-1"),
+                &OrderId::new("ex-1"),
+                None,
+            );
+            let mut trade = fill(OrderId::new(order_id), Side::Buy, dec!(4));
+            trade.client_order_id = cid.map(ClientOrderId::new);
+            let _ = state.update_from_trade(&trade);
+            -netting_position(&state).unwrap().pnl_realised
+        };
+
+        assert_eq!(
+            fees_from(dec!(10), "ex-1", None),
+            dec!(4),
+            "a fill of an order of 10"
+        );
+        assert_eq!(
+            fees_from(dec!(11), "ex-1", None),
+            Decimal::ZERO,
+            "an order short of it"
+        );
+        assert_eq!(
+            fees_from(dec!(11), "unknown", Some("cid-1")),
+            Decimal::ZERO,
+            "found by the client order id the fill names"
+        );
+        assert_eq!(
+            fees_from(dec!(11), "untracked", None),
+            dec!(4),
+            "an order of unknown size is charged"
+        );
     }
 
     /// Only a fee in the base asset is a change in the holding. One in quote, or in a third asset

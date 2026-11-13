@@ -9,7 +9,7 @@ use crate::{
     },
     exchange::mock::request::MockExchangeRequest,
     expiry::{ExpirySellOut, LongOptionExpiry},
-    fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
+    fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
     order::{
@@ -75,8 +75,8 @@ pub struct MockExecutionConfig {
     /// driver that splits it into two equal halves rounds each down to a whole millisecond, so an
     /// odd value shortens that driver's round trip by one millisecond.
     pub latency_ms: u64,
-    /// Fee model used by the mock exchange to compute trading fees, for every kind of instrument
-    /// not in [`fee_model_by_kind`](Self::fee_model_by_kind).
+    /// Fee model used by the mock exchange to compute trading fees, for every instrument no entry
+    /// of [`fee_model_overrides`](Self::fee_model_overrides) matches.
     ///
     /// Defaults to [`FeeModelConfig::Zero`]. Use [`FeeModelConfig::Percentage`]
     /// for spot/futures simulation (e.g. 0.1% taker fee), and [`FeeModelConfig::Composite`] for a
@@ -181,12 +181,19 @@ pub struct MockExecutionConfig {
     ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_close: Option<SessionCalendarConfig>,
-    /// The fee model for each kind of instrument that is not priced by
-    /// [`fee_model`](Self::fee_model): a venue whose options and shares pay different fees.
+    /// Fee models for some instruments in place of [`fee_model`](Self::fee_model), by name, by
+    /// kind and underlying, or by kind: a venue whose options and shares pay different fees, or
+    /// whose index options pay more than its equity options. See [`FeeModelOverrides`] for which
+    /// entry an instrument pays.
+    ///
+    /// When it builds, the venue logs a warning for each name, and each kind and underlying, that
+    /// none of its instruments has: likely a typo, which would otherwise charge that instrument the
+    /// default. An entry by kind is not checked, since one config often serves venues of different
+    /// instruments.
     ///
     /// Defaults to empty: every instrument pays [`fee_model`](Self::fee_model).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+    #[serde(default, skip_serializing_if = "FeeModelOverrides::is_empty")]
+    pub fee_model_overrides: FeeModelOverrides,
     /// Whether the mock exchange sells a long option the account cannot afford to exercise, at a
     /// set time before it expires, as a broker sells out an account short of the cash or shares.
     /// See [`ExpirySellOut`].
@@ -227,7 +234,7 @@ impl MockExecutionConfig {
             amend: AmendConfig::default(),
             time_in_force: TimeInForceRules::default(),
             session_close: None,
-            fee_model_by_kind: BTreeMap::new(),
+            fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
         }
     }
@@ -343,30 +350,14 @@ impl MockExecutionConfig {
         }
     }
 
-    /// This config with its whole [`fee_model_by_kind`](Self::fee_model_by_kind) map replaced by
-    /// `fee_model_by_kind`. To set one kind's model, use
-    /// [`with_fee_model_for`](Self::with_fee_model_for).
+    /// This config with its [`fee_model_overrides`](Self::fee_model_overrides) set to
+    /// `fee_model_overrides`.
     #[must_use]
-    pub fn with_fee_model_by_kind(
-        self,
-        fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
-    ) -> Self {
+    pub fn with_fee_model_overrides(self, fee_model_overrides: FeeModelOverrides) -> Self {
         Self {
-            fee_model_by_kind,
+            fee_model_overrides,
             ..self
         }
-    }
-
-    /// This config charging instruments of `kind` under `fee_model`, replacing any model it had
-    /// for `kind`: see [`fee_model_by_kind`](Self::fee_model_by_kind).
-    #[must_use]
-    pub fn with_fee_model_for(
-        mut self,
-        kind: InstrumentKindDiscriminant,
-        fee_model: FeeModelConfig,
-    ) -> Self {
-        self.fee_model_by_kind.insert(kind, fee_model);
-        self
     }
 
     /// This config selling out a long option the account cannot afford to exercise, under
@@ -1206,7 +1197,8 @@ mod tests {
 
         let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.001)));
         let option_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.002)));
-        let share_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.003)));
+        let fee_model_overrides =
+            FeeModelOverrides::new().with_kind(InstrumentKindDiscriminant::Option, option_fee);
         let slippage = SlippageConfig::uniform(dec!(0.0001), dec!(0.0002), 7).unwrap();
         let stale_market = StaleMarketPolicy::Wait {
             max_age: Duration::from_secs(5),
@@ -1242,8 +1234,7 @@ mod tests {
             .with_amend(AmendConfig::NONE)
             .with_time_in_force(time_in_force.clone())
             .with_session_close(session_close.clone())
-            .with_fee_model_for(InstrumentKindDiscriminant::Option, share_fee)
-            .with_fee_model_for(InstrumentKindDiscriminant::Option, option_fee.clone())
+            .with_fee_model_overrides(fee_model_overrides.clone())
             .with_expiry_sell_out(expiry_sell_out);
 
         assert_eq!(config.mocked_exchange, ExchangeId::Mock);
@@ -1269,22 +1260,7 @@ mod tests {
         assert_eq!(config.time_in_force, time_in_force);
         assert_eq!(config.session_close, Some(session_close));
         assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
-        // A later entry for the same kind replaces the earlier one.
-        assert_eq!(
-            config.fee_model_by_kind,
-            BTreeMap::from([(InstrumentKindDiscriminant::Option, option_fee.clone())])
-        );
-
-        // The whole-map setter replaces every entry, including ones set one at a time.
-        let spot_fee = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.004)));
-        let replaced = config.with_fee_model_by_kind(BTreeMap::from([(
-            InstrumentKindDiscriminant::Spot,
-            spot_fee.clone(),
-        )]));
-        assert_eq!(
-            replaced.fee_model_by_kind,
-            BTreeMap::from([(InstrumentKindDiscriminant::Spot, spot_fee)])
-        );
+        assert_eq!(config.fee_model_overrides, fee_model_overrides);
     }
 
     #[test]

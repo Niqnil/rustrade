@@ -177,6 +177,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
+- **Fees tiered by premium and by order size, and fee models per instrument**
+  (`rustrade-execution`, `rustrade`, #908).
+  - **New `FeeBasis::PerContractByPrice(PriceBands)`:** a per-contract charge whose rate depends on
+    the fill's price, such as an index option's exchange fee tiered by premium. `PriceBands` is a
+    list of `PriceBand { from, per_contract }`, each charging from its price (inclusive) until the
+    next band's. `PriceBands::new` and deserialising refuse an empty list, a first band that does
+    not start at zero, and prices that do not strictly increase (`PriceBandsError`). A price below
+    zero pays the first band.
+  - **New `FeeComponent::from_order_quantity(min)`:** charges a component only on fills of orders
+    of at least `min` contracts in all, counted on the order's whole quantity, not the fill's. A
+    negative threshold is refused (`FeeModelError::NegativeOrderQuantity`).
+  - **New `FeeInput::order_quantity`**, set with `with_order_quantity`. `None` means the order's
+    size is unknown, and a threshold component is then charged, which overstates rather than
+    understates the fee. The simulated venue always sets it. The engine's `InstrumentState`
+    reads it from the order it tracks, and leaves it unknown for a fill of an order it does not
+    track, or no longer tracks because the order's terminal update arrived first.
+  - **New `FeeModelOverrides` and `MockExecutionConfig::fee_model_overrides`**, set with
+    `with_fee_model_overrides`: fee models in place of `fee_model`, by the instrument's exact name,
+    by its kind and underlying, or by its kind, in that order of precedence. `resolve` picks one
+    for an instrument. A key by kind and underlying separates the options on an underlying from
+    the underlying itself; two option families on one underlying need keys by name. Serialised,
+    the entries by kind and underlying are a list, and a repeated entry or an unknown key is
+    refused (`FeeModelOverridesError`). When it is built, the simulated venue logs a warning for
+    each entry by name, or by kind and underlying, that none of its instruments matches.
+  - The `CompositeFeeModel` rustdoc has an index option example of both new rules.
+
 - **A fee schedule that changes over time** (`rustrade-execution`, `rustrade`, #912).
   - **New `FeeModelConfig::Dated(DatedFeeModel)`:** an initial model, then a list of `FeeChange`s,
     each a whole model in effect from its `from` time. A fill is charged by the model in effect at
@@ -202,8 +228,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     total. An order pays the same however it is split into fills, and a rested remainder holds
     exactly what its fills are charged. The fee is not rounded; a venue that rounds each fee type
     up to the cent charges up to a cent more per fee type per rounding.
-  - **New `MockExecutionConfig::fee_model_by_kind`:** a fee model per instrument kind, in place of
-    `fee_model`, for a venue whose options and shares pay different fees.
+  - **A fee model per instrument kind**, in place of `fee_model`, for a venue whose options and
+    shares pay different fees: see `MockExecutionConfig::fee_model_overrides` (#908).
   - **The engine's `InstrumentState::fee_model`** reads what a fill's order had filled before it
     from `Trade::order_filled_quantity`. A fill that does not report it is priced as its order's
     first, so a per-order charge is charged on each such fill.
@@ -245,22 +271,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the positional `new` that took every field.
   - Each other setting has a consuming `with_*` setter named after its field. The setters for an
     optional setting (`with_spot_margin`, `with_fee_asset`, `with_session_close`,
-    `with_expiry_sell_out`) take the value itself. `with_fee_model_for(kind, model)` sets one
-    kind's fee model, and `with_fee_model_by_kind` replaces the whole map.
+    `with_expiry_sell_out`) take the value itself.
   - Serialised configs are unchanged: the same three fields are required and the rest default.
 - **Breaking: `ExecutionManager` has a `clock` field** (`rustrade`, #919). It stamps an
   `AccountEventKind::OrderDeadline`. `ExecutionManager::new` takes it as its last argument, and a
   struct literal must set it. `ExecutionManager::init` takes it from `AccountStreamOptions::clock`.
 
-- **Breaking: the fee model API** (`rustrade-execution`, #907, #912).
-  - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side, its time and the
-    order's prior filled quantity to the price, quantity, contract size and liquidity it took
-    before. Build one with `FeeInput::new(side, price, quantity, contract_size, time)`, then
-    `with_liquidity` and `with_prior_filled`.
+- **Breaking: the fee model API** (`rustrade-execution`, #907, #908, #912).
+  - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side, its time, the
+    order's prior filled quantity and the order's whole quantity to the price, quantity, contract
+    size and liquidity it took before. Build one with
+    `FeeInput::new(side, price, quantity, contract_size, time)`, then `with_liquidity`,
+    `with_prior_filled` and `with_order_quantity`.
   - `FeeModelConfig` is no longer `Copy`, and is `#[non_exhaustive]`: clone it where it was
     copied, and give a `match` on it a wildcard arm.
-  - `MockExecutionConfig` has a `fee_model_by_kind` field. A struct literal must set it
-    (`Default::default()` for none), and `MockExecutionConfig::new` takes it as a last argument.
 
 - **Breaking: amend in place grows the engine's enums, output and order-tracking traits**
   (`rustrade-execution`, `rustrade`, #892).
