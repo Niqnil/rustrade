@@ -587,10 +587,10 @@ impl SimulatedVenue {
     /// outweighing it.
     ///
     /// A fee charged only from an order size, taken from what a sale receives, makes what the
-    /// sale delivers drop where its quantity reaches the threshold. The bisection keeps a quantity
-    /// that delivers `want` throughout, so the leg still delivers it, but the quantity found may
-    /// lie past the threshold when a smaller one below it would have done: the sale is then
-    /// larger than it needed to be, and pays the fee.
+    /// sale delivers drop where its quantity reaches the threshold. The search for the quantity
+    /// that delivers `want` keeps one that delivers it throughout, so the leg still delivers it,
+    /// but the quantity found may lie past the threshold when a smaller one below it would have
+    /// done: the sale is then larger than it needed to be, and pays the fee.
     fn searched_leg_quantity(
         &self,
         leg: &Leg,
@@ -710,7 +710,8 @@ fn bracket(start: Decimal, limit: Decimal, reached: impl Fn(Decimal) -> bool) ->
 }
 
 /// The least quantity in `(0, high]` of which `holds` holds, to `Decimal`'s precision, given that
-/// it holds of `high` and of every quantity above the least.
+/// it holds of `high` and of every quantity above the least. Without the second, it is still a
+/// quantity of which `holds` holds, though perhaps not the least.
 fn least(high: Decimal, holds: impl Fn(Decimal) -> bool) -> Decimal {
     let (mut low, mut high) = (Decimal::ZERO, high);
     for _ in 0..256 {
