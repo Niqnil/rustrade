@@ -437,6 +437,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Cargo.lock` takes `rustix` 1.1.6, and the audit ignore lists cover `zstd-safe` 5.0.2's
+  unsound warnings.** `rustix` 1.1.4 carried RUSTSEC-2026-0486 (its xattr functions could mark
+  unwritten bytes as initialized). It reaches the build only through the `hyperliquid` feature
+  (`ethers-core` -> `tempfile`), and nothing here calls those functions. The eight `zstd-safe` 5.0.2
+  warnings (RUSTSEC-2026-0395, -0397, -0399 to -0402, -0404, -0406) concern a copy that is never
+  compiled, like the RUSTSEC-2026-0403 entry already ignored. They are now ignored in `deny.toml`
+  and the CI audit job, because any warning made that job report a check run, which
+  intermittently failed. `cargo audit` now reports no vulnerabilities and no warnings.
+
 - **`IbkrHistoricalData`'s requests no longer wait forever** (`rustrade-data`, `ibkr` feature,
   #883). Its requests had no deadline: one IB never answered never returned, and a candle or
   calculator request caught by a dropped connection waited through every reconnect attempt,
