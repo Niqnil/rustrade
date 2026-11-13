@@ -226,6 +226,7 @@ Before cutting a release, verify documentation is current:
   - `rustrade-execution/README.md`
   - `rustrade-instrument/README.md`
   - `rustrade-integration/README.md`
+  - `rustrade-pricing/README.md`
 - [ ] Version numbers are consistent across all `Cargo.toml` files
 
 **Release process (maintainers):**
