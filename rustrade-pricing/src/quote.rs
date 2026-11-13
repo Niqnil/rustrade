@@ -1,7 +1,7 @@
 //! Turning an option's bid and ask into the one price an implied-volatility solve takes.
 
 /// Why a quote gives no price to solve from.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum QuoteError {
     /// Neither a bid nor an ask.

@@ -27,6 +27,7 @@ pub struct Valuation {
 /// change in volatility, and `rho` per 1.0 change in the rate. Multiply by 0.01 for "per vol point"
 /// or "per 1%" figures.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Greeks {
     /// Option price.
     pub price: f64,
@@ -66,6 +67,12 @@ pub(crate) const RATE_BUMP: f64 = 1e-4;
 /// - Never price an American option below its exercise value, nor any option below zero.
 /// - The price should increase with volatility. The solver brackets a root and needs the price to
 ///   cross the target once.
+///
+/// Implementations are meant to be stateless and shared: every method takes `&self`. Make a model
+/// `Send + Sync` if it is to price from several threads (plain data, as [`FiniteDifferenceModel`]
+/// is, already is).
+///
+/// [`FiniteDifferenceModel`]: crate::FiniteDifferenceModel
 pub trait OptionModel {
     /// The price, delta, gamma and theta at `volatility`.
     fn value(&self, inputs: &OptionInputs, volatility: f64) -> Result<Valuation, PricingError>;

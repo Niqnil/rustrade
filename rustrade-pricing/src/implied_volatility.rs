@@ -10,6 +10,7 @@ use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
 /// The defaults search volatilities from 1e-7 to 4.0 (400%) and stop once the price is reproduced
 /// within 1e-8 of `max(1, price)`, or the volatility is pinned within 1e-8.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct ImpliedVolatilityConfig {
     /// Lowest volatility searched. Must be finite and positive.
     pub min_volatility: f64,
@@ -38,6 +39,36 @@ impl Default for ImpliedVolatilityConfig {
 }
 
 impl ImpliedVolatilityConfig {
+    /// Sets the lowest volatility searched.
+    pub fn with_min_volatility(mut self, min_volatility: f64) -> Self {
+        self.min_volatility = min_volatility;
+        self
+    }
+
+    /// Sets the highest volatility searched.
+    pub fn with_max_volatility(mut self, max_volatility: f64) -> Self {
+        self.max_volatility = max_volatility;
+        self
+    }
+
+    /// Sets the volatility tolerance.
+    pub fn with_volatility_tolerance(mut self, volatility_tolerance: f64) -> Self {
+        self.volatility_tolerance = volatility_tolerance;
+        self
+    }
+
+    /// Sets the price tolerance, relative to `max(1, price)`.
+    pub fn with_price_tolerance(mut self, price_tolerance: f64) -> Self {
+        self.price_tolerance = price_tolerance;
+        self
+    }
+
+    /// Sets the most root-finding iterations.
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
     fn validate(&self) -> Result<(), ImpliedVolatilityError> {
         let invalid = |reason| Err(ImpliedVolatilityError::InvalidConfig { reason });
         if !(self.min_volatility.is_finite() && self.min_volatility > 0.0) {
@@ -63,7 +94,7 @@ impl ImpliedVolatilityConfig {
 ///
 /// Each case says what is wrong with the price relative to the model, so a caller can tell a bad
 /// quote from a model limit. Prices are in the option's currency.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ImpliedVolatilityError {
     /// The model could not price the option (invalid inputs, expired, unsupported exercise).
@@ -100,7 +131,10 @@ pub enum ImpliedVolatilityError {
     /// example an American call when rates are positive). No volatility is determined: either
     /// none reproduces the price, or every volatility up to some level does, as for a deep
     /// in-the-money American put that should be exercised now, or any option deep enough in the
-    /// money that its price does not move with volatility.
+    /// money that its price does not move with volatility. Where vega is that small, a model's
+    /// discretisation error can put even a price it produced itself at or below the floor (see
+    /// [`FiniteDifferenceModel`](crate::FiniteDifferenceModel)'s accuracy): such a price carries no
+    /// usable volatility either.
     #[error("price {price} is at the option's floor {floor}: volatility is undetermined")]
     AtIntrinsic {
         /// The price given.
@@ -151,9 +185,11 @@ pub enum ImpliedVolatilityError {
 ///    option is worth at least its European counterpart, so that volatility is at or above the
 ///    answer); otherwise the highest volatility searched.
 /// 4. The solve stops when the price is reproduced within `price_tolerance` (relative to
-///    `max(1, price)`) or the bracket is narrower than `volatility_tolerance`. A result whose price
-///    is still far from the target, which happens only if the model's price jumps, is refused
-///    with [`NoConvergence`](ImpliedVolatilityError::NoConvergence).
+///    `max(1, price)`) or the bracket is narrower than `volatility_tolerance`. A result pinned by
+///    the volatility tolerance is accepted if its price is within 1e-4 of `max(1, price)` of the
+///    target, and otherwise refused with
+///    [`NoConvergence`](ImpliedVolatilityError::NoConvergence): that happens only if the model's
+///    price jumps.
 ///
 /// The result is deterministic: the same model, inputs, price and settings give the same
 /// volatility.

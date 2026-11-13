@@ -58,7 +58,7 @@ pub const DEFAULT_DAMPING_STEPS: usize = 2;
 pub const DEFAULT_STD_DEVS: f64 = 5.0;
 
 /// A finite-difference grid could not be configured as asked.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FiniteDifferenceConfigError {
     /// Fewer than [`MIN_SPACE_STEPS`] space steps.
@@ -81,17 +81,30 @@ pub enum FiniteDifferenceConfigError {
 /// 4000 × 4000 grid's value: a tenth of a cent on a $100 stock. Long-dated, high-volatility options
 /// are less accurate (about 5e-5 of the spot for two years at 60%). Delta is within about 5e-5.
 /// The cost of one price grows with `space_steps × time_steps`; an implied-volatility solve prices
-/// around five to fifteen times. Finer grids
-/// cost more and converge toward the exact value; coarser ones are faster and less accurate.
+/// around five to fifteen times, and [`greeks`](OptionModel::greeks) five times (vega and rho each
+/// re-solve twice on the same grid). Finer grids cost more and converge toward the exact value;
+/// coarser ones are faster and less accurate.
+///
+/// The grid is laid out for each volatility, so its error varies with the volatility. Where the
+/// price barely moves with volatility (deep in the money, or very close to expiry) that error can
+/// outweigh vega: the price can then fall slightly as volatility rises, by up to the accuracy
+/// above.
 ///
 /// Results depend on the grid: two models with different settings give slightly different prices
 /// and implied volatilities for the same inputs. Use one configuration everywhere a result must
 /// match, for example in a backtest and live.
 ///
 /// # Determinism
-/// The same inputs, volatility and settings give bit-identical results on every platform: the
-/// arithmetic is IEEE 754 double precision in a fixed order, and every transcendental function
-/// comes from `libm` rather than the platform's maths library.
+/// The same inputs, volatility and settings give bit-identical results on every platform, for a
+/// given version of the `libm` crate: the arithmetic is IEEE 754 double precision in a fixed
+/// order, and every transcendental function comes from `libm` rather than the platform's maths
+/// library. A different `libm` version (or a new release of this crate) may change the last
+/// digits, so build every system whose results must match from one lock file.
+///
+/// # Errors
+/// Besides the inputs' own validation ([`OptionInputs::validate`]), valid but extreme inputs whose
+/// grid cannot be represented in `f64`, or whose solve gives a non-finite value, are refused with
+/// [`PricingError::OutsideModelRange`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FiniteDifferenceModel {
     space_steps: usize,
@@ -842,6 +855,8 @@ fn segment_steps(length: f64, expiry: f64, time_steps: usize) -> usize {
 }
 
 /// The grid index at or below a position in grid units; zero for a negative position.
+// The saturating cast is the intent: see the comment in the body.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn index_below(position: f64) -> usize {
     // `as` saturates: a negative or NaN position gives 0, and the callers clamp the top.
     position.floor() as usize
@@ -1364,6 +1379,45 @@ mod tests {
         assert_eq!(greeks.vega, model().vega(&inputs, 0.25).unwrap());
         assert_eq!(greeks.rho, model().rho(&inputs, 0.25).unwrap());
         assert!(greeks.vega > 0.0);
+    }
+
+    #[test]
+    fn results_are_pinned_to_the_bit() {
+        // Bit-identical results are part of the contract: this pins a price, its Greeks and an
+        // implied volatility to the bit. A change here means results changed, through this
+        // crate's arithmetic or a `libm` release; it must be deliberate and noted in the
+        // changelog.
+        let inputs = OptionInputs::new(Put, American, 101.0, 100.0, 0.25, 0.04)
+            .with_dividend_yield(0.01)
+            .with_dividends(vec![CashDividend::new(6.0 / 52.0, 0.75)]);
+        let greeks = model().greeks(&inputs, 0.3).unwrap();
+        let volatility = crate::implied_volatility(
+            &model(),
+            &inputs,
+            5.0,
+            &crate::ImpliedVolatilityConfig::default(),
+        )
+        .unwrap();
+        let bits = [
+            greeks.price,
+            greeks.delta,
+            greeks.gamma,
+            greeks.theta,
+            greeks.vega,
+            greeks.rho,
+            volatility,
+        ]
+        .map(f64::to_bits);
+        let expected: [u64; 7] = [
+            0x4016_2814_c411_978c,
+            0xbfdc_b7c1_b13b_bf48,
+            0x3f9b_505f_56e1_831d,
+            0xc025_539b_29bf_d574,
+            0x4033_d10e_2585_0c6a,
+            0xc024_cc3c_81ef_2c54,
+            0x3fd1_7555_13c9_4a1d,
+        ];
+        assert_eq!(bits, expected);
     }
 
     #[test]

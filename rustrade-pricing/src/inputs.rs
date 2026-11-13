@@ -25,6 +25,7 @@ pub fn year_fraction(start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
 /// The drop happens there, so pass the instant the stock first trades without the dividend, for
 /// example the ex-date's market open.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct CashDividend {
     /// Ex-dividend instant, in years from the valuation instant.
     pub time: f64,
@@ -54,6 +55,7 @@ impl CashDividend {
 /// When the stock is worth less than a dividend at its ex-date, it pays what it is worth and
 /// falls to zero.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OptionInputs {
     /// Call or put.
     pub kind: OptionKind,
@@ -211,7 +213,7 @@ fn require_finite(name: &'static str, value: f64) -> Result<(), PricingError> {
 }
 
 /// Why a model could not price an option.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PricingError {
     /// An input is out of its domain (for example a non-positive spot, or a NaN rate).

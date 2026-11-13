@@ -21,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     continuous yield can be given as well, and early exercise is solved exactly at each time step
     when the yield is not negative. Delta and gamma come from the grid; theta from the
     Black-Scholes equation; vega and rho bump the input on the same grid. The grid size is
-    configurable (`FiniteDifferenceModel::new`), and results are bit-identical across platforms:
-    the transcendental functions come from the pure-Rust `libm` crate.
+    configurable (`FiniteDifferenceModel::new`), and results are bit-identical across platforms
+    for a given `libm` version: the transcendental functions come from the pure-Rust `libm`
+    crate. Inputs too extreme for the grid to represent are refused with
+    `PricingError::OutsideModelRange` rather than giving NaN.
   - **`implied_volatility`** solves for the volatility at which any `OptionModel` reproduces a
     price, by Brent's method. When none exists it returns an `ImpliedVolatilityError` that says
     why, checked before any search: `BelowIntrinsic` (below the no-arbitrage floor),
@@ -33,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`OptionInputs`** holds the contract and market inputs. Times are years of 365 days counted
     to the second (`year_fraction`), and rates are continuously compounded. Greeks are per unit
     of each input: vega per 1.0 of volatility, rho per 1.0 of rate, theta per year.
+    `OptionInputs`, `CashDividend`, `Greeks` and `ImpliedVolatilityConfig` are
+    `#[non_exhaustive]`, so fields can be added later: build them with `new` and the `with_*`
+    setters (the config from `Default`).
 
 - **Earnings releases, from SEC EDGAR (past) and Alpha Vantage (coming and past), and a store
   that answers them as of any instant** (`rustrade-data`, #879).
