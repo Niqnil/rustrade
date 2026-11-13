@@ -50,6 +50,10 @@ massive = ["dep:urlencoding", "serde_json/raw_value"]
 # via `rustrade-execution`). `serde_json/raw_value` reads each price's decimal text exactly, and
 # `reqwest/stream` decodes a response line by line instead of buffering it.
 thetadata = ["dep:chrono-tz", "serde_json/raw_value", "reqwest/stream"]
+# SEC EDGAR: past earnings releases from 8-K filings. No account or key; SEC requires a declared
+# User-Agent. `chrono-tz` converts EDGAR's New York acceptance times to UTC (already in the
+# workspace tree via `rustrade-execution`).
+sec-edgar = ["dep:chrono-tz"]
 
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
@@ -271,6 +275,14 @@ required-features = ["thetadata"]
 name = "thetadata_live"
 required-features = ["thetadata"]
 
+[[test]]
+name = "sec_edgar_rest"
+required-features = ["sec-edgar"]
+
+[[test]]
+name = "sec_edgar_live"
+required-features = ["sec-edgar"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 
@@ -325,3 +337,7 @@ required-features = ["ibkr"]
 [[example]]
 name = "thetadata_options"
 required-features = ["thetadata"]
+
+[[example]]
+name = "sec_edgar_earnings"
+required-features = ["sec-edgar"]

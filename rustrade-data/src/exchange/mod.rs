@@ -69,6 +69,15 @@ pub mod lse;
 #[cfg(feature = "thetadata")]
 pub mod thetadata;
 
+// No `///` here, for the reason given on `lse` above.
+#[cfg(feature = "sec-edgar")]
+pub mod sec_edgar;
+
+/// New York wall-clock times, shared by the providers that report US market times without an
+/// offset.
+#[cfg(any(feature = "thetadata", feature = "sec-edgar"))]
+pub(crate) mod new_york;
+
 /// OSI option contract symbols, shared by the providers that spell contracts that way.
 #[cfg(any(feature = "lse", feature = "massive"))]
 pub(crate) mod osi;
