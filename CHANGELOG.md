@@ -177,6 +177,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
+- **A fee schedule that changes over time** (`rustrade-execution`, `rustrade`, #912).
+  - **New `FeeModelConfig::Dated(DatedFeeModel)`:** an initial model, then a list of `FeeChange`s,
+    each a whole model in effect from its `from` time. A fill is charged by the model in effect at
+    its time: the last change at or before it, else the initial model. A backtest spanning a fee
+    revision then charges each fill the fees of its day rather than today's.
+  - **`DatedFeeModel::new` refuses** changes whose times are not strictly increasing
+    (`FeeModelError::ChangesNotIncreasing`) and a dated model inside another
+    (`FeeModelError::NestedDated`). Deserialising validates the same way. An empty list of changes
+    charges as the initial model.
+  - **The simulated venue and the engine price a fill at its exchange time.** A resting order
+    holds the fee in effect when it rested. If its fill costs differently because the schedule
+    changed in between, the venue costs the fill afresh, and cancels the order if the account can
+    no longer afford it.
+
 - **A composable fee model** (`rustrade-execution`, `rustrade`, #907).
   - **New `FeeModelConfig::Composite(CompositeFeeModel)`:** a list of `FeeComponent`s whose
     charges add. A component charges a `FeeBasis`: per contract, per underlying unit, a share of
@@ -238,11 +252,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AccountEventKind::OrderDeadline`. `ExecutionManager::new` takes it as its last argument, and a
   struct literal must set it. `ExecutionManager::init` takes it from `AccountStreamOptions::clock`.
 
-- **Breaking: the fee model API** (`rustrade-execution`, #907).
-  - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side and the order's prior
-    filled quantity to the price, quantity, contract size and liquidity it took before. Build one
-    with `FeeInput::new(side, price, quantity, contract_size)`, then `with_liquidity` and
-    `with_prior_filled`.
+- **Breaking: the fee model API** (`rustrade-execution`, #907, #912).
+  - `FeeModel::compute_fee` takes a `&FeeInput`, which adds the fill's side, its time and the
+    order's prior filled quantity to the price, quantity, contract size and liquidity it took
+    before. Build one with `FeeInput::new(side, price, quantity, contract_size, time)`, then
+    `with_liquidity` and `with_prior_filled`.
   - `FeeModelConfig` is no longer `Copy`, and is `#[non_exhaustive]`: clone it where it was
     copied, and give a `match` on it a wildcard arm.
   - `MockExecutionConfig` has a `fee_model_by_kind` field. A struct literal must set it

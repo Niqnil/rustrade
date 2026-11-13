@@ -93,9 +93,9 @@ pub mod expiry;
 pub use expiry::{ExpirySellOut, ExpirySellOutError, LongOptionExpiry, SellOutAffordability};
 pub mod fee;
 pub use fee::{
-    CompositeFeeModel, FeeAssetConfig, FeeAssetConfigError, FeeBasis, FeeComponent, FeeInput,
-    FeeModel, FeeModelConfig, FeeModelError, Liquidity, PerContractFeeModel, PercentageFeeModel,
-    SpotFeeAsset, ZeroFeeModel,
+    CompositeFeeModel, DatedFeeModel, FeeAssetConfig, FeeAssetConfigError, FeeBasis, FeeChange,
+    FeeComponent, FeeInput, FeeModel, FeeModelConfig, FeeModelError, Liquidity,
+    PerContractFeeModel, PercentageFeeModel, SpotFeeAsset, ZeroFeeModel,
 };
 pub mod fill;
 pub use fill::{

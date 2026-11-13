@@ -80,7 +80,8 @@ pub struct MockExecutionConfig {
     ///
     /// Defaults to [`FeeModelConfig::Zero`]. Use [`FeeModelConfig::Percentage`]
     /// for spot/futures simulation (e.g. 0.1% taker fee), and [`FeeModelConfig::Composite`] for a
-    /// schedule of several fees, such as a broker's regulatory pass-through fees.
+    /// schedule of several fees, such as a broker's regulatory pass-through fees. Wrap any of them
+    /// in [`FeeModelConfig::Dated`] for fees that change over a backtest's span.
     #[serde(default)]
     pub fee_model: FeeModelConfig,
     /// Fill model used by the mock exchange to compute execution prices.
