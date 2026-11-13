@@ -15,7 +15,9 @@
 //!
 //! Providers revise coming dates in place and keep no history of a change, so a moved date shows
 //! up as a second record with the same key and a later [`known_at`](EarningsRelease::known_at).
-//! Two records with the same key describe the same release; the later one supersedes the earlier.
+//! Two records with the same key describe the same release; the later one supersedes the earlier,
+//! and a record that the release has happened supersedes any that does not say so.
+//! [`EarningsStore`] keeps them all and applies that order.
 //!
 //! # Point in time
 //! [`known_at`](EarningsRelease::known_at) is the earliest instant the record's content is known
@@ -31,10 +33,17 @@
 //! No provider records when an issuer announced a coming date, so a calendar's `known_at` is only
 //! as early as its first fetch. Records fetched and kept over time are the only history of a
 //! calendar.
+//!
+//! [`EarningsStore`] answers from such records the next and the previous release of a symbol as
+//! of any instant, from the records public by then.
 
 use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+
+mod store;
+
+pub use store::EarningsStore;
 
 /// One provider's statement about one earnings release. See the [module documentation](self).
 ///
@@ -107,7 +116,7 @@ impl EarningsRelease {
     }
 
     /// The release this record describes: two records with the same key describe the same
-    /// release, and the one with the later [`known_at`](Self::known_at) supersedes the other.
+    /// release. Which one supersedes the other is set out in [`EarningsStore`]'s contract.
     pub fn key(&self) -> EarningsKey {
         EarningsKey::new(self.symbol.clone(), self.fiscal_period_end)
     }
