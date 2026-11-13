@@ -324,6 +324,23 @@ mod tests {
     }
 
     #[test]
+    fn an_8k_filed_on_the_period_end_day_is_not_that_periods_release() {
+        // Results can only follow a period's end; an Item 2.02 filing dated that very day
+        // reports something earlier.
+        let filings = [
+            filing("10q", "10-Q", "2026-08-06", "2026-06-30", ""),
+            filing(
+                "on-period-end",
+                "8-K",
+                "2026-06-30",
+                "2026-06-30",
+                "2.02,9.01",
+            ),
+        ];
+        assert_eq!(paired(&filings), vec![]);
+    }
+
+    #[test]
     fn a_period_without_a_filed_report_has_no_release_yet() {
         let filings = [
             filing("q3-results", "8-K", "2026-10-13", "2026-10-13", "2.02,9.01"),

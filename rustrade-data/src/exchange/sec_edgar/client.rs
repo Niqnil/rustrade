@@ -394,6 +394,8 @@ mod tests {
             "My App admin@",
             "My App @example.com",
             "My App admin@localhost",
+            "My App admin@.com",
+            "My App admin@example.",
             "My App a@b@example.com",
             "My App admin@example.com\u{7}",
         ] {
@@ -410,7 +412,10 @@ mod tests {
     #[test]
     fn debug_does_not_print_the_user_agent() {
         let client = SecEdgarClient::new("Sample Company admin@example.com").unwrap();
-        assert!(!format!("{client:?}").contains("admin@example.com"));
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("admin@example.com"), "{debug}");
+        assert!(debug.starts_with("SecEdgarClient"), "{debug}");
+        assert!(debug.contains(DEFAULT_DATA_URL), "{debug}");
     }
 
     #[test]
@@ -436,13 +441,14 @@ mod tests {
     #[test]
     fn a_rate_over_secs_limit_is_refused() {
         let client = SecEdgarClient::new("App admin@example.com").unwrap();
+        assert_eq!(client.pacer.interval, Duration::from_secs(1) / 9);
         let at_limit = NonZeroU32::new(SEC_MAX_REQUESTS_PER_SECOND).unwrap();
-        assert!(
-            client
-                .clone()
-                .with_max_requests_per_second(at_limit)
-                .is_ok()
-        );
+        let fast = client
+            .clone()
+            .with_max_requests_per_second(at_limit)
+            .unwrap();
+        assert_eq!(fast.pacer.interval, Duration::from_millis(100));
+        assert!(!Arc::ptr_eq(&fast.pacer, &client.pacer));
         let over = NonZeroU32::new(SEC_MAX_REQUESTS_PER_SECOND + 1).unwrap();
         assert!(matches!(
             client.with_max_requests_per_second(over),

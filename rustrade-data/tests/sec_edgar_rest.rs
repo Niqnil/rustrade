@@ -68,9 +68,9 @@ async fn mount_submissions(server: &MockServer, body: Value) {
 }
 
 fn header_path(accession: &str) -> String {
+    // The archive path names the CIK without padding.
     format!(
-        "/Archives/edgar/data/{}/{}/{accession}-index-headers.html",
-        CIK.get(),
+        "/Archives/edgar/data/1234/{}/{accession}-index-headers.html",
         accession.replace('-', "")
     )
 }

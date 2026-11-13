@@ -116,6 +116,6 @@ mod tests {
     #[test]
     fn a_cik_displays_as_ten_digits() {
         assert_eq!(Cik::new(320193).to_string(), "0000320193");
-        assert_eq!(Cik::new(1).get(), 1);
+        assert_eq!(Cik::new(320193).get(), 320193);
     }
 }
