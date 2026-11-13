@@ -15,6 +15,17 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> String {
     s[..s.floor_char_boundary(max_bytes)].to_owned()
 }
 
+/// A configured base URL, checked to be `http` or `https`, without a trailing `/`. The error is a
+/// message for the caller's own error type.
+#[cfg(any(feature = "sec-edgar", feature = "alpha-vantage"))]
+pub(crate) fn http_base_url(text: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(text).map_err(|e| format!("base URL {text:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("base URL {text:?} is not http or https"));
+    }
+    Ok(text.trim_end_matches('/').to_owned())
+}
+
 /// Cap for error-path body reads (see [`read_body_capped`]).
 ///
 /// Generous relative to any real diagnostic envelope — so it never truncates a legitimate error or

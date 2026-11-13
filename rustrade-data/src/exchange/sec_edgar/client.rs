@@ -8,16 +8,15 @@ use super::{
 use crate::{
     earnings::{EarningsProvider, EarningsRelease, ReleaseSource, ReleaseStatus},
     exchange::{
-        http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped},
+        http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, http_base_url, read_body_capped},
         new_york,
+        pacer::Pacer,
     },
 };
 use chrono::{NaiveDate, TimeDelta, Utc};
-use parking_lot::Mutex;
 use serde::{Deserialize, de::DeserializeOwned};
 use smol_str::SmolStr;
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, time::Duration};
-use tokio::time::Instant;
 
 /// Where SEC serves its website and filing archive.
 pub const DEFAULT_WWW_URL: &str = "https://www.sec.gov";
@@ -100,7 +99,7 @@ impl SecEdgarClient {
             http,
             www_url: DEFAULT_WWW_URL.to_owned(),
             data_url: DEFAULT_DATA_URL.to_owned(),
-            pacer: Arc::new(Pacer::new(DEFAULT_REQUESTS_PER_SECOND)),
+            pacer: Arc::new(Pacer::new(interval(DEFAULT_REQUESTS_PER_SECOND))),
         })
     }
 
@@ -128,7 +127,7 @@ impl SecEdgarClient {
             )));
         }
         Ok(Self {
-            pacer: Arc::new(Pacer::new(rate)),
+            pacer: Arc::new(Pacer::new(interval(rate))),
             ..self
         })
     }
@@ -333,46 +332,12 @@ fn is_email(word: &str) -> bool {
 }
 
 fn base_url(text: &str) -> Result<String, SecEdgarError> {
-    let parsed = url::Url::parse(text)
-        .map_err(|e| SecEdgarError::invalid_input(format!("base URL {text:?}: {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(SecEdgarError::invalid_input(format!(
-            "base URL {text:?} is not http or https"
-        )));
-    }
-    Ok(text.trim_end_matches('/').to_owned())
+    http_base_url(text).map_err(SecEdgarError::invalid_input)
 }
 
-/// Spaces requests evenly: each waits for the slot one interval after the previous one's.
-#[derive(Debug)]
-struct Pacer {
-    interval: Duration,
-    next: Mutex<Option<Instant>>,
-}
-
-impl Pacer {
-    fn new(rate: NonZeroU32) -> Self {
-        Self {
-            interval: Duration::from_secs(1) / rate.get(),
-            next: Mutex::new(None),
-        }
-    }
-
-    /// Wait for this request's slot. A caller dropped while waiting gives up its slot unused but
-    /// blocks no one.
-    async fn wait(&self) {
-        tokio::time::sleep_until(self.claim()).await;
-    }
-
-    /// Claim the next free slot: now, or one interval after the last claimed slot if that is
-    /// later.
-    fn claim(&self) -> Instant {
-        let mut next = self.next.lock();
-        let now = Instant::now();
-        let slot = next.map_or(now, |next| next.max(now));
-        *next = Some(slot + self.interval);
-        slot
-    }
+/// The time between requests at `rate` a second.
+fn interval(rate: NonZeroU32) -> Duration {
+    Duration::from_secs(1) / rate.get()
 }
 
 #[cfg(test)]
@@ -443,39 +408,18 @@ mod tests {
     #[test]
     fn a_rate_over_secs_limit_is_refused() {
         let client = SecEdgarClient::new("App admin@example.com").unwrap();
-        assert_eq!(client.pacer.interval, Duration::from_secs(1) / 9);
+        assert_eq!(client.pacer.interval(), Duration::from_secs(1) / 9);
         let at_limit = NonZeroU32::new(SEC_MAX_REQUESTS_PER_SECOND).unwrap();
         let fast = client
             .clone()
             .with_max_requests_per_second(at_limit)
             .unwrap();
-        assert_eq!(fast.pacer.interval, Duration::from_millis(100));
+        assert_eq!(fast.pacer.interval(), Duration::from_millis(100));
         assert!(!Arc::ptr_eq(&fast.pacer, &client.pacer));
         let over = NonZeroU32::new(SEC_MAX_REQUESTS_PER_SECOND + 1).unwrap();
         assert!(matches!(
             client.with_max_requests_per_second(over),
             Err(SecEdgarError::InvalidInput { .. })
         ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_pacer_spaces_requests_by_its_interval_and_shares_across_clones() {
-        let pacer = Arc::new(Pacer::new(NonZeroU32::new(4).unwrap()));
-        let start = Instant::now();
-        pacer.wait().await;
-        assert_eq!(start.elapsed(), Duration::ZERO);
-        let other = Arc::clone(&pacer);
-        other.wait().await;
-        assert_eq!(start.elapsed(), Duration::from_millis(250));
-        pacer.wait().await;
-        assert_eq!(start.elapsed(), Duration::from_millis(500));
-
-        // After an idle spell the next request goes at once, and the one after waits again.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let idle_end = Instant::now();
-        pacer.wait().await;
-        assert_eq!(idle_end.elapsed(), Duration::ZERO);
-        pacer.wait().await;
-        assert_eq!(idle_end.elapsed(), Duration::from_millis(250));
     }
 }

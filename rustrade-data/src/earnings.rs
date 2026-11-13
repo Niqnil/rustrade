@@ -7,11 +7,15 @@
 //! merged.
 //!
 //! # Identity and revisions
-//! A release is identified by its [`EarningsKey`]: the issuer's symbol and the last day of the
-//! fiscal period it reports. Providers revise coming dates in place and keep no history of a
-//! change, so a moved date shows up as a second record with the same key and a later
-//! [`known_at`](EarningsRelease::known_at). Two records with the same key describe the same
-//! release; the later one supersedes the earlier.
+//! A release is identified by its [`EarningsKey`]: the issuer's symbol and the fiscal period it
+//! reports, named by the calendar month end nearest the period's last day
+//! ([`nearest_month_end`]). Providers disagree on that last day: one gives the exact date, such
+//! as a Saturday for an issuer whose fiscal year has 52 or 53 weeks, and another rounds it to a
+//! month end. Their records of the same release have the same key all the same.
+//!
+//! Providers revise coming dates in place and keep no history of a change, so a moved date shows
+//! up as a second record with the same key and a later [`known_at`](EarningsRelease::known_at).
+//! Two records with the same key describe the same release; the later one supersedes the earlier.
 //!
 //! # Point in time
 //! [`known_at`](EarningsRelease::known_at) is the earliest instant the record's content is known
@@ -28,7 +32,7 @@
 //! as early as its first fetch. Records fetched and kept over time are the only history of a
 //! calendar.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Months, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -41,8 +45,10 @@ use smol_str::SmolStr;
 pub struct EarningsRelease {
     /// The issuer's ticker symbol, as the caller named it to the provider.
     pub symbol: SmolStr,
-    /// The last day of the fiscal period whose results the release reports. Issuers with 52- or
-    /// 53-week years end their periods on a weekday rather than a month end.
+    /// The last day of the fiscal period whose results the release reports, as the provider gives
+    /// it. Issuers with 52- or 53-week years end their periods on a weekday near a month end; some
+    /// providers give that day, and others round it to the month end.
+    /// [`key`](Self::key) names the period by the nearest month end, which both agree on.
     pub fiscal_period_end: NaiveDate,
     /// The release's date in the local time of the issuer's listing exchange (New York for US
     /// issuers). It can fall on a day without a session.
@@ -78,7 +84,7 @@ impl EarningsRelease {
     ///     known_at,
     ///     ReleaseSource::new(EarningsProvider::SecEdgar, known_at).with_record_id("0000001234-26-000002"),
     /// );
-    /// assert_eq!(release.key().symbol, "XYZ");
+    /// assert_eq!(release.key().symbol(), "XYZ");
     /// ```
     pub fn new(
         symbol: impl Into<SmolStr>,
@@ -103,20 +109,84 @@ impl EarningsRelease {
     /// The release this record describes: two records with the same key describe the same
     /// release, and the one with the later [`known_at`](Self::known_at) supersedes the other.
     pub fn key(&self) -> EarningsKey {
-        EarningsKey {
-            symbol: self.symbol.clone(),
-            fiscal_period_end: self.fiscal_period_end,
-        }
+        EarningsKey::new(self.symbol.clone(), self.fiscal_period_end)
     }
 }
 
-/// The identity of one earnings release: the issuer and the fiscal period it reports.
+/// The identity of one earnings release: the issuer and the fiscal period it reports, named by
+/// the calendar month end nearest the period's last day. See
+/// ["Identity and revisions"](self#identity-and-revisions).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(from = "KeyFields")]
 pub struct EarningsKey {
+    symbol: SmolStr,
+    period: NaiveDate,
+}
+
+impl EarningsKey {
+    /// The release of `symbol`'s results for the fiscal period whose last day is
+    /// `fiscal_period_end`, exact or already rounded to a month end.
+    pub fn new(symbol: impl Into<SmolStr>, fiscal_period_end: NaiveDate) -> Self {
+        Self {
+            symbol: symbol.into(),
+            period: nearest_month_end(fiscal_period_end),
+        }
+    }
+
     /// The issuer's ticker symbol.
-    pub symbol: SmolStr,
-    /// The last day of the fiscal period the release reports.
-    pub fiscal_period_end: NaiveDate,
+    pub fn symbol(&self) -> &SmolStr {
+        &self.symbol
+    }
+
+    /// The month end nearest the fiscal period's last day, which names the period.
+    pub fn period(&self) -> NaiveDate {
+        self.period
+    }
+}
+
+/// A deserialized key's fields, normalised on the way in so a stored key cannot hold a period
+/// that is not a month end.
+#[derive(Deserialize)]
+struct KeyFields {
+    symbol: SmolStr,
+    period: NaiveDate,
+}
+
+impl From<KeyFields> for EarningsKey {
+    fn from(fields: KeyFields) -> Self {
+        Self::new(fields.symbol, fields.period)
+    }
+}
+
+/// The calendar month end nearest `date`: the end of `date`'s own month, or of the month before
+/// if that is closer (on a tie, its own).
+///
+/// It names a fiscal period whatever day a provider gives as its end. An issuer whose fiscal year
+/// has 52 or 53 weeks ends each period on a fixed weekday: the last one in a month, up to six days
+/// before the month ends, or the one nearest the month end, up to three days either side. All of
+/// these, and the month end itself, map to the same month end:
+///
+/// ```
+/// use chrono::NaiveDate;
+/// use rustrade_data::earnings::nearest_month_end;
+///
+/// let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+/// assert_eq!(nearest_month_end(day(2026, 9, 26)), day(2026, 9, 30)); // a Saturday, 4 days early
+/// assert_eq!(nearest_month_end(day(2019, 9, 1)), day(2019, 8, 31)); // a Sunday, 1 day late
+/// assert_eq!(nearest_month_end(day(2026, 9, 30)), day(2026, 9, 30));
+/// ```
+pub fn nearest_month_end(date: NaiveDate) -> NaiveDate {
+    let first_of_month = date.with_day(1).unwrap_or(date);
+    let previous_end = first_of_month.pred_opt().unwrap_or(first_of_month);
+    let own_end = first_of_month
+        .checked_add_months(Months::new(1))
+        .and_then(|next_first| next_first.pred_opt())
+        .unwrap_or(date);
+    if own_end - date <= date - previous_end {
+        own_end
+    } else {
+        previous_end
+    }
 }
 
 /// When in the trading day of its [`date`](EarningsRelease::date) a release came, relative to the
@@ -211,6 +281,8 @@ impl ReleaseSource {
 pub enum EarningsProvider {
     /// The SEC's EDGAR filings: past releases, from the 8-K filings that furnish them.
     SecEdgar,
+    /// Alpha Vantage: its earnings calendar of coming releases, and its earnings history.
+    AlphaVantage,
 }
 
 #[cfg(test)]
@@ -229,6 +301,58 @@ mod tests {
             known_at,
             ReleaseSource::new(EarningsProvider::SecEdgar, known_at),
         )
+    }
+
+    #[test]
+    fn an_exact_period_end_and_its_month_end_make_the_same_key() {
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let exact = release(
+            day(2026, 9, 26),
+            Utc.with_ymd_and_hms(2026, 10, 30, 0, 0, 0).unwrap(),
+        );
+        let rounded = release(
+            day(2026, 9, 30),
+            Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(exact.key(), rounded.key());
+        assert_eq!(exact.key().period(), day(2026, 9, 30));
+        assert_eq!(exact.fiscal_period_end, day(2026, 9, 26));
+    }
+
+    #[test]
+    fn the_nearest_month_end_rounds_either_way_and_across_a_year() {
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let cases = [
+            (day(2026, 9, 26), day(2026, 9, 30)),
+            (day(2026, 9, 24), day(2026, 9, 30)),
+            (day(2019, 9, 1), day(2019, 8, 31)),
+            (day(2026, 1, 3), day(2025, 12, 31)),
+            (day(2025, 12, 27), day(2025, 12, 31)),
+            (day(2026, 2, 28), day(2026, 2, 28)),
+            (day(2024, 2, 29), day(2024, 2, 29)),
+            (day(2024, 3, 2), day(2024, 2, 29)),
+            (day(2026, 3, 1), day(2026, 2, 28)),
+            // The middle of a month: 14 days after the previous end, 16 before its own.
+            (day(2026, 4, 14), day(2026, 3, 31)),
+            // A tie (15 days each way) goes to its own month.
+            (day(2026, 4, 15), day(2026, 4, 30)),
+            (day(2026, 4, 16), day(2026, 4, 30)),
+        ];
+        for (date, expected) in cases {
+            assert_eq!(nearest_month_end(date), expected, "{date}");
+        }
+    }
+
+    #[test]
+    fn a_deserialized_key_is_normalised() {
+        let key: EarningsKey =
+            serde_json::from_str(r#"{"symbol":"XYZ","period":"2026-09-26"}"#).unwrap();
+        assert_eq!(
+            key,
+            EarningsKey::new("XYZ", NaiveDate::from_ymd_opt(2026, 9, 30).unwrap())
+        );
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, r#"{"symbol":"XYZ","period":"2026-09-30"}"#);
     }
 
     #[test]
@@ -265,13 +389,9 @@ mod tests {
         );
         moved.date = NaiveDate::from_ymd_opt(2026, 1, 29).unwrap();
         assert_eq!(first.key(), moved.key());
-        assert_eq!(
-            first.key(),
-            EarningsKey {
-                symbol: SmolStr::new("XYZ"),
-                fiscal_period_end: period_end,
-            }
-        );
+        assert_eq!(first.key(), EarningsKey::new("XYZ", period_end));
+        assert_eq!(first.key().symbol(), "XYZ");
+        assert_eq!(first.key().period(), period_end);
 
         let next_quarter = release(
             NaiveDate::from_ymd_opt(2026, 3, 31).unwrap(),
