@@ -1384,10 +1384,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // order this state tracks. One it no longer tracks, such as an order whose terminal
         // update arrived before this fill, or one it never sent, leaves the size unknown, and
         // such a fee is then charged: an overstatement once more.
-        let order_quantity = self.tracked_order_quantity(trade);
         // At the trade's exchange time, so a fee schedule that changes over time charges the
         // schedule in effect when the trade filled.
-        let input = FeeInput::new(
+        let mut input = FeeInput::new(
             trade.side,
             trade.price,
             trade.quantity,
@@ -1396,10 +1395,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         )
         .with_liquidity(Liquidity::Taker)
         .with_prior_filled(prior_filled);
-        let input = match order_quantity {
-            Some(order_quantity) => input.with_order_quantity(order_quantity),
-            None => input,
-        };
+        input.order_quantity = self.tracked_order_quantity(trade);
         self.fee_model.compute_fee(&input)
     }
 

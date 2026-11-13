@@ -357,10 +357,8 @@ impl PriceBands {
     /// it, or the first band for a price below zero.
     pub fn per_contract_at(&self, price: Decimal) -> Decimal {
         let in_band = self.0.partition_point(|band| band.from <= price);
-        // Validated non-empty, so the first band always exists.
-        self.0
-            .get(in_band.saturating_sub(1))
-            .map_or(Decimal::ZERO, |band| band.per_contract)
+        // In bounds: the bands are validated non-empty, so index 0 always exists.
+        self.0[in_band.saturating_sub(1)].per_contract
     }
 }
 
@@ -1023,8 +1021,9 @@ impl Default for FeeModelConfig {
 
 impl FeeModelConfig {
     /// Whether a fill's fee is its quantity times the fee of one unit, whatever its order filled
-    /// before: true unless a [`Composite`](Self::Composite) charges per order or bounds a
-    /// component per order, or a [`Dated`](Self::Dated) schedule holds such a model at any time.
+    /// before: true unless a [`Composite`](Self::Composite) charges per order, bounds a component
+    /// per order or limits one to orders of a size, or a [`Dated`](Self::Dated) schedule holds
+    /// such a model at any time.
     pub(crate) fn is_linear(&self) -> bool {
         match self {
             Self::Zero(_) | Self::PerContract(_) | Self::Percentage(_) => true,
@@ -1131,7 +1130,8 @@ impl FeeModelOverrides {
         &self.by_name
     }
 
-    /// The models by kind and underlying.
+    /// The models by kind and underlying, flattened into one entry each, in order of kind and
+    /// then underlying.
     pub fn by_underlying(
         &self,
     ) -> impl Iterator<
