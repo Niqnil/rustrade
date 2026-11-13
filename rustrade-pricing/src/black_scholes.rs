@@ -17,6 +17,27 @@ pub(crate) fn norm_pdf(x: f64) -> f64 {
     libm::exp(-0.5 * x * x) / (2.0 * std::f64::consts::PI).sqrt()
 }
 
+/// The present value of the stock delivered `tau` years from now: the stock net of its continuous
+/// `dividend_yield` and of the cash `dividends`, given as `(years from now, amount)`, each paid
+/// before `tau`.
+///
+/// A cash dividend paid at `t` leaves the stock with that amount less, which would have grown with
+/// the stock at `rate - dividend_yield` from `t` to `tau`; its present value is therefore
+/// `amount·exp(-rate·t - dividend_yield·(tau - t))`, not just `amount·exp(-rate·t)`.
+pub(crate) fn discounted_forward(
+    stock: f64,
+    tau: f64,
+    rate: f64,
+    dividend_yield: f64,
+    dividends: impl IntoIterator<Item = (f64, f64)>,
+) -> f64 {
+    let paid: f64 = dividends
+        .into_iter()
+        .map(|(time, amount)| amount * libm::exp(-rate * time - dividend_yield * (tau - time)))
+        .sum();
+    stock * libm::exp(-dividend_yield * tau) - paid
+}
+
 /// The Black-Scholes-Merton price of a European option.
 ///
 /// `spot`, `strike` and `time` must be positive and `volatility` positive. The caller
@@ -112,5 +133,28 @@ mod tests {
             |volatility| european_price(OptionKind::Call, 100.0, 95.0, 0.5, 0.03, 0.0, volatility);
         assert_eq!(bisect_volatility(call, 101.0, 1e-7, 4.0), None);
         assert_eq!(bisect_volatility(call, 1.0, 1e-7, 4.0), None);
+    }
+
+    #[test]
+    fn bisect_volatility_takes_prices_at_the_ends_and_exact_hits() {
+        let identity = |volatility| volatility;
+        // A price at either end of the range is inside it.
+        let low = bisect_volatility(identity, 0.25, 0.25, 1.0).unwrap();
+        assert!((low - 0.25).abs() < 1e-15, "{low}");
+        assert_eq!(bisect_volatility(identity, 1.0, 0.25, 1.0), Some(1.0));
+        // The first midpoint, 0.625, is the answer: it is kept as the top and returned exactly.
+        assert_eq!(bisect_volatility(identity, 0.625, 0.25, 1.0), Some(0.625));
+    }
+
+    #[test]
+    fn discounted_forward_takes_out_the_yield_and_each_dividend() {
+        let (stock, tau, r, q) = (100.0, 0.75, 0.05, 0.03);
+        let plain = discounted_forward(stock, tau, r, q, []);
+        assert!((plain - stock * (-q * tau).exp()).abs() < 1e-12);
+        // A dividend at t costs its amount discounted at r to t and at q from t to tau.
+        let with = discounted_forward(stock, tau, r, q, [(0.25, 2.0), (0.5, 1.0)]);
+        let expected =
+            plain - 2.0 * (-r * 0.25 - q * 0.5).exp() - 1.0 * (-r * 0.5 - q * 0.25).exp();
+        assert!((with - expected).abs() < 1e-12, "{with} vs {expected}");
     }
 }

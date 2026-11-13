@@ -36,6 +36,7 @@
 //!   bump the volatility and rate on the same grid, so the bump measures the input's effect and
 //!   not a change of grid.
 
+use crate::black_scholes::discounted_forward;
 use crate::inputs::{OptionInputs, PricingError, payoff, validate_volatility};
 use crate::model::{OptionModel, RATE_BUMP, Valuation, volatility_bump};
 use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
@@ -365,15 +366,16 @@ impl Solver<'_> {
     fn edge_value(&self, tau: f64, stock: f64) -> f64 {
         let problem = self.problem;
         // Dividends still to come before expiry are those whose instant is less than `tau` before
-        // expiry. A stock cannot pay out more than it is worth, so the forward is floored at zero.
-        let pending: f64 = problem
+        // expiry, each `tau - dividend_tau` years from this instant. A stock cannot pay out more
+        // than it is worth, so the forward is floored at zero.
+        let pending = problem
             .dividends
             .iter()
             .map(|&(time, amount)| (problem.expiry - time, amount))
             .filter(|&(dividend_tau, _)| dividend_tau < tau)
-            .map(|(dividend_tau, amount)| amount * libm::exp(-self.rate * (tau - dividend_tau)))
-            .sum();
-        let forward = (stock * libm::exp(-problem.dividend_yield * tau) - pending).max(0.0);
+            .map(|(dividend_tau, amount)| (tau - dividend_tau, amount));
+        let forward =
+            discounted_forward(stock, tau, self.rate, problem.dividend_yield, pending).max(0.0);
         let strike = problem.strike * libm::exp(-self.rate * tau);
         let european = match problem.kind {
             OptionKind::Call => (forward - strike).max(0.0),
@@ -1105,7 +1107,11 @@ mod tests {
         let american_price = model().price(&american, 0.2).unwrap();
         let european_price = model().price(&european, 0.2).unwrap();
         assert!(american_price.is_finite());
-        assert!(american_price >= european_price);
+        // Early exercise is worth about 0.17 here: the floor is applied, not skipped.
+        assert!(
+            american_price > european_price + 0.1,
+            "{american_price} vs {european_price}"
+        );
         assert!(american_price >= american.intrinsic_value());
     }
 
@@ -1271,6 +1277,196 @@ mod tests {
             damped_error < 0.5 * plain_error,
             "{damped_error} vs {plain_error}"
         );
+    }
+
+    #[test]
+    fn no_damping_starts_with_plain_crank_nicolson() {
+        // With one time step, one damped step replaces Crank-Nicolson with two implicit half
+        // steps; with none the step stays Crank-Nicolson, so the two prices differ.
+        let inputs = OptionInputs::new(Call, European, 100.0, 100.0, 0.1, 0.04);
+        let one_step = FiniteDifferenceModel::new(400, 1).unwrap();
+        let plain = one_step.with_damping_steps(0).price(&inputs, 0.2).unwrap();
+        let damped = one_step.with_damping_steps(1).price(&inputs, 0.2).unwrap();
+        assert!((plain - damped).abs() > 1e-6, "{plain} vs {damped}");
+    }
+
+    #[test]
+    fn linear_payoffs_are_priced_exactly() {
+        // Every node of a deep in-the-money European option is in the money, so its value is
+        // linear in the stock, and the fitted scheme is exact for the stock and for constants.
+        // The grid's edges carry the same linear value, so any error there would show here. A
+        // zero rate keeps the strike's leg constant: time steps only approximate its discounting.
+        let (s, t, q) = (100.0, 0.75, 0.03);
+        let call = OptionInputs::new(Call, European, s, 1.0, t, 0.0).with_dividend_yield(q);
+        let put = OptionInputs::new(Put, European, s, 400.0, t, 0.0).with_dividend_yield(q);
+        let forward = s * (-q * t).exp();
+        let call_price = model().price(&call, 0.2).unwrap();
+        assert_close(call_price, forward - 1.0, 1e-9, "call");
+        let put_price = model().price(&put, 0.2).unwrap();
+        assert_close(put_price, 400.0 - forward, 1e-9, "put");
+    }
+
+    /// Runs `check` on a solver for `inputs` at `volatility` on the default grid.
+    fn with_solver(inputs: &OptionInputs, volatility: f64, check: impl FnOnce(&Solver<'_>)) {
+        let model = model();
+        let problem = Problem::new(inputs, volatility).unwrap();
+        let grid = Grid::new(&problem, volatility, &model);
+        check(&Solver {
+            problem: &problem,
+            grid: &grid,
+            volatility,
+            rate: problem.rate,
+            model: &model,
+        });
+    }
+
+    #[test]
+    fn edge_value_is_the_discounted_forward_intrinsic_value() {
+        // Dividends at 0.25 and 0.75 of a one-year life are 0.75 and 0.25 before expiry.
+        let (r, q) = (0.05, 0.03);
+        let dividends = vec![CashDividend::new(0.25, 1.5), CashDividend::new(0.75, 2.0)];
+        let call = OptionInputs::new(Call, European, 100.0, 90.0, 1.0, r)
+            .with_dividend_yield(q)
+            .with_dividends(dividends);
+        // Each dividend still to come costs its amount discounted at r to its instant and at q
+        // from there to expiry.
+        let pending = |tau: f64| {
+            let mut total = 0.0;
+            if tau > 0.75 {
+                total += 1.5 * (-r * (tau - 0.75) - q * 0.75).exp();
+            }
+            if tau > 0.25 {
+                total += 2.0 * (-r * (tau - 0.25) - q * 0.25).exp();
+            }
+            total
+        };
+        let forward = |tau: f64, stock: f64| stock * (-q * tau).exp() - pending(tau);
+        with_solver(&call, 0.2, |solver| {
+            // At 0.25 before expiry the later dividend has just been paid: none is still to come.
+            for tau in [0.25, 0.5, 1.0] {
+                let expected = forward(tau, 100.0) - 90.0 * (-r * tau).exp();
+                assert_close(
+                    solver.edge_value(tau, 100.0),
+                    expected,
+                    1e-12,
+                    &format!("{tau}"),
+                );
+            }
+            // A stock worth less than its dividends delivers nothing.
+            assert_eq!(solver.edge_value(1.0, 3.0), 0.0);
+        });
+        let put = OptionInputs {
+            kind: Put,
+            strike: 110.0,
+            ..call
+        };
+        with_solver(&put, 0.2, |solver| {
+            let expected = 110.0 * (-r * 0.5).exp() - forward(0.5, 50.0);
+            assert_close(solver.edge_value(0.5, 50.0), expected, 1e-12, "put");
+        });
+        // An American put deep in the money is worth at least its exercise value.
+        let american = OptionInputs {
+            exercise: American,
+            ..put
+        };
+        with_solver(&american, 0.2, |solver| {
+            assert!(110.0 * (-r * 0.5).exp() - forward(0.5, 50.0) < 60.0);
+            assert_eq!(solver.edge_value(0.5, 50.0), 60.0);
+        });
+    }
+
+    #[test]
+    fn value_at_zero_by_kind_and_exercise() {
+        let r = 0.05;
+        let put = OptionInputs::new(Put, European, 100.0, 110.0, 1.0, r);
+        with_solver(&put, 0.2, |solver| {
+            assert_close(
+                solver.value_at_zero(0.5),
+                110.0 * (-r * 0.5).exp(),
+                1e-12,
+                "european",
+            )
+        });
+        let american = OptionInputs {
+            exercise: American,
+            ..put.clone()
+        };
+        with_solver(&american, 0.2, |solver| {
+            assert_eq!(solver.value_at_zero(0.5), 110.0)
+        });
+        let call = OptionInputs { kind: Call, ..put };
+        with_solver(&call, 0.2, |solver| {
+            assert_eq!(solver.value_at_zero(0.5), 0.0)
+        });
+    }
+
+    #[test]
+    fn a_dividend_reads_each_value_at_the_stock_less_the_dividend() {
+        // A deep in-the-money European call is linear in the stock: just after the dividend it is
+        // worth its edge value, and just before, the same at the stock less the dividend.
+        let (amount, tau) = (2.0, 0.5);
+        let inputs = OptionInputs::new(Call, European, 100.0, 1.0, 1.0, 0.05)
+            .with_dividend_yield(0.03)
+            .with_dividends(vec![CashDividend::new(0.5, amount)]);
+        with_solver(&inputs, 0.2, |solver| {
+            let factor = solver.stock_factor(tau);
+            let stocks: Vec<f64> = solver.grid.exp_y.iter().map(|&y| y * factor).collect();
+            let mut values: Vec<f64> = stocks
+                .iter()
+                .map(|&stock| solver.edge_value(tau, stock))
+                .collect();
+            let mut jumped = vec![0.0; values.len()];
+            solver.pay_dividend(&mut values, &mut jumped, tau, amount);
+            let dy = solver.grid.dy;
+            let mut below = 0;
+            for (node, (&stock, &value)) in stocks.iter().zip(&values).enumerate() {
+                let after = stock - amount;
+                let expected = solver.edge_value(tau, after);
+                if after < stocks[0] {
+                    // Below the grid: the edge's limit value, exactly.
+                    below += 1;
+                    assert_eq!(value, expected, "node {node}");
+                } else {
+                    // Linear interpolation in ln(S) of a value linear in S errs by at most
+                    // S·dy²/8.
+                    let tolerance = stock * dy * dy / 8.0 + 1e-12;
+                    assert_close(value, expected, tolerance, &format!("node {node}"));
+                }
+            }
+            assert!(below > 0);
+        });
+    }
+
+    #[test]
+    fn the_spot_is_read_exactly_from_a_cubic() {
+        // The read fits a cubic through the four nodes around the spot, so values on a cubic in y
+        // give back its value and derivatives at the spot. A strike off the spot and a yield keep
+        // the spot between nodes.
+        let inputs =
+            OptionInputs::new(Call, European, 100.0, 94.7, 0.5, 0.04).with_dividend_yield(0.01);
+        with_solver(&inputs, 0.2, |solver| {
+            let grid = solver.grid;
+            let y_spot = 100f64.ln() + grid.shift * 0.5;
+            let position = (y_spot - grid.y_min) / grid.dy;
+            assert!((position - position.round()).abs() > 0.1, "{position}");
+            let cubic = |y: f64| {
+                let x = y - y_spot;
+                10.0 + x * (50.0 + x * (30.0 + x * 40.0))
+            };
+            let values: Vec<f64> = (0..grid.len())
+                .map(|node| cubic(grid.y_min + node as f64 * grid.dy))
+                .collect();
+            let valuation = solver.read_spot(&values);
+            // At the spot the cubic is 10, its first derivative in y 50 and its second 60.
+            assert_close(valuation.price, 10.0, 1e-9, "price");
+            assert_close(valuation.delta, 50.0 / 100.0, 1e-9, "delta");
+            assert_close(
+                valuation.gamma,
+                (60.0 - 50.0) / (100.0 * 100.0),
+                1e-9,
+                "gamma",
+            );
+        });
     }
 
     #[test]
