@@ -155,9 +155,11 @@ impl FeeModel for ZeroFeeModel {
 ///
 /// `total_fee = commission_per_contract * quantity.abs()`
 ///
-/// This matches the typical Alpaca/IBKR per-contract options pricing.
 /// The input's `contract_size` is not used; the fee is per contract unit,
 /// not per underlying share.
+///
+/// For an option schedule with premium tiers, a minimum per order or pass-through fees, such as
+/// IBKR's US option commissions, see [`CompositeFeeModel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct PerContractFeeModel {
     #[serde(with = "rust_decimal::serde::str")]
@@ -693,6 +695,98 @@ impl FeeComponent {
 /// let large = FeeInput::new(Side::Buy, dec!(1.00), dec!(10), dec!(100), Utc::now())
 ///     .with_order_quantity(dec!(10));
 /// assert_eq!(index_options.compute_fee(&large), dec!(12.50));
+/// ```
+///
+/// # Example: IBKR's US option commissions at one volume tier
+/// IBKR Pro charges US options a commission per contract tiered by premium, with a minimum per
+/// order, and passes exchange, clearing and regulatory fees through. This schedule follows its
+/// published commissions for SmartRouted orders as read on 2026-11-13, at its lowest volume tier:
+/// up to 10,000 contracts a month. The rates change, so check the venue's current schedule before
+/// relying on them.
+///
+/// Parts of the schedule a fee model cannot express:
+/// - **Volume tiers.** The commission falls for each month's contracts beyond 10,000, 50,000 and
+///   100,000, counted across the account's trades, and the premium bands change with it. A fee
+///   model prices one fill at a time and does not see the month's count, so choose the tier the
+///   strategy's monthly volume falls in, and model the rates of that tier.
+/// - **Exchange fees and the options regulatory fee.** Each exchange charges its own, and they
+///   depend on the product, on the account's capacity and on whether the fill made or took
+///   liquidity. The simulated venue does not route orders to exchanges, so add the fees you expect
+///   as components of your own, limited to one side of the book with
+///   [`on_liquidity`](FeeComponent::on_liquidity) where they differ, and give a symbol whose
+///   fees differ, such as an index option, its own model with [`FeeModelOverrides`] (see the
+///   previous example).
+/// - **Amended orders.** IBKR may treat an amended order as a new one, and charge its minimum
+///   again. The simulated venue charges the minimum once per order, however often it is amended.
+///
+/// IBKR charges no commission on an option's exercise or assignment, and the simulated venue
+/// charges no fee on either.
+///
+/// ```
+/// use chrono::Utc;
+/// use rust_decimal_macros::dec;
+/// use rustrade_execution::fee::{
+///     CompositeFeeModel, FeeBasis, FeeComponent, FeeInput, FeeModel, Liquidity, PriceBand,
+///     PriceBands,
+/// };
+/// use rustrade_instrument::Side;
+///
+/// // The commission at up to 10,000 contracts a month: per contract by premium, and at least
+/// // $1.00 an order.
+/// let commission = FeeComponent::new(FeeBasis::PerContractByPrice(
+///     PriceBands::new(vec![
+///         PriceBand::new(dec!(0), dec!(0.25)),    // premium below $0.05
+///         PriceBand::new(dec!(0.05), dec!(0.50)), // from $0.05, below $0.10
+///         PriceBand::new(dec!(0.10), dec!(0.65)), // from $0.10
+///     ])
+///     .expect("bands start at zero and increase"),
+/// ))
+/// .with_min_per_order(dec!(1.00));
+///
+/// // The commission alone reproduces IBKR's published examples for this tier.
+/// let commission_only = CompositeFeeModel::new(vec![commission.clone()])
+///     .expect("no component has a minimum above its maximum");
+/// let order = |premium, contracts| {
+///     FeeInput::new(Side::Buy, premium, contracts, dec!(100), Utc::now())
+///         .with_order_quantity(contracts)
+/// };
+/// assert_eq!(commission_only.compute_fee(&order(dec!(2), dec!(1))), dec!(1.00));
+/// assert_eq!(commission_only.compute_fee(&order(dec!(5), dec!(2))), dec!(1.30));
+/// assert_eq!(commission_only.compute_fee(&order(dec!(0.075), dec!(3))), dec!(1.50));
+/// assert_eq!(commission_only.compute_fee(&order(dec!(0.03), dec!(5))), dec!(1.25));
+///
+/// // The minimum is per order, not per fill: 3 contracts at $2 filled as 1, then 2, pay
+/// // 3 × $0.65 in all, as one fill of 3 would.
+/// let first = FeeInput::new(Side::Buy, dec!(2), dec!(1), dec!(100), Utc::now())
+///     .with_order_quantity(dec!(3));
+/// let second = FeeInput::new(Side::Buy, dec!(2), dec!(2), dec!(100), Utc::now())
+///     .with_prior_filled(dec!(1))
+///     .with_order_quantity(dec!(3));
+/// assert_eq!(commission_only.compute_fee(&first), dec!(1.00));
+/// assert_eq!(commission_only.compute_fee(&second), dec!(0.95));
+///
+/// let ibkr_options = CompositeFeeModel::new(vec![
+///     commission,
+///     // Exchange fee and options regulatory fee, for taker fills: they depend on where the order
+///     // executes (see above). Set your own; this rate is illustrative.
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0.20))).on_liquidity(Liquidity::Taker),
+///     // OCC clearing fee: per contract.
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0.025))),
+///     // SEC Section 31 fee: a share of the value of a sale.
+///     FeeComponent::new(FeeBasis::Notional(dec!(0.0000206))).on_side(Side::Sell),
+///     // FINRA trading activity fee: per contract sold. Zero during a fee holiday that runs to
+///     // the end of 2026; a `DatedFeeModel` can charge the rate from when it resumes.
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0))).on_side(Side::Sell),
+///     // Consolidated audit trail fee: per contract.
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0.0003))),
+/// ])
+/// .expect("no component has a minimum above its maximum");
+///
+/// // A taker sale of 10 contracts at a $1.20 premium: $6.50 commission, $2.00 exchange fee,
+/// // $0.25 clearing, $0.02472 SEC fee on $1,200 of sales, and $0.003 audit trail fee.
+/// let sale = FeeInput::new(Side::Sell, dec!(1.20), dec!(10), dec!(100), Utc::now())
+///     .with_order_quantity(dec!(10));
+/// assert_eq!(ibkr_options.compute_fee(&sale), dec!(8.77772));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "Vec<FeeComponent>", into = "Vec<FeeComponent>")]
