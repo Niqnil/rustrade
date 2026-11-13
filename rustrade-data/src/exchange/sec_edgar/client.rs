@@ -259,20 +259,16 @@ impl SecEdgarClient {
             if date < from || date > to {
                 continue;
             }
-            releases.push(EarningsRelease {
-                symbol: symbol.clone(),
-                fiscal_period_end: period_end,
+            releases.push(EarningsRelease::new(
+                symbol.clone(),
+                period_end,
                 date,
-                timing: filings::timing(local.time()),
-                status: ReleaseStatus::Reported,
+                filings::timing(local.time()),
+                ReleaseStatus::Reported,
                 known_at,
-                source: ReleaseSource {
-                    provider: EarningsProvider::SecEdgar,
-                    record_id: Some(SmolStr::new(accession)),
-                    updated_at: None,
-                    observed_at,
-                },
-            });
+                ReleaseSource::new(EarningsProvider::SecEdgar, observed_at)
+                    .with_record_id(accession.as_str()),
+            ));
         }
         releases.sort_by_key(|release| (release.date, release.known_at));
         Ok(releases)

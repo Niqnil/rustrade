@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
 /// One provider's statement about one earnings release. See the [module documentation](self).
+///
+/// `#[non_exhaustive]`: fields may be added without a major-version bump. Build one with
+/// [`EarningsRelease::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EarningsRelease {
     /// The issuer's ticker symbol, as the caller named it to the provider.
     pub symbol: SmolStr,
@@ -55,6 +59,47 @@ pub struct EarningsRelease {
 }
 
 impl EarningsRelease {
+    /// A record of the release of `symbol`'s results for the fiscal period ending
+    /// `fiscal_period_end`, reported by `source`.
+    ///
+    /// ```
+    /// use chrono::{NaiveDate, TimeZone, Utc};
+    /// use rustrade_data::earnings::{
+    ///     EarningsProvider, EarningsRelease, ReleaseSource, ReleaseStatus, ReleaseTiming,
+    /// };
+    ///
+    /// let known_at = Utc.with_ymd_and_hms(2026, 1, 28, 21, 30, 0).unwrap();
+    /// let release = EarningsRelease::new(
+    ///     "XYZ",
+    ///     NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+    ///     NaiveDate::from_ymd_opt(2026, 1, 28).unwrap(),
+    ///     ReleaseTiming::AfterClose,
+    ///     ReleaseStatus::Reported,
+    ///     known_at,
+    ///     ReleaseSource::new(EarningsProvider::SecEdgar, known_at).with_record_id("0000001234-26-000002"),
+    /// );
+    /// assert_eq!(release.key().symbol, "XYZ");
+    /// ```
+    pub fn new(
+        symbol: impl Into<SmolStr>,
+        fiscal_period_end: NaiveDate,
+        date: NaiveDate,
+        timing: ReleaseTiming,
+        status: ReleaseStatus,
+        known_at: DateTime<Utc>,
+        source: ReleaseSource,
+    ) -> Self {
+        Self {
+            symbol: symbol.into(),
+            fiscal_period_end,
+            date,
+            timing,
+            status,
+            known_at,
+            source,
+        }
+    }
+
     /// The release this record describes: two records with the same key describe the same
     /// release, and the one with the later [`known_at`](Self::known_at) supersedes the other.
     pub fn key(&self) -> EarningsKey {
@@ -112,7 +157,11 @@ pub enum ReleaseStatus {
 }
 
 /// Where an [`EarningsRelease`] came from.
+///
+/// `#[non_exhaustive]`: fields may be added without a major-version bump. Build one with
+/// [`ReleaseSource::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReleaseSource {
     /// The provider that reported the record.
     pub provider: EarningsProvider,
@@ -123,6 +172,35 @@ pub struct ReleaseSource {
     pub updated_at: Option<DateTime<Utc>>,
     /// When this library fetched the record.
     pub observed_at: DateTime<Utc>,
+}
+
+impl ReleaseSource {
+    /// A record from `provider`, fetched at `observed_at`, with no record identifier or update
+    /// time.
+    pub fn new(provider: EarningsProvider, observed_at: DateTime<Utc>) -> Self {
+        Self {
+            provider,
+            record_id: None,
+            updated_at: None,
+            observed_at,
+        }
+    }
+
+    /// With the provider's own identifier for the record.
+    pub fn with_record_id(self, record_id: impl Into<SmolStr>) -> Self {
+        Self {
+            record_id: Some(record_id.into()),
+            ..self
+        }
+    }
+
+    /// With the time the provider last changed the record.
+    pub fn with_updated_at(self, updated_at: DateTime<Utc>) -> Self {
+        Self {
+            updated_at: Some(updated_at),
+            ..self
+        }
+    }
 }
 
 /// A provider of [`EarningsRelease`]s.
@@ -142,20 +220,36 @@ mod tests {
     use chrono::TimeZone;
 
     fn release(period_end: NaiveDate, known_at: DateTime<Utc>) -> EarningsRelease {
-        EarningsRelease {
-            symbol: SmolStr::new("XYZ"),
-            fiscal_period_end: period_end,
-            date: NaiveDate::from_ymd_opt(2026, 1, 28).unwrap(),
-            timing: ReleaseTiming::AfterClose,
-            status: ReleaseStatus::Confirmed,
+        EarningsRelease::new(
+            "XYZ",
+            period_end,
+            NaiveDate::from_ymd_opt(2026, 1, 28).unwrap(),
+            ReleaseTiming::AfterClose,
+            ReleaseStatus::Confirmed,
             known_at,
-            source: ReleaseSource {
-                provider: EarningsProvider::SecEdgar,
-                record_id: None,
-                updated_at: None,
-                observed_at: known_at,
-            },
-        }
+            ReleaseSource::new(EarningsProvider::SecEdgar, known_at),
+        )
+    }
+
+    #[test]
+    fn a_source_starts_without_an_id_or_update_time_and_takes_each_on_its_own() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let source = ReleaseSource::new(EarningsProvider::SecEdgar, observed_at);
+        assert_eq!(
+            (source.provider, source.record_id.clone(), source.updated_at),
+            (EarningsProvider::SecEdgar, None, None)
+        );
+        assert_eq!(source.observed_at, observed_at);
+
+        let with_id = source.clone().with_record_id("A-1");
+        assert_eq!(with_id.record_id.as_deref(), Some("A-1"));
+        assert_eq!(with_id.updated_at, None);
+
+        let with_both = with_id.with_updated_at(updated_at);
+        assert_eq!(with_both.record_id.as_deref(), Some("A-1"));
+        assert_eq!(with_both.updated_at, Some(updated_at));
+        assert_eq!(with_both.observed_at, observed_at);
     }
 
     #[test]

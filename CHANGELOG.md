@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     issuer's symbol, the fiscal period's end, the release's date and `ReleaseTiming`
     (`BeforeOpen`, `DuringSession`, `AfterClose`, `Unknown`), a `ReleaseStatus` (`Reported`,
     `Confirmed`, `Projected`, `Postponed`, `Canceled`, `Unknown`), `known_at` and a
-    `ReleaseSource`. `EarningsRelease::key` (symbol and period end) identifies the release, so a
+    `ReleaseSource`. Both structs are `#[non_exhaustive]`, so fields can be added later: build
+    them with `EarningsRelease::new` and `ReleaseSource::new` (plus `with_record_id` and
+    `with_updated_at`). `EarningsRelease::key` (symbol and period end) identifies the release, so a
     later record of the same release supersedes an earlier one.
   - **`known_at` is the earliest instant the record is known to have been public**, so a
     backtest that keeps only records known at its clock sees what a live system could have known.
