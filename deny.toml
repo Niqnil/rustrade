@@ -63,9 +63,21 @@ ignore = [
     # compiled copy ever falls below 8.2.0, this ignore would hide it: re-check on any zstd bump.
     # cargo audit also lists eight "unsound" warnings of the same date on 5.0.2 (RUSTSEC-2026-0395,
     # -0397, -0399, -0400, -0401, -0402, -0404, -0406). They are harmless for the same reason, the
-    # copy is never compiled, and are not ignored because warnings do not fail CI. They go away with
-    # the zip chain.
+    # copy is never compiled, and go away with the zip chain. They are ignored even though a warning
+    # alone does not fail `cargo audit`: CI's audit-check step reports any warning by creating and
+    # then updating a check run, and that update intermittently fails ("Not Found"), failing the
+    # job. With no warnings left, the step reports nothing and cannot hit it. Like 0403, these are
+    # ignored by id, not by version: they would also hide the compiled copy if it ever fell below
+    # its patched range (^7.4.0 or >=8.2.0), so the re-check on any zstd bump covers all nine.
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 is an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace; the compiled 8.x copy is >=8.2.0" },
+    { id = "RUSTSEC-2026-0395", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0397", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0399", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0400", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0401", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0402", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0404", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0406", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
 
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
