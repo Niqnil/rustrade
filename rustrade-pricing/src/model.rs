@@ -27,7 +27,6 @@ pub struct Valuation {
 /// change in volatility, and `rho` per 1.0 change in the rate. Multiply by 0.01 for "per vol point"
 /// or "per 1%" figures.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
 pub struct Greeks {
     /// Option price.
     pub price: f64,

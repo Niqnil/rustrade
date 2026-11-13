@@ -35,9 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`OptionInputs`** holds the contract and market inputs. Times are years of 365 days counted
     to the second (`year_fraction`), and rates are continuously compounded. Greeks are per unit
     of each input: vega per 1.0 of volatility, rho per 1.0 of rate, theta per year.
-    `OptionInputs`, `CashDividend`, `Greeks` and `ImpliedVolatilityConfig` are
-    `#[non_exhaustive]`, so fields can be added later: build them with `new` and the `with_*`
-    setters (the config from `Default`).
+    `OptionInputs`, `CashDividend` and `ImpliedVolatilityConfig` are `#[non_exhaustive]`, so
+    fields can be added later: build them with `new` and the `with_*` setters (the config from
+    `Default`).
 
 - **Earnings releases, from SEC EDGAR (past) and Alpha Vantage (coming and past), and a store
   that answers them as of any instant** (`rustrade-data`, #879).

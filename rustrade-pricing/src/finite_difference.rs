@@ -686,8 +686,11 @@ impl Solver<'_> {
         let intrinsic = self.exercise_value(spot);
         let tolerance = EXERCISE_TOLERANCE * problem.strike;
         let factor = self.stock_factor(problem.expiry);
+        // Out of the money the value and the exercise value are both about zero, so only a node
+        // in the money counts.
         let exercised = |node: usize| {
-            values[node] - self.exercise_value(grid.exp_y[node] * factor) <= tolerance
+            let exercise = self.exercise_value(grid.exp_y[node] * factor);
+            exercise > 0.0 && values[node] - exercise <= tolerance
         };
         if problem.american && exercised(node) && exercised(node + 1) {
             let exercise_delta = match problem.kind {
@@ -808,13 +811,14 @@ impl Factorization {
             OptionKind::Call => (false, matrix.lower, matrix.upper),
             OptionKind::Put => (true, matrix.upper, matrix.lower),
         };
-        let mut pivot = matrix.diagonal;
-        for step in 0..self.inverse_pivots.len() {
-            if step > 0 {
-                pivot = matrix.diagonal - to_previous * self.ratios[step - 1];
-            }
-            self.inverse_pivots[step] = 1.0 / pivot;
-            self.ratios[step] = to_next / pivot;
+        // The first row has no row before it: a previous ratio of zero leaves its pivot the
+        // diagonal exactly.
+        let mut previous_ratio = 0.0;
+        for (inverse_pivot, ratio) in self.inverse_pivots.iter_mut().zip(&mut self.ratios) {
+            let pivot = matrix.diagonal - to_previous * previous_ratio;
+            *inverse_pivot = 1.0 / pivot;
+            *ratio = to_next / pivot;
+            previous_ratio = *ratio;
         }
         self.factored = Some((matrix, kind));
         self.reversed = reversed;
@@ -1190,6 +1194,26 @@ mod tests {
                 theta: 0.0,
             };
             assert_eq!(valuation, expected, "S {spot} T {expiry} vol {volatility}");
+        }
+    }
+
+    #[test]
+    fn far_out_of_the_money_american_options_have_no_delta() {
+        // Out of the money the value and the exercise value are both about zero: that is not
+        // the exercise region, and delta stays about zero.
+        let cases = [
+            (Put, 200.0, 0.05, 0.2),
+            (Put, 300.0, 1.0, 0.1),
+            (Call, 50.0, 0.05, 0.2),
+            (Call, 40.0, 0.25, 0.2),
+        ];
+        for (kind, spot, expiry, volatility) in cases {
+            let inputs = OptionInputs::new(kind, American, spot, 100.0, expiry, 0.05);
+            let valuation = model().value(&inputs, volatility).unwrap();
+            let label = format!("{kind} S {spot} T {expiry} vol {volatility}");
+            assert_close(valuation.price, 0.0, 1e-9, &label);
+            assert_close(valuation.delta, 0.0, 1e-6, &label);
+            assert_close(valuation.theta, 0.0, 1e-6, &label);
         }
     }
 
