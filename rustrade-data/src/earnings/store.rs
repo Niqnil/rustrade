@@ -59,11 +59,11 @@ use std::{
 /// - Every record put in is kept, so memory grows with each fetch of a calendar. Only a record
 ///   equal in every field to one already held is dropped; the same calendar fetched twice differs
 ///   in [`observed_at`](super::ReleaseSource::observed_at) and is kept twice.
-/// - A query reads each of the symbol's releases, and within each the records not yet public at
-///   `as_of` before the one standing, so its cost grows with the records kept.
+/// - A query reads each of the symbol's releases, and within each skips the stronger records not
+///   yet public at `as_of` to reach the one standing, so its cost grows with the records kept.
 /// - Records supersede one another only under the same [`EarningsKey`]. Two providers whose
 ///   period ends name different months describe two releases, and an estimate whose date has
-///   passed can then be previous beside the record that the release happened.
+///   passed can then be previous beside the record reporting that the release happened.
 ///
 /// ```
 /// use chrono::{NaiveDate, TimeZone, Utc};

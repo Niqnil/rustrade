@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     next nor previous, and a `Postponed` one is next whatever its date. Any other release has
     happened once its standing record is `Reported` or dated before T's date in the store's time
     zone (`EarningsStore::new(zone)`, one zone per store); on its own date, with no `Reported`
-    record yet, it is still next. `current` gives a release's standing record and `observations` all of
-    its records. Every record is kept, so an earlier instant's answer stays the same.
+    record yet, it is still next. `current` gives a release's standing record and `observations`
+    all of its records. Every record is kept, so an earlier instant's answer stays the same.
   - **New `exchange::sec_edgar` (feature `sec-edgar`):** `SecEdgarClient::earnings_releases`
     reads a company's filing index and pairs each 10-Q or 10-K with the latest 8-K furnishing
     Item 2.02 ("Results of Operations") filed between the period's end and the report. Taking
