@@ -185,6 +185,10 @@ pub mod error;
 /// Defines the generic [`MarketEvent<T>`](MarketEvent) used in every [`MarketStream`].
 pub mod event;
 
+// No `///` here: the file carries its own `//!` documentation, and supplying both makes rustdoc
+// resolve the file's inner links in this module's scope rather than the child's.
+pub mod earnings;
+
 /// [`Connector`] implementations for each exchange.
 pub mod exchange;
 

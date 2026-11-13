@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Earnings releases, and an SEC EDGAR provider for past ones** (`rustrade-data`, #879).
+  - **New `earnings` module** with one record for every provider: `EarningsRelease` carries the
+    issuer's symbol, the fiscal period's end, the release's date and `ReleaseTiming`
+    (`BeforeOpen`, `DuringSession`, `AfterClose`, `Unknown`), a `ReleaseStatus` (`Reported`,
+    `Confirmed`, `Projected`, `Postponed`, `Canceled`, `Unknown`), `known_at` and a
+    `ReleaseSource`. `EarningsRelease::key` (symbol and period end) identifies the release, so a
+    later record of the same release supersedes an earlier one.
+  - **`known_at` is the earliest instant the record is known to have been public**, so a
+    backtest that keeps only records known at its clock sees what a live system could have known.
+  - **New `exchange::sec_edgar` (feature `sec-edgar`):** `SecEdgarClient::earnings_releases`
+    reads a company's filing index and pairs each 10-Q or 10-K with the latest 8-K furnishing
+    Item 2.02 ("Results of Operations") filed between the period's end and the report. Taking
+    the latest skips other figures some issuers furnish under the same item first, such as
+    quarterly production numbers. Each release is dated, timed against the 09:30–16:00 New York
+    session, and stamped `known_at` from the acceptance time in its filing header.
+    `company_tickers` maps tickers to CIKs.
+  - **SEC requires a declared sender:** `SecEdgarClient::new` takes a User-Agent with a name and
+    a contact email, refuses one without both, and keeps it out of `Debug`. The client paces its
+    requests to 9 a second (SEC allows 10), shared by its clones.
+  - **Known limitations:** the newest period appears only once its 10-Q or 10-K is filed, which
+    can be weeks after the release. A release whose 8-K was filed late is dated late (Item 2.02
+    allows four business days). Early closes are not known, so a release after one reads as
+    during the session. Foreign private issuers (20-F, 6-K filers) are refused with
+    `SecEdgarError::ForeignPrivateIssuer`. Some 8-Ks before 2012 lack their item list, so their
+    releases can be missing. EDGAR has no coming dates.
+  - SEC states that information on sec.gov may be copied and redistributed, citing SEC as the
+    source.
+
 - **Cancel an order's unfilled remainder after a set time** (`rustrade-execution`, `rustrade`,
   #919).
   - **New `RequestOpen::cancel_after: Option<Duration>`**, set with `with_cancel_after`. It is an

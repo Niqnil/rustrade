@@ -4,7 +4,7 @@
 //! (`2024-11-04T09:30:00`, `2024-11-04T17:16:56.205`). Converting one to an instant needs the zone's
 //! rules on that date, which move with daylight saving.
 
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 
 /// The UTC instant of a New York wall-clock time.
@@ -17,11 +17,7 @@ use chrono_tz::America::New_York;
 /// - **The skipped hour** (the second Sunday of March, 02:00 to 03:00 does not exist): no instant
 ///   has that wall time, so the time is refused (`None`) rather than shifted.
 pub fn new_york_to_utc(local: NaiveDateTime) -> Option<DateTime<Utc>> {
-    match New_York.from_local_datetime(&local) {
-        LocalResult::Single(time) => Some(time.with_timezone(&Utc)),
-        LocalResult::Ambiguous(earlier, _later) => Some(earlier.with_timezone(&Utc)),
-        LocalResult::None => None,
-    }
+    crate::exchange::new_york::to_utc(local)
 }
 
 /// The New York date of `instant`.
