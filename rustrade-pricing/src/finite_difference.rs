@@ -38,7 +38,7 @@
 
 use crate::black_scholes::discounted_forward;
 use crate::inputs::{OptionInputs, PricingError, payoff, validate_volatility};
-use crate::model::{OptionModel, RATE_BUMP, Valuation, volatility_bump};
+use crate::model::{Greeks, OptionModel, RATE_BUMP, Valuation, volatility_bump};
 use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
 
 /// Fewest space steps a model accepts: enough for the three nodes the spot's value is read from
@@ -197,6 +197,30 @@ impl FiniteDifferenceModel {
     }
 }
 
+impl FiniteDifferenceModel {
+    /// Central difference over volatility ± 1e-4 (or half the volatility, when smaller), on a
+    /// grid already laid out.
+    fn vega_on(
+        &self,
+        problem: &Problem,
+        grid: &Grid,
+        volatility: f64,
+    ) -> Result<f64, PricingError> {
+        let bump = volatility_bump(volatility);
+        let up = self.solve_at(problem, volatility + bump, problem.rate, grid)?;
+        let down = self.solve_at(problem, volatility - bump, problem.rate, grid)?;
+        Ok((up.price - down.price) / (2.0 * bump))
+    }
+
+    /// Central difference over rate ± 1e-4, holding the dividend yield fixed, on a grid already
+    /// laid out.
+    fn rho_on(&self, problem: &Problem, grid: &Grid, volatility: f64) -> Result<f64, PricingError> {
+        let up = self.solve_at(problem, volatility, problem.rate + RATE_BUMP, grid)?;
+        let down = self.solve_at(problem, volatility, problem.rate - RATE_BUMP, grid)?;
+        Ok((up.price - down.price) / (2.0 * RATE_BUMP))
+    }
+}
+
 impl OptionModel for FiniteDifferenceModel {
     fn value(&self, inputs: &OptionInputs, volatility: f64) -> Result<Valuation, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
@@ -209,10 +233,7 @@ impl OptionModel for FiniteDifferenceModel {
     fn vega(&self, inputs: &OptionInputs, volatility: f64) -> Result<f64, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
         let grid = Grid::new(&problem, volatility, self)?;
-        let bump = volatility_bump(volatility);
-        let up = self.solve_at(&problem, volatility + bump, problem.rate, &grid)?;
-        let down = self.solve_at(&problem, volatility - bump, problem.rate, &grid)?;
-        Ok((up.price - down.price) / (2.0 * bump))
+        self.vega_on(&problem, &grid, volatility)
     }
 
     /// Central difference over rate ± 1e-4, holding the dividend yield fixed, both solved on the
@@ -220,9 +241,22 @@ impl OptionModel for FiniteDifferenceModel {
     fn rho(&self, inputs: &OptionInputs, volatility: f64) -> Result<f64, PricingError> {
         let problem = Problem::new(inputs, volatility)?;
         let grid = Grid::new(&problem, volatility, self)?;
-        let up = self.solve_at(&problem, volatility, problem.rate + RATE_BUMP, &grid)?;
-        let down = self.solve_at(&problem, volatility, problem.rate - RATE_BUMP, &grid)?;
-        Ok((up.price - down.price) / (2.0 * RATE_BUMP))
+        self.rho_on(&problem, &grid, volatility)
+    }
+
+    /// The valuation, vega and rho from one grid layout: five solves.
+    fn greeks(&self, inputs: &OptionInputs, volatility: f64) -> Result<Greeks, PricingError> {
+        let problem = Problem::new(inputs, volatility)?;
+        let grid = Grid::new(&problem, volatility, self)?;
+        let valuation = self.solve_at(&problem, volatility, problem.rate, &grid)?;
+        Ok(Greeks {
+            price: valuation.price,
+            delta: valuation.delta,
+            gamma: valuation.gamma,
+            theta: valuation.theta,
+            vega: self.vega_on(&problem, &grid, volatility)?,
+            rho: self.rho_on(&problem, &grid, volatility)?,
+        })
     }
 }
 
@@ -482,33 +516,15 @@ impl Solver<'_> {
                 } else {
                     tau + dt * (step - 1) as f64
                 };
+                // Every step of the segment is given the same length, `dt`, so they share one
+                // factored matrix (a damped half step's implicit weight, 1·dt/2, equals Crank-
+                // Nicolson's 0.5·dt). The times still land exactly on the stops.
                 if steps_taken < self.model.damping_steps {
                     let middle = 0.5 * (start + next);
-                    self.advance(
-                        &mut values,
-                        &mut scratch,
-                        &operator,
-                        1.0,
-                        middle - start,
-                        middle,
-                    );
-                    self.advance(
-                        &mut values,
-                        &mut scratch,
-                        &operator,
-                        1.0,
-                        next - middle,
-                        next,
-                    );
+                    self.advance(&mut values, &mut scratch, &operator, 1.0, 0.5 * dt, middle);
+                    self.advance(&mut values, &mut scratch, &operator, 1.0, 0.5 * dt, next);
                 } else {
-                    self.advance(
-                        &mut values,
-                        &mut scratch,
-                        &operator,
-                        0.5,
-                        next - start,
-                        next,
-                    );
+                    self.advance(&mut values, &mut scratch, &operator, 0.5, dt, next);
                 }
                 steps_taken += 1;
             }
@@ -563,17 +579,16 @@ impl Solver<'_> {
         // grid's in-the-money end, and the floor can be applied exactly inside the solve. A
         // negative yield can split a put's exercise region in two, so it is floored after.
         let floor_in_solve = american && self.problem.dividend_yield >= 0.0;
-        solve_tridiagonal(
-            rhs,
-            &mut scratch.upper,
+        let factorization = &mut scratch.factorization;
+        factorization.refresh(
             Tridiagonal {
                 lower: -implicit * to_lower,
                 diagonal: 1.0 + implicit * to_self,
                 upper: -implicit * to_upper,
             },
             self.problem.kind,
-            floor_in_solve.then_some(&scratch.exercise[1..n]),
         );
+        factorization.solve(rhs, floor_in_solve.then_some(&scratch.exercise[1..n]));
 
         values[0] = low;
         values[n] = high;
@@ -700,7 +715,7 @@ const EXERCISE_TOLERANCE: f64 = 1e-12;
 /// Reusable buffers for one solve.
 struct Scratch {
     rhs: Vec<f64>,
-    upper: Vec<f64>,
+    factorization: Factorization,
     jumped: Vec<f64>,
     exercise: Vec<f64>,
 }
@@ -709,7 +724,7 @@ impl Scratch {
     fn new(n: usize) -> Self {
         Self {
             rhs: vec![0.0; n - 1],
-            upper: vec![0.0; n - 1],
+            factorization: Factorization::new(n - 1),
             jumped: vec![0.0; n + 1],
             exercise: vec![0.0; n + 1],
         }
@@ -726,55 +741,97 @@ struct Operator {
 }
 
 /// A tridiagonal matrix with constant diagonals.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Tridiagonal {
     lower: f64,
     diagonal: f64,
     upper: f64,
 }
 
-/// Solves `matrix · x = rhs` in place in `rhs` (Thomas algorithm), `scratch` being of the same
-/// length.
+/// A [`Tridiagonal`] matrix factored for the Thomas algorithm, in the elimination order of one
+/// option kind.
 ///
-/// With a `floor`, each unknown is floored at it as the back substitution reaches it, which
-/// solves the early-exercise problem exactly when the exercise region is one interval at the
-/// in-the-money end (Brennan-Schwartz). The back substitution must start from that end: the high
-/// end for a call, the low end for a put, so a put eliminates from the top down.
-fn solve_tridiagonal(
-    rhs: &mut [f64],
-    scratch: &mut [f64],
-    matrix: Tridiagonal,
-    kind: OptionKind,
-    floor: Option<&[f64]>,
-) {
-    let len = rhs.len();
-    // Elimination runs away from the exercise end; `to_previous` couples a row to the row
-    // eliminated before it, `to_next` to the one after.
-    let (index, to_previous, to_next): (&dyn Fn(usize) -> usize, f64, f64) = match kind {
-        OptionKind::Call => (&|step| step, matrix.lower, matrix.upper),
-        OptionKind::Put => (&|step| len - 1 - step, matrix.upper, matrix.lower),
-    };
-    let diagonal = matrix.diagonal;
+/// The matrix depends only on the step length, which is the same for every step of a segment
+/// between dividends, so the factorization is reused across steps and each solve needs no
+/// division.
+///
+/// Elimination runs away from the exercise end, so that with a floor each unknown is floored as
+/// the back substitution reaches it. That solves the early-exercise problem exactly when the
+/// exercise region is one interval at the in-the-money end (Brennan-Schwartz). The back
+/// substitution must start from that end: the high end for a call, the low end for a put, so a
+/// put eliminates from the top down.
+struct Factorization {
+    /// The matrix and kind factored, or `None` before the first.
+    factored: Option<(Tridiagonal, OptionKind)>,
+    /// Whether elimination runs from the last row to the first (a put).
+    reversed: bool,
+    /// The coupling of a row to the row eliminated before it.
+    to_previous: f64,
+    /// `1 / pivot` for each elimination step.
+    inverse_pivots: Vec<f64>,
+    /// The coupling of each step's row to the next row, divided by its pivot.
+    ratios: Vec<f64>,
+}
 
-    let first = index(0);
-    scratch[0] = to_next / diagonal;
-    rhs[first] /= diagonal;
-    for step in 1..len {
-        let (row, previous) = (index(step), index(step - 1));
-        let pivot = diagonal - to_previous * scratch[step - 1];
-        scratch[step] = to_next / pivot;
-        rhs[row] = (rhs[row] - to_previous * rhs[previous]) / pivot;
+impl Factorization {
+    fn new(len: usize) -> Self {
+        Self {
+            factored: None,
+            reversed: false,
+            to_previous: 0.0,
+            inverse_pivots: vec![0.0; len],
+            ratios: vec![0.0; len],
+        }
     }
 
-    let floored = |row: usize, value: f64| match floor {
-        Some(floor) => value.max(floor[row]),
-        None => value,
-    };
-    let last = index(len - 1);
-    rhs[last] = floored(last, rhs[last]);
-    for step in (0..len - 1).rev() {
-        let (row, next) = (index(step), index(step + 1));
-        rhs[row] = floored(row, rhs[row] - scratch[step] * rhs[next]);
+    /// Factors `matrix` for `kind`, unless it is already the one factored.
+    fn refresh(&mut self, matrix: Tridiagonal, kind: OptionKind) {
+        if self.factored == Some((matrix, kind)) {
+            return;
+        }
+        // `to_previous` couples a row to the row eliminated before it, `to_next` to the one
+        // after.
+        let (reversed, to_previous, to_next) = match kind {
+            OptionKind::Call => (false, matrix.lower, matrix.upper),
+            OptionKind::Put => (true, matrix.upper, matrix.lower),
+        };
+        let mut pivot = matrix.diagonal;
+        for step in 0..self.inverse_pivots.len() {
+            if step > 0 {
+                pivot = matrix.diagonal - to_previous * self.ratios[step - 1];
+            }
+            self.inverse_pivots[step] = 1.0 / pivot;
+            self.ratios[step] = to_next / pivot;
+        }
+        self.factored = Some((matrix, kind));
+        self.reversed = reversed;
+        self.to_previous = to_previous;
+    }
+
+    /// Solves the factored system for `rhs`, in place, flooring each unknown at `floor` when
+    /// given (see the type's docs).
+    fn solve(&self, rhs: &mut [f64], floor: Option<&[f64]>) {
+        let len = rhs.len();
+        let reversed = self.reversed;
+        let index = |step: usize| if reversed { len - 1 - step } else { step };
+        let to_previous = self.to_previous;
+
+        rhs[index(0)] *= self.inverse_pivots[0];
+        for step in 1..len {
+            let (row, previous) = (index(step), index(step - 1));
+            rhs[row] = (rhs[row] - to_previous * rhs[previous]) * self.inverse_pivots[step];
+        }
+
+        let floored = |row: usize, value: f64| match floor {
+            Some(floor) => value.max(floor[row]),
+            None => value,
+        };
+        let last = index(len - 1);
+        rhs[last] = floored(last, rhs[last]);
+        for step in (0..len - 1).rev() {
+            let (row, next) = (index(step), index(step + 1));
+            rhs[row] = floored(row, rhs[row] - self.ratios[step] * rhs[next]);
+        }
     }
 }
 
