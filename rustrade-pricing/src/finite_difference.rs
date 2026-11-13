@@ -834,9 +834,9 @@ impl Factorization {
         let to_previous = self.to_previous;
 
         rhs[index(0)] *= self.inverse_pivots[0];
-        for step in 1..len {
+        for (step, inverse_pivot) in self.inverse_pivots[..len].iter().enumerate().skip(1) {
             let (row, previous) = (index(step), index(step - 1));
-            rhs[row] = (rhs[row] - to_previous * rhs[previous]) * self.inverse_pivots[step];
+            rhs[row] = (rhs[row] - to_previous * rhs[previous]) * inverse_pivot;
         }
 
         let floored = |row: usize, value: f64| match floor {
