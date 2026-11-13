@@ -59,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       date is announced or estimated, and are known when fetched. The calendar lists only dates
       Alpha Vantage has, so a company without one is missing.
     - Past releases are `Reported` and known by their session bound: 09:30 New York on the
-      release date for a release before the open, else 00:00 New York the next day.
+      release date for a release before the open, else 00:00 New York the next day. A release
+      whose bound has not passed when fetched is `Unknown`, known when fetched.
     - Alpha Vantage answers a refused request (its request rate, its daily allowance, a
       premium-only call) with HTTP 200 and a notice; on the CSV calendar the notice arrives cut
       into the columns. Both read as `AlphaVantageError::Refused`. An unknown symbol's empty

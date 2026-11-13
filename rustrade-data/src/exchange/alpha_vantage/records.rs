@@ -65,10 +65,11 @@ struct Quarter {
 
 /// The releases in an `EARNINGS` body for `symbol`, fetched at `observed_at`, oldest first.
 ///
-/// A release dated on or before `observed_at`'s New York date is [`ReleaseStatus::Reported`],
-/// public by its session bound: the open on its date if it came before the open, else the end of
-/// its date. One dated later has not happened when fetched: [`ReleaseStatus::Unknown`], known at
-/// `observed_at`.
+/// A release whose session bound has passed by `observed_at` is [`ReleaseStatus::Reported`],
+/// public by that bound: the open on its date if it came before the open, else the end of its
+/// date. Any other release, dated later or on the fetch day before its bound, is not known to have
+/// happened when fetched: [`ReleaseStatus::Unknown`], known at `observed_at`. So no record's
+/// `known_at` is later than `observed_at`.
 pub(crate) fn history(
     body: &str,
     symbol: &str,
@@ -81,7 +82,6 @@ pub(crate) fn history(
             symbol: symbol.to_owned(),
         });
     }
-    let today = new_york::date_of(observed_at);
     let source = ReleaseSource::new(EarningsProvider::AlphaVantage, observed_at);
     let mut releases = history
         .quarterly
@@ -89,8 +89,9 @@ pub(crate) fn history(
         .map(|quarter| {
             let date = date(&quarter.reported_date, "reportedDate")?;
             let timing = timing(quarter.report_time.as_deref().unwrap_or(""))?;
-            let (status, known_at) = if date <= today {
-                (ReleaseStatus::Reported, session_bound(date, timing)?)
+            let bound = session_bound(date, timing)?;
+            let (status, known_at) = if bound <= observed_at {
+                (ReleaseStatus::Reported, bound)
             } else {
                 (ReleaseStatus::Unknown, observed_at)
             };
@@ -121,8 +122,11 @@ pub(crate) fn calendar(
             AlphaVantageError::decode("earnings calendar: JSON in place of CSV")
         }));
     }
+    // `flexible`: a notice cut into the columns has as many fields as its key has characters, up
+    // to the header's count. A short ordinary row still fails, on its first missing field.
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
+        .flexible(true)
         .from_reader(body.as_bytes());
     let headers = reader
         .headers()
@@ -210,7 +214,7 @@ fn timing(text: &str) -> Result<ReleaseTiming, AlphaVantageError> {
     }
 }
 
-/// When a past release dated `date` was public by: the open on `date` if it came before the
+/// When a release dated `date` was public by: the open on `date` if it came before the
 /// open, else the end of `date` (00:00 New York the next day), the latest the date allows.
 fn session_bound(
     date: NaiveDate,
@@ -352,12 +356,41 @@ mod tests {
     }
 
     #[test]
-    fn a_release_dated_on_the_fetch_day_is_reported() {
+    fn a_release_on_the_fetch_day_is_reported_only_once_its_bound_has_passed() {
+        // Fetched at 15:00 New York: past the open, not yet the end of the day.
         let body = r#"{"symbol": "XYZ", "quarterlyEarnings": [
-            {"fiscalDateEnding": "2026-09-30", "reportedDate": "2026-11-13", "reportTime": "pre-market"}
+            {"fiscalDateEnding": "2026-09-30", "reportedDate": "2026-11-13", "reportTime": "pre-market"},
+            {"fiscalDateEnding": "2026-08-31", "reportedDate": "2026-11-13", "reportTime": "post-market"},
+            {"fiscalDateEnding": "2026-07-31", "reportedDate": "2026-11-13", "reportTime": ""}
         ]}"#;
         let releases = history(body, "XYZ", observed()).unwrap();
-        assert_eq!(releases[0].status, ReleaseStatus::Reported);
+        let open = new_york::to_utc(day(2026, 11, 13).and_time(SESSION_OPEN)).unwrap();
+        let rows: Vec<_> = releases
+            .iter()
+            .map(|r| (r.timing, r.status, r.known_at))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (ReleaseTiming::Unknown, ReleaseStatus::Unknown, observed()),
+                (
+                    ReleaseTiming::AfterClose,
+                    ReleaseStatus::Unknown,
+                    observed()
+                ),
+                (ReleaseTiming::BeforeOpen, ReleaseStatus::Reported, open),
+            ]
+        );
+        // At its bound exactly, a release is reported.
+        let at_bound = history(body, "XYZ", open).unwrap();
+        assert_eq!(
+            at_bound.iter().map(|r| r.status).collect::<Vec<_>>(),
+            vec![
+                ReleaseStatus::Unknown,
+                ReleaseStatus::Unknown,
+                ReleaseStatus::Reported
+            ]
+        );
     }
 
     #[test]
@@ -450,6 +483,11 @@ mod tests {
             matches!(refused, Err(AlphaVantageError::Refused { .. })),
             "{refused:?}"
         );
+        let note = calendar(&format!("{HEADER}N,o,t,e\r\n"), observed());
+        assert!(
+            matches!(note, Err(AlphaVantageError::Refused { .. })),
+            "{note:?}"
+        );
         let error = calendar(&format!("{HEADER}E,r,r,o,r, ,M\r\n"), observed());
         assert!(
             matches!(error, Err(AlphaVantageError::Api { status: 200, .. })),
@@ -473,6 +511,11 @@ mod tests {
         let body = format!("{HEADER}X,Y,Z,W,V,U,T\r\n");
         assert!(matches!(
             calendar(&body, observed()),
+            Err(AlphaVantageError::Decode { .. })
+        ));
+        let short = format!("{HEADER}AAA,Aye,2026-11-20\r\n");
+        assert!(matches!(
+            calendar(&short, observed()),
             Err(AlphaVantageError::Decode { .. })
         ));
         let missing = "symbol,name,reportDate\r\nAAA,Aye,2026-11-20\r\n";

@@ -123,11 +123,12 @@ impl AlphaVantageClient {
 
     /// `symbol`'s past quarterly earnings releases, oldest first. One request.
     ///
-    /// Each record is [`ReleaseStatus::Reported`] and public by the session bound of its date:
+    /// A record is [`ReleaseStatus::Reported`] and public by the session bound of its date:
     /// the regular session's open (09:30 New York) for a release before the open, else the end
-    /// of its date (00:00 New York the next day), the latest the date allows. A row dated after
-    /// the fetch, should Alpha Vantage send one, has not happened yet: [`ReleaseStatus::Unknown`],
-    /// known when fetched. The records keep `symbol` as given.
+    /// of its date (00:00 New York the next day), the latest the date allows. A row whose bound
+    /// has not passed when fetched (dated later, or dated that day and not yet past its bound) is
+    /// not known to have happened: [`ReleaseStatus::Unknown`], known when fetched. So no record is
+    /// known later than it was fetched. The records keep `symbol` as given.
     ///
     /// # Errors
     /// - [`AlphaVantageError::InvalidInput`] if `symbol` is empty.
@@ -147,9 +148,9 @@ impl AlphaVantageClient {
             .await?;
         let observed_at = Utc::now();
         if let Some(error) = records::notice(&body) {
-            return Err(self.scrubbed(error));
+            return Err(error);
         }
-        records::history(&body, symbol, observed_at).map_err(|error| self.scrubbed(error))
+        records::history(&body, symbol, observed_at)
     }
 
     /// The releases Alpha Vantage expects within `horizon`: of `symbol` only, or of every company
@@ -180,17 +181,19 @@ impl AlphaVantageClient {
         }
         let body = self.get(&params).await?;
         let observed_at = Utc::now();
-        records::calendar(&body, observed_at).map_err(|error| self.scrubbed(error))
+        records::calendar(&body, observed_at)
     }
 
-    /// The body of a successful `GET /query` with `params` and the API key.
+    /// The body of a successful `GET /query` with `params` and the API key, without the key.
+    ///
+    /// Every error message is built from this body, or from an error body or transport error
+    /// scrubbed here, so none holds the key. Scrubbing comes before any message is capped, which
+    /// could otherwise cut the key and leave a part of it that no longer matches.
     async fn get(&self, params: &[(&str, &str)]) -> Result<String, AlphaVantageError> {
         self.pacer.wait().await;
         // `without_url`: the URL carries the API key in its query.
-        let transport = |e: reqwest::Error| {
-            self.scrubbed(AlphaVantageError::Http {
-                message: e.without_url().to_string(),
-            })
+        let transport = |e: reqwest::Error| AlphaVantageError::Http {
+            message: self.scrubbed(e.without_url().to_string()),
         };
         let response = self
             .http
@@ -205,33 +208,21 @@ impl AlphaVantageClient {
             let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES)
                 .await
                 .unwrap_or_default();
-            return Err(self.scrubbed(AlphaVantageError::Api {
+            return Err(AlphaVantageError::Api {
                 status: status.as_u16(),
-                message: super::error::cap(&body),
-            }));
+                message: super::error::cap(&self.scrubbed(body)),
+            });
         }
-        response.text().await.map_err(transport)
+        let body = response.text().await.map_err(transport)?;
+        Ok(self.scrubbed(body))
     }
 
-    /// `error` with the API key replaced wherever its message holds it.
-    fn scrubbed(&self, error: AlphaVantageError) -> AlphaVantageError {
-        let scrub = |text: String| text.replace(&self.api_key, KEY_PLACEHOLDER);
-        match error {
-            AlphaVantageError::Refused { message } => AlphaVantageError::Refused {
-                message: scrub(message),
-            },
-            AlphaVantageError::Api { status, message } => AlphaVantageError::Api {
-                status,
-                message: scrub(message),
-            },
-            AlphaVantageError::Http { message } => AlphaVantageError::Http {
-                message: scrub(message),
-            },
-            AlphaVantageError::Decode { message } => AlphaVantageError::Decode {
-                message: scrub(message),
-            },
-            other @ (AlphaVantageError::NotFound { .. }
-            | AlphaVantageError::InvalidInput { .. }) => other,
+    /// `text` with the API key replaced wherever it appears.
+    fn scrubbed(&self, text: String) -> String {
+        if text.contains(&self.api_key) {
+            text.replace(&self.api_key, KEY_PLACEHOLDER)
+        } else {
+            text
         }
     }
 }
@@ -311,32 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn every_message_loses_the_key() {
+    fn scrubbing_replaces_every_copy_of_the_key() {
         let client = AlphaVantageClient::new("KEY123").unwrap();
-        let with_key = || "bad key KEY123 here".to_owned();
-        for error in [
-            AlphaVantageError::Refused {
-                message: with_key(),
-            },
-            AlphaVantageError::Api {
-                status: 200,
-                message: with_key(),
-            },
-            AlphaVantageError::Http {
-                message: with_key(),
-            },
-            AlphaVantageError::Decode {
-                message: with_key(),
-            },
-        ] {
-            let text = client.scrubbed(error).to_string();
-            assert!(!text.contains("KEY123"), "{text}");
-            assert!(text.contains("bad key <api key> here"), "{text}");
-        }
-        let not_found = AlphaVantageError::NotFound {
-            symbol: "XYZ".into(),
-        };
-        assert_eq!(client.scrubbed(not_found.clone()), not_found);
+        assert_eq!(
+            client.scrubbed("KEY123 bad key KEY123 here".to_owned()),
+            "<api key> bad key <api key> here"
+        );
+        assert_eq!(client.scrubbed("no key".to_owned()), "no key");
     }
 
     #[test]

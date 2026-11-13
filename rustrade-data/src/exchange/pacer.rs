@@ -27,8 +27,8 @@ impl Pacer {
         self.interval
     }
 
-    /// Wait for this request's slot. A caller dropped while waiting gives up its slot unused but
-    /// blocks no one.
+    /// Wait for this request's slot. A caller dropped while waiting leaves its slot unused: later
+    /// requests still wait for it, one interval each, but none is blocked indefinitely.
     pub(crate) async fn wait(&self) {
         tokio::time::sleep_until(self.claim()).await;
     }

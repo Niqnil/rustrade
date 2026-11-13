@@ -209,6 +209,35 @@ async fn notices_and_error_statuses_keep_their_meaning_without_the_key() {
 }
 
 #[tokio::test]
+async fn a_key_cut_by_the_message_cap_leaves_no_part_behind() {
+    // The key starts 505 bytes in, so a cap at 512 bytes would cut it.
+    let text = format!("{}{KEY} tail", "x".repeat(505));
+    let server = MockServer::start().await;
+    let respond = |symbol: &str, response: ResponseTemplate| {
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .and(query_param("symbol", symbol))
+            .respond_with(response)
+    };
+    respond(
+        "NOTICE",
+        ResponseTemplate::new(200).set_body_string(format!(r#"{{"Information": "{text}"}}"#)),
+    )
+    .mount(&server)
+    .await;
+    respond("STATUS", ResponseTemplate::new(500).set_body_string(text))
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    for symbol in ["NOTICE", "STATUS"] {
+        let error = client.earnings_history(symbol).await.unwrap_err();
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains(&KEY[..7]), "{symbol}: {shown}");
+        assert!(shown.contains("<api ke"), "{symbol}: {shown}");
+    }
+}
+
+#[tokio::test]
 async fn a_calendar_refusal_cut_into_the_csv_is_refused() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

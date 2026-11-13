@@ -5,6 +5,7 @@
 //! rules on that date, which move with daylight saving.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono_tz::America::New_York;
 
 /// The UTC instant of a New York wall-clock time.
 ///
@@ -21,7 +22,7 @@ pub fn new_york_to_utc(local: NaiveDateTime) -> Option<DateTime<Utc>> {
 
 /// The New York date of `instant`.
 pub(crate) fn new_york_date(instant: DateTime<Utc>) -> NaiveDate {
-    crate::exchange::new_york::date_of(instant)
+    instant.with_timezone(&New_York).date_naive()
 }
 
 /// Parse a ThetaData timestamp (`YYYY-MM-DDTHH:MM:SS` with an optional fraction) as New York time

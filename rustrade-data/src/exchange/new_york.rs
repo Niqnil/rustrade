@@ -18,12 +18,6 @@ pub(crate) fn to_utc(local: NaiveDateTime) -> Option<DateTime<Utc>> {
     }
 }
 
-/// The New York date of `instant`.
-#[cfg(any(feature = "thetadata", feature = "alpha-vantage"))]
-pub(crate) fn date_of(instant: DateTime<Utc>) -> chrono::NaiveDate {
-    instant.with_timezone(&New_York).date_naive()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -59,20 +53,6 @@ mod tests {
         assert_eq!(
             to_utc(local(2026, 11, 1, 1, 30)),
             Some(utc(2026, 11, 1, 5, 30))
-        );
-    }
-
-    #[test]
-    #[cfg(any(feature = "thetadata", feature = "alpha-vantage"))]
-    fn an_instant_takes_new_yorks_date_not_utcs() {
-        // 03:30 UTC is still the evening before in New York.
-        assert_eq!(
-            date_of(utc(2026, 7, 16, 3, 30)),
-            NaiveDate::from_ymd_opt(2026, 7, 15).unwrap()
-        );
-        assert_eq!(
-            date_of(utc(2026, 7, 16, 4, 30)),
-            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
         );
     }
 

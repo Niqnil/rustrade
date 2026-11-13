@@ -29,9 +29,9 @@
 //!   have yet is missing, even within the horizon, and it does not say whether a date is
 //!   announced or estimated ([`ReleaseStatus::Unknown`](crate::earnings::ReleaseStatus::Unknown)).
 //!   It can include a release dated the day before the request.
-//! - **Point in time.** A calendar record is known when fetched. A past release is known by the
-//!   end of its session bound (see [`AlphaVantageClient::earnings_history`]), never earlier than
-//!   it was public; its exact time is not known.
+//! - **Point in time.** A calendar record is known when fetched. A past release is known by its
+//!   session bound (see [`AlphaVantageClient::earnings_history`]), never earlier than it was
+//!   public; its exact time is not known. One whose bound has not passed is known when fetched.
 //! - **Symbols** are Alpha Vantage's: it writes share classes with either `.` or `-`.
 //!
 //! # Refusals
