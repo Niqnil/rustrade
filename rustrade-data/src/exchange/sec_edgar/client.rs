@@ -13,10 +13,11 @@ use crate::{
     },
 };
 use chrono::{NaiveDate, TimeDelta, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, de::DeserializeOwned};
 use smol_str::SmolStr;
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::time::Instant;
 
 /// Where SEC serves its website and filing archive.
 pub const DEFAULT_WWW_URL: &str = "https://www.sec.gov";
@@ -33,9 +34,10 @@ const DEFAULT_REQUESTS_PER_SECOND: NonZeroU32 = match NonZeroU32::new(9) {
     None => unreachable!(),
 };
 
-/// How long after a release its 8-K can be filed: Item 2.02 allows four business days, which a
-/// weekend and a holiday stretch to eight calendar days. Releases whose 8-K was filed later than
-/// this after the requested range are not looked up.
+/// How long a filing's date can trail the New York date of its acceptance, which dates its
+/// release. EDGAR dates a filing accepted after 17:30 the next business day, so a weekend and a
+/// holiday put up to four calendar days between them; the rest is margin for closures. Releases
+/// whose 8-K is dated later than this after the requested range are not looked up.
 const MAX_FILING_LAG: TimeDelta = TimeDelta::days(8);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -181,7 +183,8 @@ impl SecEdgarClient {
     ///
     /// # Errors
     /// - [`SecEdgarError::InvalidInput`] if `from` is after `to`.
-    /// - [`SecEdgarError::NotFound`] if SEC knows no company `cik`.
+    /// - [`SecEdgarError::NotFound`] if SEC knows no company `cik`, or a filing its index lists
+    ///   is missing.
     /// - [`SecEdgarError::ForeignPrivateIssuer`] if the company files 20-F, 40-F and 6-K reports.
     /// - Any request's error.
     pub async fn earnings_releases(
@@ -359,17 +362,20 @@ impl Pacer {
         }
     }
 
-    /// Wait for this request's slot. The lock is held only to claim the slot, not while waiting,
-    /// so a caller dropped while waiting gives up its slot unused but blocks no one.
+    /// Wait for this request's slot. A caller dropped while waiting gives up its slot unused but
+    /// blocks no one.
     async fn wait(&self) {
-        let slot = {
-            let mut next = self.next.lock().await;
-            let now = Instant::now();
-            let slot = next.map_or(now, |next| next.max(now));
-            *next = Some(slot + self.interval);
-            slot
-        };
-        tokio::time::sleep_until(slot).await;
+        tokio::time::sleep_until(self.claim()).await;
+    }
+
+    /// Claim the next free slot: now, or one interval after the last claimed slot if that is
+    /// later.
+    fn claim(&self) -> Instant {
+        let mut next = self.next.lock();
+        let now = Instant::now();
+        let slot = next.map_or(now, |next| next.max(now));
+        *next = Some(slot + self.interval);
+        slot
     }
 }
 

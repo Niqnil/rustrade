@@ -272,6 +272,19 @@ async fn an_evening_filing_dated_the_next_business_day_keeps_its_release_date() 
     assert_eq!(releases.len(), 1);
     assert_eq!(releases[0].date, date(2026, 7, 17));
     assert_eq!(releases[0].timing, ReleaseTiming::AfterClose);
+    drop(server);
+
+    // A range starting on the Monday the filing is dated: its header is read, and the release,
+    // dated Friday, is dropped.
+    let server = MockServer::start().await;
+    mount_submissions(&server, submissions(&rows, json!([]))).await;
+    mount_header(&server, "0000001234-26-000019", "20260717180500", 1).await;
+    let releases = client(&server)
+        .await
+        .earnings_releases(CIK, "XYZ", date(2026, 7, 20), date(2026, 7, 24))
+        .await
+        .unwrap();
+    assert_eq!(releases, vec![]);
 }
 
 #[tokio::test]
@@ -320,7 +333,7 @@ async fn older_pages_are_read_only_when_the_range_reaches_them() {
 
     // A range reaching back into the page: it is read, and its release paired.
     let server = MockServer::start().await;
-    mount_submissions(&server, submissions(&YEAR, pages)).await;
+    mount_submissions(&server, submissions(&YEAR, pages.clone())).await;
     Mock::given(method("GET"))
         .and(path(format!("/submissions/{page_name}")))
         .and(header("user-agent", USER_AGENT))
@@ -339,6 +352,23 @@ async fn older_pages_are_read_only_when_the_range_reaches_them() {
         .map(|r| (r.fiscal_period_end, r.date))
         .collect();
     assert_eq!(pairs, vec![(date(2020, 6, 30), date(2020, 7, 21))]);
+    drop(server);
+
+    // A range starting on the page's last filing date: the page is read.
+    let server = MockServer::start().await;
+    mount_submissions(&server, submissions(&YEAR, pages)).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/submissions/{page_name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(columns(&page_rows)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let releases = client(&server)
+        .await
+        .earnings_releases(CIK, "XYZ", date(2020, 8, 5), date(2020, 8, 31))
+        .await
+        .unwrap();
+    assert_eq!(releases, vec![]);
 }
 
 #[tokio::test]

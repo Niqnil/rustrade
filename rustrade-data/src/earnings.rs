@@ -17,7 +17,12 @@
 //! [`known_at`](EarningsRelease::known_at) is the earliest instant the record's content is known
 //! to have been public: the release itself for a past release, or the moment the library fetched
 //! the record when the provider gives no better time. A backtest that only uses records whose
-//! `known_at` is at or before its clock sees what a live system could have known then.
+//! `known_at` is at or before its clock uses only what had been made public by then.
+//!
+//! That bounds when the content was public, not when a provider could return it. A provider can
+//! publish a record well after its `known_at`: SEC EDGAR, for one, returns a release only once
+//! the period's quarterly or annual report is filed, often weeks later. A backtest that must only
+//! see what a given provider would have returned live has to apply that provider's delay itself.
 //!
 //! No provider records when an issuer announced a coming date, so a calendar's `known_at` is only
 //! as early as its first fetch. Records fetched and kept over time are the only history of a
@@ -87,7 +92,10 @@ pub enum ReleaseTiming {
 }
 
 /// How certain a release's date is.
+///
+/// `#[non_exhaustive]`: providers' calendars may need statuses added without a major-version bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ReleaseStatus {
     /// The release has happened on this date.
     Reported,

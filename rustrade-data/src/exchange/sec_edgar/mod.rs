@@ -30,8 +30,11 @@
 //! - **Dated by the 8-K's acceptance.** The release's [`date`](crate::earnings::EarningsRelease::date),
 //!   [`timing`](crate::earnings::EarningsRelease::timing) (against the regular session, 09:30 to 16:00 New York
 //!   time) and [`known_at`](crate::earnings::EarningsRelease::known_at) come from the acceptance time in the
-//!   filing's header. Companies usually furnish the 8-K with the release, minutes after it, but
-//!   Item 2.02 allows up to four business days: a late filing dates its release late. Early closes
+//!   filing's header, so they describe the filing. Companies usually furnish the 8-K with the
+//!   release, minutes after it, but Item 2.02 allows up to four business days: a late filing dates
+//!   its release late, and even a filing on the same day can move its timing (a release before the
+//!   open whose 8-K is accepted after the close reads as
+//!   [`AfterClose`](crate::earnings::ReleaseTiming::AfterClose)). Early closes
 //!   are not known here, so a release after an early close but before 16:00 reads as
 //!   [`DuringSession`](crate::earnings::ReleaseTiming::DuringSession).
 //!
@@ -39,6 +42,8 @@
 //! - **Foreign private issuers** file 20-F, 40-F and 6-K reports, which carry no item numbers:
 //!   [`SecEdgarError::ForeignPrivateIssuer`].
 //! - **Results first disclosed in the 10-Q or 10-K**, with no 8-K: no release.
+//! - **A later Item 2.02 filing before the report**, such as an updated outlook furnished between
+//!   the results and the 10-Q: it is taken as the release, in place of the results.
 //! - **Older filings**: EDGAR's item lists are complete from 2012; some earlier 8-Ks lack them, so
 //!   their releases can be missing.
 //! - **Coming releases**: EDGAR records filings only after the fact.

@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     requests to 9 a second (SEC allows 10), shared by its clones.
   - **Known limitations:** the newest period appears only once its 10-Q or 10-K is filed, which
     can be weeks after the release. A release whose 8-K was filed late is dated late (Item 2.02
-    allows four business days). Early closes are not known, so a release after one reads as
+    allows four business days), and its timing describes the 8-K's acceptance, which can come
+    hours after the release. A later Item 2.02 filing before the report, such as an updated
+    outlook, is taken as the release. Early closes are not known, so a release after one reads as
     during the session. Foreign private issuers (20-F, 6-K filers) are refused with
     `SecEdgarError::ForeignPrivateIssuer`. Some 8-Ks before 2012 lack their item list, so their
     releases can be missing. EDGAR has no coming dates.
