@@ -73,10 +73,22 @@ pub mod thetadata;
 #[cfg(feature = "sec-edgar")]
 pub mod sec_edgar;
 
+// No `///` here, for the reason given on `lse` above.
+#[cfg(feature = "alpha-vantage")]
+pub mod alpha_vantage;
+
 /// New York wall-clock times, shared by the providers that report US market times without an
 /// offset.
-#[cfg(any(feature = "thetadata", feature = "sec-edgar"))]
+#[cfg(any(
+    feature = "thetadata",
+    feature = "sec-edgar",
+    feature = "alpha-vantage"
+))]
 pub(crate) mod new_york;
+
+/// Even request spacing, shared by the REST providers whose limits are a request rate.
+#[cfg(any(feature = "sec-edgar", feature = "alpha-vantage"))]
+pub(crate) mod pacer;
 
 /// OSI option contract symbols, shared by the providers that spell contracts that way.
 #[cfg(any(feature = "lse", feature = "massive"))]

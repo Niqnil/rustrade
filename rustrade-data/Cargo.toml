@@ -54,6 +54,10 @@ thetadata = ["dep:chrono-tz", "serde_json/raw_value", "reqwest/stream"]
 # User-Agent. `chrono-tz` converts EDGAR's New York acceptance times to UTC (already in the
 # workspace tree via `rustrade-execution`).
 sec-edgar = ["dep:chrono-tz"]
+# Alpha Vantage: earnings calendar and earnings history (free key; non-commercial terms).
+# `chrono-tz` places its session-bound times in New York; `csv` reads the calendar, which Alpha
+# Vantage serves only as CSV (already in the workspace tree via `databento`'s `dbn`).
+alpha-vantage = ["dep:chrono-tz", "dep:csv"]
 
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
@@ -111,6 +115,8 @@ hex = { workspace = true, optional = true }
 # one-line fix if that day comes; carrying the dependency for a switch that has not happened is
 # supply-chain surface a public library should not spend up front.
 parquet = { version = "60.0.0", default-features = false, features = ["zstd"], optional = true }
+# Reads Alpha Vantage's earnings calendar, which it serves only as CSV, with quoted fields.
+csv = { version = "1.4.0", optional = true }
 
 # Protocol
 url = { workspace = true }
@@ -283,6 +289,14 @@ required-features = ["sec-edgar"]
 name = "sec_edgar_live"
 required-features = ["sec-edgar"]
 
+[[test]]
+name = "alpha_vantage_rest"
+required-features = ["alpha-vantage"]
+
+[[test]]
+name = "alpha_vantage_live"
+required-features = ["alpha-vantage"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 
@@ -341,3 +355,7 @@ required-features = ["thetadata"]
 [[example]]
 name = "sec_edgar_earnings"
 required-features = ["sec-edgar"]
+
+[[example]]
+name = "alpha_vantage_earnings"
+required-features = ["alpha-vantage"]

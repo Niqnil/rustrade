@@ -9,17 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Earnings releases, and an SEC EDGAR provider for past ones** (`rustrade-data`, #879).
+- **Earnings releases, from SEC EDGAR (past) and Alpha Vantage (coming and past)**
+  (`rustrade-data`, #879).
   - **New `earnings` module** with one record for every provider: `EarningsRelease` carries the
     issuer's symbol, the fiscal period's end, the release's date and `ReleaseTiming`
     (`BeforeOpen`, `DuringSession`, `AfterClose`, `Unknown`), a `ReleaseStatus` (`Reported`,
     `Confirmed`, `Projected`, `Postponed`, `Canceled`, `Unknown`), `known_at` and a
     `ReleaseSource`. Both structs are `#[non_exhaustive]`, so fields can be added later: build
     them with `EarningsRelease::new` and `ReleaseSource::new` (plus `with_record_id` and
-    `with_updated_at`). `EarningsRelease::key` (symbol and period end) identifies the release, so a
-    later record of the same release supersedes an earlier one.
+    `with_updated_at`). `EarningsRelease::key` identifies the release, so a later record of the
+    same release supersedes an earlier one.
+  - **An `EarningsKey` names the fiscal period by the month end nearest its last day**
+    (`earnings::nearest_month_end`). Providers disagree on that day: SEC gives the exact end, a
+    weekday for an issuer whose fiscal year has 52 or 53 weeks (a quarter ending Saturday 26
+    September), and Alpha Vantage rounds it to the month end (30 September). Both name the same
+    key; the record keeps the provider's date. A key's fields are read with `symbol()` and
+    `period()`, and `EarningsKey::new` normalises.
   - **`known_at` is the earliest instant the record is known to have been public**, so a
-    backtest that keeps only records known at its clock sees what a live system could have known.
+    backtest that keeps only records known at its clock uses only what had been made public by
+    then. It is not when a provider could return the record: a backtest replaying one provider as
+    a live feed applies that provider's delay itself.
   - **New `exchange::sec_edgar` (feature `sec-edgar`):** `SecEdgarClient::earnings_releases`
     reads a company's filing index and pairs each 10-Q or 10-K with the latest 8-K furnishing
     Item 2.02 ("Results of Operations") filed between the period's end and the report. Taking
@@ -40,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     releases can be missing. EDGAR has no coming dates.
   - SEC states that information on sec.gov may be copied and redistributed, citing SEC as the
     source.
+  - **New `exchange::alpha_vantage` (feature `alpha-vantage`):** `AlphaVantageClient` reads Alpha
+    Vantage's earnings calendar (`earnings_calendar`, coming releases within three, six or twelve
+    months, for one company or all) and its earnings history (`earnings_history`, one company's
+    past quarterly releases). **Alpha Vantage's data is for personal, non-commercial use only:**
+    use by or for a firm, or giving others access, needs a commercial licence. See
+    <https://www.alphavantage.co/terms_of_service/>.
+    - Calendar records are `ReleaseStatus::Unknown`, since the calendar does not say whether a
+      date is announced or estimated, and are known when fetched. The calendar lists only dates
+      Alpha Vantage has, so a company without one is missing.
+    - Past releases are `Reported` and known by their session bound: 09:30 New York on the
+      release date for a release before the open, else 00:00 New York the next day.
+    - Alpha Vantage answers a refused request (its request rate, its daily allowance, a
+      premium-only call) with HTTP 200 and a notice; on the CSV calendar the notice arrives cut
+      into the columns. Both read as `AlphaVantageError::Refused`. An unknown symbol's empty
+      history is `NotFound`.
+    - The client paces its requests to 50 a minute (a free key allows one a second and 25 a day;
+      `with_requests_per_minute` for a premium plan), keeps the API key out of `Debug`, and
+      removes it from every error.
 
 - **Cancel an order's unfilled remainder after a set time** (`rustrade-execution`, `rustrade`,
   #919).
