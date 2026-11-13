@@ -16,6 +16,9 @@ use std::{
 /// backtest asks it what a live system would have known at its clock, and a live system asks it
 /// about now.
 ///
+/// The store is plain data, [`Send`] and [`Sync`]: a caller sharing one between threads adds its
+/// own lock.
+///
 /// # Contract
 /// - **Visibility.** A query as of `as_of` uses only records whose
 ///   [`known_at`](EarningsRelease::known_at) is at or before `as_of`.
@@ -56,9 +59,11 @@ use std::{
 /// - Every record put in is kept, so memory grows with each fetch of a calendar. Only a record
 ///   equal in every field to one already held is dropped; the same calendar fetched twice differs
 ///   in [`observed_at`](super::ReleaseSource::observed_at) and is kept twice.
-///
-/// It is plain data: [`Send`] and [`Sync`], and a caller sharing one between threads adds its own
-/// lock.
+/// - A query reads each of the symbol's releases, and within each the records not yet public at
+///   `as_of` before the one standing, so its cost grows with the records kept.
+/// - Records supersede one another only under the same [`EarningsKey`]. Two providers whose
+///   period ends name different months describe two releases, and an estimate whose date has
+///   passed can then be previous beside the record that the release happened.
 ///
 /// ```
 /// use chrono::{NaiveDate, TimeZone, Utc};
@@ -173,9 +178,9 @@ impl EarningsStore {
             .and_then(|records| standing_record(records, as_of))
     }
 
-    /// The coming release of `symbol` as of `as_of` with the earliest date (a
-    /// [`Postponed`](ReleaseStatus::Postponed) one first, by its old date), or `None` if none is
-    /// known by then. See the [contract](Self#contract).
+    /// The coming release of `symbol` as of `as_of` with the earliest date, or `None` if none is
+    /// known by then. A [`Postponed`](ReleaseStatus::Postponed) release is coming whatever its
+    /// date, and is ordered by the date it was postponed from. See the [contract](Self#contract).
     pub fn next(&self, symbol: &str, as_of: DateTime<Utc>) -> Option<&EarningsRelease> {
         self.standing(symbol, as_of)
             .filter(|(standing, _, _)| matches!(standing, Standing::Coming))
@@ -403,6 +408,76 @@ mod tests {
                 [&estimate, &reported]
             );
         }
+    }
+
+    #[test]
+    fn a_reported_record_beats_a_later_cancel_or_postponement() {
+        let reported = record(
+            Q4,
+            day(2026, 1, 28),
+            ReleaseStatus::Reported,
+            utc(2026, 1, 29, 5, 0),
+        );
+        for status in [ReleaseStatus::Canceled, ReleaseStatus::Postponed] {
+            let later = record(Q4, day(2026, 1, 28), status, utc(2026, 2, 1, 0, 0));
+            let mut store = new_york();
+            store.extend([reported.clone(), later]);
+            let as_of = utc(2026, 2, 2, 0, 0);
+            assert_eq!(
+                store.current(&reported.key(), as_of),
+                Some(&reported),
+                "{status:?}"
+            );
+            assert_eq!(store.previous("XYZ", as_of), Some(&reported), "{status:?}");
+            assert_eq!(store.next("XYZ", as_of), None, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_reported_record_supersedes_an_earlier_one() {
+        let first = record(
+            Q4,
+            day(2026, 1, 28),
+            ReleaseStatus::Reported,
+            utc(2026, 1, 29, 5, 0),
+        );
+        let amended = record(
+            Q4,
+            day(2026, 1, 27),
+            ReleaseStatus::Reported,
+            utc(2026, 2, 10, 0, 0),
+        );
+        let mut store = new_york();
+        store.extend([amended.clone(), first.clone()]);
+        assert_eq!(store.previous("XYZ", utc(2026, 2, 9, 0, 0)), Some(&first));
+        assert_eq!(
+            store.previous("XYZ", utc(2026, 2, 10, 0, 0)),
+            Some(&amended)
+        );
+    }
+
+    #[test]
+    fn a_postponed_release_confirmed_on_a_new_date_is_next_on_that_date() {
+        let postponed = record(
+            Q4,
+            day(2026, 1, 28),
+            ReleaseStatus::Postponed,
+            utc(2026, 1, 20, 0, 0),
+        );
+        let confirmed = record(
+            Q4,
+            day(2026, 2, 12),
+            ReleaseStatus::Confirmed,
+            utc(2026, 2, 3, 0, 0),
+        );
+        let mut store = new_york();
+        store.extend([confirmed.clone(), postponed.clone()]);
+        assert_eq!(store.next("XYZ", utc(2026, 2, 2, 0, 0)), Some(&postponed));
+        assert_eq!(store.next("XYZ", utc(2026, 2, 3, 0, 0)), Some(&confirmed));
+        assert_eq!(
+            store.previous("XYZ", utc(2026, 2, 13, 5, 0)),
+            Some(&confirmed)
+        );
     }
 
     #[test]

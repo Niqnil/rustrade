@@ -33,11 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from the records put in, whatever their provider. A query as of T uses only records known by
     T (`known_at <= T`). Of one release's visible records, a `Reported` one stands over any other,
     so a calendar's estimate known later does not hide a release; then the later `known_at`,
-    `observed_at` and `updated_at`, then the later insertion. A release has happened once its
-    standing record is `Reported` or dated before T's date in the store's time zone
-    (`EarningsStore::new(zone)`, one zone per store); on its own date, with no `Reported` record
-    yet, it is still next. A `Canceled` release is neither next nor previous; a `Postponed` one is
-    next whatever its date. `current` gives a release's standing record and `observations` all of
+    `observed_at` and `updated_at`, then the later insertion. A `Canceled` release is neither
+    next nor previous, and a `Postponed` one is next whatever its date. Any other release has
+    happened once its standing record is `Reported` or dated before T's date in the store's time
+    zone (`EarningsStore::new(zone)`, one zone per store); on its own date, with no `Reported`
+    record yet, it is still next. `current` gives a release's standing record and `observations` all of
     its records. Every record is kept, so an earlier instant's answer stays the same.
   - **New `exchange::sec_edgar` (feature `sec-edgar`):** `SecEdgarClient::earnings_releases`
     reads a company's filing index and pairs each 10-Q or 10-K with the latest 8-K furnishing
