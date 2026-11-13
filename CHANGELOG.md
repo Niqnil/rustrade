@@ -204,8 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The `CompositeFeeModel` rustdoc has an index option example of both new rules.
   - The `CompositeFeeModel` rustdoc also has IBKR's US option commissions at one volume tier, with
     their premium bands, minimum per order and pass-through clearing and regulatory fees, and says
-    what a fee model cannot express: monthly volume tiers, and exchange fees that depend on where
-    an order executes (#878).
+    what a fee model cannot express: monthly volume tiers, and exchange and regulatory fees that
+    depend on where an order executes (#878).
 
 - **A fee schedule that changes over time** (`rustrade-execution`, `rustrade`, #912).
   - **New `FeeModelConfig::Dated(DatedFeeModel)`:** an initial model, then a list of `FeeChange`s,

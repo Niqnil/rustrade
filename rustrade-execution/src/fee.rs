@@ -706,21 +706,22 @@ impl FeeComponent {
 ///
 /// Parts of the schedule a fee model cannot express:
 /// - **Volume tiers.** The commission falls for each month's contracts beyond 10,000, 50,000 and
-///   100,000, counted across the account's trades, and the premium bands change with it. A fee
-///   model prices one fill at a time and does not see the month's count, so choose the tier the
-///   strategy's monthly volume falls in, and model the rates of that tier.
-/// - **Exchange fees and the options regulatory fee.** Each exchange charges its own, and they
-///   depend on the product, on the account's capacity and on whether the fill made or took
-///   liquidity. The simulated venue does not route orders to exchanges, so add the fees you expect
-///   as components of your own, limited to one side of the book with
-///   [`on_liquidity`](FeeComponent::on_liquidity) where they differ, and give a symbol whose
-///   fees differ, such as an index option, its own model with [`FeeModelOverrides`] (see the
-///   previous example).
-/// - **Amended orders.** IBKR may treat an amended order as a new one, and charge its minimum
-///   again. The simulated venue charges the minimum once per order, however often it is amended.
+///   100,000, counted across the client's US and Canadian option trades, and the premium bands
+///   change with it. A fee model prices one fill at a time and does not see the month's count, so
+///   choose the tier the strategy's monthly volume falls in, and model the rates of that tier.
+/// - **Exchange fees and the options regulatory fee.** Each exchange charges its own, and its
+///   exchange fee also depends on the product, on the account's capacity and on whether the fill
+///   made or took liquidity. The simulated venue does not route orders to exchanges, so add the
+///   fees you expect as components of your own, limited to one side of the book with
+///   [`on_liquidity`](FeeComponent::on_liquidity) where they differ, and give a symbol whose fees
+///   differ, such as an index option, its own model with [`FeeModelOverrides`] (see the previous
+///   example).
 ///
-/// IBKR charges no commission on an option's exercise or assignment, and the simulated venue
-/// charges no fee on either.
+/// IBKR may treat an amended order as a new one, and charge its minimum again. The simulated
+/// venue does not amend an option order, so a changed order is cancelled and replaced, and the
+/// replacement pays its own minimum. IBKR charges no commission on an option's exercise or
+/// assignment, and the simulated venue charges no fee when it exercises or assigns an option at
+/// expiry (it does not model early assignment).
 ///
 /// ```
 /// use chrono::Utc;
@@ -767,9 +768,10 @@ impl FeeComponent {
 ///
 /// let ibkr_options = CompositeFeeModel::new(vec![
 ///     commission,
-///     // Exchange fee and options regulatory fee, for taker fills: they depend on where the order
-///     // executes (see above). Set your own; this rate is illustrative.
+///     // Exchange fee, here on taker fills only, and options regulatory fee: both depend on
+///     // where the order executes (see above). Set your own; these rates are illustrative.
 ///     FeeComponent::new(FeeBasis::PerContract(dec!(0.20))).on_liquidity(Liquidity::Taker),
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0.005))),
 ///     // OCC clearing fee: per contract.
 ///     FeeComponent::new(FeeBasis::PerContract(dec!(0.025))),
 ///     // SEC Section 31 fee: a share of the value of a sale.
@@ -783,10 +785,11 @@ impl FeeComponent {
 /// .expect("no component has a minimum above its maximum");
 ///
 /// // A taker sale of 10 contracts at a $1.20 premium: $6.50 commission, $2.00 exchange fee,
-/// // $0.25 clearing, $0.02472 SEC fee on $1,200 of sales, and $0.003 audit trail fee.
+/// // $0.05 regulatory fee, $0.25 clearing, $0.02472 SEC fee on $1,200 of sales, and $0.003
+/// // audit trail fee.
 /// let sale = FeeInput::new(Side::Sell, dec!(1.20), dec!(10), dec!(100), Utc::now())
 ///     .with_order_quantity(dec!(10));
-/// assert_eq!(ibkr_options.compute_fee(&sale), dec!(8.77772));
+/// assert_eq!(ibkr_options.compute_fee(&sale), dec!(8.82772));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "Vec<FeeComponent>", into = "Vec<FeeComponent>")]
