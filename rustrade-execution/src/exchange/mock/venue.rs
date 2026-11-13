@@ -15,7 +15,10 @@ use crate::{
         orders::{AlreadyResting, NotQueued, OpenOrder, Rank, Reservation, RestingOrder},
     },
     expiry::{ExpirySellOut, LongOptionExpiry, SellOutAffordability},
-    fee::{FeeAssetConfig, FeeInput, FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
+    fee::{
+        FeeAssetConfig, FeeInput, FeeModel, FeeModelConfig, FeeModelOverrides, Liquidity,
+        SpotFeeAsset,
+    },
     fill::{FillContext, FillModel, MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{HeldPosition, HoldingCostModel},
     margin::{InterestDue, MarginEffect, MarginInterestModel, SpotMarginConfig},
@@ -58,11 +61,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tracing::warn;
 
 mod liquidation;
@@ -731,12 +730,12 @@ pub enum VenueRegime {
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
-    /// Prices each fill's fee, for every kind of instrument not in
-    /// [`fee_model_by_kind`](Self::fee_model_by_kind).
+    /// Prices each fill's fee, for every instrument no entry of
+    /// [`fee_model_overrides`](Self::fee_model_overrides) matches.
     pub fee_model: FeeModelConfig,
-    /// Prices each fill's fee for the kinds of instrument it holds, in place of
-    /// [`fee_model`](Self::fee_model). See [`MockExecutionConfig::fee_model_by_kind`].
-    pub fee_model_by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+    /// Prices each fill's fee for the instruments an entry matches, in place of
+    /// [`fee_model`](Self::fee_model). See [`MockExecutionConfig::fee_model_overrides`].
+    pub fee_model_overrides: FeeModelOverrides,
     /// Which asset a spot fill's fee is charged in. See `# How a spot fill is accounted`.
     pub spot_fee_asset: SpotFeeAsset,
     /// Prices each taker fill. Built from the configuration's
@@ -1022,10 +1021,11 @@ impl SimulatedVenue {
             .expiry_sell_out
             .map(|sell_out| sell_out_instants(&instruments, sell_out.before_expiry()))
             .unwrap_or_default();
+        warn_unmatched_fee_overrides(&config.fee_model_overrides, &instruments);
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model.clone(),
-            fee_model_by_kind: config.fee_model_by_kind.clone(),
+            fee_model_overrides: config.fee_model_overrides.clone(),
             spot_fee_asset: config.spot_fee_asset,
             fill_model: Arc::new(config.fill_model),
             slippage: Slippage::new(config.slippage),
@@ -2943,7 +2943,7 @@ impl SimulatedVenue {
                 order.side,
                 remaining,
                 limit,
-                FeePricing::maker(order.state.filled_quantity, time_exchange),
+                FeePricing::maker(order.state.filled_quantity, order.quantity, time_exchange),
             );
 
             let mut committed = match self.settle_resting(
@@ -3172,7 +3172,7 @@ impl SimulatedVenue {
             side,
             filled_quantity,
             fill_price,
-            FeePricing::taker(order.state.filled_quantity, time_exchange),
+            FeePricing::taker(order.state.filled_quantity, order.quantity, time_exchange),
         );
 
         let mut committed = match self.settle_resting_afresh(
@@ -3431,7 +3431,7 @@ impl SimulatedVenue {
                 side,
                 filled_quantity,
                 price,
-                FeePricing::taker(order.state.filled_quantity, time_exchange),
+                FeePricing::taker(order.state.filled_quantity, order.quantity, time_exchange),
             );
             (price, settlement)
         });
@@ -3456,7 +3456,11 @@ impl SimulatedVenue {
                 side,
                 unfilled,
                 limit,
-                FeePricing::maker(order.state.filled_quantity + filled_quantity, time_exchange),
+                FeePricing::maker(
+                    order.state.filled_quantity + filled_quantity,
+                    order.quantity,
+                    time_exchange,
+                ),
             )
         });
         // One order pays with one asset, which a call sale whose fill only closes a long, while its
@@ -5405,7 +5409,7 @@ impl SimulatedVenue {
             side,
             request.state.quantity,
             estimate,
-            FeePricing::first(liquidity, time_exchange),
+            FeePricing::first(liquidity, request.state.quantity, time_exchange),
         );
 
         let debit = settlement.reserved();
@@ -5958,7 +5962,7 @@ impl SimulatedVenue {
             side,
             filled_quantity,
             fill_price,
-            FeePricing::first(Liquidity::Taker, time_exchange),
+            FeePricing::first(Liquidity::Taker, request.state.quantity, time_exchange),
         );
 
         // What holding the remainder will cost, priced exactly as the fill that settles it will be
@@ -5978,7 +5982,7 @@ impl SimulatedVenue {
                 side,
                 unfilled,
                 limit,
-                FeePricing::maker(filled_quantity, time_exchange),
+                FeePricing::maker(filled_quantity, request.state.quantity, time_exchange),
             )),
             _ => None,
         };
@@ -6278,7 +6282,7 @@ impl SimulatedVenue {
             request.state.side,
             request.state.quantity - filled_quantity,
             limit,
-            FeePricing::maker(filled_quantity, time_exchange),
+            FeePricing::maker(filled_quantity, request.state.quantity, time_exchange),
         );
 
         let debit = settlement.reserved();
@@ -6505,16 +6509,18 @@ impl SimulatedVenue {
             pricing.time,
         )
         .with_liquidity(pricing.liquidity)
-        .with_prior_filled(pricing.prior_filled);
+        .with_prior_filled(pricing.prior_filled)
+        .with_order_quantity(pricing.order_quantity);
         let fees_quote = self.fee_model_for(terms).compute_fee(&input);
         self.settlement_with_fee(terms, position, side, quantity, price, fees_quote)
     }
 
-    /// The fee model that prices a fill of the instrument `terms` describes: its kind's in
-    /// [`fee_model_by_kind`](Self::fee_model_by_kind), else [`fee_model`](Self::fee_model).
+    /// The fee model that prices a fill of the instrument `terms` describes: the one
+    /// [`fee_model_overrides`](Self::fee_model_overrides) resolves for it, else
+    /// [`fee_model`](Self::fee_model).
     fn fee_model_for(&self, terms: &InstrumentTerms) -> &FeeModelConfig {
-        self.fee_model_by_kind
-            .get(&terms.kind)
+        self.fee_model_overrides
+            .resolve(&terms.name, terms.kind, &terms.underlying)
             .unwrap_or(&self.fee_model)
     }
 
@@ -7073,6 +7079,62 @@ fn option_expiries(
         })
         .sorted_unstable()
         .collect()
+}
+
+/// Logs a warning for each entry of `overrides` that [`unmatched_fee_overrides`] finds: likely a
+/// typo, which would charge the instrument it meant the default.
+fn warn_unmatched_fee_overrides(
+    overrides: &FeeModelOverrides,
+    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+) {
+    for unmatched in unmatched_fee_overrides(overrides, instruments) {
+        match unmatched {
+            UnmatchedFeeOverride::Name(name) => warn!(
+                instrument = %name,
+                "fee model override names an instrument this venue does not have; it is never used"
+            ),
+            UnmatchedFeeOverride::Underlying(kind, underlying) => warn!(
+                ?kind,
+                base = %underlying.base,
+                quote = %underlying.quote,
+                "fee model override names a kind and underlying no instrument on this venue has; \
+                 it is never used"
+            ),
+        }
+    }
+}
+
+/// An entry of a [`FeeModelOverrides`] that matches none of a venue's instruments.
+#[derive(Debug, PartialEq)]
+enum UnmatchedFeeOverride<'a> {
+    Name(&'a InstrumentNameExchange),
+    Underlying(
+        InstrumentKindDiscriminant,
+        &'a Underlying<AssetNameExchange>,
+    ),
+}
+
+/// The entries of `overrides` by name, or by kind and underlying, that match none of
+/// `instruments`. Entries by kind are not checked: one config often serves venues of different
+/// instruments, and a kind they lack is no sign of a mistake.
+fn unmatched_fee_overrides<'a>(
+    overrides: &'a FeeModelOverrides,
+    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+) -> Vec<UnmatchedFeeOverride<'a>> {
+    let names = overrides
+        .by_name()
+        .keys()
+        .filter(|name| !instruments.contains_key(*name))
+        .map(UnmatchedFeeOverride::Name);
+    let underlyings = overrides
+        .by_underlying()
+        .filter(|(kind, underlying, _)| {
+            !instruments.values().any(|instrument| {
+                instrument.kind.discriminant() == *kind && &instrument.underlying == *underlying
+            })
+        })
+        .map(|(kind, underlying, _)| UnmatchedFeeOverride::Underlying(kind, underlying));
+    names.chain(underlyings).collect()
 }
 
 /// The spot instrument each option in `instruments` settles against: the only spot instrument
@@ -7798,7 +7860,8 @@ struct Released {
 
 /// How a fill's fee is priced, besides the fill itself: which side of the book it is on, how much
 /// of its order had filled before it, for a fee charged once or bounded per order (see
-/// [`FeeInput::prior_filled`]), and when, for a schedule that changes over time (see
+/// [`FeeInput::prior_filled`]), how large its order is, for a fee charged only from an order size
+/// (see [`FeeInput::order_quantity`]), and when, for a schedule that changes over time (see
 /// [`FeeInput::time`]).
 ///
 /// An order's fill and the hold of its remainder are both priced through this, the remainder after
@@ -7808,33 +7871,37 @@ struct Released {
 struct FeePricing {
     liquidity: Liquidity,
     prior_filled: Decimal,
+    order_quantity: Decimal,
     time: DateTime<Utc>,
 }
 
 impl FeePricing {
-    /// The first fill of its order, on the `liquidity` side, at `time`.
-    fn first(liquidity: Liquidity, time: DateTime<Utc>) -> Self {
+    /// The first fill of its order of `order_quantity`, on the `liquidity` side, at `time`.
+    fn first(liquidity: Liquidity, order_quantity: Decimal, time: DateTime<Utc>) -> Self {
         Self {
             liquidity,
             prior_filled: Decimal::ZERO,
+            order_quantity,
             time,
         }
     }
 
-    /// A taker fill after `prior_filled` of its order, at `time`.
-    fn taker(prior_filled: Decimal, time: DateTime<Utc>) -> Self {
+    /// A taker fill after `prior_filled` of its order of `order_quantity`, at `time`.
+    fn taker(prior_filled: Decimal, order_quantity: Decimal, time: DateTime<Utc>) -> Self {
         Self {
             liquidity: Liquidity::Taker,
             prior_filled,
+            order_quantity,
             time,
         }
     }
 
-    /// A maker fill after `prior_filled` of its order, at `time`.
-    fn maker(prior_filled: Decimal, time: DateTime<Utc>) -> Self {
+    /// A maker fill after `prior_filled` of its order of `order_quantity`, at `time`.
+    fn maker(prior_filled: Decimal, order_quantity: Decimal, time: DateTime<Utc>) -> Self {
         Self {
             liquidity: Liquidity::Maker,
             prior_filled,
+            order_quantity,
             time,
         }
     }
@@ -7846,6 +7913,7 @@ impl FeePricing {
 /// the ledger, so pricing never holds a borrow the balance moves need.
 #[derive(Debug, Clone)]
 struct InstrumentTerms {
+    name: InstrumentNameExchange,
     underlying: Underlying<AssetNameExchange>,
     kind: InstrumentKindDiscriminant,
     contract_size: Decimal,
@@ -7858,6 +7926,7 @@ impl InstrumentTerms {
         instrument: &Instrument<ExchangeId, AssetNameExchange>,
     ) -> Result<Self, UnindexedApiError> {
         Ok(Self {
+            name: instrument.name_exchange.clone(),
             underlying: instrument.underlying.clone(),
             kind: instrument.kind.discriminant(),
             contract_size: instrument.kind.contract_size(),
@@ -13086,6 +13155,57 @@ mod tests {
         );
     }
 
+    /// A fee charged only from an order size counts the order's whole quantity: a fill smaller
+    /// than the threshold, and the remainder it rests, both pay it when their order reaches it,
+    /// and neither does when the order falls short.
+    #[test]
+    fn an_order_size_threshold_counts_the_whole_order_across_a_partial_fill_and_its_remainder() {
+        for (quantity, rate) in [("1", d("1")), ("0.99", Decimal::ZERO)] {
+            let mut venue = venue_offering(sized("0.4"));
+            venue.fee_model = FeeModelConfig::Composite(
+                CompositeFeeModel::new(vec![
+                    FeeComponent::new(FeeBasis::PerContract(d("1"))).from_order_quantity(d("1")),
+                ])
+                .unwrap(),
+            );
+
+            let arrival =
+                venue.open_order(limit_request("split", Side::Buy, quantity, "48000", gtc()));
+            let taker = filled_trade(&arrival).clone();
+            assert_eq!(taker.quantity, d("0.4"));
+            assert_eq!(taker.fees.fees, d("0.4") * rate, "order of {quantity}");
+            // 0.4 at 47900 and its fee spent; the remainder holds its cost at 48000 and its fee.
+            let rest = d(quantity) - d("0.4");
+            let spent = d("0.4") * d("47900") + taker.fees.fees;
+            assert_eq!(total_quote(&venue), d("1000000") - spent);
+            assert_eq!(
+                free_quote(&venue),
+                d("1000000") - spent - rest * d("48000") - rest * rate,
+                "order of {quantity}"
+            );
+
+            let fills = venue.apply_market(
+                &instrument_name(),
+                MarketObservation::new(book("48000", "48000")),
+                time(2),
+            );
+            let maker = fills
+                .iter()
+                .find_map(|event| match &event.kind {
+                    AccountEventKind::Trade(trade) => Some(trade),
+                    _ => None,
+                })
+                .expect("the remainder fills");
+            assert_eq!(maker.quantity, rest);
+            assert_eq!(maker.fees.fees, rest * rate, "order of {quantity}");
+            assert_eq!(
+                free_quote(&venue),
+                total_quote(&venue),
+                "the remainder's fill was charged exactly what it held"
+            );
+        }
+    }
+
     /// A fee charged once per order, and a minimum per order, are charged on the order's first
     /// fill only: the remainder it rests holds, and its fill pays, only what the order's whole
     /// quantity adds to them.
@@ -13133,16 +13253,17 @@ mod tests {
     #[test]
     fn a_kind_with_its_own_fee_model_is_priced_by_it() {
         let mut venue = venue_offering(sized("1"));
-        venue.fee_model_by_kind.insert(
-            InstrumentKindDiscriminant::Spot,
-            FeeModelConfig::PerContract(PerContractFeeModel {
-                commission_per_contract: d("3"),
-            }),
-        );
-        venue.fee_model_by_kind.insert(
-            InstrumentKindDiscriminant::Option,
-            FeeModelConfig::default(),
-        );
+        venue.fee_model_overrides = FeeModelOverrides::new()
+            .with_kind(
+                InstrumentKindDiscriminant::Spot,
+                FeeModelConfig::PerContract(PerContractFeeModel {
+                    commission_per_contract: d("3"),
+                }),
+            )
+            .with_kind(
+                InstrumentKindDiscriminant::Option,
+                FeeModelConfig::default(),
+            );
 
         let outcome = venue.open_order(limit_request(
             "spot",
@@ -19876,6 +19997,7 @@ mod tests {
     mod borrow_capacity;
     mod borrow_price_window;
     mod collateral_ratio;
+    mod fees;
     mod liquidation;
     mod options;
     mod sell_out;

@@ -1,7 +1,12 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, asset::name::AssetNameExchange};
+use rustrade_instrument::{
+    Side, Underlying,
+    asset::name::AssetNameExchange,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Which side of the trade a fill was on: the one that supplied liquidity, or the one that took it.
@@ -24,12 +29,13 @@ pub enum Liquidity {
     Maker,
 }
 
-/// What a [`FeeModel`] prices: one fill, when it happened, and how much of its order had filled
-/// before it.
+/// What a [`FeeModel`] prices: one fill, when it happened, how much of its order had filled
+/// before it, and how large the order is.
 ///
-/// Build one with [`new`](Self::new), which assumes a taker fill that is its order's first, and
-/// set the rest with [`with_liquidity`](Self::with_liquidity) and
-/// [`with_prior_filled`](Self::with_prior_filled).
+/// Build one with [`new`](Self::new), which assumes a taker fill that is its order's first, of an
+/// order whose size is unknown, and set the rest with [`with_liquidity`](Self::with_liquidity),
+/// [`with_prior_filled`](Self::with_prior_filled) and
+/// [`with_order_quantity`](Self::with_order_quantity).
 ///
 /// `#[non_exhaustive]`: further facts about the fill may be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +61,18 @@ pub struct FeeInput {
     /// When the fill happened, on the venue's clock. A [`DatedFeeModel`] charges the schedule in
     /// effect at this time.
     pub time: DateTime<Utc>,
+    /// The fill's order's whole quantity, in contracts, as the order stands when this fill
+    /// happens: not the fill's own quantity. Its sign is ignored. When known, it is at least
+    /// `prior_filled + quantity`.
+    ///
+    /// A component charged only from an order size (see
+    /// [`FeeComponent::from_order_quantity`]) reads it. `None` means the order's size is unknown,
+    /// and such a component is then charged, so an unknown size overstates the fee rather than
+    /// understating it.
+    ///
+    /// An amended order's later fills see its amended quantity; its earlier fills are not
+    /// charged again.
+    pub order_quantity: Option<Decimal>,
 }
 
 impl FeeInput {
@@ -74,6 +92,7 @@ impl FeeInput {
             liquidity: Liquidity::Taker,
             prior_filled: Decimal::ZERO,
             time,
+            order_quantity: None,
         }
     }
 
@@ -91,20 +110,30 @@ impl FeeInput {
             ..self
         }
     }
+
+    /// The same fill, of an order of `order_quantity` contracts in all.
+    #[must_use]
+    pub fn with_order_quantity(self, order_quantity: Decimal) -> Self {
+        Self {
+            order_quantity: Some(order_quantity),
+            ..self
+        }
+    }
 }
 
 /// Computes the trading fee for a single fill, in the instrument's quote asset.
 ///
 /// # Implementer obligations
 /// A fill's fee must not depend on how its order's quantity was split into fills at one price and
-/// one time: the fee of `q1` after `p` filled plus the fee of `q2` after `p + q1` filled must equal
-/// the fee of `q1 + q2` after `p` filled. The simulated venue relies on this. It reserves an
-/// order's remaining fee in one amount when the order rests, and charges it fill by fill. Every
-/// model in this module meets it at one price and one time. A bounded
-/// [`Notional`](FeeBasis::Notional) component, with an order that fills at several prices, only
-/// approximates it (see [`FeeComponent`]). A [`DatedFeeModel`] whose schedule changes while an
-/// order rests charges the order's later fills by the new schedule; the simulated venue then costs
-/// such a fill afresh rather than settling what it reserved.
+/// one time, for one [`order_quantity`](FeeInput::order_quantity): the fee of `q1` after `p` filled
+/// plus the fee of `q2` after `p + q1` filled must equal the fee of `q1 + q2` after `p` filled. The
+/// simulated venue relies on this. It reserves an order's remaining fee in one amount when the
+/// order rests, and charges it fill by fill. Every model in this module meets it at one price and
+/// one time. A bounded [`Notional`](FeeBasis::Notional) or
+/// [`PerContractByPrice`](FeeBasis::PerContractByPrice) component, with an order that fills at
+/// several prices, only approximates it (see [`FeeComponent`]). A [`DatedFeeModel`] whose schedule
+/// changes while an order rests charges the order's later fills by the new schedule; the simulated
+/// venue then costs such a fill afresh rather than settling what it reserved.
 pub trait FeeModel {
     /// The fee of the fill `input` describes. Negative is a rebate.
     fn compute_fee(&self, input: &FeeInput) -> Decimal;
@@ -229,7 +258,7 @@ impl FeeModel for PercentageFeeModel {
 /// Serialised, the amount is a decimal string: `{"PerContract":"0.025"}`.
 ///
 /// `#[non_exhaustive]`: further bases may be added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub enum FeeBasis {
     /// `amount × n`: a charge per contract, whatever the contract's size. An options clearing
@@ -244,6 +273,10 @@ pub enum FeeBasis {
     /// `amount` once the order has filled anything: a ticket charge, paid on the order's first
     /// fill only.
     PerOrder(#[serde(with = "rust_decimal::serde::str")] Decimal),
+    /// `per_contract × n`, `per_contract` being that of the [`PriceBand`] the fill's price falls
+    /// in: a per-contract charge tiered by premium, such as an index option's exchange fee or a
+    /// broker's option commission. See [`PriceBands`].
+    PerContractByPrice(PriceBands),
 }
 
 impl FeeBasis {
@@ -253,13 +286,139 @@ impl FeeBasis {
     /// charged through [`FeeComponent::bounded`], which charges nothing for an order that has
     /// filled nothing, without asking the basis.
     fn charge(&self, input: &FeeInput, filled: Decimal) -> Decimal {
-        match *self {
+        match self {
             Self::PerContract(amount) => amount * filled,
             Self::PerUnderlyingUnit(amount) => amount * filled * input.contract_size,
             Self::Notional(rate) => rate * input.price * filled * input.contract_size,
-            Self::PerOrder(amount) => amount,
+            Self::PerOrder(amount) => *amount,
+            Self::PerContractByPrice(bands) => bands.per_contract_at(input.price) * filled,
         }
     }
+}
+
+/// One band of a [`PriceBands`] schedule: the per-contract charge for fills priced at
+/// [`from`](Self::from) or above, up to the next band's `from`.
+///
+/// Serialised, both are decimal strings: `{"from": "1", "per_contract": "0.65"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct PriceBand {
+    /// The lowest fill price in the band, inclusive.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub from: Decimal,
+    /// The charge per contract for a fill in the band. Negative is a rebate.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub per_contract: Decimal,
+}
+
+impl PriceBand {
+    /// A charge of `per_contract` for fills priced at `from` or above.
+    pub fn new(from: Decimal, per_contract: Decimal) -> Self {
+        Self { from, per_contract }
+    }
+}
+
+/// A per-contract charge chosen by the fill's price, for
+/// [`FeeBasis::PerContractByPrice`]: a list of [`PriceBand`]s, each charging from its
+/// [`from`](PriceBand::from) price, inclusive, until the next band's.
+///
+/// The price is [`FeeInput::price`], the price per unit of the underlying: for an option, the
+/// premium per share, not per contract, which is how option fee schedules quote their bands.
+///
+/// [`new`](Self::new) refuses, and so does deserialising:
+/// - an empty list ([`PriceBandsError::Empty`]);
+/// - a first band that does not start at zero ([`PriceBandsError::FirstNotZero`]);
+/// - bands whose `from` prices are not strictly increasing ([`PriceBandsError::NotIncreasing`]).
+///
+/// A fill priced below zero, which some instruments allow, is charged the first band, so the first
+/// band covers every price below the second band's `from`.
+///
+/// Serialised, it is the list of its bands: `[{"from": "0", "per_contract": "0.50"}, {"from":
+/// "1", "per_contract": "0.65"}]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(try_from = "Vec<PriceBand>", into = "Vec<PriceBand>")]
+pub struct PriceBands(Vec<PriceBand>);
+
+impl PriceBands {
+    /// A schedule charging each of `bands` from its price until the next band's.
+    ///
+    /// # Errors
+    /// Returns [`PriceBandsError`] if `bands` is empty, its first band does not start at zero, or
+    /// its `from` prices are not strictly increasing.
+    pub fn new(bands: Vec<PriceBand>) -> Result<Self, PriceBandsError> {
+        Self::try_from(bands)
+    }
+
+    /// The bands, in price order.
+    pub fn bands(&self) -> &[PriceBand] {
+        &self.0
+    }
+
+    /// The charge per contract for a fill at `price`: the last band whose `from` is at or below
+    /// it, or the first band for a price below zero.
+    pub fn per_contract_at(&self, price: Decimal) -> Decimal {
+        let in_band = self.0.partition_point(|band| band.from <= price);
+        // Validated non-empty, so the first band always exists.
+        self.0
+            .get(in_band.saturating_sub(1))
+            .map_or(Decimal::ZERO, |band| band.per_contract)
+    }
+}
+
+impl TryFrom<Vec<PriceBand>> for PriceBands {
+    type Error = PriceBandsError;
+
+    fn try_from(bands: Vec<PriceBand>) -> Result<Self, Self::Error> {
+        let Some(first) = bands.first() else {
+            return Err(PriceBandsError::Empty);
+        };
+        if !first.from.is_zero() {
+            return Err(PriceBandsError::FirstNotZero { from: first.from });
+        }
+        for (index, pair) in bands.windows(2).enumerate() {
+            if let [previous, band] = pair
+                && band.from <= previous.from
+            {
+                return Err(PriceBandsError::NotIncreasing {
+                    index: index + 1,
+                    previous: previous.from,
+                    from: band.from,
+                });
+            }
+        }
+        Ok(Self(bands))
+    }
+}
+
+impl From<PriceBands> for Vec<PriceBand> {
+    fn from(bands: PriceBands) -> Self {
+        bands.0
+    }
+}
+
+/// Why a [`PriceBands`] schedule was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum PriceBandsError {
+    /// No bands, so no price has a charge.
+    #[error("a price band schedule has no bands")]
+    Empty,
+    /// The first band starts at `from` rather than zero.
+    #[error("the first price band starts at {from}, not at zero")]
+    FirstNotZero {
+        /// The first band's price.
+        from: Decimal,
+    },
+    /// The band at `index` starts at `from`, which is not above `previous`, the price of the band
+    /// before it.
+    #[error("price band {index}: starts at {from}, which is not above {previous}")]
+    NotIncreasing {
+        /// The band's position in the list.
+        index: usize,
+        /// The price of the band before it.
+        previous: Decimal,
+        /// Its own price.
+        from: Decimal,
+    },
 }
 
 /// One line of a venue's fee schedule: a [`FeeBasis`], the fills it applies to, and optional
@@ -269,6 +428,12 @@ impl FeeBasis {
 /// [`on_side`](Self::on_side) limits the component to buys or to sells (a fee charged on sales
 /// only), and [`on_liquidity`](Self::on_liquidity) to maker or taker fills. Unset, it applies to
 /// every fill.
+///
+/// [`from_order_quantity`](Self::from_order_quantity) limits it to fills of orders of at least a
+/// quantity, counted on the order's whole quantity, not on the fill's or on what has filled so far:
+/// a fee charged only from 10 contracts charges every fill of a 10-contract order, and no fill of
+/// a 9-contract one. A fill whose order's size is unknown is charged (see
+/// [`FeeInput::order_quantity`]).
 ///
 /// # Bounds per order
 /// [`with_min_per_order`](Self::with_min_per_order) and
@@ -280,7 +445,8 @@ impl FeeBasis {
 ///
 /// Two approximations follow from pricing each fill on its own:
 /// - What had filled before is valued at this fill's price, which matters only for a
-///   [`Notional`](FeeBasis::Notional) basis with bounds, when an order fills at several prices.
+///   [`Notional`](FeeBasis::Notional) or [`PerContractByPrice`](FeeBasis::PerContractByPrice)
+///   basis with bounds, when an order fills at several prices.
 /// - The bounds count the order's whole filled quantity, including fills a side or liquidity
 ///   filter excludes. So a [`PerOrder`](FeeBasis::PerOrder) charge, or a minimum, limited to one
 ///   side or liquidity is charged only if the order's first fill is on it: a ticket on maker fills
@@ -289,14 +455,20 @@ impl FeeBasis {
 ///
 /// # Validation
 /// A component charges only as part of a [`CompositeFeeModel`], which refuses one whose minimum
-/// exceeds its maximum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+/// exceeds its maximum, or whose order quantity threshold is negative.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct FeeComponent {
     basis: FeeBasis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     side: Option<Side>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     liquidity: Option<Liquidity>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rust_decimal::serde::str_option"
+    )]
+    min_order_quantity: Option<Decimal>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -318,6 +490,7 @@ impl FeeComponent {
             basis,
             side: None,
             liquidity: None,
+            min_order_quantity: None,
             min_per_order: None,
             max_per_order: None,
         }
@@ -341,6 +514,16 @@ impl FeeComponent {
         }
     }
 
+    /// The same component, charged only on fills of orders of at least `min` contracts in all,
+    /// `min` included. See `# Which fills`.
+    #[must_use]
+    pub fn from_order_quantity(self, min: Decimal) -> Self {
+        Self {
+            min_order_quantity: Some(min),
+            ..self
+        }
+    }
+
     /// The same component, charging an order at least `min` in total once it fills.
     #[must_use]
     pub fn with_min_per_order(self, min: Decimal) -> Self {
@@ -360,8 +543,8 @@ impl FeeComponent {
     }
 
     /// What the component charges for.
-    pub fn basis(&self) -> FeeBasis {
-        self.basis
+    pub fn basis(&self) -> &FeeBasis {
+        &self.basis
     }
 
     /// The side it is charged on, or `None` for both.
@@ -372,6 +555,11 @@ impl FeeComponent {
     /// The liquidity it is charged on, or `None` for both.
     pub fn liquidity(&self) -> Option<Liquidity> {
         self.liquidity
+    }
+
+    /// The least quantity of an order whose fills it is charged on, if limited.
+    pub fn min_order_quantity(&self) -> Option<Decimal> {
+        self.min_order_quantity
     }
 
     /// The least it charges an order that fills, if bounded.
@@ -385,9 +573,12 @@ impl FeeComponent {
     }
 
     /// Whether the component charges a fill its quantity times one contract's charge, whatever
-    /// its order filled before: neither per order nor bounded per order.
+    /// its order filled before and however large the order: neither per order, nor bounded per
+    /// order, nor limited to orders of a size. An order quantity threshold is not linear: an order
+    /// below it pays nothing, and one at it pays for every contract.
     fn is_linear(&self) -> bool {
         !matches!(self.basis, FeeBasis::PerOrder(_))
+            && self.min_order_quantity.is_none()
             && self.min_per_order.is_none()
             && self.max_per_order.is_none()
     }
@@ -409,6 +600,11 @@ impl FeeComponent {
             || self
                 .liquidity
                 .is_some_and(|liquidity| liquidity != input.liquidity)
+            || self.min_order_quantity.is_some_and(|min| {
+                input
+                    .order_quantity
+                    .is_some_and(|order_quantity| order_quantity.abs() < min)
+            })
         {
             return Decimal::ZERO;
         }
@@ -425,10 +621,12 @@ impl FeeComponent {
 ///
 /// It expresses a schedule no single model can: a $0 commission plus pass-through regulatory fees
 /// charged per contract, per share or on the value of sales; a per-contract commission with a
-/// minimum per order; or a ticket charge per order on top of a rate.
+/// minimum per order; a ticket charge per order on top of a rate; or a per-contract fee tiered by
+/// premium, or charged only on orders from a size.
 ///
-/// [`new`](Self::new) refuses a component whose minimum exceeds its maximum, and so does
-/// deserialising one. Serialised, it is the list of its components.
+/// [`new`](Self::new) refuses a component whose minimum exceeds its maximum, or whose order
+/// quantity threshold is negative, and so does deserialising one. Serialised, it is the list of
+/// its components.
 ///
 /// # Rounding
 /// The fee is not rounded. A venue that rounds each fee, or each day's total of each fee type, up
@@ -439,8 +637,7 @@ impl FeeComponent {
 /// through. This schedule follows its fee schedule of 2026-10-12, for equity options. The rates
 /// change, so check the venue's current schedule before relying on them. Alpaca rounds each fee
 /// type's daily total up to the cent, which this does not model (see `# Rounding`). Index options
-/// also pay a commission per contract and exchange fees that vary by symbol and premium, which
-/// this model cannot yet express.
+/// pay more: see the next example.
 ///
 /// ```
 /// use rust_decimal_macros::dec;
@@ -461,6 +658,44 @@ impl FeeComponent {
 /// .expect("no component has a minimum above its maximum");
 /// # let _ = alpaca_options;
 /// ```
+///
+/// # Example: index option fees tiered by premium and by order size
+/// Index options often pay a commission per contract and an exchange fee that depends on the
+/// symbol and the premium. The rates here are illustrative. Give each symbol its own model with
+/// [`FeeModelOverrides`].
+///
+/// ```
+/// use chrono::Utc;
+/// use rust_decimal_macros::dec;
+/// use rustrade_execution::fee::{
+///     CompositeFeeModel, FeeBasis, FeeComponent, FeeInput, FeeModel, PriceBand, PriceBands,
+/// };
+/// use rustrade_instrument::Side;
+///
+/// let index_options = CompositeFeeModel::new(vec![
+///     // A commission per contract, charged only on orders of 10 contracts or more.
+///     FeeComponent::new(FeeBasis::PerContract(dec!(0.65))).from_order_quantity(dec!(10)),
+///     // An exchange fee per contract: one rate below a $1 premium, another from $1.
+///     FeeComponent::new(FeeBasis::PerContractByPrice(
+///         PriceBands::new(vec![
+///             PriceBand::new(dec!(0), dec!(0.50)),
+///             PriceBand::new(dec!(1), dec!(0.60)),
+///         ])
+///         .expect("bands start at zero and increase"),
+///     )),
+/// ])
+/// .expect("no component has a minimum above its maximum");
+///
+/// // 5 contracts at a $0.95 premium, of a 5-contract order: the lower band, no commission.
+/// let small = FeeInput::new(Side::Buy, dec!(0.95), dec!(5), dec!(100), Utc::now())
+///     .with_order_quantity(dec!(5));
+/// assert_eq!(index_options.compute_fee(&small), dec!(2.50));
+///
+/// // 10 contracts at a $1.00 premium, of a 10-contract order: the upper band, and the commission.
+/// let large = FeeInput::new(Side::Buy, dec!(1.00), dec!(10), dec!(100), Utc::now())
+///     .with_order_quantity(dec!(10));
+/// assert_eq!(index_options.compute_fee(&large), dec!(12.50));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "Vec<FeeComponent>", into = "Vec<FeeComponent>")]
 pub struct CompositeFeeModel(Vec<FeeComponent>);
@@ -469,8 +704,9 @@ impl CompositeFeeModel {
     /// A schedule charging the sum of `components`. An empty list charges nothing.
     ///
     /// # Errors
-    /// Returns [`FeeModelError::MinAboveMax`] if a component's minimum per order exceeds its
-    /// maximum.
+    /// - [`FeeModelError::MinAboveMax`] if a component's minimum per order exceeds its maximum.
+    /// - [`FeeModelError::NegativeOrderQuantity`] if a component's order quantity threshold is
+    ///   negative.
     pub fn new(components: Vec<FeeComponent>) -> Result<Self, FeeModelError> {
         Self::try_from(components)
     }
@@ -490,6 +726,11 @@ impl TryFrom<Vec<FeeComponent>> for CompositeFeeModel {
                 && min > max
             {
                 return Err(FeeModelError::MinAboveMax { index, min, max });
+            }
+            if let Some(min) = component.min_order_quantity
+                && min < Decimal::ZERO
+            {
+                return Err(FeeModelError::NegativeOrderQuantity { index, min });
             }
         }
         Ok(Self(components))
@@ -703,6 +944,15 @@ pub enum FeeModelError {
         /// Its maximum per order.
         max: Decimal,
     },
+    /// The component at `index` is charged only from an order quantity of `min`, which is
+    /// negative.
+    #[error("fee component {index}: order quantity threshold {min} is negative")]
+    NegativeOrderQuantity {
+        /// The component's position in the list.
+        index: usize,
+        /// Its order quantity threshold.
+        min: Decimal,
+    },
     /// The change at `index` of a [`DatedFeeModel`] takes effect at `from`, which is not after
     /// `previous`, the time of the change before it.
     #[error(
@@ -787,6 +1037,240 @@ impl FeeModelConfig {
     pub(crate) fn is_dated(&self) -> bool {
         matches!(self, Self::Dated(_))
     }
+}
+
+/// Fee models for some instruments, each in place of a venue's default model: by the
+/// instrument's exact name, by its kind and underlying, or by its kind alone.
+///
+/// [`resolve`](Self::resolve) picks the model of the most specific entry that matches an
+/// instrument, in this order, and `None` if none does, so the caller falls back to its default:
+/// 1. its name, exactly (see [`with_name`](Self::with_name));
+/// 2. its kind and underlying, base and quote (see [`with_underlying`](Self::with_underlying));
+/// 3. its kind (see [`with_kind`](Self::with_kind)).
+///
+/// An entry that matches no instrument is never used, and an instrument no entry matches pays the
+/// default.
+///
+/// # Choosing a key
+/// A key by kind separates a venue's options from its shares. A key by kind and underlying
+/// separates the options on one underlying from the options on others, without catching the
+/// underlying itself, which is of another kind. It cannot separate two families of options on one
+/// underlying, such as an index's standard and weekly options, which an [`OptionContract`] does
+/// not tell apart: key those by name.
+///
+/// [`OptionContract`]: rustrade_instrument::instrument::kind::option::OptionContract
+///
+/// # Serialised form
+/// Each part is left out when empty, and deserialising refuses an unknown key and an underlying
+/// listed twice for one kind ([`FeeModelOverridesError::DuplicateUnderlying`]):
+///
+/// ```json
+/// {
+///   "by_name": {"SPXW261218C06000000": <model>},
+///   "by_underlying": [
+///     {"kind": "option", "underlying": {"base": "spx", "quote": "usd"}, "model": <model>}
+///   ],
+///   "by_kind": {"option": <model>}
+/// }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(try_from = "FeeModelOverridesRepr", into = "FeeModelOverridesRepr")]
+pub struct FeeModelOverrides {
+    by_name: BTreeMap<InstrumentNameExchange, FeeModelConfig>,
+    by_underlying: BTreeMap<
+        InstrumentKindDiscriminant,
+        BTreeMap<Underlying<AssetNameExchange>, FeeModelConfig>,
+    >,
+    by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+}
+
+impl FeeModelOverrides {
+    /// No overrides: every instrument pays the default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// These overrides, with the instrument named `name` on the venue charged under `model`,
+    /// replacing any model it had.
+    #[must_use]
+    pub fn with_name(
+        mut self,
+        name: impl Into<InstrumentNameExchange>,
+        model: FeeModelConfig,
+    ) -> Self {
+        self.by_name.insert(name.into(), model);
+        self
+    }
+
+    /// These overrides, with instruments of `kind` on `underlying` charged under `model`,
+    /// replacing any model they had.
+    #[must_use]
+    pub fn with_underlying(
+        mut self,
+        kind: InstrumentKindDiscriminant,
+        underlying: Underlying<AssetNameExchange>,
+        model: FeeModelConfig,
+    ) -> Self {
+        self.by_underlying
+            .entry(kind)
+            .or_default()
+            .insert(underlying, model);
+        self
+    }
+
+    /// These overrides, with instruments of `kind` charged under `model`, replacing any model
+    /// they had.
+    #[must_use]
+    pub fn with_kind(mut self, kind: InstrumentKindDiscriminant, model: FeeModelConfig) -> Self {
+        self.by_kind.insert(kind, model);
+        self
+    }
+
+    /// The models by instrument name.
+    pub fn by_name(&self) -> &BTreeMap<InstrumentNameExchange, FeeModelConfig> {
+        &self.by_name
+    }
+
+    /// The models by kind and underlying.
+    pub fn by_underlying(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            InstrumentKindDiscriminant,
+            &Underlying<AssetNameExchange>,
+            &FeeModelConfig,
+        ),
+    > {
+        self.by_underlying.iter().flat_map(|(kind, models)| {
+            models
+                .iter()
+                .map(|(underlying, model)| (*kind, underlying, model))
+        })
+    }
+
+    /// The models by kind.
+    pub fn by_kind(&self) -> &BTreeMap<InstrumentKindDiscriminant, FeeModelConfig> {
+        &self.by_kind
+    }
+
+    /// Whether there are no overrides at all.
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty() && self.by_underlying.is_empty() && self.by_kind.is_empty()
+    }
+
+    /// The model of the most specific entry matching the instrument named `name`, of `kind`, on
+    /// `underlying`, or `None` if no entry matches. See the type's documentation for the order.
+    pub fn resolve(
+        &self,
+        name: &InstrumentNameExchange,
+        kind: InstrumentKindDiscriminant,
+        underlying: &Underlying<AssetNameExchange>,
+    ) -> Option<&FeeModelConfig> {
+        self.by_name
+            .get(name)
+            .or_else(|| {
+                self.by_underlying
+                    .get(&kind)
+                    .and_then(|models| models.get(underlying))
+            })
+            .or_else(|| self.by_kind.get(&kind))
+    }
+}
+
+/// [`FeeModelOverrides`]'s serialised form, validated on the way in.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FeeModelOverridesRepr {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    by_name: BTreeMap<InstrumentNameExchange, FeeModelConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    by_underlying: Vec<UnderlyingFeeModelRepr>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
+}
+
+/// One entry of [`FeeModelOverridesRepr::by_underlying`]: a list rather than a map, since a JSON
+/// map's keys are strings and this one is a kind and an underlying.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UnderlyingFeeModelRepr {
+    kind: InstrumentKindDiscriminant,
+    underlying: Underlying<AssetNameExchange>,
+    model: FeeModelConfig,
+}
+
+impl TryFrom<FeeModelOverridesRepr> for FeeModelOverrides {
+    type Error = FeeModelOverridesError;
+
+    fn try_from(repr: FeeModelOverridesRepr) -> Result<Self, Self::Error> {
+        let FeeModelOverridesRepr {
+            by_name,
+            by_underlying: entries,
+            by_kind,
+        } = repr;
+        let mut by_underlying: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+        for UnderlyingFeeModelRepr {
+            kind,
+            underlying,
+            model,
+        } in entries
+        {
+            let models = by_underlying.entry(kind).or_default();
+            if models.contains_key(&underlying) {
+                return Err(FeeModelOverridesError::DuplicateUnderlying { kind, underlying });
+            }
+            models.insert(underlying, model);
+        }
+        Ok(Self {
+            by_name,
+            by_underlying,
+            by_kind,
+        })
+    }
+}
+
+impl From<FeeModelOverrides> for FeeModelOverridesRepr {
+    fn from(overrides: FeeModelOverrides) -> Self {
+        let FeeModelOverrides {
+            by_name,
+            by_underlying,
+            by_kind,
+        } = overrides;
+        Self {
+            by_name,
+            by_underlying: by_underlying
+                .into_iter()
+                .flat_map(|(kind, models)| {
+                    models
+                        .into_iter()
+                        .map(move |(underlying, model)| UnderlyingFeeModelRepr {
+                            kind,
+                            underlying,
+                            model,
+                        })
+                })
+                .collect(),
+            by_kind,
+        }
+    }
+}
+
+/// Why a [`FeeModelOverrides`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum FeeModelOverridesError {
+    /// `underlying` is listed more than once for instruments of `kind`.
+    #[error(
+        "fee model overrides list {kind:?} on {}/{} more than once",
+        .underlying.base,
+        .underlying.quote
+    )]
+    DuplicateUnderlying {
+        /// The instruments' kind.
+        kind: InstrumentKindDiscriminant,
+        /// Their underlying.
+        underlying: Underlying<AssetNameExchange>,
+    },
 }
 
 /// Which asset the simulated venue charges a spot fill's fee in.
@@ -1419,10 +1903,10 @@ mod tests {
         let inverted = FeeComponent::new(FeeBasis::PerContract(d("1")))
             .with_min_per_order(d("5"))
             .with_max_per_order(d("4"));
-        let equal = inverted.with_min_per_order(d("4"));
+        let equal = inverted.clone().with_min_per_order(d("4"));
 
         assert_eq!(
-            CompositeFeeModel::new(vec![equal, inverted]),
+            CompositeFeeModel::new(vec![equal.clone(), inverted]),
             Err(FeeModelError::MinAboveMax {
                 index: 1,
                 min: d("5"),
@@ -1460,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_composite_with_a_per_order_charge_or_bound_is_not_linear() {
+    fn only_a_composite_with_a_per_order_charge_bound_or_threshold_is_not_linear() {
         let composite =
             |component| FeeModelConfig::Composite(CompositeFeeModel::new(vec![component]).unwrap());
         let per_contract = FeeComponent::new(FeeBasis::PerContract(d("1")));
@@ -1473,10 +1957,12 @@ mod tests {
             })
             .is_linear()
         );
-        assert!(composite(per_contract.on_side(Side::Sell)).is_linear());
+        assert!(composite(per_contract.clone().on_side(Side::Sell)).is_linear());
+        assert!(composite(FeeComponent::new(FeeBasis::PerContractByPrice(bands()))).is_linear());
         assert!(!composite(FeeComponent::new(FeeBasis::PerOrder(d("1")))).is_linear());
-        assert!(!composite(per_contract.with_min_per_order(d("1"))).is_linear());
-        assert!(!composite(per_contract.with_max_per_order(d("1"))).is_linear());
+        assert!(!composite(per_contract.clone().with_min_per_order(d("1"))).is_linear());
+        assert!(!composite(per_contract.clone().with_max_per_order(d("1"))).is_linear());
+        assert!(!composite(per_contract.from_order_quantity(d("10"))).is_linear());
     }
 
     #[test]
@@ -1484,16 +1970,18 @@ mod tests {
         let component = FeeComponent::new(FeeBasis::PerOrder(d("1")))
             .on_side(Side::Buy)
             .on_liquidity(Liquidity::Maker)
+            .from_order_quantity(d("10"))
             .with_min_per_order(d("0.5"))
             .with_max_per_order(d("2"));
 
-        assert_eq!(component.basis(), FeeBasis::PerOrder(d("1")));
+        assert_eq!(component.basis(), &FeeBasis::PerOrder(d("1")));
         assert_eq!(component.side(), Some(Side::Buy));
         assert_eq!(component.liquidity(), Some(Liquidity::Maker));
+        assert_eq!(component.min_order_quantity(), Some(d("10")));
         assert_eq!(component.min_per_order(), Some(d("0.5")));
         assert_eq!(component.max_per_order(), Some(d("2")));
         assert_eq!(
-            CompositeFeeModel::new(vec![component])
+            CompositeFeeModel::new(vec![component.clone()])
                 .unwrap()
                 .components(),
             &[component]
@@ -1702,5 +2190,415 @@ mod tests {
         assert!(!dated(per_contract("1"), per_order()).is_linear());
         assert!(dated(per_contract("1"), per_contract("2")).is_dated());
         assert!(!per_contract("1").is_dated());
+    }
+
+    /// 0.50 a contract below 1, 0.65 from 1, 0.80 from 5.
+    fn bands() -> PriceBands {
+        PriceBands::new(vec![
+            PriceBand::new(d("0"), d("0.50")),
+            PriceBand::new(d("1"), d("0.65")),
+            PriceBand::new(d("5"), d("0.80")),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_price_band_charges_from_its_price_inclusive_until_the_next() {
+        let bands = bands();
+
+        for (price, per_contract) in [
+            ("0", "0.50"),
+            ("0.99", "0.50"),
+            ("1", "0.65"),
+            ("4.99", "0.65"),
+            ("5", "0.80"),
+            ("1000", "0.80"),
+        ] {
+            assert_eq!(
+                bands.per_contract_at(d(price)),
+                d(per_contract),
+                "at {price}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_price_below_zero_pays_the_first_band() {
+        assert_eq!(bands().per_contract_at(d("-0.01")), d("0.50"));
+        assert_eq!(bands().per_contract_at(d("-100")), d("0.50"));
+    }
+
+    #[test]
+    fn a_banded_basis_charges_each_contract_its_band_rate() {
+        let banded = FeeComponent::new(FeeBasis::PerContractByPrice(bands()));
+
+        // 3 contracts of 100 at a 2.5 premium: the band from 1. The contract size does not count.
+        assert_eq!(banded.compute_fee(&buy("2.5", "3", "100")), d("1.95"));
+        assert_eq!(banded.compute_fee(&sell("0.4", "2", "100")), d("1.00"));
+        assert_eq!(banded.compute_fee(&buy("5", "-2", "100")), d("1.60"));
+    }
+
+    #[test]
+    fn price_bands_report_what_they_were_built_with() {
+        assert_eq!(
+            bands().bands(),
+            &[
+                PriceBand::new(d("0"), d("0.50")),
+                PriceBand::new(d("1"), d("0.65")),
+                PriceBand::new(d("5"), d("0.80")),
+            ]
+        );
+    }
+
+    #[test]
+    fn price_bands_must_start_at_zero_and_increase() {
+        let band = |from, per_contract| PriceBand::new(d(from), d(per_contract));
+
+        assert_eq!(PriceBands::new(vec![]), Err(PriceBandsError::Empty));
+        assert_eq!(
+            PriceBands::new(vec![band("0.01", "1")]),
+            Err(PriceBandsError::FirstNotZero { from: d("0.01") })
+        );
+        assert_eq!(
+            PriceBands::new(vec![band("-1", "1")]),
+            Err(PriceBandsError::FirstNotZero { from: d("-1") })
+        );
+        assert_eq!(
+            PriceBands::new(vec![band("0", "1"), band("1", "2"), band("1", "3")]),
+            Err(PriceBandsError::NotIncreasing {
+                index: 2,
+                previous: d("1"),
+                from: d("1"),
+            })
+        );
+        assert_eq!(
+            PriceBands::new(vec![band("0", "1"), band("2", "2"), band("1", "3")]),
+            Err(PriceBandsError::NotIncreasing {
+                index: 2,
+                previous: d("2"),
+                from: d("1"),
+            })
+        );
+        // One band charges every price; a rebate is allowed.
+        assert!(PriceBands::new(vec![band("0", "-0.1")]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_price_band_schedule_says_why() {
+        assert_eq!(
+            PriceBandsError::Empty.to_string(),
+            "a price band schedule has no bands"
+        );
+        assert_eq!(
+            PriceBandsError::FirstNotZero { from: d("0.5") }.to_string(),
+            "the first price band starts at 0.5, not at zero"
+        );
+        assert_eq!(
+            PriceBandsError::NotIncreasing {
+                index: 2,
+                previous: d("1"),
+                from: d("0.5"),
+            }
+            .to_string(),
+            "price band 2: starts at 0.5, which is not above 1"
+        );
+    }
+
+    #[test]
+    fn a_banded_basis_round_trips_and_is_validated_on_deserialise() {
+        let basis = FeeBasis::PerContractByPrice(
+            PriceBands::new(vec![
+                PriceBand::new(d("0"), d("0.5")),
+                PriceBand::new(d("1"), d("0.65")),
+            ])
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&basis).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"PerContractByPrice":[{"from":"0","per_contract":"0.5"},{"from":"1","per_contract":"0.65"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<FeeBasis>(&json).unwrap(), basis);
+
+        for (json, message) in [
+            (r#"{"PerContractByPrice":[]}"#, "no bands"),
+            (
+                r#"{"PerContractByPrice":[{"from":"1","per_contract":"0.5"}]}"#,
+                "not at zero",
+            ),
+            (
+                r#"{"PerContractByPrice":[{"from":"0","per_contract":"0.5"},{"from":"0","per_contract":"0.6"}]}"#,
+                "not above",
+            ),
+        ] {
+            let error = serde_json::from_str::<FeeBasis>(json).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_threshold_charges_only_orders_from_its_quantity() {
+        let commission =
+            FeeComponent::new(FeeBasis::PerContract(d("0.65"))).from_order_quantity(d("10"));
+        let fill =
+            |order_quantity: &str| buy("1", "4", "100").with_order_quantity(d(order_quantity));
+
+        assert_eq!(commission.compute_fee(&fill("9.99")), Decimal::ZERO);
+        assert_eq!(commission.compute_fee(&fill("10")), d("2.60"));
+        assert_eq!(commission.compute_fee(&fill("25")), d("2.60"));
+        // The order's sign is ignored, as a fill's is.
+        assert_eq!(commission.compute_fee(&fill("-10")), d("2.60"));
+        assert_eq!(commission.compute_fee(&fill("-9")), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_threshold_charges_a_fill_whose_order_size_is_unknown() {
+        let commission =
+            FeeComponent::new(FeeBasis::PerContract(d("0.65"))).from_order_quantity(d("10"));
+        let fill = buy("1", "4", "100");
+
+        assert_eq!(fill.order_quantity, None);
+        assert_eq!(commission.compute_fee(&fill), d("2.60"));
+        assert_eq!(
+            fill.with_order_quantity(d("4")).order_quantity,
+            Some(d("4"))
+        );
+    }
+
+    #[test]
+    fn a_threshold_charges_an_order_the_same_however_it_is_split() {
+        let model = CompositeFeeModel::new(vec![
+            FeeComponent::new(FeeBasis::PerContract(d("0.65")))
+                .from_order_quantity(d("10"))
+                .with_min_per_order(d("1")),
+            FeeComponent::new(FeeBasis::PerContractByPrice(bands())),
+        ])
+        .unwrap();
+
+        for order in ["9", "12"] {
+            let fill = |quantity: &str, prior: Decimal| {
+                sell("2", quantity, "100")
+                    .with_prior_filled(prior)
+                    .with_order_quantity(d(order))
+            };
+            let whole = model.compute_fee(&fill(order, Decimal::ZERO));
+            for split in ["0.5", "1", "3", "8"] {
+                let rest = d(order) - d(split);
+                let first = model.compute_fee(&fill(split, Decimal::ZERO));
+                let second = model.compute_fee(&fill(&rest.to_string(), d(split)));
+                assert_eq!(first + second, whole, "order {order}, split after {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_negative_order_quantity_threshold_is_refused() {
+        let threshold =
+            |min| FeeComponent::new(FeeBasis::PerContract(d("1"))).from_order_quantity(d(min));
+
+        assert_eq!(
+            CompositeFeeModel::new(vec![threshold("0"), threshold("-1")]),
+            Err(FeeModelError::NegativeOrderQuantity {
+                index: 1,
+                min: d("-1"),
+            })
+        );
+        assert!(CompositeFeeModel::new(vec![threshold("0")]).is_ok());
+        assert_eq!(
+            FeeModelError::NegativeOrderQuantity {
+                index: 1,
+                min: d("-1"),
+            }
+            .to_string(),
+            "fee component 1: order quantity threshold -1 is negative"
+        );
+
+        let error = serde_json::from_str::<CompositeFeeModel>(
+            r#"[{"basis":{"PerContract":"1"},"min_order_quantity":"-1"}]"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is negative"), "{error}");
+    }
+
+    #[test]
+    fn a_threshold_round_trips() {
+        let model = CompositeFeeModel::new(vec![
+            FeeComponent::new(FeeBasis::PerContract(d("0.65"))).from_order_quantity(d("10")),
+        ])
+        .unwrap();
+        let json = serde_json::to_string(&model).unwrap();
+
+        assert_eq!(
+            json,
+            r#"[{"basis":{"PerContract":"0.65"},"min_order_quantity":"10"}]"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CompositeFeeModel>(&json).unwrap(),
+            model
+        );
+    }
+
+    #[test]
+    fn a_dated_model_holding_a_threshold_is_not_linear() {
+        let threshold = FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![
+                FeeComponent::new(FeeBasis::PerContract(d("1"))).from_order_quantity(d("10")),
+            ])
+            .unwrap(),
+        );
+        let dated =
+            DatedFeeModel::new(per_contract("1"), vec![FeeChange::new(at(0), threshold)]).unwrap();
+
+        assert!(!FeeModelConfig::Dated(dated).is_linear());
+    }
+
+    fn option_kind() -> InstrumentKindDiscriminant {
+        InstrumentKindDiscriminant::Option
+    }
+
+    fn spx() -> Underlying<AssetNameExchange> {
+        Underlying::new("spx", "usd")
+    }
+
+    fn name(name: &str) -> InstrumentNameExchange {
+        InstrumentNameExchange::new(name)
+    }
+
+    /// One override of each kind, each a different per-contract fee.
+    fn overrides() -> FeeModelOverrides {
+        FeeModelOverrides::new()
+            .with_name("SPXW-C", per_contract("3"))
+            .with_underlying(option_kind(), spx(), per_contract("2"))
+            .with_kind(option_kind(), per_contract("1"))
+    }
+
+    #[test]
+    fn an_override_by_name_beats_one_by_underlying_which_beats_one_by_kind() {
+        let overrides = overrides();
+
+        assert_eq!(
+            overrides.resolve(&name("SPXW-C"), option_kind(), &spx()),
+            Some(&per_contract("3"))
+        );
+        assert_eq!(
+            overrides.resolve(&name("SPX-C"), option_kind(), &spx()),
+            Some(&per_contract("2"))
+        );
+        assert_eq!(
+            overrides.resolve(
+                &name("NDX-C"),
+                option_kind(),
+                &Underlying::new("ndx", "usd")
+            ),
+            Some(&per_contract("1"))
+        );
+        // The same base in another quote is another underlying.
+        assert_eq!(
+            overrides.resolve(
+                &name("SPX-C"),
+                option_kind(),
+                &Underlying::new("spx", "eur")
+            ),
+            Some(&per_contract("1"))
+        );
+    }
+
+    #[test]
+    fn an_override_by_underlying_does_not_catch_another_kind_on_it() {
+        let overrides =
+            FeeModelOverrides::new().with_underlying(option_kind(), spx(), per_contract("2"));
+
+        assert_eq!(
+            overrides.resolve(&name("SPX"), InstrumentKindDiscriminant::Spot, &spx()),
+            None
+        );
+        assert_eq!(
+            FeeModelOverrides::new().resolve(&name("SPX"), option_kind(), &spx()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_later_override_replaces_an_earlier_one_with_its_key() {
+        let overrides = overrides()
+            .with_name("SPXW-C", per_contract("13"))
+            .with_underlying(option_kind(), spx(), per_contract("12"))
+            .with_kind(option_kind(), per_contract("11"));
+
+        assert_eq!(
+            overrides.by_name(),
+            &BTreeMap::from([(name("SPXW-C"), per_contract("13"))])
+        );
+        assert_eq!(
+            overrides.by_underlying().collect::<Vec<_>>(),
+            vec![(option_kind(), &spx(), &per_contract("12"))]
+        );
+        assert_eq!(
+            overrides.by_kind(),
+            &BTreeMap::from([(option_kind(), per_contract("11"))])
+        );
+    }
+
+    #[test]
+    fn overrides_are_empty_only_with_no_entry_of_any_kind() {
+        assert!(FeeModelOverrides::new().is_empty());
+        assert!(
+            !FeeModelOverrides::new()
+                .with_name("x", per_contract("1"))
+                .is_empty()
+        );
+        assert!(
+            !FeeModelOverrides::new()
+                .with_underlying(option_kind(), spx(), per_contract("1"))
+                .is_empty()
+        );
+        assert!(
+            !FeeModelOverrides::new()
+                .with_kind(option_kind(), per_contract("1"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn overrides_round_trip_with_underlyings_as_a_list() {
+        let overrides = overrides();
+        let json = serde_json::to_string(&overrides).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"by_name":{"SPXW-C":{"PerContract":{"commission_per_contract":"3"}}},"by_underlying":[{"kind":"option","underlying":{"base":"spx","quote":"usd"},"model":{"PerContract":{"commission_per_contract":"2"}}}],"by_kind":{"option":{"PerContract":{"commission_per_contract":"1"}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<FeeModelOverrides>(&json).unwrap(),
+            overrides
+        );
+        assert_eq!(
+            serde_json::to_string(&FeeModelOverrides::new()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::from_str::<FeeModelOverrides>("{}").unwrap(),
+            FeeModelOverrides::new()
+        );
+    }
+
+    #[test]
+    fn deserialising_overrides_refuses_a_repeated_underlying_and_an_unknown_key() {
+        let entry =
+            r#"{"kind":"option","underlying":{"base":"spx","quote":"usd"},"model":{"Zero":null}}"#;
+        let error = serde_json::from_str::<FeeModelOverrides>(&format!(
+            r#"{{"by_underlying":[{entry},{entry}]}}"#
+        ))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fee model overrides list Option on spx/usd more than once"),
+            "{error}"
+        );
+
+        let error = serde_json::from_str::<FeeModelOverrides>(r#"{"by_names":{}}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 }

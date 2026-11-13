@@ -398,7 +398,7 @@ impl SimulatedVenue {
                 side,
                 quantity,
                 price,
-                FeePricing::first(Liquidity::Taker, self.time_exchange()),
+                FeePricing::first(Liquidity::Taker, quantity, self.time_exchange()),
             )
         };
         let mut quantity = Decimal::ONE;
@@ -502,7 +502,7 @@ impl SimulatedVenue {
             leg.side,
             quantity,
             leg.price,
-            FeePricing::first(Liquidity::Taker, self.time_exchange()),
+            FeePricing::first(Liquidity::Taker, quantity, self.time_exchange()),
         )
     }
 

@@ -185,7 +185,7 @@ impl SimulatedVenue {
             Side::Sell,
             quantity,
             price,
-            FeePricing::first(Liquidity::Taker, at),
+            FeePricing::first(Liquidity::Taker, quantity, at),
         );
         let mut cancelled = Vec::new();
         self.cancel_orders(|working| working == instrument, at, &mut cancelled);
