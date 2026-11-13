@@ -324,6 +324,9 @@ user of the library would need it in the same form. If so, it belongs here.
   configurable rather than tuned to one consumer.
 - **Market data as the source sends it,** including option greeks that a venue or data provider
   computes.
+- **Option pricing models** (`rustrade-pricing`): an option's price, implied volatility and Greeks
+  from inputs the caller supplies, the same in simulation and live. A model is a mechanism; the
+  engine does not use it.
 
 **Downstream, in the consumer:**
 
@@ -334,7 +337,8 @@ user of the library would need it in the same form. If so, it belongs here.
 - What to do when a stream ends or a request fails: whether to resume, retry or halt. Each
   component documents its own reconnects and retries, and when, if ever, it gives up.
 - When to trade: gating orders by trading hours or a market calendar.
-- Computing greeks and other analytics from market data.
+- Choosing a model's inputs (rates, dividends, which quote to solve on), and analytics built on its
+  results, such as volatility surfaces and signals.
 
 The library should make a policy possible without choosing it. It exposes what a consumer needs to
 decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
