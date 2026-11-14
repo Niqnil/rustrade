@@ -6,7 +6,8 @@ members = [
     "rustrade-execution",
     "rustrade-integration",
     "rustrade-macro",
-    "rustrade-instrument"
+    "rustrade-instrument",
+    "rustrade-pricing"
 ]
 
 [workspace.package]
