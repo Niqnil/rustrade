@@ -1769,19 +1769,32 @@ fn kind_has_limit_price(kind: &OrderKind) -> bool {
     }
 }
 
-pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
+/// The [`TimeInForce`] of a Binance order of type `order_type` reported with `timeInForce` `tif`.
+///
+/// - A `LIMIT_MAKER` order is post-only, which Binance expresses as the order type, not as its
+///   time in force: it is read as [`TimeInForce::GoodUntilCancelled`] with `post_only` whatever
+///   `tif` says.
+/// - `GTD` is read as [`TimeInForce::Unreported`]: these reports carry no expiry to build a
+///   [`TimeInForce::GoodTillDate`] from.
+/// - An absent or unknown `tif` is [`TimeInForce::Unreported`] too, an unknown one with a
+///   warning, rather than a guess.
+pub(crate) fn parse_time_in_force(order_type: &str, tif: Option<&str>) -> TimeInForce {
+    if order_type == "LIMIT_MAKER" {
+        return TimeInForce::GoodUntilCancelled { post_only: true };
+    }
     match tif {
-        "GTC" => TimeInForce::GoodUntilCancelled { post_only: false },
-        "GTX" => TimeInForce::GoodUntilCancelled { post_only: true },
-        "IOC" => TimeInForce::ImmediateOrCancel,
-        "FOK" => TimeInForce::FillOrKill,
-        "GTD" => TimeInForce::GoodUntilEndOfDay,
-        _ => {
+        Some("GTC") => TimeInForce::GoodUntilCancelled { post_only: false },
+        Some("GTX") => TimeInForce::GoodUntilCancelled { post_only: true },
+        Some("IOC") => TimeInForce::ImmediateOrCancel,
+        Some("FOK") => TimeInForce::FillOrKill,
+        Some("GTD") => TimeInForce::Unreported,
+        None => TimeInForce::Unreported,
+        Some(tif) => {
             warn!(
                 time_in_force = tif,
-                "unknown Binance TimeInForce, defaulting to GTC"
+                "unknown Binance TimeInForce, reporting it as Unreported"
             );
-            TimeInForce::GoodUntilCancelled { post_only: false }
+            TimeInForce::Unreported
         }
     }
 }
@@ -2264,7 +2277,8 @@ fn convert_order_row<T: BinanceOrderFields>(
         }
     };
     let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
-    let kind = match o.order_type() {
+    let order_type = o.order_type();
+    let kind = match order_type {
         Some(t) => {
             // decode_order_kind already logs a warning on what it cannot describe
             let decoded = decode_order_kind(
@@ -2292,7 +2306,8 @@ fn convert_order_row<T: BinanceOrderFields>(
     } else {
         None
     };
-    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    // The order type is present: an order without one returned above.
+    let time_in_force = parse_time_in_force(order_type.unwrap_or_default(), o.time_in_force());
     // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
     // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
     // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
@@ -3278,7 +3293,7 @@ fn convert_order_snapshot(
             return None;
         }
     };
-    let time_in_force = parse_time_in_force(report.time_in_force.as_deref().unwrap_or("GTC"));
+    let time_in_force = parse_time_in_force(order_type, report.time_in_force.as_deref());
     // Field `z`: the order's cumulative filled quantity. Usually 0 on a NEW, but read it there
     // too in case of an immediate partial fill on an aggressive order; on a TRADE it is the whole
     // point of the snapshot.
@@ -3997,7 +4012,8 @@ fn wire_time_in_force(tif: TimeInForce) -> Result<Option<BinanceTimeInForce>, Un
         TimeInForce::GoodUntilEndOfDay
         | TimeInForce::GoodTillDate { .. }
         | TimeInForce::AtOpen
-        | TimeInForce::AtClose => Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN)),
+        | TimeInForce::AtClose
+        | TimeInForce::Unreported => Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN)),
     }
 }
 
@@ -4494,6 +4510,7 @@ mod tests {
             },
             TimeInForce::AtOpen,
             TimeInForce::AtClose,
+            TimeInForce::Unreported,
         ];
         let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
 

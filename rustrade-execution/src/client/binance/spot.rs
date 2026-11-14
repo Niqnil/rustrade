@@ -3596,22 +3596,28 @@ mod tests {
 
     #[test]
     fn test_parse_time_in_force() {
+        let limit = |tif| parse_time_in_force("LIMIT", tif);
         assert_eq!(
-            parse_time_in_force("GTC"),
+            limit(Some("GTC")),
             TimeInForce::GoodUntilCancelled { post_only: false }
         );
         assert_eq!(
-            parse_time_in_force("GTX"),
+            limit(Some("GTX")),
             TimeInForce::GoodUntilCancelled { post_only: true }
         );
-        assert_eq!(parse_time_in_force("IOC"), TimeInForce::ImmediateOrCancel);
-        assert_eq!(parse_time_in_force("FOK"), TimeInForce::FillOrKill);
-        assert_eq!(parse_time_in_force("GTD"), TimeInForce::GoodUntilEndOfDay);
-        // Unknown defaults to GTC
-        assert_eq!(
-            parse_time_in_force("UNKNOWN"),
-            TimeInForce::GoodUntilCancelled { post_only: false }
-        );
+        assert_eq!(limit(Some("IOC")), TimeInForce::ImmediateOrCancel);
+        assert_eq!(limit(Some("FOK")), TimeInForce::FillOrKill);
+        // No expiry to build a GoodTillDate from, so not a guess at one.
+        assert_eq!(limit(Some("GTD")), TimeInForce::Unreported);
+        assert_eq!(limit(Some("UNKNOWN")), TimeInForce::Unreported);
+        assert_eq!(limit(None), TimeInForce::Unreported);
+        // Post-only is the order type on Binance, whatever timeInForce says.
+        for tif in [Some("GTC"), None] {
+            assert_eq!(
+                parse_time_in_force("LIMIT_MAKER", tif),
+                TimeInForce::GoodUntilCancelled { post_only: true }
+            );
+        }
     }
 
     #[test]
@@ -4024,6 +4030,34 @@ mod tests {
         "s":"BTCUSDT","i":12345,"c":"client-1","x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY",
         "o":"LIMIT","f":"GTC","q":"2","p":"100","z":"1","l":"1","L":"100","t":555,"n":"0.1",
         "N":"USDT","T":1700000001000}}"#;
+
+    /// A post-only order, sent as `LIMIT_MAKER`, reads back as post-only on the stream and in a
+    /// REST listing, though Binance reports its `timeInForce` as `GTC`.
+    #[test]
+    fn a_limit_maker_order_reads_back_as_post_only() {
+        let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
+
+        let frame = WS_NEW.replace(r#""o":"LIMIT""#, r#""o":"LIMIT_MAKER""#);
+        let delivered = drive_ws_pipeline(&[frame.as_str()]);
+        let tifs: Vec<TimeInForce> = delivered
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                AccountEventKind::OrderSnapshot(snap) => Some(snap.0.time_in_force),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tifs, [post_only]);
+
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let row = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            r#type: Some("LIMIT_MAKER".to_string()),
+            ..make_base_open_order()
+        };
+        let order = convert_open_order(&row, ExchangeId::BinanceSpot, &instrument, &|_| None)
+            .expect("a live LIMIT_MAKER row converts");
+        assert_eq!(order.time_in_force, post_only);
+        assert_eq!(order.kind, OrderKind::Limit);
+    }
 
     /// A fill's order snapshot must survive the dedup gate that sits between the converter and the
     /// consumer.

@@ -371,7 +371,7 @@ pub(super) fn open_order_to_order(
         quantity,
         // Neither the kind nor the time in force is in this response.
         kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        time_in_force: TimeInForce::Unreported,
         state: Open {
             id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", row.oid))),
             time_exchange,
@@ -590,7 +590,7 @@ pub(super) fn order_update_to_order(
         price: Some(price),
         quantity: orig_sz,
         kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        time_in_force: TimeInForce::Unreported,
         state,
     })
 }
@@ -721,7 +721,8 @@ pub(super) fn classify_order(kind: OrderKind, tif: TimeInForce) -> Result<WireKi
             | TimeInForce::GoodUntilEndOfDay
             | TimeInForce::GoodTillDate { .. }
             | TimeInForce::AtOpen
-            | TimeInForce::AtClose => false,
+            | TimeInForce::AtClose
+            | TimeInForce::Unreported => false,
         };
         if taken {
             Ok(WireKind::Trigger {
@@ -746,7 +747,8 @@ pub(super) fn classify_order(kind: OrderKind, tif: TimeInForce) -> Result<WireKi
                 | TimeInForce::GoodUntilEndOfDay
                 | TimeInForce::GoodTillDate { .. }
                 | TimeInForce::AtOpen
-                | TimeInForce::AtClose => {
+                | TimeInForce::AtClose
+                | TimeInForce::Unreported => {
                     return Err(Unclassified::TimeInForce(TIME_IN_FORCE_NOT_TAKEN));
                 }
             };
@@ -1114,6 +1116,7 @@ mod tests {
             },
             TimeInForce::AtOpen,
             TimeInForce::AtClose,
+            TimeInForce::Unreported,
         ];
         let every_tif = [gtc, post_only, ioc].into_iter().chain(not_taken);
 
@@ -1731,6 +1734,8 @@ pub(super) mod info_tests {
 
         assert_eq!(order.key.cid, ClientOrderId::new(CID));
         assert_eq!(order.quantity, dec!(0.0075));
+        // The update carries no time in force, so it reports none rather than a guess.
+        assert_eq!(order.time_in_force, TimeInForce::Unreported);
         match order.state {
             OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
                 assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("7001")));
@@ -1861,6 +1866,8 @@ pub(super) mod info_tests {
         assert_eq!(order.quantity, dec!(0.0075));
         assert_eq!(order.state.filled_quantity, dec!(0.0025));
         assert_eq!(order.state.id, VenueOrderId::Assigned(OrderId::new("7001")));
+        // The listing carries no time in force, so it reports none rather than a guess.
+        assert_eq!(order.time_in_force, TimeInForce::Unreported);
     }
 
     #[test]

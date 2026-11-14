@@ -5025,15 +5025,19 @@ fn parse_order_kind(
     }
 }
 
+/// The [`TimeInForce`] Alpaca's `time_in_force` reads as: every value [`map_time_in_force`] sends,
+/// and [`TimeInForce::Unreported`] for any other, with a warning, rather than a guess.
 fn parse_time_in_force(s: &str) -> TimeInForce {
     match s {
         "gtc" | "GTC" => TimeInForce::GoodUntilCancelled { post_only: false },
         "day" | "DAY" => TimeInForce::GoodUntilEndOfDay,
         "fok" | "FOK" => TimeInForce::FillOrKill,
         "ioc" | "IOC" => TimeInForce::ImmediateOrCancel,
+        "opg" | "OPG" => TimeInForce::AtOpen,
+        "cls" | "CLS" => TimeInForce::AtClose,
         other => {
-            warn!(%other, "Alpaca: unknown time_in_force, defaulting to GoodUntilEndOfDay");
-            TimeInForce::GoodUntilEndOfDay
+            warn!(%other, "Alpaca: unknown time_in_force, reporting it as Unreported");
+            TimeInForce::Unreported
         }
     }
 }
@@ -5443,7 +5447,8 @@ impl OrderAssetClass {
 /// - `post_only: true` on any order. Alpaca does not support post-only orders: silently placing a
 ///   taker-eligible GTC order would be the opposite of caller intent, risking unexpected taker
 ///   fees;
-/// - [`TimeInForce::GoodTillDate`], which needs an `expired_at` this client does not yet send.
+/// - [`TimeInForce::GoodTillDate`], which needs an `expired_at` this client does not yet send;
+/// - [`TimeInForce::Unreported`], which is only read back, never sent.
 fn map_time_in_force(
     tif: TimeInForce,
     asset_class: OrderAssetClass,
@@ -5478,6 +5483,7 @@ fn map_time_in_force(
         TimeInForce::GoodTillDate { .. } => {
             Err("Alpaca GoodTillDate is not yet wired through this client")
         }
+        TimeInForce::Unreported => Err("Unreported is only read back from a venue, never sent"),
     }
 }
 
@@ -8454,16 +8460,30 @@ mod tests {
         );
     }
 
-    // M-4: parse_time_in_force — pin the unknown-value fallback to GoodUntilEndOfDay.
-    // If Alpaca adds a new TIF (e.g. "opg" for at-the-open), orders continue to be
-    // tracked with EOD expiry until this function is updated; the warn! makes it visible.
+    /// Every time in force the client sends reads back as itself, and one it does not know reads
+    /// as Unreported rather than as a guess.
     #[test]
-    fn parse_time_in_force_unknown_value_falls_back_to_good_until_end_of_day() {
-        assert_eq!(
-            parse_time_in_force("opg"),
+    fn parse_time_in_force_reads_back_what_is_sent_and_nothing_else() {
+        for tif in [
+            TimeInForce::GoodUntilCancelled { post_only: false },
             TimeInForce::GoodUntilEndOfDay,
-            "unknown TIF must fall back to GoodUntilEndOfDay (with a warn! in production)"
-        );
+            TimeInForce::FillOrKill,
+            TimeInForce::ImmediateOrCancel,
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+        ] {
+            let sent = map_time_in_force(tif, OrderAssetClass::Equity).unwrap();
+            assert_eq!(parse_time_in_force(sent), tif, "{sent}");
+        }
+        assert_eq!(parse_time_in_force("gtd"), TimeInForce::Unreported);
+        // Only ever read back, so never sent, whatever the asset class.
+        for asset_class in [
+            OrderAssetClass::Equity,
+            OrderAssetClass::Option,
+            OrderAssetClass::Crypto,
+        ] {
+            assert!(map_time_in_force(TimeInForce::Unreported, asset_class).is_err());
+        }
     }
 
     // L-4: build_instrument_snapshots — output order must match the instruments slice,
