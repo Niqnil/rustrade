@@ -475,6 +475,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Cargo.lock` takes `quinn-udp` 0.5.16.** 0.5.14 carried RUSTSEC-2026-0538: on OpenBSD,
+  NetBSD, Solaris, illumos and Apple platforms without `fast-apple-datapath`, a datagram larger
+  than the receive buffer left the receive loop spinning instead of returning `WouldBlock`, until
+  a later datagram fit. Nothing here compiles it: it arrives only through
+  `reqwest`'s optional HTTP/3 support, which no crate in the workspace enables. The bump clears
+  the advisory from `cargo audit`.
+
 - **`Cargo.lock` takes `rustix` 1.1.6, and the audit ignore lists cover `zstd-safe` 5.0.2's
   unsound warnings.** `rustix` 1.1.4 carried RUSTSEC-2026-0486 (its xattr functions could mark
   unwritten bytes as initialized). It reaches the build only through the `hyperliquid` feature
