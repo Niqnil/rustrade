@@ -60,6 +60,11 @@
 //! assert!(valuation.delta < 0.0 && valuation.delta > -1.0);
 //! ```
 
+// Runs the README's example as a doctest, so it cannot fall out of step with the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 mod black_scholes;
 
 pub mod finite_difference;
