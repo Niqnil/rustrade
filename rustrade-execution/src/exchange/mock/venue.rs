@@ -12236,14 +12236,8 @@ mod tests {
         }
     }
 
-    /// The two kinds of time in force a market order cannot keep, as opposed to the many it makes
-    /// moot.
-    ///
-    /// `AtOpen` and `AtClose` say *when* an order executes rather than how long it works, and
-    /// honouring them needs a session calendar. Filling one on arrival would answer a question its
-    /// sender did not ask, at a price that is not the auction it wanted — this library's own IBKR
-    /// client turns them into real market-on-close orders, so they are not a flag to be ignored.
-    /// `post_only` is refused because a market order takes liquidity by definition.
+    /// `Unreported` is only read back from a venue, so the venue refuses it on every kind before
+    /// its own time-in-force rules, with nothing resting and no balance moved.
     #[test]
     fn an_unreported_time_in_force_is_refused_on_every_kind() {
         for limit in [true, false] {
@@ -12282,6 +12276,14 @@ mod tests {
         }
     }
 
+    /// The two kinds of time in force a market order cannot keep, as opposed to the many it makes
+    /// moot.
+    ///
+    /// `AtOpen` and `AtClose` say *when* an order executes rather than how long it works, and
+    /// honouring them needs a session calendar. Filling one on arrival would answer a question its
+    /// sender did not ask, at a price that is not the auction it wanted — this library's own IBKR
+    /// client turns them into real market-on-close orders, so they are not a flag to be ignored.
+    /// `post_only` is refused because a market order takes liquidity by definition.
     #[test]
     fn a_market_order_is_rejected_for_a_time_in_force_it_cannot_keep() {
         for time_in_force in [

@@ -595,10 +595,25 @@ mod tests {
             ),
             (TimeInForce::AtOpen, TimeInForceKind::AtOpen),
             (TimeInForce::AtClose, TimeInForceKind::AtClose),
+            (TimeInForce::Unreported, TimeInForceKind::Unreported),
         ];
         for (time_in_force, kind) in cases {
             assert_eq!(time_in_force.kind(), kind, "{time_in_force}");
         }
+    }
+
+    #[test]
+    fn an_unreported_time_in_force_round_trips_through_serde() {
+        let json = serde_json::to_string(&TimeInForce::Unreported).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimeInForce>(&json).unwrap(),
+            TimeInForce::Unreported
+        );
+        let json = serde_json::to_string(&TimeInForceKind::Unreported).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimeInForceKind>(&json).unwrap(),
+            TimeInForceKind::Unreported
+        );
     }
 
     #[test]
