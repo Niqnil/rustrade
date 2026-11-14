@@ -1,9 +1,7 @@
 [toolchain]
-channel = "stable"
-components = [
-    "cargo",
-    "clippy",
-    "rust-std",
-    "rustc",
-    "rustfmt"
-]
+# An exact release, so every contributor and CI build with the same compiler and lints. Dependabot
+# proposes each new release; fix any new lints in that PR. The MSRV (`rust-version` in Cargo.toml)
+# is separate: it is the oldest compiler users may build with.
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

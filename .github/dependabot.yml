@@ -36,3 +36,17 @@ updates:
           - "patch"
     commit-message:
       prefix: "ci"
+
+  # Proposes each new Rust release for rust-toolchain.toml. Fix any lints the new release adds in
+  # that PR, so they never land in unrelated ones.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    rebase-strategy: "disabled"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"

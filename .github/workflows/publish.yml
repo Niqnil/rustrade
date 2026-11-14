@@ -37,10 +37,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        with:
-          components: rustfmt, clippy
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       # Fails in seconds on a tag that does not match every crate's version, before the tests run
       # rather than after them. The publish step checks again, since it can be re-run on its own.
@@ -81,8 +79,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       # Trusted publishing: no long-lived crates.io token exists. The token this returns expires
       # after 30 minutes and is revoked when the job ends.

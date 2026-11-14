@@ -87,10 +87,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        with:
-          components: rustfmt
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
@@ -106,9 +104,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Only `cargo metadata --no-deps` is run, which reads the workspace manifests without
-      # resolving or building anything -- no toolchain components and no network are needed.
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      # resolving or building anything -- no network is needed. The shared setup still installs
+      # the pinned components, a few seconds, so every job sets Rust up the same way.
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Check tier-2 pins match the record
         run: ./.github/scripts/check-tier2-pins.sh
@@ -128,8 +127,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
@@ -207,8 +206,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
@@ -263,10 +262,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        with:
-          components: clippy
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
@@ -290,8 +287,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
@@ -376,9 +373,9 @@ jobs:
             echo "rust=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install stable toolchain
+      - name: Set up Rust
         if: steps.diff.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: ./.github/actions/setup-rust
 
       - name: Install cargo-mutants
         if: steps.diff.outputs.rust == 'true'
@@ -459,8 +456,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       # `test`'s cache, restored read-only. This job runs only on PRs, and a PR run can save a cache
       # only to its own ref, so a cache of this job's own would start cold on every new PR. `test`
@@ -573,8 +570,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       # NOTE: deliberately no `cargo generate-lockfile` step. `Cargo.lock` is committed, and
       # re-resolving it here would audit a graph that is not the one this repository ships --
