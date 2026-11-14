@@ -215,9 +215,9 @@ fn booked<Exchange, Asset, Instrument>(
             quantity: trade.quantity,
             fee: trade.fees.fees,
         }),
-        AccountEventKind::OrderSnapshot(order) => match order.0.state {
+        AccountEventKind::OrderSnapshot(order) => match order.0.order.state {
             OrderState::Inactive(InactiveOrderState::Expired(expired)) => Some(Booked::Expired {
-                cid: order.0.key.cid,
+                cid: order.0.order.key.cid,
                 time: expired.time_exchange,
             }),
             _ => None,

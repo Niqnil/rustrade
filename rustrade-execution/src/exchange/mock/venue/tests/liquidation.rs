@@ -80,7 +80,7 @@ fn shape(events: &[UnindexedAccountEvent]) -> Vec<String> {
             AccountEventKind::BalanceSnapshot(balance) => format!("balance {}", balance.0.asset),
             AccountEventKind::MarginDebt(update) => format!("debt {}", update.asset),
             AccountEventKind::Trade(trade) => format!("trade {}", trade.side),
-            AccountEventKind::OrderSnapshot(order) => format!("order {}", order.0.key.cid),
+            AccountEventKind::OrderSnapshot(order) => format!("order {}", order.0.order.key.cid),
             AccountEventKind::Notice(notice) => format!("notice {}", notice.kind),
             AccountEventKind::CashFlow(_) => "cash flow".to_owned(),
             other => format!("{other:?}"),
@@ -126,9 +126,9 @@ fn order_named<'a>(
         .iter()
         .find_map(|event| match &event.kind {
             AccountEventKind::OrderSnapshot(order)
-                if order.0.key.cid == ClientOrderId::new(cid) =>
+                if order.0.order.key.cid == ClientOrderId::new(cid) =>
             {
-                Some(&order.0)
+                Some(&order.0.order)
             }
             _ => None,
         })

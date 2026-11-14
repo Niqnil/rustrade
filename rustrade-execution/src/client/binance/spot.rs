@@ -85,6 +85,7 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::{
             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
             UnindexedOrderResponseCancel,
@@ -1170,15 +1171,7 @@ impl ExecutionClient for BinanceSpot {
                 let wrapped = listing
                     .orders
                     .into_iter()
-                    .map(|o| Order {
-                        key: o.key,
-                        side: o.side,
-                        price: o.price,
-                        quantity: o.quantity,
-                        kind: o.kind,
-                        time_in_force: o.time_in_force,
-                        state: OrderState::active(o.state),
-                    })
+                    .map(|o| OrderReport::state_only(o.map_state(OrderState::active)))
                     .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
                     inst,
@@ -4042,7 +4035,7 @@ mod tests {
         let tifs: Vec<TimeInForce> = delivered
             .iter()
             .filter_map(|ev| match &ev.kind {
-                AccountEventKind::OrderSnapshot(snap) => Some(snap.0.time_in_force),
+                AccountEventKind::OrderSnapshot(snap) => Some(snap.0.order.time_in_force),
                 _ => None,
             })
             .collect();
@@ -4081,7 +4074,7 @@ mod tests {
         let snapshots: Vec<Decimal> = delivered
             .iter()
             .filter_map(|ev| match &ev.kind {
-                AccountEventKind::OrderSnapshot(snap) => match &snap.0.state {
+                AccountEventKind::OrderSnapshot(snap) => match &snap.0.order.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => Some(open.filled_quantity),
                     _ => None,
                 },
@@ -4452,12 +4445,15 @@ mod tests {
         match &event.kind {
             AccountEventKind::OrderSnapshot(snap) => {
                 let order = &snap.0;
-                assert_eq!(order.side, Side::Buy);
-                assert_eq!(order.kind, OrderKind::Limit);
-                assert_eq!(order.price, Some(Decimal::from_str("50000.00").unwrap()));
-                assert_eq!(order.quantity, Decimal::from_str("0.01").unwrap());
-                assert_eq!(order.key.cid.0.as_str(), "client-1");
-                assert_eq!(order.key.instrument.name().as_str(), "BTCUSDT");
+                assert_eq!(order.order.side, Side::Buy);
+                assert_eq!(order.order.kind, OrderKind::Limit);
+                assert_eq!(
+                    order.order.price,
+                    Some(Decimal::from_str("50000.00").unwrap())
+                );
+                assert_eq!(order.order.quantity, Decimal::from_str("0.01").unwrap());
+                assert_eq!(order.order.key.cid.0.as_str(), "client-1");
+                assert_eq!(order.order.key.instrument.name().as_str(), "BTCUSDT");
             }
             other => panic!("NEW should yield OrderSnapshot, got {other:?}"),
         }
@@ -4485,14 +4481,14 @@ mod tests {
             panic!("NEW should yield OrderSnapshot, got {:?}", event.kind);
         };
         assert_eq!(
-            snap.0.kind,
+            snap.0.order.kind,
             OrderKind::TrailingStopFixedLimit {
                 offset: Decimal::from(25),
                 offset_type: TrailingOffsetType::BasisPoints,
                 activation_price: Some(Decimal::from(50_000)),
             }
         );
-        assert_eq!(snap.0.price, Some(Decimal::from(49_000)));
+        assert_eq!(snap.0.order.price, Some(Decimal::from(49_000)));
     }
 
     /// A report without its order type (`o`) cannot say what kind the order is, so its snapshot
@@ -4634,7 +4630,7 @@ mod tests {
                 second.kind
             );
         };
-        (trade, snap.0)
+        (trade, snap.0.order)
     }
 
     /// A `PARTIALLY_FILLED` report carries the order's cumulative filled quantity in `z`. The
@@ -5607,7 +5603,7 @@ mod tests {
         // OpenInFlight → None (order is not yet acknowledged by exchange)
         let event = UnindexedAccountEvent::new(
             ExchangeId::BinanceSpot,
-            AccountEventKind::OrderSnapshot(Snapshot(Order::new(
+            AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order::new(
                 key.clone(),
                 Side::Buy,
                 None, // Market orders have no limit price
@@ -5617,7 +5613,7 @@ mod tests {
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Active(
                     ActiveOrderState::OpenInFlight(OpenInFlight::new(Utc::now())),
                 ),
-            ))),
+            )))),
         );
         assert!(
             dedup_key_from_event(&event).is_none(),
@@ -5627,7 +5623,7 @@ mod tests {
         // CancelInFlight → None
         let event = UnindexedAccountEvent::new(
             ExchangeId::BinanceSpot,
-            AccountEventKind::OrderSnapshot(Snapshot(Order::new(
+            AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order::new(
                 key.clone(),
                 Side::Buy,
                 None, // Market orders have no limit price
@@ -5637,7 +5633,7 @@ mod tests {
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Active(
                     ActiveOrderState::CancelInFlight(CancelInFlight::new(None, Utc::now())),
                 ),
-            ))),
+            )))),
         );
         assert!(
             dedup_key_from_event(&event).is_none(),
@@ -5647,7 +5643,7 @@ mod tests {
         // Inactive(FullyFilled) → None
         let event = UnindexedAccountEvent::new(
             ExchangeId::BinanceSpot,
-            AccountEventKind::OrderSnapshot(Snapshot(Order::new(
+            AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order::new(
                 key,
                 Side::Buy,
                 None, // Market orders have no limit price
@@ -5662,7 +5658,7 @@ mod tests {
                         None,
                     )),
                 ),
-            ))),
+            )))),
         );
         assert!(
             dedup_key_from_event(&event).is_none(),
@@ -8381,10 +8377,10 @@ mod tests {
         let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
             panic!("an order snapshot: {event:?}");
         };
-        assert_eq!(snapshot.0.key.cid, ClientOrderId::new("gone"));
-        assert_eq!(snapshot.0.key.strategy, StrategyId::unknown());
+        assert_eq!(snapshot.0.order.key.cid, ClientOrderId::new("gone"));
+        assert_eq!(snapshot.0.order.key.strategy, StrategyId::unknown());
         assert!(matches!(
-            snapshot.0.state,
+            snapshot.0.order.state,
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
         ));
         let mut asked = looked_up(&server).await;

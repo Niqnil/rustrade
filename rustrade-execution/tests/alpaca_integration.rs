@@ -534,7 +534,10 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
         "{instrument}'s order list is not declared complete"
     );
     assert!(
-        snapshot.orders.iter().any(|order| order.key.cid == cid),
+        snapshot
+            .orders
+            .iter()
+            .any(|order| order.order.key.cid == cid),
         "the resting {instrument} order is not listed under its client id {cid}: {:?}",
         snapshot.orders
     );
@@ -572,7 +575,11 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
                     snapshot.orders_complete,
                     "{instrument}'s order list is not declared complete"
                 );
-                if snapshot.orders.iter().all(|order| order.key.cid != cid) {
+                if snapshot
+                    .orders
+                    .iter()
+                    .all(|order| order.order.key.cid != cid)
+                {
                     return;
                 }
                 format!("still listed: {:?}", snapshot.orders)
@@ -842,7 +849,7 @@ async fn test_account_stream_with_order() {
                         let order = snapshot.value();
                         println!(
                             "  OrderSnapshot: {:?} {} {}",
-                            order.side, order.quantity, order.key.instrument
+                            order.order.side, order.order.quantity, order.order.key.instrument
                         );
                     }
                     AccountEventKind::OrderCancelled(resp) => {

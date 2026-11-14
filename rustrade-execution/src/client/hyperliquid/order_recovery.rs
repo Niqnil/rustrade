@@ -24,6 +24,7 @@ use crate::{
     order::{
         Order, UnindexedOrderKey,
         id::ClientOrderId,
+        report::OrderReport,
         state::{ActiveOrderState, Open, OrderState},
     },
 };
@@ -203,13 +204,17 @@ pub(super) fn status_from_record(
         debug!(cid = %key.cid, asked = %key.instrument, coin = %record.update.order.coin, "Hyperliquid order is on another instrument than asked");
         return Some(VenueOrderStatus::Unknown);
     }
-    let Order {
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state,
+    let OrderReport {
+        order:
+            Order {
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+                ..
+            },
         ..
     } = order_update_to_order(
         &record.update,
@@ -281,6 +286,7 @@ pub(super) fn remember_snapshot(
         .instruments
         .iter()
         .flat_map(|instrument| &instrument.orders)
+        .map(|report| &report.order)
     {
         if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
             known.live(&order.key, order.quantity, order.kind, open);
@@ -956,9 +962,9 @@ pub(super) mod tests {
             strategy: StrategyId::unknown(),
             ..key(CID)
         };
-        assert_eq!(order.key, held);
+        assert_eq!(order.order.key, held);
         assert!(matches!(
-            order.state,
+            order.order.state,
             OrderState::Inactive(InactiveOrderState::Cancelled(_))
         ));
         assert!(!known.lock().contains(&ClientOrderId::new(CID)));

@@ -61,6 +61,7 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         amend::{AmendPatch, AmendTarget, Amended},
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::{
             CancelThenOpen, CancelThenOpenError, OrderAmend, OrderRequestCancel, OrderRequestOpen,
             OrderResponseAmend, OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
@@ -431,7 +432,7 @@ fn test_engine_process_engine_event_with_audit() {
     // CID must be "netting" (PositionId::NETTING.0) to match the order the engine placed.
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -448,7 +449,7 @@ fn test_engine_process_engine_event_with_audit() {
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
                 filled_quantity: dec!(1),
             }),
-        })),
+        }))),
     }));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(16));
@@ -666,7 +667,7 @@ fn test_engine_process_engine_event_with_audit() {
     // Simulate Order FullyFilled update for Sequence(21) LIMIT eth_btc_sell_order
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(1),
@@ -684,7 +685,7 @@ fn test_engine_process_engine_event_with_audit() {
                 dec!(1),
                 None,
             )),
-        })),
+        }))),
     }));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(24));
@@ -1198,7 +1199,7 @@ fn account_event_order_response(
 ) -> EngineEvent<DataKind> {
     EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(instrument),
@@ -1215,7 +1216,7 @@ fn account_event_order_response(
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
                 filled_quantity: Decimal::try_from(filled).unwrap(),
             }),
-        })),
+        }))),
     }))
 }
 
@@ -2085,7 +2086,7 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
         replica,
         EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: OrderKey {
                     exchange: ExchangeIndex(0),
                     instrument: option,
@@ -2102,7 +2103,7 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
                     time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
                     filled_quantity: dec!(0),
                 }),
-            })),
+            }))),
         }))
     );
     assert_eq!(
@@ -2637,7 +2638,7 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
         &mut engine,
         EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: open.key.clone(),
                 side: open.state.side,
                 price: open.state.price,
@@ -2645,7 +2646,7 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
                 kind: open.state.kind,
                 time_in_force: open.state.time_in_force,
                 state: OrderState::active(venue_open.clone()),
-            })),
+            }))),
         })),
     );
 
@@ -2770,7 +2771,7 @@ fn test_an_adopted_order_is_amended_with_its_reduce_only_unknown() {
         &mut engine,
         EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: adopted.key.clone(),
                 side: adopted.state.side,
                 price: adopted.state.price,
@@ -2782,7 +2783,7 @@ fn test_an_adopted_order_is_amended_with_its_reduce_only_unknown() {
                     time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
                     filled_quantity: dec!(0),
                 }),
-            })),
+            }))),
         })),
     );
 
@@ -3102,7 +3103,7 @@ fn test_strategy_amends_are_sent_after_cancels() {
             .record_in_flight_open(&open, STARTING_TIMESTAMP);
         engine.state.update_from_account(&AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: open.key.clone(),
                 side: open.state.side,
                 price: open.state.price,
@@ -3114,7 +3115,7 @@ fn test_strategy_amends_are_sent_after_cancels() {
                     time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
                     filled_quantity: dec!(0),
                 }),
-            })),
+            }))),
         });
     }
 
@@ -5531,7 +5532,7 @@ fn send_order_ack(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -5548,7 +5549,7 @@ fn send_order_ack(
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
                 filled_quantity: dec!(0),
             }),
-        })),
+        }))),
     }));
     engine.process(event);
 }
@@ -5593,7 +5594,7 @@ fn send_fully_filled_snapshot(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -5611,7 +5612,7 @@ fn send_fully_filled_snapshot(
                 dec!(1),
                 None,
             )),
-        })),
+        }))),
     }));
     engine.process(event);
 }
@@ -5715,7 +5716,7 @@ fn send_fully_filled_open_snapshot(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -5733,7 +5734,7 @@ fn send_fully_filled_open_snapshot(
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
                 filled_quantity: dec!(1),
             }),
-        })),
+        }))),
     }));
     engine.process(event);
 }
@@ -8314,7 +8315,7 @@ fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
     // Ack arrives, but terminal: Inactive(FullyFilled) rather than Active(Open).
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -8332,7 +8333,7 @@ fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
                 dec!(1),
                 None,
             )),
-        })),
+        }))),
     }));
     engine.process(event);
 
@@ -8861,7 +8862,7 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
     // What `ExecutionManager::process_open_timeout` sends when no answer came in time.
     let timeout = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: request.key.clone(),
             side: request.state.side,
             price: request.state.price,
@@ -8869,7 +8870,7 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
             state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
-        })),
+        }))),
     }));
     process_with_audit(&mut engine, timeout);
     assert!(
@@ -8908,7 +8909,7 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
     // reported it working since, so the order stays tracked and no rejection is counted.
     let never_placed = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: request.key.clone(),
             side: request.state.side,
             price: request.state.price,
@@ -8916,7 +8917,7 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
             state: OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::UnknownToVenue)),
-        })),
+        }))),
     }));
     process_with_audit(&mut engine, never_placed);
     assert!(
@@ -9197,7 +9198,7 @@ fn test_hedging_pending_fill_keeps_the_fee_value_it_arrived_with() {
         &mut engine,
         EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: OrderKey {
                     exchange: ExchangeIndex(0),
                     instrument: InstrumentIndex(1),
@@ -9214,7 +9215,7 @@ fn test_hedging_pending_fill_keeps_the_fee_value_it_arrived_with() {
                     time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
                     filled_quantity: dec!(0),
                 }),
-            })),
+            }))),
         })),
     );
 
@@ -9681,7 +9682,7 @@ fn test_order_deadline_on_an_open_the_venue_refuses_sends_nothing() {
 
     let refused = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+        kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: ExchangeIndex(0),
                 instrument: InstrumentIndex(0),
@@ -9696,7 +9697,7 @@ fn test_order_deadline_on_an_open_the_venue_refuses_sends_nothing() {
             state: OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
                 ApiError::OrderRejected("refused".into()),
             ))),
-        })),
+        }))),
     }));
     let audit = process_with_audit(&mut engine, refused);
     assert!(order_deadline_outputs(audit).is_empty());

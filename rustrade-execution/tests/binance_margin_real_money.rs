@@ -528,7 +528,9 @@ async fn wait_for(events: &Events, wanted: impl Fn(&UnindexedAccountEvent) -> bo
 
 fn describe(event: &UnindexedAccountEvent) -> String {
     match &event.kind {
-        AccountEventKind::OrderSnapshot(order) => format!("OrderSnapshot {}", order.0.key.cid),
+        AccountEventKind::OrderSnapshot(order) => {
+            format!("OrderSnapshot {}", order.0.order.key.cid)
+        }
         AccountEventKind::OrderCancelled(cancel) => format!("OrderCancelled {}", cancel.key.cid),
         AccountEventKind::Trade(_) => "Trade".to_owned(),
         AccountEventKind::BalanceStreamUpdate(_) => "BalanceStreamUpdate".to_owned(),
@@ -735,7 +737,7 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
         borrowed.is_none(),
         "a NoSideEffect order borrowed {borrowed:?}"
     );
-    let snapshot_of = |cid: ClientOrderId| move |event: &UnindexedAccountEvent| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.key.cid == cid);
+    let snapshot_of = |cid: ClientOrderId| move |event: &UnindexedAccountEvent| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.order.key.cid == cid);
     let cancel_of = |cid: ClientOrderId| move |event: &UnindexedAccountEvent| matches!(&event.kind, AccountEventKind::OrderCancelled(cancel) if cancel.key.cid == cid);
     assert!(
         wait_for(events, snapshot_of(cid.clone())).await,
@@ -1041,7 +1043,7 @@ async fn trailing_read_back(
 
     // The stream carries `trailingDelta`: if it reports the order as trailing, a REST row without
     // the field lacks it, rather than describing a fixed stop.
-    let snapshot_arrived = wait_for(events, |event| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.key.cid == cid)).await;
+    let snapshot_arrived = wait_for(events, |event| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.order.key.cid == cid)).await;
 
     let raw_log = std::env::var("BINANCE_REAL_MONEY_RAW_LOG").ok();
     let config = rest_config();
@@ -1081,7 +1083,9 @@ async fn trailing_read_back(
         .unwrap()
         .iter()
         .find_map(|event| match &event.kind {
-            AccountEventKind::OrderSnapshot(order) if order.0.key.cid == cid => Some(order.0.kind),
+            AccountEventKind::OrderSnapshot(order) if order.0.order.key.cid == cid => {
+                Some(order.0.order.kind)
+            }
             _ => None,
         });
     println!("{account:?}: the stream reported the order as {streamed:?}");
@@ -1143,7 +1147,7 @@ async fn trailing_without_activation(
         .0
         .parse()
         .expect("Binance's orderId is an integer");
-    let snapshot_arrived = wait_for(events, |event| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.key.cid == cid)).await;
+    let snapshot_arrived = wait_for(events, |event| matches!(&event.kind, AccountEventKind::OrderSnapshot(order) if order.0.order.key.cid == cid)).await;
 
     let raw_log = std::env::var("BINANCE_REAL_MONEY_RAW_LOG").ok();
     let mut query = BTreeMap::from([("symbol".to_owned(), Value::from(symbol.clone()))]);
@@ -1161,7 +1165,9 @@ async fn trailing_without_activation(
         .unwrap()
         .iter()
         .find_map(|event| match &event.kind {
-            AccountEventKind::OrderSnapshot(order) if order.0.key.cid == cid => Some(order.0.kind),
+            AccountEventKind::OrderSnapshot(order) if order.0.order.key.cid == cid => {
+                Some(order.0.order.kind)
+            }
             _ => None,
         });
     println!("RESULT {account:?}: accepted; the stream reported the order as {streamed:?}");

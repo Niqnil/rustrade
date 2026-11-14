@@ -618,14 +618,15 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
             AccountEventKind::OrderSnapshot(order) => {
                 let instrument_state = self
                     .instruments
-                    .instrument_index_mut(&order.value().key.instrument);
+                    .instrument_index_mut(&order.value().order.key.instrument);
 
                 // Propagate any PositionExited from deferred fill replay (fill-before-ack
                 // race in OmsMode::Hedging). update_from_trade side effects (tearsheet,
                 // position removal) are correct regardless; this ensures the output event
                 // also reaches EngineOutput::PositionExit consumers.
-                let applied =
-                    instrument_state.replay_order_snapshot(order.as_ref(), reduce_only_fills);
+                // Only the report's order is read: no term it states is adopted yet.
+                let applied = instrument_state
+                    .replay_order_snapshot(Snapshot(&order.value().order), reduce_only_fills);
                 instrument_state.data.process(event);
                 applied
             }

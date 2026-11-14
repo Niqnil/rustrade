@@ -107,6 +107,7 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::{OrderReport, UnindexedOrderReport},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
@@ -3157,17 +3158,8 @@ fn filter_and_convert_margin_balances(
 /// isolated snapshot paths.
 fn active_order_snapshot(
     o: Order<ExchangeId, InstrumentNameExchange, Open>,
-) -> Order<ExchangeId, InstrumentNameExchange, OrderState<AssetNameExchange, InstrumentNameExchange>>
-{
-    Order {
-        key: o.key,
-        side: o.side,
-        price: o.price,
-        quantity: o.quantity,
-        kind: o.kind,
-        time_in_force: o.time_in_force,
-        state: OrderState::active(o.state),
-    }
+) -> UnindexedOrderReport {
+    OrderReport::state_only(o.map_state(OrderState::active))
 }
 
 /// Convert one side (base or quote) of an isolated `assets[]` entry into a margin [`AssetBalance`].
@@ -6513,9 +6505,9 @@ mod tests {
         let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
             panic!("an order snapshot: {event:?}");
         };
-        assert_eq!(snapshot.0.kind, trailing_stop);
+        assert_eq!(snapshot.0.order.kind, trailing_stop);
         assert!(matches!(
-            snapshot.0.state,
+            snapshot.0.order.state,
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
         ));
         assert!(!known.lock().contains(&ClientOrderId::new("trailing")));
@@ -6571,10 +6563,10 @@ mod tests {
             let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
                 panic!("an order snapshot: {event:?}");
             };
-            assert_eq!(snapshot.0.key.cid, ClientOrderId::new("gone"));
-            assert_eq!(snapshot.0.key.strategy, StrategyId::unknown());
+            assert_eq!(snapshot.0.order.key.cid, ClientOrderId::new("gone"));
+            assert_eq!(snapshot.0.order.key.strategy, StrategyId::unknown());
             assert!(matches!(
-                snapshot.0.state,
+                snapshot.0.order.state,
                 OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
             ));
             let mut requests = margin_requests(&server).await;

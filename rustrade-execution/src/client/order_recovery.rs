@@ -18,6 +18,7 @@ use crate::{
     order::{
         OrderKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
+        report::OrderReport,
         state::{ActiveOrderState, Open, OrderState, UnindexedOrderState},
     },
 };
@@ -548,15 +549,17 @@ impl KnownLiveOrders {
     /// request that fails is answered only to its caller, and never reaches this.
     pub(crate) fn observe(&mut self, event: &UnindexedAccountEvent) {
         match &event.kind {
-            AccountEventKind::OrderSnapshot(Snapshot(order)) => match &order.state {
-                OrderState::Active(ActiveOrderState::Open(open)) => {
-                    self.live(&order.key, order.quantity, order.kind, open);
+            AccountEventKind::OrderSnapshot(Snapshot(OrderReport { order, .. })) => {
+                match &order.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => {
+                        self.live(&order.key, order.quantity, order.kind, open);
+                    }
+                    OrderState::Active(_) => {}
+                    OrderState::Inactive(_) => {
+                        self.ended(&order.key.cid);
+                    }
                 }
-                OrderState::Active(_) => {}
-                OrderState::Inactive(_) => {
-                    self.ended(&order.key.cid);
-                }
-            },
+            }
             AccountEventKind::OrderCancelled(response) => {
                 self.ended(&response.key.cid);
             }
@@ -1302,9 +1305,9 @@ fn settle(
             }
             let event = UnindexedAccountEvent::new(
                 exchange,
-                AccountEventKind::OrderSnapshot(Snapshot::new(
+                AccountEventKind::OrderSnapshot(Snapshot::new(OrderReport::state_only(
                     (*order).map_state(OrderState::Inactive),
-                )),
+                ))),
             );
             tx.send_event(event).then_some(1)
         }
@@ -1435,15 +1438,17 @@ pub(crate) mod tests {
         key: UnindexedOrderKey,
         state: OrderState<AssetNameExchange, InstrumentNameExchange>,
     ) -> UnindexedAccountEvent {
-        event(AccountEventKind::OrderSnapshot(Snapshot(Order {
-            key,
-            side: Side::Buy,
-            price: Some(dec!(100)),
-            quantity: dec!(2),
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            state,
-        })))
+        event(AccountEventKind::OrderSnapshot(Snapshot(
+            OrderReport::state_only(Order {
+                key,
+                side: Side::Buy,
+                price: Some(dec!(100)),
+                quantity: dec!(2),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state,
+            }),
+        )))
     }
 
     fn fill(order_id: &str, order_filled: Option<Decimal>) -> UnindexedAccountEvent {
@@ -2534,7 +2539,7 @@ pub(crate) mod tests {
         let AccountEventKind::OrderSnapshot(Snapshot(order)) = &event.kind else {
             panic!("an order snapshot: {event:?}");
         };
-        assert_eq!(order.key.cid, ClientOrderId::new("AFAST"));
+        assert_eq!(order.order.key.cid, ClientOrderId::new("AFAST"));
         assert!(!unchecked.contains(&InstrumentNameExchange::new("AFAST")));
         assert!(!known.lock().contains(&ClientOrderId::new("AFAST")));
         assert!(
@@ -2595,7 +2600,7 @@ pub(crate) mod tests {
         assert_eq!(listings.load(Ordering::Relaxed), 1);
         let mut sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event.kind {
-                AccountEventKind::OrderSnapshot(Snapshot(order)) => order.key.cid,
+                AccountEventKind::OrderSnapshot(Snapshot(order)) => order.order.key.cid,
                 other => panic!("an order snapshot: {other:?}"),
             })
             .collect();

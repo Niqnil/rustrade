@@ -524,6 +524,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     good-till-date time does not parse, is now read with `Unreported`. It was left out of
     open-order listings, ended-order lookups and reconnect snapshots altogether.
 
+- **Breaking: an order snapshot says which of its order's terms the venue stated**
+  (`rustrade-execution`, `rustrade`). A report's price, quantity, kind and time in force may be
+  the venue's current values, an echo of what the order was placed with, or a stand-in, and a
+  reader could not tell which.
+  - **New `OrderReport { order, reported }`** in `order::report`: the order as before, and a
+    `ReportedTerms` saying which of `quantity`, `price`, `kind` and `time_in_force` are the
+    venue's current values. `ReportedTerms` is `#[non_exhaustive]`: build one from
+    `ReportedTerms::NONE` or `ReportedTerms::ALL` and the `with_*` setters.
+    `OrderReport::new` never states a `TimeInForce::Unreported` or an
+    `OrderKind::ConditionalUnresolved`; `OrderReport::state_only` states no term.
+  - **`AccountEventKind::OrderSnapshot` carries a `Snapshot<OrderReport>`, and
+    `InstrumentAccountSnapshot::orders` is a `Vec<OrderReport>`.** Read the order as
+    `report.order`. Serialised, the order's fields stay where they were and `reported` sits
+    beside them; a snapshot serialised without it reads as stating no term.
+  - **Hyperliquid states the terms its reads carry.** An open-order listing states every term,
+    less the quantity on a row without `origSz`, the kind on a row whose type is missing,
+    unknown or triggered, and a time in force it reads as `Unreported`. An account-stream update
+    states its quantity and price.
+  - **Every other producer states no term yet**, the engine's own snapshots and the simulated
+    venue included. The engine reads only each report's order, as before.
+
 ### Fixed
 
 - **A Hyperliquid order that fills in part when placed is no longer reported fully filled**

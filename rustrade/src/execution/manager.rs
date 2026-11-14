@@ -37,6 +37,7 @@ use rustrade_execution::{
         amend::Amended,
         deadline::OrderDeadline,
         id::ClientOrderId,
+        report::OrderReport,
         request::{
             CancelReplaceAnswer, CancelThenOpen, OnCancelFailure, OrderRequestAmend,
             OrderRequestCancel, OrderRequestOpen, OrderResponseAmend, OrderResponseCancel,
@@ -1202,7 +1203,10 @@ where
         );
         AccountStreamEvent::Item(AccountEvent {
             exchange: open.key.exchange,
-            kind: AccountEventKind::OrderSnapshot(Snapshot(dropped_open(open, cancel.clone()))),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(dropped_open(
+                open,
+                cancel.clone(),
+            )))),
         })
     }
 
@@ -1327,7 +1331,7 @@ where
 
         AccountStreamEvent::Item(AccountEvent {
             exchange: request.key.exchange,
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key: request.key,
                 side,
                 price,
@@ -1335,7 +1339,7 @@ where
                 kind,
                 time_in_force,
                 state: self.indexer.order_state(state),
-            })),
+            }))),
         })
     }
 
@@ -1544,7 +1548,7 @@ where
         );
         Some(AccountStreamEvent::Item(AccountEvent {
             exchange: order.key.exchange,
-            kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(order))),
         }))
     }
 
@@ -1719,17 +1723,19 @@ where
                 } = *order;
                 AccountStreamEvent::Item(AccountEvent {
                     exchange: key.exchange,
-                    kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
-                        key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: self
-                            .indexer
-                            .order_state(UnindexedOrderState::Inactive(ended)),
-                    })),
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(
+                        Order {
+                            key,
+                            side,
+                            price,
+                            quantity,
+                            kind,
+                            time_in_force,
+                            state: self
+                                .indexer
+                                .order_state(UnindexedOrderState::Inactive(ended)),
+                        },
+                    ))),
                 })
             }
             AmendLookupOutcome::NotApplied => {
@@ -1760,7 +1766,7 @@ where
 
         AccountStreamEvent::Item(AccountEvent {
             exchange: key.exchange,
-            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                 key,
                 side: state.side,
                 price: state.price,
@@ -1768,7 +1774,7 @@ where
                 kind: state.kind,
                 time_in_force: state.time_in_force,
                 state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
-            })),
+            }))),
         })
     }
 }
@@ -2105,7 +2111,7 @@ mod tests {
                 AccountStreamEvent::Item(AccountEvent {
                     kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
                     ..
-                }) if order.key == *key && order.state == OrderState::inactive(rejection.clone())
+                }) if order.order.key == *key && order.order.state == OrderState::inactive(rejection.clone())
             )),
             "the open's answer must reach the Engine under the request's key: {events:?}"
         );
@@ -3714,9 +3720,9 @@ mod tests {
             .filter_map(|event| async move {
                 match event {
                     rustrade_data::streams::reconnect::Event::Item(AccountEvent {
-                        kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                        kind: AccountEventKind::OrderSnapshot(Snapshot(report)),
                         ..
-                    }) => Some(order),
+                    }) => Some(report.order),
                     _ => None,
                 }
             })
@@ -3924,7 +3930,7 @@ mod tests {
         assert!(matches!(
             &events[1],
             AccountEventKind::OrderSnapshot(Snapshot(order))
-                if matches!(order.state, OrderState::Inactive(InactiveOrderState::Cancelled(_)))
+                if matches!(order.order.state, OrderState::Inactive(InactiveOrderState::Cancelled(_)))
         ));
     }
 
@@ -4506,8 +4512,8 @@ mod tests {
                         ..
                     }) => format!(
                         "snapshot {} {}",
-                        order.key.cid,
-                        match order.state {
+                        order.order.key.cid,
+                        match order.order.state {
                             OrderState::Active(_) => "active".to_string(),
                             OrderState::Inactive(state) => format!("{state:?}"),
                         }
@@ -5008,8 +5014,8 @@ mod tests {
                                 ..
                             }) => Some(format!(
                                 "snapshot {} {}",
-                                order.key.cid,
-                                if order.state.has_ended() {
+                                order.order.key.cid,
+                                if order.order.state.has_ended() {
                                     "ended"
                                 } else {
                                     "ok"

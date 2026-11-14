@@ -82,11 +82,11 @@ fn expired_in(
         .filter_map(|event| match &event.kind {
             AccountEventKind::OrderSnapshot(order)
                 if matches!(
-                    order.0.state,
+                    order.0.order.state,
                     OrderState::Inactive(InactiveOrderState::Expired(_))
                 ) =>
             {
-                Some(&order.0)
+                Some(&order.0.order)
             }
             _ => None,
         })
@@ -444,7 +444,7 @@ fn seeded_day_config(
     config.session_close = session_close;
     config.initial_state.instruments = vec![InstrumentAccountSnapshot {
         instrument: instrument_name(),
-        orders: vec![Order {
+        orders: vec![OrderReport::state_only(Order {
             key: OrderKey {
                 exchange: EXCHANGE,
                 instrument: instrument_name(),
@@ -461,7 +461,7 @@ fn seeded_day_config(
                 accepted,
                 Decimal::ZERO,
             )),
-        }],
+        })],
         orders_complete: true,
         position: PositionReport::Unreported,
         isolated: None,

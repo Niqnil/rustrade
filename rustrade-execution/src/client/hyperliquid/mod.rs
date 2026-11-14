@@ -2880,12 +2880,12 @@ mod tests {
         assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.key.instrument.as_ref(), "BTC-USDC-PERP");
-                assert_eq!(order.side, Side::Buy);
-                assert_eq!(order.price, Some(dec!(64000)));
-                assert_eq!(order.quantity, dec!(0.5));
+                assert_eq!(order.order.key.instrument.as_ref(), "BTC-USDC-PERP");
+                assert_eq!(order.order.side, Side::Buy);
+                assert_eq!(order.order.price, Some(dec!(64000)));
+                assert_eq!(order.order.quantity, dec!(0.5));
                 assert!(matches!(
-                    order.state,
+                    order.order.state,
                     crate::order::state::OrderState::Active(_)
                 ));
             }
@@ -2915,9 +2915,9 @@ mod tests {
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.side, Side::Sell);
+                assert_eq!(order.order.side, Side::Sell);
                 assert!(matches!(
-                    order.state,
+                    order.order.state,
                     crate::order::state::OrderState::Inactive(
                         crate::order::state::InactiveOrderState::FullyFilled(_)
                     )
@@ -2949,9 +2949,9 @@ mod tests {
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.key.instrument.as_ref(), "SOL-USDC-PERP");
+                assert_eq!(order.order.key.instrument.as_ref(), "SOL-USDC-PERP");
                 assert!(matches!(
-                    order.state,
+                    order.order.state,
                     crate::order::state::OrderState::Inactive(
                         crate::order::state::InactiveOrderState::Cancelled(_)
                     )

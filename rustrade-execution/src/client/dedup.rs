@@ -139,19 +139,20 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             // OrderSnapshot wraps Order<..., OrderState<...>>. An acknowledgement and a fill both
             // arrive here as Active(Open { .. }), distinguished only by `filled_quantity` -- so
             // that field is part of the key rather than a detail the key discards.
-            match &snap.0.state {
+            let order = &snap.0.order;
+            match &order.state {
                 OrderState::Active(active) => {
                     // ActiveOrderState variants: OpenInFlight, Open, CancelInFlight
                     use crate::order::state::ActiveOrderState;
                     match active {
                         ActiveOrderState::Open(open) => Some(DedupKey {
-                            instrument: snap.0.key.instrument.name().clone(),
+                            instrument: order.key.instrument.name().clone(),
                             // A venue that named the order gives the key; one that did not leaves
                             // the client id, which is stable across re-deliveries for the same
                             // reason the venue id is.
                             id: match open.id.assigned() {
                                 Some(id) => id.0.clone(),
-                                None => snap.0.key.cid.0.clone(),
+                                None => order.key.cid.0.clone(),
                             },
                             kind: DedupEventKind::OrderState {
                                 filled_quantity: open.filled_quantity,

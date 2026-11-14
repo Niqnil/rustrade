@@ -24,6 +24,7 @@ use rustrade_execution::{
     order::{
         Order, OrderEvent, UnindexedOrderKey,
         deadline::OrderDeadline,
+        report::OrderReport,
         request::{
             CancelThenOpen, OnCancelFailure, OrderRequestAmend, OrderRequestCancel,
             OrderRequestOpen, UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
@@ -1819,7 +1820,7 @@ fn step<MarketKind>(
 
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                 exchange: key.exchange,
-                kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                kind: AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(Order {
                     key,
                     side,
                     price,
@@ -1827,7 +1828,7 @@ fn step<MarketKind>(
                     kind,
                     time_in_force,
                     state,
-                })),
+                }))),
             }))
         }
         Deliverable::CancelResponse(response) => {
@@ -2041,7 +2042,7 @@ mod tests {
                 EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                     kind: AccountEventKind::OrderSnapshot(order),
                     ..
-                })) => Some(&order.0.state),
+                })) => Some(&order.0.order.state),
                 _ => None,
             })
             .expect("the run reported an order")
@@ -2852,7 +2853,7 @@ mod tests {
         )));
         config.initial_state.instruments = vec![InstrumentAccountSnapshot {
             instrument: InstrumentNameExchange::new("btc_usdt"),
-            orders: vec![Order {
+            orders: vec![OrderReport::state_only(Order {
                 key: OrderKey {
                     exchange: EXCHANGE,
                     instrument: InstrumentNameExchange::new("btc_usdt"),
@@ -2869,7 +2870,7 @@ mod tests {
                     accepted,
                     Decimal::ZERO,
                 )),
-            }],
+            })],
             orders_complete: true,
             position: PositionReport::Unreported,
             isolated: None,
@@ -3230,7 +3231,7 @@ mod tests {
                 events[3]
             );
         };
-        assert_eq!(expired.state.time_exchange(), Some(at(300)));
+        assert_eq!(expired.order.state.time_exchange(), Some(at(300)));
     }
 
     /// A deadline that falls on a tick's instant is reached before the tick, as any venue-bound
@@ -3464,8 +3465,8 @@ mod tests {
                     kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
                     ..
                 })) => Some((
-                    order.key.cid.clone(),
-                    matches!(order.state, OrderState::Active(_)),
+                    order.order.key.cid.clone(),
+                    matches!(order.order.state, OrderState::Active(_)),
                 )),
                 _ => None,
             })
@@ -3534,7 +3535,7 @@ mod tests {
                 EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                     kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
                     ..
-                })) => Some((order.key.cid.clone(), order.state.clone())),
+                })) => Some((order.order.key.cid.clone(), order.order.state.clone())),
                 _ => None,
             })
             .collect();

@@ -52,7 +52,7 @@ use crate::{
     balance::{AssetBalance, AssetBalanceUpdate},
     error::StreamTerminationReason,
     order::{
-        Order, OrderSnapshot,
+        report::OrderReport,
         request::{OrderResponseAmend, OrderResponseCancel},
     },
     position::PositionReport,
@@ -60,7 +60,6 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
-use order::state::OrderState;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
@@ -280,10 +279,12 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// [`InstrumentBalanceUpdate`](Self::InstrumentBalanceUpdate), the engine does not store it.
     InstrumentBalanceSnapshot(InstrumentBalanceSnapshot<AssetKey, InstrumentKey>),
 
-    /// Single [`Order`] snapshot - used to upsert existing order state if it's more recent.
+    /// Single [`Order`](order::Order) snapshot - used to upsert existing order state if it's more recent.
     ///
-    /// This variant covers general order updates, and open order responses.
-    OrderSnapshot(Snapshot<Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>),
+    /// This variant covers general order updates, and open order responses. The
+    /// [`OrderReport`] says which of the order's terms are the venue's current values; the
+    /// others may echo the placement.
+    OrderSnapshot(Snapshot<OrderReport<ExchangeKey, AssetKey, InstrumentKey>>),
 
     /// Response to an [`OrderRequestCancel<ExchangeKey, InstrumentKey>`](order::request::OrderRequestOpen).
     OrderCancelled(OrderResponseCancel<ExchangeKey, AssetKey, InstrumentKey>),
@@ -296,7 +297,7 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// stand in for this answer.
     OrderAmended(OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>),
 
-    /// [`Order<ExchangeKey, InstrumentKey, Open>`] partial or full-fill.
+    /// [`Order<ExchangeKey, InstrumentKey, Open>`](order::Order) partial or full-fill.
     ///
     /// The fee asset (`AssetKey`) may be the quote asset, base asset, or a third-party
     /// asset (e.g., BNB on Binance). Use `fees.fees_quote` for quote-equivalent value
@@ -439,9 +440,10 @@ pub struct InstrumentAccountSnapshot<
     /// placed with where the venue reports it.
     ///
     /// Whether this is **every** order open at the venue is stated by
-    /// [`orders_complete`](Self::orders_complete), not implied by the list.
+    /// [`orders_complete`](Self::orders_complete), not implied by the list. Each
+    /// [`OrderReport`] says which of its order's terms the venue stated.
     #[serde(default = "Vec::new")]
-    pub orders: Vec<OrderSnapshot<ExchangeKey, AssetKey, InstrumentKey>>,
+    pub orders: Vec<OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
     /// `true` only when [`orders`](Self::orders) lists every order open at the venue for this
     /// instrument when it was read, each under the `ClientOrderId` it was placed with.
     ///
@@ -589,7 +591,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey
             instrument
                 .orders
                 .iter()
-                .filter_map(|order| order.state.time_exchange())
+                .filter_map(|report| report.order.state.time_exchange())
         });
         let balance_times = self.balances.iter().map(|balance| balance.time_exchange);
 
@@ -676,5 +678,80 @@ mod tests {
             ExchangeId::HyperliquidPerp,
             StreamTerminationReason::Error("stream closed".to_string()),
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod account_snapshot_tests {
+    use super::*;
+    use crate::{
+        balance::Balance,
+        order::{
+            Order, OrderKey, OrderKind, TimeInForce,
+            id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+            state::{Open, OrderState},
+        },
+    };
+    use rust_decimal_macros::dec;
+    use rustrade_instrument::Side;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+
+    fn snapshot(order_time: Option<i64>, balance_time: Option<i64>) -> AccountSnapshot {
+        let orders = order_time.map(|seconds| {
+            OrderReport::state_only(Order {
+                key: OrderKey::new(
+                    ExchangeIndex::new(0),
+                    InstrumentIndex::new(0),
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("cid"),
+                ),
+                side: Side::Buy,
+                price: Some(dec!(100)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: OrderState::active(Open::new(
+                    VenueOrderId::Assigned(OrderId::new("1")),
+                    at(seconds),
+                    dec!(0),
+                )),
+            })
+        });
+        let balances = balance_time.map(|seconds| {
+            AssetBalance::new(
+                AssetIndex::new(0),
+                Balance::new(dec!(1), dec!(1)),
+                at(seconds),
+            )
+        });
+        AccountSnapshot::new(
+            ExchangeIndex::new(0),
+            balances.into_iter().collect(),
+            vec![InstrumentAccountSnapshot::new(
+                InstrumentIndex::new(0),
+                orders.into_iter().collect(),
+                true,
+                PositionReport::Unreported,
+                None,
+            )],
+        )
+    }
+
+    /// The most recent time is the latest of every order's and every balance's.
+    #[test]
+    fn time_most_recent_is_the_latest_order_or_balance_time() {
+        assert_eq!(
+            snapshot(Some(20), Some(10)).time_most_recent(),
+            Some(at(20))
+        );
+        assert_eq!(
+            snapshot(Some(10), Some(20)).time_most_recent(),
+            Some(at(20))
+        );
+        assert_eq!(snapshot(None, None).time_most_recent(), None);
     }
 }

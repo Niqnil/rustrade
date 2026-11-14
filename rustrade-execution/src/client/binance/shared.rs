@@ -31,6 +31,7 @@ use crate::{
         ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
         TrailingOffsetType, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::UnindexedOrderResponseCancel,
         state::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
@@ -1736,7 +1737,9 @@ pub(crate) fn resolve_snapshot_kind(
     let AccountEventKind::OrderSnapshot(snapshot) = &mut event.kind else {
         return None;
     };
-    let order = &mut snapshot.0;
+    // Only a kind the report left unresolved is replaced, and `OrderReport::new` never states
+    // an unresolved kind as the venue's, so the report's flags stay right.
+    let order = &mut snapshot.0.order;
     let (kind, note) = resolve_kind(exchange, &order.key.cid, order.kind, || {
         known(&order.key.cid)
     });
@@ -3325,7 +3328,7 @@ fn convert_order_snapshot(
     Some(UnindexedAccountEvent::new(
         exchange,
         AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
-            order,
+            OrderReport::state_only(order),
         )),
     ))
 }
