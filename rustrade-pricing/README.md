@@ -15,14 +15,15 @@ can be used on its own.
   equation on a Crank-Nicolson grid, with early exercise solved at every time step.
 - **Dividends.** Discrete cash dividends (`CashDividend`) drop the stock by their amount at each
   ex-dividend instant. A continuous yield can be given as well.
-- **Greeks.** Delta, gamma and theta come from the grid; vega and rho re-solve with the input
-  bumped on the same grid.
+- **Greeks.** Delta and gamma come from the grid, and theta from the Black-Scholes equation at the
+  spot. Vega and rho re-solve with the input bumped on the same grid.
 - **Implied volatility for any model.** `implied_volatility` finds the volatility at which a model
-  reproduces a price. When none exists it returns an `ImpliedVolatilityError` that says why:
-  below or at intrinsic value, above the upper bound, no convergence, or an invalid input. It
-  never returns NaN.
+  reproduces a price. When none exists it returns an `ImpliedVolatilityError` that says why: the
+  price is below the option's no-arbitrage floor, at it (no volatility is determined) or above
+  the upper bound, the search did not converge, the price or a setting is invalid, or the model
+  cannot price the option.
 - **Quotes.** `mid_price` turns a bid and ask into a midpoint, or a `QuoteError` for a quote that
-  has none (no quote, one-sided, zero bid, crossed).
+  has none: no quote, one-sided, zero bid, crossed, or a negative or non-finite side.
 - **Bring your own model.** Implement the `OptionModel` trait, and the implied-volatility solver
   and the default vega and rho work with it.
 - **Deterministic.** Results are bit-identical on every platform for a given version of the
@@ -90,10 +91,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Accuracy and cost
 
-The default grid has 400 steps in the stock price and 200 in time. On it, options from a few hours
-to a year out at 20–40% volatility price within about 1e-5 of the spot of a much finer grid's
-value: a tenth of a cent on a $100 stock. Long-dated, high-volatility options are less accurate
-(about 5e-5 of the spot for two years at 60%).
+The default grid has 400 steps in the stock price and 200 in time. On it, listed equity options
+from a few hours to a year out at 20–40% volatility price within about 1e-5 of the spot of a
+4000 × 4000 grid's value: a tenth of a cent on a $100 stock. Long-dated, high-volatility options
+are less accurate (about 5e-5 of the spot for two years at 60%).
+
+Where an option's price barely moves with volatility (deep in the money, or very close to expiry),
+the grid's error can outweigh vega. There a price can fall slightly as volatility rises, and an
+implied volatility means little. A price at or below the floor is reported as `AtIntrinsic`.
 
 The cost of one price grows with the grid's size. An implied-volatility solve prices about five to
 fifteen times, and `greeks` five times. `FiniteDifferenceModel::new` sets the grid: finer is
@@ -112,7 +117,7 @@ dividends, build rate curves or fit volatility surfaces.
 ## Documentation
 
 API documentation is on [docs.rs](https://docs.rs/rustrade-pricing). See the
-[workspace README](../README.md) for the rest of rustrade.
+[workspace README](https://github.com/Niqnil/rustrade#readme) for the rest of rustrade.
 
 ## License
 
