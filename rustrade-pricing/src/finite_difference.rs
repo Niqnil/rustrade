@@ -516,6 +516,7 @@ impl Solver<'_> {
             let length = stop - tau;
             let steps = segment_steps(length, problem.expiry, self.model.time_steps);
             let dt = length / steps as f64;
+            let mut start = tau;
             for step in 1..=steps {
                 // The last step lands exactly on the stop, so rounding never skips the dividend
                 // or the valuation instant.
@@ -523,11 +524,6 @@ impl Solver<'_> {
                     stop
                 } else {
                     tau + dt * step as f64
-                };
-                let start = if step == 1 {
-                    tau
-                } else {
-                    tau + dt * (step - 1) as f64
                 };
                 // Every step of the segment is given the same length, `dt`, so they share one
                 // factored matrix (a damped half step's implicit weight, 1·dt/2, equals Crank-
@@ -540,6 +536,7 @@ impl Solver<'_> {
                     self.advance(&mut values, &mut scratch, &operator, 0.5, dt, next);
                 }
                 steps_taken += 1;
+                start = next;
             }
             tau = stop;
             if let Some(amount) = dividend {
@@ -1198,6 +1195,36 @@ mod tests {
     }
 
     #[test]
+    fn a_puts_time_value_rises_from_zero_at_the_exercise_boundary() {
+        // Below the boundary the put is exercised: worth K - S exactly, delta -1. Just above it,
+        // its time value starts from zero; the grid cell that holds the boundary is valued from
+        // the solution, not counted as exercised, or the time value would jump there.
+        for (expiry, volatility) in [(0.5, 0.3), (0.25, 0.2), (1.0, 0.4)] {
+            let value = |spot: f64| {
+                let inputs = OptionInputs::new(Put, American, spot, 100.0, expiry, 0.05);
+                model().value(&inputs, volatility).unwrap()
+            };
+            let (mut exercised, mut held) = (40.0, 100.0);
+            assert_eq!(value(exercised).delta, -1.0);
+            assert!(value(held).delta > -1.0);
+            while held - exercised > 1e-9 {
+                let middle = 0.5 * (exercised + held);
+                if value(middle).delta == -1.0 {
+                    exercised = middle;
+                } else {
+                    held = middle;
+                }
+            }
+            // Measured exactly zero; counting the boundary's cell as exercised gives about 1e-3.
+            let time_value = value(held).price - (100.0 - held);
+            assert!(
+                time_value.abs() <= 1e-9,
+                "T {expiry} vol {volatility}: time value {time_value} just above {held}"
+            );
+        }
+    }
+
+    #[test]
     fn far_out_of_the_money_american_options_have_no_delta() {
         // Out of the money the value and the exercise value are both about zero: that is not
         // the exercise region, and delta stays about zero.
@@ -1403,6 +1430,51 @@ mod tests {
         assert_eq!(greeks.vega, model().vega(&inputs, 0.25).unwrap());
         assert_eq!(greeks.rho, model().rho(&inputs, 0.25).unwrap());
         assert!(greeks.vega > 0.0);
+    }
+
+    #[test]
+    fn results_scale_with_the_currency_unit() {
+        // Quoting the stock, the strike and the dividends in a unit λ times smaller multiplies
+        // the price, delta's numerator and theta by λ and gamma by 1/λ: the model has no scale of
+        // its own. Tolerances such as the exercise test's must therefore be relative to the
+        // strike. Covers a put near the money, a call ahead of a large dividend and a put inside
+        // its exercise region.
+        let cases = [
+            OptionInputs::new(Put, American, 101.0, 100.0, 0.25, 0.04)
+                .with_dividend_yield(0.01)
+                .with_dividends(vec![CashDividend::new(6.0 / 52.0, 0.75)]),
+            OptionInputs::new(Call, American, 100.0, 95.0, 0.5, 0.03)
+                .with_dividends(vec![CashDividend::new(0.4, 6.0)]),
+            OptionInputs::new(Put, American, 60.0, 100.0, 0.5, 0.05),
+        ];
+        for inputs in cases {
+            let base = model().value(&inputs, 0.3).unwrap();
+            for scale in [1e-8, 1e8] {
+                let mut scaled = inputs.clone();
+                scaled.spot *= scale;
+                scaled.strike *= scale;
+                for dividend in &mut scaled.dividends {
+                    dividend.amount *= scale;
+                }
+                let valuation = model().value(&scaled, 0.3).unwrap();
+                let what = format!("{inputs:?} scaled by {scale}");
+                let relative = |actual: f64, expected: f64| {
+                    (actual - expected).abs() / expected.abs().max(f64::MIN_POSITIVE)
+                };
+                for (name, actual, expected) in [
+                    ("price", valuation.price / scale, base.price),
+                    ("delta", valuation.delta, base.delta),
+                    ("gamma", valuation.gamma * scale, base.gamma),
+                    ("theta", valuation.theta / scale, base.theta),
+                ] {
+                    // Measured at most about 1e-12; zero (inside the exercise region) stays zero.
+                    assert!(
+                        relative(actual, expected) <= 1e-10,
+                        "{what}: {name} {actual} vs {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

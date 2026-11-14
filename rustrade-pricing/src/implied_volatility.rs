@@ -557,6 +557,52 @@ mod tests {
     }
 
     #[test]
+    fn config_setters_set_only_their_field() {
+        let base = ImpliedVolatilityConfig::default();
+        let cases = [
+            (
+                base.with_min_volatility(0.01),
+                ImpliedVolatilityConfig {
+                    min_volatility: 0.01,
+                    ..base
+                },
+            ),
+            (
+                base.with_max_volatility(2.5),
+                ImpliedVolatilityConfig {
+                    max_volatility: 2.5,
+                    ..base
+                },
+            ),
+            (
+                base.with_volatility_tolerance(1e-6),
+                ImpliedVolatilityConfig {
+                    volatility_tolerance: 1e-6,
+                    ..base
+                },
+            ),
+            (
+                base.with_price_tolerance(1e-5),
+                ImpliedVolatilityConfig {
+                    price_tolerance: 1e-5,
+                    ..base
+                },
+            ),
+            (
+                base.with_max_iterations(7),
+                ImpliedVolatilityConfig {
+                    max_iterations: 7,
+                    ..base
+                },
+            ),
+        ];
+        for (set, expected) in cases {
+            assert_eq!(set, expected);
+            assert_ne!(set, base);
+        }
+    }
+
+    #[test]
     fn config_validation_names_each_problem() {
         let base = ImpliedVolatilityConfig::default();
         assert_eq!(base.validate(), Ok(()));
