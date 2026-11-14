@@ -176,6 +176,12 @@
 //! places a limit order that rests until cancelled (seen on testnet: the triggered order rests
 //! under the same id, as `Gtc`), which only `GoodUntilCancelled` describes.
 //!
+//! An order that fills in part when placed is answered `filled` with the part that filled, as
+//! seen on testnet. The clients report the order as Hyperliquid left it. A `Gtc` limit order
+//! rests the rest, so it is reported open under its oid with that part filled. An `Ioc` limit
+//! order cancels the rest, so it is reported cancelled with that part filled. Only an order that
+//! filled whole is reported fully filled.
+//!
 //! # Funding
 //!
 //! Hyperliquid settles perpetual funding every hour, as a payment into or out of the collateral
@@ -250,7 +256,7 @@ use crate::{
         Order, OrderKey, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Filled, Open, OrderState, UnindexedOrderState},
+        state::{Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin, TradesRead},
@@ -259,12 +265,12 @@ use chrono::{DateTime, Utc};
 use common::{
     CLOID_REQUIRED, CancelOnDropStream, HYPERLIQUID_TIME_IN_FORCE, InstrumentFilter,
     OpenOrderListing, UnknownCoins, cancel_outcome, cid_to_cloid, classify_order, cloid_to_cid,
-    millis_to_datetime, open_order_to_order, parse_decimal, parse_side, span_millis,
-    user_fills_by_time, warn_unknown_coins,
+    millis_to_datetime, open_order_to_order, parse_decimal, parse_side, placement_state,
+    span_millis, user_fills_by_time, warn_unknown_coins,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
-use error::{map_order_error, order_outcome_unanswered, order_rejection};
+use error::map_order_error;
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
 use funding::{funding_cash_flow, send_fundings};
@@ -1063,9 +1069,7 @@ impl ExecutionClient for HyperliquidClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
-        use hyperliquid_rust_sdk::{
-            ClientOrderRequest, ExchangeDataStatus, ExchangeResponseStatus,
-        };
+        use hyperliquid_rust_sdk::ClientOrderRequest;
 
         let make_inactive =
             |error: UnindexedOrderError| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
@@ -1178,65 +1182,13 @@ impl ExecutionClient for HyperliquidClient {
             }
         };
 
-        // Parse response
-        let state = match response {
-            ExchangeResponseStatus::Ok(exchange_resp) => {
-                // Check status from response data
-                let status = exchange_resp
-                    .data
-                    .and_then(|d| d.statuses.into_iter().next());
-
-                match status {
-                    Some(ExchangeDataStatus::Resting(resting)) => {
-                        debug!(oid = resting.oid, "Order resting");
-                        OrderState::active(Open {
-                            id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", resting.oid))),
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
-                    }
-                    Some(ExchangeDataStatus::Filled(filled)) => {
-                        debug!(oid = filled.oid, avg_px = %filled.avg_px, "Order filled");
-                        // Hyperliquid provides avg_px for filled orders
-                        let avg_price = parse_decimal(&filled.avg_px, "avg_px");
-                        OrderState::fully_filled(Filled::new(
-                            OrderId(format_smolstr!("{}", filled.oid)),
-                            Utc::now(),
-                            parse_decimal(&filled.total_sz, "total_sz")
-                                .unwrap_or(request.state.quantity),
-                            avg_price,
-                        ))
-                    }
-                    Some(ExchangeDataStatus::Error(msg)) => {
-                        warn!(%msg, "Order rejected by exchange");
-                        OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
-                    }
-                    Some(
-                        ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
-                    ) => {
-                        // The venue answered without an oid, so the order's only handle is the
-                        // cloid it was placed with. A standalone trigger order is answered
-                        // `resting` with an oid; these statuses belong to grouped orders.
-                        debug!(cid = %request.key.cid, "Order waiting under its cloid");
-                        OrderState::active(Open {
-                            id: VenueOrderId::ClientAssigned,
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
-                    }
-                    Some(ExchangeDataStatus::Success) | None => {
-                        // The venue took the request without saying what became of the order,
-                        // so it may be live: the outcome is unknown, not a refusal.
-                        warn!(cid = %request.key.cid, "Order answered without its status; outcome unknown");
-                        OrderState::inactive(order_outcome_unanswered())
-                    }
-                }
-            }
-            ExchangeResponseStatus::Err(msg) => {
-                warn!(%msg, "Order rejected");
-                OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
-            }
-        };
+        let state = placement_state(
+            response,
+            wire_kind,
+            request.state.quantity,
+            &request.key.cid,
+            ExchangeId::HyperliquidPerp,
+        );
         let order = Order {
             key: OrderKey {
                 exchange: ExchangeId::HyperliquidPerp,
@@ -2247,6 +2199,65 @@ mod tests {
                 market.state
             );
             assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        /// Hyperliquid answers a placement that filled in part `filled`, with the part that
+        /// filled. A `Gtc` order rests the rest, so it is open with that part filled; an `Ioc`
+        /// order cancelled the rest. Only an order of the size that filled is fully filled.
+        #[tokio::test]
+        async fn a_perp_placement_filled_in_part_is_open_or_cancelled_by_its_time_in_force() {
+            let server = server_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [
+                    {"filled": {"totalSz": "0.0004", "avgPx": "60000.0", "oid": 88}}
+                ]}},
+            }))
+            .await;
+            let client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
+            let btc = InstrumentNameExchange::from("BTC-USDC-PERP");
+            let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+            let place = |tif, quantity| {
+                place_with(
+                    &client,
+                    &btc,
+                    OrderKind::Limit,
+                    tif,
+                    Some(dec!(60000)),
+                    quantity,
+                )
+            };
+
+            let rested = place(gtc, dec!(0.001)).await;
+            assert!(
+                matches!(
+                    &rested.state,
+                    OrderState::Active(crate::order::state::ActiveOrderState::Open(open))
+                        if open.filled_quantity == dec!(0.0004)
+                ),
+                "{:?}",
+                rested.state
+            );
+
+            let cancelled = place(TimeInForce::ImmediateOrCancel, dec!(0.001)).await;
+            assert!(
+                matches!(
+                    &cancelled.state,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                        if cancelled.filled_quantity == Some(dec!(0.0004))
+                ),
+                "{:?}",
+                cancelled.state
+            );
+
+            let filled = place(gtc, dec!(0.0004)).await;
+            assert!(
+                matches!(
+                    filled.state,
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+                ),
+                "{:?}",
+                filled.state
+            );
         }
 
         /// A limit order goes out with Hyperliquid's spelling of its time in force, and a trigger

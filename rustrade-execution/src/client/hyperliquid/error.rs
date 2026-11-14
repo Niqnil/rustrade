@@ -174,13 +174,12 @@ fn refusal(msg: String, instrument: &InstrumentNameExchange) -> UnindexedOrderEr
     UnindexedOrderError::Rejected(order_rejection(msg))
 }
 
-/// An order answered `ok` with a bare `success` status or with none: Hyperliquid took the
-/// request but did not say what became of the order, which may be live. Its outcome is unknown,
-/// as [`map_order_error`] reads a failure after the send.
-pub(super) fn order_outcome_unanswered() -> UnindexedOrderError {
-    UnindexedOrderError::Connectivity(ConnectivityError::Socket(
-        "Hyperliquid answered the order without its status".to_owned(),
-    ))
+/// An order Hyperliquid took without an answer that says what became of it, which may be live:
+/// answered `ok` with a bare `success` status or with none, say. `why` completes "Hyperliquid
+/// ..." for the error's message. Its outcome is unknown, as [`map_order_error`] reads a failure
+/// after the send.
+pub(super) fn order_outcome_unknown(why: &str) -> UnindexedOrderError {
+    UnindexedOrderError::Connectivity(ConnectivityError::Socket(format!("Hyperliquid {why}")))
 }
 
 /// Classify why Hyperliquid refused an order: the error of a placement response or of the SDK
@@ -475,7 +474,9 @@ mod tests {
 
     #[test]
     fn an_order_answered_without_its_status_has_an_unknown_outcome() {
-        assert!(order_outcome_unanswered().is_outcome_unknown());
+        assert!(
+            order_outcome_unknown("answered the order without its status").is_outcome_unknown()
+        );
     }
 
     #[test]
