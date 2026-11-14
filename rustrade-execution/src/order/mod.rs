@@ -432,6 +432,16 @@ pub enum TimeInForce {
     AtOpen,
     /// Execute at market close. Only valid with Market (→ MOC) or Limit (→ LOC) orders.
     AtClose,
+    /// A time in force the venue did not state, or stated in a form that does not map to one of
+    /// the others: the order has one, but the report does not say which.
+    ///
+    /// Only read back from a venue, never placed: every client, and the simulated venue, refuses
+    /// one with [`OrderError::UnsupportedTimeInForce`](crate::error::OrderError::UnsupportedTimeInForce).
+    /// A client reports it rather than guess, so a reader never takes a guessed time in force for
+    /// the order's real one: for example a venue read path that carries no time in force at all,
+    /// a time in force the client does not know, or a good-till-date order whose expiry the
+    /// report leaves out.
+    Unreported,
 }
 
 impl TimeInForce {
@@ -446,6 +456,7 @@ impl TimeInForce {
             Self::GoodTillDate { .. } => TimeInForceKind::GoodTillDate,
             Self::AtOpen => TimeInForceKind::AtOpen,
             Self::AtClose => TimeInForceKind::AtClose,
+            Self::Unreported => TimeInForceKind::Unreported,
         }
     }
 }
@@ -475,6 +486,8 @@ pub enum TimeInForceKind {
     AtOpen,
     /// [`TimeInForce::AtClose`].
     AtClose,
+    /// [`TimeInForce::Unreported`], which no venue takes.
+    Unreported,
 }
 
 impl<ExchangeKey, InstrumentKey> Order<ExchangeKey, InstrumentKey, ActiveOrderState>
@@ -582,10 +595,25 @@ mod tests {
             ),
             (TimeInForce::AtOpen, TimeInForceKind::AtOpen),
             (TimeInForce::AtClose, TimeInForceKind::AtClose),
+            (TimeInForce::Unreported, TimeInForceKind::Unreported),
         ];
         for (time_in_force, kind) in cases {
             assert_eq!(time_in_force.kind(), kind, "{time_in_force}");
         }
+    }
+
+    #[test]
+    fn an_unreported_time_in_force_round_trips_through_serde() {
+        let json = serde_json::to_string(&TimeInForce::Unreported).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimeInForce>(&json).unwrap(),
+            TimeInForce::Unreported
+        );
+        let json = serde_json::to_string(&TimeInForceKind::Unreported).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimeInForceKind>(&json).unwrap(),
+            TimeInForceKind::Unreported
+        );
     }
 
     #[test]

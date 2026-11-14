@@ -2190,6 +2190,7 @@ mod tests {
             for (kind, tif) in [
                 (OrderKind::Limit, TimeInForce::FillOrKill),
                 (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay),
+                (OrderKind::Limit, TimeInForce::Unreported),
                 (
                     OrderKind::Stop { trigger_price },
                     TimeInForce::GoodUntilCancelled { post_only: true },

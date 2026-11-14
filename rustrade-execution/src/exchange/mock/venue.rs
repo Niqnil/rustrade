@@ -7447,6 +7447,9 @@ fn clamp_to_limit(side: Side, price: Decimal, limit: Decimal) -> Decimal {
 /// [`TimeInForce::GoodUntilCancelled`] with `post_only` is likewise refused on a market order, as
 /// a promise never to take liquidity is one a market order cannot keep.
 ///
+/// [`TimeInForce::Unreported`] is refused on every kind, as every live client refuses it: it is
+/// only read back from a venue, never placed.
+///
 /// # Errors
 /// Returns [`OrderError::UnsupportedTimeInForce`] naming what it would take to honour the pair.
 /// Rejecting is the point: treating an unsupported time in force as `GoodUntilCancelled` would
@@ -7457,6 +7460,14 @@ fn validate_time_in_force_supported(
     time_in_force: TimeInForce,
     session_close: bool,
 ) -> Result<(), UnindexedOrderError> {
+    if time_in_force == TimeInForce::Unreported {
+        return Err(UnindexedOrderError::unsupported_time_in_force(
+            time_in_force,
+            "SimulatedVenue does not take TimeInForce::Unreported: it is only read back from a \
+             venue, never placed",
+        ));
+    }
+
     let missing = match (order_kind, time_in_force) {
         // Governs *when* an order executes, not how long it works, whatever the kind.
         (_, TimeInForce::AtOpen | TimeInForce::AtClose) => "an opening or closing auction",
@@ -12222,6 +12233,46 @@ mod tests {
                 "{time_in_force} on a market order must still fill, got: {:?}",
                 outcome.response.state
             );
+        }
+    }
+
+    /// `Unreported` is only read back from a venue, so the venue refuses it on every kind before
+    /// its own time-in-force rules, with nothing resting and no balance moved.
+    #[test]
+    fn an_unreported_time_in_force_is_refused_on_every_kind() {
+        for limit in [true, false] {
+            // A limit order needs a market-driven venue, which a request-priced one refuses on
+            // its kind before its time in force is looked at.
+            let mut venue = if limit {
+                make_market_venue("10", "1000000")
+            } else {
+                make_venue("10", "1000000")
+            };
+            let request = if limit {
+                limit_request("tif", Side::Buy, "1", "48000", TimeInForce::Unreported)
+            } else {
+                let mut request = buy_request("1", market_prices("48000"));
+                request.state.time_in_force = TimeInForce::Unreported;
+                request
+            };
+
+            let outcome = venue.open_order(request);
+
+            assert!(outcome.events.is_empty(), "limit {limit}: no balance moves");
+            assert!(
+                venue.orders_open(&[]).is_empty(),
+                "limit {limit}: nothing rests"
+            );
+            match outcome.response.state {
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    OrderError::UnsupportedTimeInForce {
+                        time_in_force: TimeInForce::Unreported,
+                        ref reason,
+                        ..
+                    },
+                )) => assert!(reason.contains("only read back"), "got: {reason}"),
+                ref other => panic!("limit {limit}: must be refused, got: {other:?}"),
+            }
         }
     }
 

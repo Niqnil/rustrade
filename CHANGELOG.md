@@ -503,6 +503,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a partial failure included, no longer reaches the rate limiter, as for every other REST
     request the SDK fails: the SDK's error does not keep the answer's headers.
 
+- **Breaking: new `TimeInForce::Unreported`, and clients read back a time in force they cannot
+  name as it, not as a guess** (`rustrade-execution`, #950). A report used to put a plausible time
+  in force on an order whose real one it did not know, so a reader could not tell a guess from the
+  venue's word.
+  - `TimeInForce::Unreported` (and `TimeInForceKind::Unreported`) is only read back, never placed.
+    Every client and the simulated venue refuse it with `OrderError::UnsupportedTimeInForce`. An
+    exhaustive `match` on `TimeInForce` or `TimeInForceKind` needs an arm for it.
+  - **Hyperliquid:** open orders, account-stream updates and order lookups carry no time in force,
+    so they report `Unreported`. They reported plain good-until-cancelled, which was wrong for every
+    post-only and immediate-or-cancel order.
+  - **Binance spot and margin:** a `LIMIT_MAKER` order reads back as post-only
+    (`GoodUntilCancelled { post_only: true }`); it read back as plain good-until-cancelled, since
+    Binance reports its `timeInForce` as `GTC`. `GTD`, an unknown value and a missing one read as
+    `Unreported`; `GTD` read as `GoodUntilEndOfDay`, and the other two as good-until-cancelled.
+  - **Alpaca:** `opg` and `cls` read back as `AtOpen` and `AtClose`; they read as
+    `GoodUntilEndOfDay`. An unknown value reads as `Unreported`, with a warning.
+  - **IBKR:** an order this client does not track (placed elsewhere, or before a restart) whose time
+    in force this client does not send (day-till-cancelled, auction, good-till-crossing), or whose
+    good-till-date time does not parse, is now read with `Unreported`. It was left out of
+    open-order listings, ended-order lookups and reconnect snapshots altogether.
+
 ### Fixed
 
 - **`Cargo.lock` takes `quinn-udp` 0.5.16.** 0.5.14 carried RUSTSEC-2026-0538: on OpenBSD,

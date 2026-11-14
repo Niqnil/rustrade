@@ -523,11 +523,14 @@ pub(crate) struct OrderShape {
 /// For an order this client did not place, or no longer tracks, such as one placed before a
 /// restart. A tracked order's shape is the one it was placed with.
 ///
+/// A time in force this client never sends (IB's day-till-cancelled, auction or good-till-crossing),
+/// or a good-till-date whose time does not parse, reads as [`TimeInForce::Unreported`], with a
+/// warning: the order is still reported, without a guessed time in force. A good-till-date that
+/// names no zone is read in `session_zone`, the gateway's (see [`parse_gtd_datetime`]).
+///
 /// # Errors
-/// A description of what does not map: an order type or time in force [`build_ib_order`] never
-/// sends, a price the type needs that IB did not list, or a good-till-date time that does not
-/// parse. A good-till-date that names no zone is read in `session_zone`, the gateway's (see
-/// [`parse_gtd_datetime`]).
+/// A description of what does not map: an order type [`build_ib_order`] never sends, or a price
+/// the type needs that IB did not list.
 pub(crate) fn order_shape_from_ib(
     order: &Order,
     session_zone: Option<chrono_tz::Tz>,
@@ -544,15 +547,27 @@ pub(crate) fn order_shape_from_ib(
         IbTimeInForce::ImmediateOrCancel => TimeInForce::ImmediateOrCancel,
         IbTimeInForce::FillOrKill => TimeInForce::FillOrKill,
         IbTimeInForce::OnOpen => TimeInForce::AtOpen,
-        IbTimeInForce::GoodTillDate => TimeInForce::GoodTillDate {
-            expiry: parse_gtd_datetime(&order.good_till_date, session_zone).ok_or_else(|| {
-                format!(
-                    "good-till-date time {:?} does not parse",
-                    order.good_till_date
-                )
-            })?,
-        },
-        other => return Err(format!("time in force {other:?}")),
+        IbTimeInForce::GoodTillDate => {
+            match parse_gtd_datetime(&order.good_till_date, session_zone) {
+                Some(expiry) => TimeInForce::GoodTillDate { expiry },
+                None => {
+                    tracing::warn!(
+                        order_id = order.order_id,
+                        good_till_date = %order.good_till_date,
+                        "IBKR good-till-date time does not parse, reporting the time in force as Unreported"
+                    );
+                    TimeInForce::Unreported
+                }
+            }
+        }
+        other => {
+            tracing::warn!(
+                order_id = order.order_id,
+                time_in_force = ?other,
+                "IBKR time in force this client does not map, reporting it as Unreported"
+            );
+            TimeInForce::Unreported
+        }
     };
 
     // A trailing order is by percentage when IB lists a percentage, else by an amount in
@@ -696,6 +711,8 @@ pub enum OrderMappingError {
     /// order TYPE (MOC/LOC), not just the TIF; callers must route through
     /// `build_ib_order` which handles the type promotion.
     AtCloseRequiresOrderTypeChange,
+    /// [`TimeInForce::Unreported`] is only read back from a venue, never sent.
+    UnreportedTimeInForce,
     /// `ibapi` rejected a bracket's prices: one is not finite, or the take profit or stop loss is
     /// on the wrong side of the entry (for a buy, the take profit must be above the entry and the
     /// stop loss below; a sell the reverse).
@@ -737,6 +754,10 @@ impl std::fmt::Display for OrderMappingError {
                 "AtClose TIF must be routed through build_ib_order, which promotes \
                  the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
             ),
+            Self::UnreportedTimeInForce => write!(
+                f,
+                "an Unreported time in force is only read back from a venue, never sent"
+            ),
             Self::InvalidBracketPrices(e) => write!(f, "invalid bracket prices: {e}"),
             Self::InvalidClientOrderId(cid) => write!(
                 f,
@@ -751,7 +772,7 @@ impl OrderMappingError {
     /// The error an order with `time_in_force` is refused with, unsent, for this mapping failure.
     ///
     /// - [`OrderError::UnsupportedTimeInForce`] for a time in force this client cannot send for
-    ///   the order: `post_only`, or `AtClose` on a kind other than market or limit.
+    ///   the order: `post_only`, `AtClose` on a kind other than market or limit, or `Unreported`.
     /// - [`OrderError::UnsupportedOrderType`] for an order kind IB has no order type for
     ///   ([`UnsupportedOrderKind`](Self::UnsupportedOrderKind)), or a trailing offset type it
     ///   cannot express ([`UnsupportedOffsetType`](Self::UnsupportedOffsetType)).
@@ -763,7 +784,8 @@ impl OrderMappingError {
         match self {
             Self::PostOnlyNotSupported
             | Self::UnsupportedOrderKindForAtClose(_)
-            | Self::AtCloseRequiresOrderTypeChange => {
+            | Self::AtCloseRequiresOrderTypeChange
+            | Self::UnreportedTimeInForce => {
                 OrderError::unsupported_time_in_force(time_in_force, self.to_string())
             }
             Self::UnsupportedOffsetType(_) | Self::UnsupportedOrderKind(_) => {
@@ -828,6 +850,7 @@ pub fn time_in_force_to_ib(tif: &TimeInForce) -> Result<IbTimeInForce, OrderMapp
         // `build_ib_order` intercepts AtClose; surfacing Err here lets other
         // callers (e.g. the bracket-order path) reject gracefully.
         TimeInForce::AtClose => Err(OrderMappingError::AtCloseRequiresOrderTypeChange),
+        TimeInForce::Unreported => Err(OrderMappingError::UnreportedTimeInForce),
     }
 }
 
@@ -1188,6 +1211,13 @@ mod tests {
                 .map(|_| ())
                 .map_err(|e| e.into_order_error(TimeInForce::AtClose))
         ));
+        // A time in force only ever read back is never sent, and the refusal says why.
+        let unreported = refusal(OrderKind::Market, None, TimeInForce::Unreported);
+        assert!(matches!(
+            &unreported,
+            Err(OrderError::UnsupportedTimeInForce { reason, .. }) if reason.contains("only read back")
+        ));
+        assert!(unsupported(TimeInForce::Unreported, unreported));
 
         // A failure about the request's values is a rejection, not an unsupported type.
         let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
@@ -2729,10 +2759,6 @@ mod tests {
         for (order, reason) in [
             (order("REL", IbTimeInForce::Day), "order type"),
             (
-                order("LMT", IbTimeInForce::DayTillCanceled),
-                "time in force",
-            ),
-            (
                 Order {
                     limit_price: None,
                     ..order("LMT", IbTimeInForce::Day)
@@ -2740,7 +2766,6 @@ mod tests {
                 "without limit_price",
             ),
             (order("STP", IbTimeInForce::Day), "without aux_price"),
-            (order("MKT", IbTimeInForce::GoodTillDate), "good-till-date"),
             (
                 Order {
                     aux_price: Some(2.0),
@@ -2770,6 +2795,29 @@ mod tests {
         ] {
             let error = order_shape_from_ib(&order, None).unwrap_err();
             assert!(error.contains(reason), "{error:?} should name {reason:?}");
+        }
+    }
+
+    /// An order whose time in force this client does not map is still read, its time in force
+    /// Unreported rather than guessed, and a good-till-date whose time does not parse likewise.
+    #[test]
+    fn order_shape_from_ib_reads_a_time_in_force_it_cannot_map_as_unreported() {
+        let order = |tif: IbTimeInForce| Order {
+            order_type: "LMT".to_owned(),
+            tif,
+            limit_price: Some(1.0),
+            ..Order::default()
+        };
+        for tif in [
+            IbTimeInForce::DayTillCanceled,
+            IbTimeInForce::Auction,
+            IbTimeInForce::GoodTillCrossing,
+            IbTimeInForce::GoodTillDate,
+        ] {
+            let shape = order_shape_from_ib(&order(tif.clone()), None).unwrap();
+            assert_eq!(shape.time_in_force, TimeInForce::Unreported, "{tif:?}");
+            assert_eq!(shape.kind, OrderKind::Limit, "{tif:?}");
+            assert_eq!(shape.price, Some(Decimal::ONE), "{tif:?}");
         }
     }
 
