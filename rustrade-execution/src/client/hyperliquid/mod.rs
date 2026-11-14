@@ -23,7 +23,7 @@
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates +
 //!   UserFundings subscriptions
 //! - REST (`InfoClient`), after each reconnect and through [`OrderStatusClient`]: how the orders
-//!   held as live ended, by `openOrders` and `orderStatus`
+//!   held as live ended, by `frontendOpenOrders` and `orderStatus`
 //!
 //! # SDK Delegation Model
 //!
@@ -141,10 +141,20 @@
 //!
 //! A trigger order carries no time in force; see [Time in force](#time-in-force).
 //!
-//! **SDK limitations** (hyperliquid_rust_sdk 0.6.x): neither the open orders this client reads
-//! nor `OrderUpdate` carry an order's trigger fields or time in force, so orders from both are
-//! reported as `OrderKind::Limit`, `GoodUntilCancelled`. Track `OrderKind` from the placement
-//! request.
+//! **Reading orders back.** An open-order listing (`frontendOpenOrders`) and an order lookup
+//! (`orderStatus`) report each order's kind, a trigger order's with its trigger price. They report
+//! its limit price too, except on a stop or take-profit market order, whose `limitPx` is only the
+//! worst price the market order it places may fill at. An order type that names no
+//! [`OrderKind`](crate::order::OrderKind) is read as `Limit`, with a `warn!`. The time in force is
+//! the one Hyperliquid reports: `Gtc`, `Alo` or `Ioc`. A trigger order that has not triggered
+//! reports none, so it is read as
+//! [`TimeInForce::Unreported`](crate::order::TimeInForce::Unreported). Once a stop-limit or
+//! take-profit-limit order triggers, the listing shows the order it placed, under the same id, as
+//! `Gtc` but without the trigger price, so it is read as that `Limit` order. `orderStatus` keeps
+//! the placement record, with its trigger and its missing time in force. The
+//! `orderUpdates` stream carries neither the kind nor the time in force, so the account stream
+//! reports its orders as `OrderKind::Limit` with `TimeInForce::Unreported`. Track the kind from
+//! the placement request.
 //!
 //! # Time in force
 //!
@@ -480,8 +490,8 @@ impl ExecutionClient for HyperliquidClient {
     /// # Cost
     ///
     /// At once, `userAbstraction` (weight 20) and, for each DEX traded, the default one included,
-    /// a `clearinghouseState` (weight 2) and an `openOrders` (weight 20); then, under a unified
-    /// account or portfolio margin, `spotClearinghouseState` (weight 2). With `n` HIP-3 DEXs
+    /// a `clearinghouseState` (weight 2) and a `frontendOpenOrders` (weight 20); then, under a
+    /// unified account or portfolio margin, `spotClearinghouseState` (weight 2). With `n` HIP-3 DEXs
     /// that is `42 + 22n`, or `44 + 22n`, against Hyperliquid's limit of 1,200 a minute per IP
     /// address.
     async fn account_snapshot(
@@ -609,9 +619,9 @@ impl ExecutionClient for HyperliquidClient {
     ///   It holds up to 4,096 orders and forgets the oldest past that, logged at `warn`. An order
     ///   placed outside this client and never listed or reported to it is not covered. Every
     ///   instrument is checked, as the stream ignores `instruments`.
-    /// - **Cost.** One `openOrders` request (weight 20) per DEX traded, together listing every
-    ///   open order, then one `orderStatus` request (weight 2) for each held order the listing no
-    ///   longer shows, 8 at a time. Both count against Hyperliquid's REST limit of 1,200 a minute
+    /// - **Cost.** One `frontendOpenOrders` request (weight 20) per DEX traded, together listing
+    ///   every open order, then one `orderStatus` request (weight 2) for each held order the
+    ///   listing no longer shows, 8 at a time. Both count against Hyperliquid's REST limit of 1,200 a minute
     ///   per IP address. The cost is per stream: a perpetuals and a spot stream on one wallet each
     ///   make their own.
     /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
@@ -1257,7 +1267,7 @@ impl ExecutionClient for HyperliquidClient {
         perp_account::fetch_balances(&self.info_client, self.wallet_h160(), &self.dexes).await
     }
 
-    /// Every open order on each DEX traded, with one `openOrders` (weight 20) per DEX.
+    /// Every open order on each DEX traded, with one `frontendOpenOrders` (weight 20) per DEX.
     ///
     /// # Errors
     ///
@@ -1443,11 +1453,11 @@ async fn perp_order_status(
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
         return Ok(Some(VenueOrderStatus::Unknown));
     };
-    let instrument = dexes.instrument(&record.order.coin);
+    let instrument = dexes.instrument(&record.update.order.coin);
     Ok(status_from_record(key, &record, instrument))
 }
 
-/// The client order ids `openOrders` (weight 20 per DEX traded) lists on the perpetuals
+/// The client order ids `frontendOpenOrders` (weight 20 per DEX traded) lists on the perpetuals
 /// `instruments`, for a reconnect's check of the orders held as live.
 async fn perp_listed_cids(
     info_client: Arc<InfoClient>,

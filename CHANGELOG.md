@@ -526,6 +526,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hyperliquid open-order listings and order lookups report each order's kind, trigger and time
+  in force** (`rustrade-execution`, `hyperliquid` feature). They reported every order as a
+  `Limit` order with `TimeInForce::Unreported`, a stop or take-profit order included.
+  - **Listings** (`fetch_open_orders`, `account_snapshot`, and the reconnect check of the
+    account streams) read `frontendOpenOrders` instead of `openOrders`, at the same weight (20).
+    **Lookups** (`fetch_order_status`, and the reconnect check) read the same fields from
+    `orderStatus`.
+  - **Kind:** `Limit`, `Stop`, `StopLimit`, `TakeProfit` or `TakeProfitLimit`, the trigger
+    kinds with their trigger price. A stop or take-profit market order reports no price: its
+    `limitPx` is only the worst price its market order may fill at. A type with no `OrderKind`
+    reads as `Limit`, with a warning.
+  - **Time in force:** `Gtc`, `Alo` and `Ioc` read as `GoodUntilCancelled`, post-only
+    `GoodUntilCancelled` and `ImmediateOrCancel`. A trigger order not yet triggered has none on
+    Hyperliquid, and reads as `Unreported`, as does any other value (with a warning).
+  - **A triggered order** is listed as the `Limit` order it placed, `Gtc`, under the same id:
+    Hyperliquid's listing no longer carries its trigger price. A lookup still reports the order
+    as placed, with its trigger, and with `Unreported`.
+  - The account stream's order updates carry none of these, so they still report `Limit` and
+    `Unreported`.
+  - **Breaking:** `hyperliquid::common::OpenOrder` has a new field, `terms` (the new
+    `OrderTerms`: `order_type`, `trigger_condition`, `tif`, `trigger_px`), and both are
+    `#[non_exhaustive]`: they are parsed from the venue, not built.
+
 - **`Cargo.lock` takes `quinn-udp` 0.5.16.** 0.5.14 carried RUSTSEC-2026-0538: on OpenBSD,
   NetBSD, Solaris, illumos and Apple platforms without `fast-apple-datapath`, a datagram larger
   than the receive buffer left the receive loop spinning instead of returning `WouldBlock`, until

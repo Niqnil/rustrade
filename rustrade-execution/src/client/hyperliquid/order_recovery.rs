@@ -7,10 +7,11 @@
 //! snapshot of recent fills. `orderUpdates` opens with no snapshot, so an order that ended while the
 //! socket was down is never reported on it. [`ReconnectWatch`] reads a drop followed by a fills
 //! snapshot as a reconnect, once the snapshot's fills have been sent on, and wakes the task
-//! [`spawn_order_checks`] starts. That task lists the open orders once, with `openOrders`, and asks
-//! `orderStatus` about each order held as live that the listing no longer shows.
+//! [`spawn_order_checks`] starts. That task lists the open orders once, with
+//! `frontendOpenOrders`, and asks `orderStatus` about each order held as live that the listing no
+//! longer shows.
 
-use super::common::{OpenOrder, cid_to_cloid, info, order_update_to_order, record_cid};
+use super::common::{OpenOrder, OrderTerms, cid_to_cloid, info, order_update_to_order, record_cid};
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     client::VenueOrderStatus,
@@ -28,7 +29,7 @@ use crate::{
 };
 use ethers::types::H160;
 use fnv::FnvHashSet;
-use hyperliquid_rust_sdk::{InfoClient, OrderUpdate, TradeInfo, UserFillsData};
+use hyperliquid_rust_sdk::{BasicOrder, InfoClient, OrderUpdate, TradeInfo, UserFillsData};
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use smol_str::format_smolstr;
 use std::{future::Future, sync::Arc};
@@ -43,11 +44,51 @@ struct OrderStatusResponse {
     /// `order` when the venue knows the order asked about, `unknownOid` when it does not.
     status: String,
     /// The order's record, present with `order`.
-    ///
-    /// Parsed as the SDK's [`OrderUpdate`], the shape `orderUpdates` sends, rather than as its
-    /// `OrderInfo`, which requires a `tif` the venue sends as `null` for a trigger order.
     #[serde(default)]
-    order: Option<OrderUpdate>,
+    order: Option<OrderRecord>,
+}
+
+/// An order record as `orderStatus` answers with it: the shape `orderUpdates` sends, as the SDK's
+/// [`OrderUpdate`], and the order's [`OrderTerms`].
+///
+/// Not the SDK's `OrderInfo`, which requires a `tif` the venue sends as `null` on a trigger order.
+#[derive(Debug, Clone)]
+pub(super) struct OrderRecord {
+    pub(super) update: OrderUpdate,
+    pub(super) terms: OrderTerms,
+}
+
+impl<'de> serde::Deserialize<'de> for OrderRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Record {
+            order: RecordOrder,
+            status: String,
+            status_timestamp: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct RecordOrder {
+            #[serde(flatten)]
+            order: BasicOrder,
+            #[serde(flatten)]
+            terms: OrderTerms,
+        }
+
+        let Record {
+            order: RecordOrder { order, terms },
+            status,
+            status_timestamp,
+        } = Record::deserialize(deserializer)?;
+        Ok(Self {
+            update: OrderUpdate {
+                order,
+                status,
+                status_timestamp,
+            },
+            terms,
+        })
+    }
 }
 
 /// How `orderStatus` is asked about the order under a client order id.
@@ -102,7 +143,7 @@ pub(super) async fn fetch_order_record(
     info_client: &InfoClient,
     address: H160,
     cid: &ClientOrderId,
-) -> Result<Option<OrderUpdate>, UnindexedClientError> {
+) -> Result<Option<OrderRecord>, UnindexedClientError> {
     let Some(query) = StatusQuery::of(cid) else {
         debug!(%cid, "Not a Hyperliquid cloid or oid, so no order is reported under it");
         return Ok(None);
@@ -111,10 +152,11 @@ pub(super) async fn fetch_order_record(
         info(info_client, "orderStatus", query.body(address)).await?;
     match (response.status.as_str(), response.order) {
         ("order", Some(record)) => {
-            let names = record_cid(record.order.cloid.as_deref(), record.order.oid)
+            let order = &record.update.order;
+            let names = record_cid(order.cloid.as_deref(), order.oid)
                 .is_some_and(|reported| reported == *cid);
             if !names {
-                debug!(%cid, oid = record.order.oid, cloid = ?record.order.cloid, "Hyperliquid reports this order under another id");
+                debug!(%cid, oid = order.oid, cloid = ?order.cloid, "Hyperliquid reports this order under another id");
             }
             Ok(names.then_some(record))
         }
@@ -154,11 +196,11 @@ pub(super) fn lookup_of(status: Option<VenueOrderStatus>) -> OrderLookup {
 /// does not convert (logged at `warn`).
 pub(super) fn status_from_record(
     key: UnindexedOrderKey,
-    record: &OrderUpdate,
+    record: &OrderRecord,
     instrument: Option<InstrumentNameExchange>,
 ) -> Option<VenueOrderStatus> {
     if instrument.as_ref() != Some(&key.instrument) {
-        debug!(cid = %key.cid, asked = %key.instrument, coin = %record.order.coin, "Hyperliquid order is on another instrument than asked");
+        debug!(cid = %key.cid, asked = %key.instrument, coin = %record.update.order.coin, "Hyperliquid order is on another instrument than asked");
         return Some(VenueOrderStatus::Unknown);
     }
     let Order {
@@ -169,7 +211,12 @@ pub(super) fn status_from_record(
         time_in_force,
         state,
         ..
-    } = order_update_to_order(record, key.exchange, key.instrument.clone())?;
+    } = order_update_to_order(
+        &record.update,
+        &record.terms,
+        key.exchange,
+        key.instrument.clone(),
+    )?;
     match state {
         OrderState::Active(ActiveOrderState::Open(state)) => {
             Some(VenueOrderStatus::Live(Box::new(Order {
@@ -468,7 +515,7 @@ pub(super) mod tests {
         })
     }
 
-    fn record(coin: &str, status: &str, sz: &str) -> OrderUpdate {
+    fn record(coin: &str, status: &str, sz: &str) -> OrderRecord {
         serde_json::from_value(record_json(coin, status, sz, Some(CLOID))).unwrap()
     }
 
@@ -526,7 +573,7 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(found.status, "canceled");
+        assert_eq!(found.update.status, "canceled");
         let requests = server.received_requests().await.unwrap();
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
         assert!(body.contains(r#""type":"orderStatus""#), "{body}");
@@ -571,7 +618,7 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(found.unwrap().order.oid, 42);
+        assert_eq!(found.unwrap().update.order.oid, 42);
         let requests = server.received_requests().await.unwrap();
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
         assert!(body.contains(r#""oid":42}"#), "{body}");
@@ -601,7 +648,7 @@ pub(super) mod tests {
     /// The lookup a reconnect's check reads from `record`.
     fn lookup_from_record(
         key: UnindexedOrderKey,
-        record: &OrderUpdate,
+        record: &OrderRecord,
         instrument: Option<InstrumentNameExchange>,
     ) -> OrderLookup {
         lookup_of(status_from_record(key, record, instrument))
@@ -698,6 +745,43 @@ pub(super) mod tests {
         );
     }
 
+    /// A lookup reports the kind and time in force `orderStatus` records: a stop market order,
+    /// with no limit price and, not triggered, no time in force; a limit order with its own.
+    #[test]
+    fn a_looked_up_order_carries_its_recorded_kind_and_time_in_force() {
+        let mut stop = record_json("BTC", "open", "0.01", Some(CLOID));
+        stop["order"]["orderType"] = "Stop Market".into();
+        stop["order"]["triggerPx"] = "59000.0".into();
+        let mut limit = record_json("BTC", "open", "0.01", Some(CLOID));
+        limit["order"]["tif"] = "Gtc".into();
+
+        let live = |record: serde_json::Value| {
+            let record: OrderRecord = serde_json::from_value(record).unwrap();
+            match status_from_record(key(CID), &record, Some(btc())) {
+                Some(VenueOrderStatus::Live(order)) => order,
+                other => panic!("expected a live order, got {other:?}"),
+            }
+        };
+
+        let stop = live(stop);
+        assert_eq!(
+            stop.kind,
+            crate::order::OrderKind::Stop {
+                trigger_price: dec!(59000)
+            }
+        );
+        assert_eq!(stop.price, None);
+        assert_eq!(stop.time_in_force, crate::order::TimeInForce::Unreported);
+
+        let limit = live(limit);
+        assert_eq!(limit.kind, crate::order::OrderKind::Limit);
+        assert_eq!(limit.price, Some(dec!(60000)));
+        assert_eq!(
+            limit.time_in_force,
+            crate::order::TimeInForce::GoodUntilCancelled { post_only: false }
+        );
+    }
+
     #[test]
     fn an_order_on_another_instrument_is_unknown() {
         let eth = InstrumentNameExchange::new("ETH-USDC-PERP");
@@ -708,7 +792,7 @@ pub(super) mod tests {
         assert!(matches!(untraded, OrderLookup::Unknown));
     }
 
-    /// An `openOrders` row.
+    /// A `frontendOpenOrders` row, without the order's terms.
     pub(in crate::client::hyperliquid) fn row(
         coin: &str,
         oid: u64,
@@ -800,7 +884,7 @@ pub(super) mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ended = record("BTC", "canceled", "0.01");
         let event = super::super::common::order_update_to_account_event(
-            &ended,
+            &ended.update,
             ExchangeId::HyperliquidPerp,
             btc(),
         )

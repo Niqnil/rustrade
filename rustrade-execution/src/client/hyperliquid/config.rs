@@ -31,9 +31,9 @@ pub struct HyperliquidConfig {
     /// [`HyperliquidClient`](super::HyperliquidClient)'s HIP-3 docs. The spot client ignores
     /// this.
     ///
-    /// Each DEX adds a `clearinghouseState` (weight 2) and an `openOrders` (weight 20) request to
-    /// every account snapshot, and an `openOrders` to every listing of open orders, against
-    /// Hyperliquid's REST limit of 1,200 a minute per IP address.
+    /// Each DEX adds a `clearinghouseState` (weight 2) and a `frontendOpenOrders` (weight 20)
+    /// request to every account snapshot, and a `frontendOpenOrders` to every listing of open
+    /// orders, against Hyperliquid's REST limit of 1,200 a minute per IP address.
     pub dexes: Vec<SmolStr>,
 }
 

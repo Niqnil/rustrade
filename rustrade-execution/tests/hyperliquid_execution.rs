@@ -1597,3 +1597,217 @@ async fn test_a_triggered_limit_order_rests_until_cancelled() {
         );
     }
 }
+
+/// An open-order listing and an order lookup report each order's kind, trigger and time in force
+/// as Hyperliquid records them: a post-only limit as post-only; a trigger order not yet triggered
+/// with its trigger and no time in force, a stop or take-profit market order with no limit price.
+/// A triggered stop-limit order is listed as the `Gtc` limit order it placed, the listing having
+/// dropped its trigger, and looked up as placed.
+///
+/// Every order is an ETH buy of about $12 that cannot fill: limits 15% below the market,
+/// untriggered stops and take profits whose triggers the market has not reached, and a stop limit
+/// whose trigger it has, with its limit 15% below. Each is cancelled.
+#[tokio::test]
+#[ignore]
+async fn test_open_orders_are_read_back_with_their_kind_and_time_in_force() {
+    use rust_decimal::{Decimal, RoundingStrategy};
+    use rustrade_execution::client::VenueOrderStatus;
+
+    init_logging();
+    let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+    let info =
+        hyperliquid_rust_sdk::InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Testnet))
+            .await
+            .expect("Failed to create InfoClient");
+    let mid: Decimal = info
+        .all_mids()
+        .await
+        .expect("Failed to read allMids")
+        .get("ETH")
+        .expect("allMids has an ETH mid")
+        .parse()
+        .expect("mid is a decimal");
+
+    let eth = eth_instrument();
+    let precision = client.order_precision(&eth).expect("ETH is listed");
+    let round = |factor| precision.round_price(mid * factor, RoundingStrategy::ToZero);
+    let limit = round(dec!(0.85));
+    let quantity = precision.round_quantity(dec!(12) / limit, RoundingStrategy::AwayFromZero);
+    let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+    let post_only = TimeInForce::GoodUntilCancelled { post_only: true };
+    let unreported = TimeInForce::Unreported;
+    let above = round(dec!(1.1));
+    let below = round(dec!(0.9));
+    let stop_limit = round(dec!(1.12));
+    let take_profit_limit = round(dec!(0.89));
+
+    struct Case {
+        kind: OrderKind,
+        price: Option<Decimal>,
+        time_in_force: TimeInForce,
+        /// Kind, price and time in force as listed.
+        listed: (OrderKind, Option<Decimal>, TimeInForce),
+        /// As looked up: `orderStatus` keeps the placement record.
+        looked_up: (OrderKind, Option<Decimal>, TimeInForce),
+    }
+    let case = |kind, price, time_in_force, listed, looked_up| Case {
+        kind,
+        price,
+        time_in_force,
+        listed,
+        looked_up,
+    };
+    let stop = OrderKind::Stop {
+        trigger_price: above,
+    };
+    let stop_limit_kind = OrderKind::StopLimit {
+        trigger_price: above,
+    };
+    let take_profit = OrderKind::TakeProfit {
+        trigger_price: below,
+    };
+    let take_profit_limit_kind = OrderKind::TakeProfitLimit {
+        trigger_price: below,
+    };
+    // A buy stop triggers at once when its trigger is below the market.
+    let triggered = OrderKind::StopLimit {
+        trigger_price: below,
+    };
+    let cases = [
+        case(
+            OrderKind::Limit,
+            Some(limit),
+            post_only,
+            (OrderKind::Limit, Some(limit), post_only),
+            (OrderKind::Limit, Some(limit), post_only),
+        ),
+        case(
+            stop,
+            None,
+            gtc,
+            (stop, None, unreported),
+            (stop, None, unreported),
+        ),
+        case(
+            stop_limit_kind,
+            Some(stop_limit),
+            gtc,
+            (stop_limit_kind, Some(stop_limit), unreported),
+            (stop_limit_kind, Some(stop_limit), unreported),
+        ),
+        case(
+            take_profit,
+            None,
+            gtc,
+            (take_profit, None, unreported),
+            (take_profit, None, unreported),
+        ),
+        case(
+            take_profit_limit_kind,
+            Some(take_profit_limit),
+            gtc,
+            (take_profit_limit_kind, Some(take_profit_limit), unreported),
+            (take_profit_limit_kind, Some(take_profit_limit), unreported),
+        ),
+        case(
+            triggered,
+            Some(limit),
+            gtc,
+            (OrderKind::Limit, Some(limit), gtc),
+            (triggered, Some(limit), unreported),
+        ),
+    ];
+
+    let mut placed = Vec::new();
+    for case in &cases {
+        let key = OrderKey {
+            exchange: ExchangeId::HyperliquidPerp,
+            instrument: &eth,
+            strategy: StrategyId::new("test-read-back-terms"),
+            cid: ClientOrderId::uuid(),
+        };
+        let response = client
+            .open_order(rustrade_execution::order::OrderEvent {
+                key: key.clone(),
+                state: RequestOpen::new(
+                    Side::Buy,
+                    case.price,
+                    quantity,
+                    case.kind,
+                    case.time_in_force,
+                ),
+            })
+            .await;
+        println!(
+            "Placed {} BUY {quantity} {eth} @ {:?}: {:?}",
+            case.kind, case.price, response.state
+        );
+        placed.push((key, matches!(response.state, OrderState::Active(_))));
+    }
+
+    // Read back before asserting, so every order is cancelled whatever the outcome.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let listed = client.fetch_open_orders(std::slice::from_ref(&eth)).await;
+    let mut looked_up = Vec::new();
+    for (key, _) in &placed {
+        let key = OrderKey {
+            exchange: key.exchange,
+            instrument: eth.clone(),
+            strategy: key.strategy.clone(),
+            cid: key.cid.clone(),
+        };
+        looked_up.push(client.fetch_order_status(&key).await);
+    }
+
+    for (key, _) in &placed {
+        let cancelled = client
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: key.clone(),
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(VenueOrderId::ClientAssigned),
+                },
+            })
+            .await;
+        assert!(cancelled.state.is_ok(), "cancel: {:?}", cancelled.state);
+    }
+
+    let listed = listed.expect("fetch_open_orders");
+    for (((key, accepted), case), looked_up) in placed.iter().zip(&cases).zip(looked_up) {
+        let placed_kind = case.kind;
+        assert!(accepted, "{placed_kind} was not placed");
+        let order = listed
+            .iter()
+            .find(|order| order.key.cid == key.cid)
+            .unwrap_or_else(|| panic!("{placed_kind} is not listed"));
+        println!(
+            "Listed {placed_kind}: kind {} price {:?} tif {:?}",
+            order.kind, order.price, order.time_in_force
+        );
+        assert_eq!(
+            (order.kind, order.price, order.time_in_force),
+            case.listed,
+            "listed {placed_kind}"
+        );
+
+        let VenueOrderStatus::Live(found) = looked_up.expect("fetch_order_status") else {
+            panic!("{placed_kind} is not live when looked up");
+        };
+        println!(
+            "Looked up {placed_kind}: kind {} price {:?} tif {:?}",
+            found.kind, found.price, found.time_in_force
+        );
+        assert_eq!(
+            (found.kind, found.price, found.time_in_force),
+            case.looked_up,
+            "looked up {placed_kind}"
+        );
+    }
+}
