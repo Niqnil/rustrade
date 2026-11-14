@@ -18,10 +18,13 @@ can be used on its own.
 - **Greeks.** Delta and gamma come from the grid, and theta from the Black-Scholes equation at the
   spot. Vega and rho re-solve with the input bumped on the same grid.
 - **Implied volatility for any model.** `implied_volatility` finds the volatility at which a model
-  reproduces a price. When none exists it returns an `ImpliedVolatilityError` that says why: the
-  price is below the option's no-arbitrage floor, at or below the model's price at the lowest
-  volatility searched (no volatility is determined), or above the upper bound, the search did not converge, the price or a setting is invalid, or the model
-  cannot price the option.
+  reproduces a price. When none exists it returns an `ImpliedVolatilityError` that says why:
+  - the price is below the option's no-arbitrage floor;
+  - the price is at or below the model's price at the lowest volatility searched, so no
+    volatility is determined;
+  - the price is above the upper bound;
+  - the search did not converge;
+  - the price or a setting is invalid, or the model cannot price the option.
 - **Quotes.** `mid_price` turns a bid and ask into a midpoint, or a `QuoteError` for a quote that
   has none: no quote, one-sided, zero bid, crossed, or a negative or non-finite side.
 - **Bring your own model.** Implement the `OptionModel` trait, and the implied-volatility solver
@@ -74,7 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The volatility at which the model reproduces a market price.
-    let volatility = implied_volatility(&model, &inputs, 6.10, &ImpliedVolatilityConfig::default())?;
+    let config = ImpliedVolatilityConfig::default();
+    let volatility = implied_volatility(&model, &inputs, 6.10, &config)?;
     println!("implied volatility {volatility:.4}");
 
     Ok(())
@@ -98,8 +102,8 @@ are less accurate (about 5e-5 of the spot for two years at 60%).
 
 Where an option's price barely moves with volatility (deep in the money, or very close to expiry),
 the grid's error can outweigh vega. There a price can fall slightly as volatility rises, and an
-implied volatility means little. A price at or below the model's price at the lowest volatility searched is
-reported as `AtIntrinsic`.
+implied volatility means little. A price at or below the model's price at the lowest volatility
+searched is reported as `AtIntrinsic`.
 
 The cost of one price grows with the grid's size. An implied-volatility solve prices about five to
 fifteen times, and `greeks` five times. `FiniteDifferenceModel::new` sets the grid: finer is
