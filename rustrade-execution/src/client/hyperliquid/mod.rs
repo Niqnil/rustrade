@@ -2201,8 +2201,6 @@ mod tests {
             assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
         }
 
-        /// A limit order goes out with Hyperliquid's spelling of its time in force, and a trigger
-        /// order with none.
         /// Hyperliquid answers a placement that filled in part `filled`, with the part that
         /// filled. A `Gtc` order rests the rest, so it is open with that part filled; an `Ioc`
         /// order cancelled the rest. Only an order of the size that filled is fully filled.
@@ -2262,6 +2260,8 @@ mod tests {
             );
         }
 
+        /// A limit order goes out with Hyperliquid's spelling of its time in force, and a trigger
+        /// order with none.
         #[tokio::test]
         async fn a_time_in_force_hyperliquid_honours_is_sent_in_its_spelling() {
             let server = resting_server().await;
