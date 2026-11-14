@@ -5,12 +5,12 @@
 //!
 //! Error mapping is in the `error` module.
 
-use crate::client::hyperliquid::error::{map_sdk_error, order_rejection};
+use crate::client::hyperliquid::error::{map_sdk_error, order_outcome_unknown, order_rejection};
 use crate::error::{OrderError, UnindexedClientError, UnindexedOrderError};
 use crate::order::{
     Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedOrderSnapshot,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-    state::{Cancelled, Filled, Open, OrderState},
+    state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
 };
 use crate::{
     InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Stream wrapper that cancels background tasks when dropped.
@@ -831,6 +831,18 @@ pub(super) enum WireKind {
     },
 }
 
+impl WireKind {
+    /// Whether the part of an order going out this way that does not fill at once rests on the
+    /// book: on a `Gtc` or `Alo` limit order, and a limit order a trigger places. An `Ioc` limit
+    /// order, and a market order a trigger places, cancel it.
+    pub(super) fn rests(self) -> bool {
+        match self {
+            Self::Limit { tif } => tif != "Ioc",
+            Self::Trigger { is_market, .. } => !is_market,
+        }
+    }
+}
+
 /// Why [`classify_order`] cannot send an order to Hyperliquid, each with the reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Unclassified {
@@ -954,6 +966,102 @@ pub fn cloid_to_cid(cloid: &str) -> Option<ClientOrderId> {
     // The 32-digit length check rules out the other spellings `try_parse` accepts.
     let uuid = Uuid::try_parse(hex).ok()?;
     Some(ClientOrderId::new(format_smolstr!("{}", uuid.hyphenated())))
+}
+
+/// The state of an order placed on Hyperliquid, read from the venue's answer to the placement.
+/// `kind` is how the order went out ([`classify_order`]), `quantity` its size, `cid` the id it
+/// was placed under, and `exchange` the client, named in logs. An order goes out alone, so only
+/// the first status is read.
+///
+/// - **`resting`**: open under its oid, with nothing filled.
+/// - **`filled`**: Hyperliquid answers `filled` with `totalSz`, the quantity that filled at once,
+///   also when only part of the order did, as seen on testnet. Only a `totalSz` of the order's
+///   whole quantity is a full fill. Otherwise what became of the rest depends on how the order
+///   went out ([`WireKind::rests`]): where it rests, the order is open under its oid with
+///   `totalSz` filled; where it is cancelled, the order is cancelled with `totalSz` filled. The
+///   average price of a part fill is not reported; the fills on the account stream carry it.
+///   A `totalSz` that does not parse leaves the outcome unknown.
+/// - **`error`**, or an `err` answer: refused, with the venue's reason.
+/// - **`waitingForFill`** or **`waitingForTrigger`**: open under its cloid alone. The venue
+///   answered without an oid; a standalone trigger order is answered `resting` with one, so
+///   these statuses belong to grouped orders.
+/// - **`success`**, or no status: Hyperliquid took the request without saying what became of
+///   the order, which may be live. The outcome is unknown, not a refusal.
+///
+/// Hyperliquid's answer carries no timestamp, so the local clock stamps the state.
+pub(super) fn placement_state(
+    response: ExchangeResponseStatus,
+    kind: WireKind,
+    quantity: Decimal,
+    cid: &ClientOrderId,
+    exchange: ExchangeId,
+) -> UnindexedOrderState {
+    let response = match response {
+        ExchangeResponseStatus::Ok(response) => response,
+        ExchangeResponseStatus::Err(msg) => {
+            warn!(%exchange, %cid, %msg, "Hyperliquid order rejected");
+            return OrderState::inactive(OrderError::Rejected(order_rejection(msg)));
+        }
+    };
+    match response
+        .data
+        .and_then(|data| data.statuses.into_iter().next())
+    {
+        Some(ExchangeDataStatus::Resting(resting)) => {
+            debug!(%exchange, %cid, oid = resting.oid, "Hyperliquid order resting");
+            OrderState::active(Open {
+                id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", resting.oid))),
+                time_exchange: Utc::now(),
+                filled_quantity: Decimal::ZERO,
+            })
+        }
+        Some(ExchangeDataStatus::Filled(filled)) => {
+            let Some(total_sz) = parse_decimal(&filled.total_sz, "totalSz") else {
+                warn!(%exchange, %cid, oid = filled.oid, "Hyperliquid order answered filled without a readable totalSz; outcome unknown");
+                return OrderState::inactive(order_outcome_unknown(
+                    "answered the order filled without a readable totalSz",
+                ));
+            };
+            let id = OrderId(format_smolstr!("{}", filled.oid));
+            if total_sz >= quantity {
+                debug!(%exchange, %cid, oid = filled.oid, avg_px = %filled.avg_px, "Hyperliquid order filled");
+                OrderState::fully_filled(Filled::new(
+                    id,
+                    Utc::now(),
+                    total_sz,
+                    parse_decimal(&filled.avg_px, "avgPx"),
+                ))
+            } else if kind.rests() {
+                debug!(%exchange, %cid, oid = filled.oid, %total_sz, %quantity, "Hyperliquid order filled in part, the rest resting");
+                OrderState::active(Open {
+                    id: VenueOrderId::Assigned(id),
+                    time_exchange: Utc::now(),
+                    filled_quantity: total_sz,
+                })
+            } else {
+                debug!(%exchange, %cid, oid = filled.oid, %total_sz, %quantity, "Hyperliquid order filled in part, the rest cancelled");
+                OrderState::inactive(Cancelled::new(id, Utc::now(), Some(total_sz)))
+            }
+        }
+        Some(ExchangeDataStatus::Error(msg)) => {
+            warn!(%exchange, %cid, %msg, "Hyperliquid order rejected by the venue");
+            OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
+        }
+        Some(ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger) => {
+            debug!(%exchange, %cid, "Hyperliquid order waiting under its cloid");
+            OrderState::active(Open {
+                id: VenueOrderId::ClientAssigned,
+                time_exchange: Utc::now(),
+                filled_quantity: Decimal::ZERO,
+            })
+        }
+        Some(ExchangeDataStatus::Success) | None => {
+            warn!(%exchange, %cid, "Hyperliquid order answered without its status; outcome unknown");
+            OrderState::inactive(order_outcome_unknown(
+                "answered the order without its status",
+            ))
+        }
+    }
 }
 
 /// Whether Hyperliquid applied a cancel of one order, read from its answer: `Err` with the reason
@@ -1231,6 +1339,104 @@ mod tests {
             cancel_outcome(answer),
             Err("User or API Wallet does not exist.".to_owned())
         );
+    }
+
+    // ---- placement answers -------------------------------------------------------------------
+
+    /// Hyperliquid's answer to a placement of one order, carrying `status`.
+    fn placement_answer(status: serde_json::Value) -> ExchangeResponseStatus {
+        serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [status]}},
+        }))
+        .unwrap()
+    }
+
+    /// A `filled` status, as Hyperliquid answers a placement that filled `total_sz` at once.
+    fn filled(total_sz: &str) -> serde_json::Value {
+        serde_json::json!({"filled": {"totalSz": total_sz, "avgPx": "1605.5", "oid": 88}})
+    }
+
+    const GTC: WireKind = WireKind::Limit { tif: "Gtc" };
+    const IOC: WireKind = WireKind::Limit { tif: "Ioc" };
+
+    /// The state of an order of 0.0127 that went out as `kind`, answered `status`.
+    fn placed(status: serde_json::Value, kind: WireKind) -> UnindexedOrderState {
+        placement_state(
+            placement_answer(status),
+            kind,
+            dec!(0.0127),
+            &ClientOrderId::new("cid"),
+            ExchangeId::HyperliquidPerp,
+        )
+    }
+
+    #[test]
+    fn a_placement_filled_whole_is_fully_filled() {
+        for kind in [GTC, IOC] {
+            match placed(filled("0.0127"), kind) {
+                OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(
+                    filled,
+                )) => {
+                    assert_eq!(filled.id, OrderId::new("88"), "{kind:?}");
+                    assert_eq!(filled.filled_quantity, dec!(0.0127), "{kind:?}");
+                    assert_eq!(filled.avg_price, Some(dec!(1605.5)), "{kind:?}");
+                }
+                other => panic!("{kind:?}: expected a full fill, got {other:?}"),
+            }
+        }
+    }
+
+    /// Hyperliquid answers `filled` with the part that filled, as seen on testnet: a `Gtc` order
+    /// rests the rest, so it is open with that part filled.
+    #[test]
+    fn a_placement_filled_in_part_that_rests_the_rest_is_open() {
+        match placed(filled("0.0063"), GTC) {
+            OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
+                assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("88")));
+                assert_eq!(open.filled_quantity, dec!(0.0063));
+            }
+            other => panic!("expected an open order, got {other:?}"),
+        }
+    }
+
+    /// An `Ioc` order cancels what did not fill at once, so it ended cancelled with the part that
+    /// filled.
+    #[test]
+    fn a_placement_filled_in_part_that_cancels_the_rest_is_cancelled_with_its_fill() {
+        match placed(filled("0.0063"), IOC) {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.id, OrderId::new("88"));
+                assert_eq!(cancelled.filled_quantity, Some(dec!(0.0063)));
+            }
+            other => panic!("expected a cancelled order, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_placement_filled_without_a_readable_size_has_an_unknown_outcome() {
+        for total_sz in ["", "abc"] {
+            let state = placed(filled(total_sz), GTC);
+            assert!(state.is_outcome_unknown(), "{total_sz:?}: {state:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_limit_order_that_is_not_ioc_or_a_trigger_placing_one_rests_its_rest() {
+        let trigger = |is_market| WireKind::Trigger {
+            trigger_price: dec!(2077.5),
+            is_market,
+            tpsl: "sl",
+        };
+        for (kind, rests) in [
+            (GTC, true),
+            (WireKind::Limit { tif: "Alo" }, true),
+            (IOC, false),
+            (trigger(false), true),
+            (trigger(true), false),
+        ] {
+            assert_eq!(kind.rests(), rests, "{kind:?}");
+        }
     }
 
     #[test]

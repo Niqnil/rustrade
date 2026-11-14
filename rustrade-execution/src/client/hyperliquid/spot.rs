@@ -88,11 +88,11 @@ use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, HYPERLIQUID_TIME_IN_FORCE, InstrumentFilter, OpenOrder,
     OpenOrderListing, UserFill, cancel_outcome, cid_to_cloid, classify_order, cloid_to_cid,
     instrument_to_spot_coin, millis_to_datetime, open_order_to_order, open_orders, parse_decimal,
-    parse_side, span_millis, spot_balances, spot_base_quote, spot_pair_to_instrument,
-    user_fills_by_time,
+    parse_side, placement_state, span_millis, spot_balances, spot_base_quote,
+    spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
-use super::error::{map_order_error, map_sdk_error, order_outcome_unanswered, order_rejection};
+use super::error::{map_order_error, map_sdk_error};
 use super::order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_of, remember_open, remember_snapshot,
     send_fills, send_observed, spawn_order_checks, status_from_record, unreadable_record,
@@ -117,7 +117,7 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Filled, Open, OrderState, UnindexedOrderState},
+        state::{Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin, TradesRead},
 };
@@ -805,9 +805,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
-        use hyperliquid_rust_sdk::{
-            ClientOrderRequest, ExchangeDataStatus, ExchangeResponseStatus,
-        };
+        use hyperliquid_rust_sdk::ClientOrderRequest;
 
         let make_inactive =
             |error: UnindexedOrderError| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
@@ -961,64 +959,13 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
         };
 
-        let state = match response {
-            ExchangeResponseStatus::Ok(exchange_resp) => {
-                let status = exchange_resp
-                    .data
-                    .and_then(|d| d.statuses.into_iter().next());
-
-                match status {
-                    Some(ExchangeDataStatus::Resting(resting)) => {
-                        debug!(oid = resting.oid, "Spot order resting");
-                        OrderState::active(Open {
-                            id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", resting.oid))),
-                            // SDK does not return exchange timestamp on order placement; use local clock.
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
-                    }
-                    Some(ExchangeDataStatus::Filled(filled)) => {
-                        debug!(oid = filled.oid, avg_px = %filled.avg_px, "Spot order filled");
-                        let avg_price = parse_decimal(&filled.avg_px, "avg_px");
-                        OrderState::fully_filled(Filled::new(
-                            OrderId(format_smolstr!("{}", filled.oid)),
-                            // SDK does not return exchange timestamp on order placement; use local clock.
-                            Utc::now(),
-                            parse_decimal(&filled.total_sz, "total_sz")
-                                .unwrap_or(request.state.quantity),
-                            avg_price,
-                        ))
-                    }
-                    Some(ExchangeDataStatus::Error(msg)) => {
-                        warn!(%msg, "Spot order rejected by exchange");
-                        OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
-                    }
-                    Some(
-                        ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
-                    ) => {
-                        // The venue answered without an oid, so the order's only handle is the
-                        // cloid it was placed with. A standalone trigger order is answered
-                        // `resting` with an oid; these statuses belong to grouped orders.
-                        debug!(cid = %request.key.cid, "Spot order waiting under its cloid");
-                        OrderState::active(Open {
-                            id: VenueOrderId::ClientAssigned,
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
-                    }
-                    Some(ExchangeDataStatus::Success) | None => {
-                        // The venue took the request without saying what became of the order,
-                        // so it may be live: the outcome is unknown, not a refusal.
-                        warn!(cid = %request.key.cid, "Spot order answered without its status; outcome unknown");
-                        OrderState::inactive(order_outcome_unanswered())
-                    }
-                }
-            }
-            ExchangeResponseStatus::Err(msg) => {
-                warn!(%msg, "Spot order rejected");
-                OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
-            }
-        };
+        let state = placement_state(
+            response,
+            wire_kind,
+            request.state.quantity,
+            &request.key.cid,
+            ExchangeId::HyperliquidSpot,
+        );
 
         let order = Order {
             key: OrderKey {
@@ -1787,6 +1734,80 @@ mod tests {
                 ),
                 "{:?}",
                 order.state
+            );
+        }
+
+        /// Hyperliquid answers a placement that filled in part `filled`, with the part that
+        /// filled. A `Gtc` order rests the rest, so it is open with that part filled; an `Ioc`
+        /// order cancelled the rest. Only an order of the size that filled is fully filled.
+        #[tokio::test]
+        async fn a_spot_placement_filled_in_part_is_open_or_cancelled_by_its_time_in_force() {
+            let (_server, client) = client_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [
+                    {"filled": {"totalSz": "0.8", "avgPx": "10.0", "oid": 88}}
+                ]}},
+            }))
+            .await;
+            let gtc = TimeInForce::GoodUntilCancelled { post_only: false };
+            let place = |tif, quantity| {
+                place_with(
+                    &client,
+                    "HYPE-USDC-SPOT",
+                    OrderKind::Limit,
+                    tif,
+                    dec!(10),
+                    quantity,
+                )
+            };
+
+            let rested = place(gtc, dec!(2)).await;
+            assert!(
+                matches!(
+                    &rested.state,
+                    OrderState::Active(crate::order::state::ActiveOrderState::Open(open))
+                        if open.filled_quantity == dec!(0.8)
+                ),
+                "{:?}",
+                rested.state
+            );
+
+            let cancelled = place(TimeInForce::ImmediateOrCancel, dec!(2)).await;
+            assert!(
+                matches!(
+                    &cancelled.state,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                        if cancelled.filled_quantity == Some(dec!(0.8))
+                ),
+                "{:?}",
+                cancelled.state
+            );
+
+            // An order of 0.8 at 10 is under the $10 minimum and refused unsent, so the whole
+            // fill is of an order of 1.
+            let (_server, client) = client_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [
+                    {"filled": {"totalSz": "1", "avgPx": "10.0", "oid": 88}}
+                ]}},
+            }))
+            .await;
+            let filled = place_with(
+                &client,
+                "HYPE-USDC-SPOT",
+                OrderKind::Limit,
+                gtc,
+                dec!(10),
+                dec!(1),
+            )
+            .await;
+            assert!(
+                matches!(
+                    filled.state,
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+                ),
+                "{:?}",
+                filled.state
             );
         }
 

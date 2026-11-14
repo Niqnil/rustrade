@@ -526,6 +526,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Hyperliquid order that fills in part when placed is no longer reported fully filled**
+  (`rustrade-execution`, `hyperliquid` feature). Hyperliquid answers such a placement `filled`,
+  with only the part that filled. Both clients reported every `filled` answer as a full fill,
+  so the engine retired a `Gtc` order whose rest was still resting on the book.
+  - A `Gtc` limit order (or a limit order a trigger places) is now reported open under its oid,
+    with that part filled. An `Ioc` limit order (or a market order a trigger places) cancelled
+    the rest, so it is reported cancelled with that part filled.
+  - Only an order that filled whole is reported fully filled. An answer whose filled size does
+    not parse leaves the order's outcome unknown, rather than read as a full fill.
+
 - **Hyperliquid open-order listings and order lookups report each order's kind, trigger and time
   in force** (`rustrade-execution`, `hyperliquid` feature). They reported every order as a
   `Limit` order with `TimeInForce::Unreported`, a stop or take-profit order included.
