@@ -539,7 +539,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reads as `Limit`, with a warning.
   - **Time in force:** `Gtc`, `Alo` and `Ioc` read as `GoodUntilCancelled`, post-only
     `GoodUntilCancelled` and `ImmediateOrCancel`. A trigger order not yet triggered has none on
-    Hyperliquid, and reads as `Unreported`.
+    Hyperliquid, and reads as `Unreported`, as does any other value (with a warning).
   - **A triggered order** is listed as the `Limit` order it placed, `Gtc`, under the same id:
     Hyperliquid's listing no longer carries its trigger price. A lookup still reports the order
     as placed, with its trigger, and with `Unreported`.

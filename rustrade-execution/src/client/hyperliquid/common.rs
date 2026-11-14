@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 /// Stream wrapper that cancels background tasks when dropped.
@@ -326,7 +326,10 @@ impl OrderTerms {
     ///   reported.
     /// - **A triggered order** is read as the `Limit` order it placed, which `frontendOpenOrders`
     ///   lists under the same id with that order's time in force (`Gtc`, as seen on testnet) but
-    ///   with the trigger price gone (`"0.0"`), so the trigger kind could not be reported.
+    ///   with the trigger price gone (`"0.0"`), so the trigger kind could not be reported. It is
+    ///   recognised by `triggerCondition` being exactly `"Triggered"`, as seen on testnet. Should
+    ///   the venue word it otherwise, the row is a trigger order without a positive trigger price,
+    ///   which does not convert, and the `warn!` names the `triggerCondition` it carried.
     /// - **Price.** `limitPx`, except on a stop or take-profit market order waiting for its
     ///   trigger: its `limitPx` is the worst price the market order it places may fill at, chosen
     ///   by whoever placed it, not a limit price, so the order reports none.
@@ -341,7 +344,7 @@ impl OrderTerms {
                 .and_then(|raw| parse_decimal(raw, "triggerPx"))
                 .filter(|price| *price > Decimal::ZERO);
             if price.is_none() {
-                warn!(?order_type, trigger_px = ?raw, "Hyperliquid trigger order has no positive triggerPx");
+                warn!(?order_type, trigger_px = ?raw, trigger_condition = ?self.trigger_condition, "Hyperliquid trigger order has no positive triggerPx");
             }
             price
         };
@@ -387,7 +390,7 @@ impl OrderTerms {
             Some("Ioc") => TimeInForce::ImmediateOrCancel,
             None => TimeInForce::Unreported,
             Some(other) => {
-                debug!(
+                warn!(
                     tif = other,
                     "Hyperliquid time in force names no TimeInForce - reporting it as Unreported"
                 );
@@ -2004,7 +2007,9 @@ pub(super) mod info_tests {
     }
 
     /// `frontendOpenOrders` rows of the shape seen on testnet, with synthetic values: a post-only
-    /// limit, and a stop limit not yet triggered, which carries no time in force.
+    /// limit; a stop limit not yet triggered, which carries no time in force; and a stop limit
+    /// that has triggered, listed without its trigger price and with the time in force of the
+    /// limit order it placed.
     const FRONTEND_OPEN_ORDERS: &str = r#"[
         {"children":[],"cloid":"0x85b60bff64d549ec95af6268d7d1df63","coin":"ETH",
          "isPositionTpsl":false,"isTrigger":false,"limitPx":"1586.5","oid":7001,
@@ -2013,7 +2018,11 @@ pub(super) mod info_tests {
         {"children":[],"cloid":null,"coin":"ETH","isPositionTpsl":false,"isTrigger":true,
          "limitPx":"2115.3","oid":7002,"orderType":"Stop Limit","origSz":"0.0075",
          "reduceOnly":false,"side":"B","sz":"0.0075","tif":null,"timestamp":1714100000000,
-         "triggerCondition":"Price above 2077.5","triggerPx":"2077.5"}
+         "triggerCondition":"Price above 2077.5","triggerPx":"2077.5"},
+        {"children":[],"cloid":null,"coin":"ETH","isPositionTpsl":false,"isTrigger":false,
+         "limitPx":"1350.2","oid":7003,"orderType":"Stop Limit","origSz":"0.0075",
+         "reduceOnly":false,"side":"B","sz":"0.0075","tif":"Gtc","timestamp":1714100000000,
+         "triggerCondition":"Triggered","triggerPx":"0.0"}
     ]"#;
 
     #[tokio::test]
@@ -2046,6 +2055,14 @@ pub(super) mod info_tests {
         assert_eq!(stop.price, Some(dec!(2115.3)));
         assert_eq!(stop.time_in_force, TimeInForce::Unreported);
         assert_eq!(stop.key.cid, ClientOrderId::new("7002"));
+
+        let triggered = open_order_to_order(&rows[2], ExchangeId::HyperliquidPerp, eth()).unwrap();
+        assert_eq!(triggered.kind, OrderKind::Limit);
+        assert_eq!(triggered.price, Some(dec!(1350.2)));
+        assert_eq!(
+            triggered.time_in_force,
+            TimeInForce::GoodUntilCancelled { post_only: false }
+        );
     }
 
     fn terms(order_type: Option<&str>, tif: Option<&str>, trigger_px: &str) -> OrderTerms {
