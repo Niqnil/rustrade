@@ -4,12 +4,12 @@ Thank you for your interest in contributing to rustrade!
 
 ## Prerequisites
 
-Rust, installed with [rustup](https://rustup.rs). `rust-toolchain.toml` pins an exact stable
-release with clippy and rustfmt, and rustup installs it the first time you run `cargo` in the
-repository (or run `rustup toolchain install` there). You then build and lint with the same
-compiler as CI, so a new Rust release cannot fail CI with lints you never saw. Dependabot proposes
-each new release as a PR, which fixes any lints it adds. The MSRV, the oldest compiler users may
-build with, is `1.95` (`rust-version` in `Cargo.toml`).
+Rust, installed with [rustup](https://rustup.rs). `rust-toolchain.toml` pins an exact stable release
+with clippy and rustfmt. rustup installs it on first use in the repository, or run `rustup toolchain
+install` there. You then build and lint with the same compiler as CI, so a new Rust release cannot
+fail CI with lints you never saw. Dependabot proposes each new release as a PR, which fixes any
+lints it adds. The MSRV, the oldest compiler users may build with, is `1.95` (`rust-version` in
+`Cargo.toml`).
 
 **Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
 `.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
@@ -51,9 +51,9 @@ clears them with everything else.
    git checkout -b feature/my-feature
    ```
 
-2. **Make your changes** and commit them. Messages follow
-   [Conventional Commits](https://www.conventionalcommits.org): `type(scope): Subject`, where the
-   type is `feat`, `fix`, `docs`, `chore`, `refactor`, `perf`, `test`, `ci` or `deps`, and the
+2. **Make your changes** and commit them. Messages follow [Conventional
+   Commits](https://www.conventionalcommits.org): `type(scope): Subject`, where the type is `feat`,
+   `fix`, `docs`, `chore`, `refactor`, `perf`, `test`, `style`, `build`, `ci` or `deps`, and the
    scope is the crate or area, e.g. `fix(execution): Reject a zero-quantity order before sending
    it`. A breaking change adds `!` after the scope and says what breaks in the body.
 
