@@ -2,7 +2,7 @@
 //! trades: each DEX's positions and open orders, and the collateral balances, which the account's
 //! abstraction mode decides where to read.
 
-use super::common::{OpenOrder, parse_decimal, spot_balances, user_info};
+use super::common::{OPEN_ORDERS_INFO, OpenOrder, parse_decimal, spot_balances, user_info};
 use super::error::map_sdk_error;
 use super::perp_dexes::PerpDexes;
 use crate::{
@@ -73,8 +73,8 @@ pub(super) async fn dex_states<'a>(
     Ok(dexes.into_iter().zip(states).collect())
 }
 
-/// Every open order on the DEXs traded, with `openOrders` (weight 20) on each: Hyperliquid lists
-/// a HIP-3 DEX's orders only when asked for that DEX. The default DEX's listing carries spot
+/// Every open order on the DEXs traded, with `frontendOpenOrders` (weight 20) on each: Hyperliquid
+/// lists a HIP-3 DEX's orders only when asked for that DEX. The default DEX's listing carries spot
 /// orders too, which the caller leaves out.
 pub(super) async fn open_orders(
     info_client: &InfoClient,
@@ -83,7 +83,7 @@ pub(super) async fn open_orders(
 ) -> Result<Vec<OpenOrder>, UnindexedClientError> {
     let listings = try_join_all(
         every_dex(dexes)
-            .map(|dex| user_info::<Vec<OpenOrder>>(info_client, "openOrders", address, dex)),
+            .map(|dex| user_info::<Vec<OpenOrder>>(info_client, OPEN_ORDERS_INFO, address, dex)),
     )
     .await?;
     Ok(listings.into_iter().flatten().collect())
@@ -266,7 +266,7 @@ pub(super) mod tests {
         let server = wiremock::MockServer::start().await;
         per_dex(
             &server,
-            "openOrders",
+            OPEN_ORDERS_INFO,
             [
                 (
                     None,
@@ -331,7 +331,7 @@ pub(super) mod tests {
 
     /// A server answering `userAbstraction` with `mode`, `spotClearinghouseState` with 998.99
     /// USDC (5.31 on hold), each DEX's `clearinghouseState` with a distinct account value, and
-    /// `openOrders` with none.
+    /// `frontendOpenOrders` with none.
     async fn balance_server(mode: &str) -> wiremock::MockServer {
         balance_server_answering_after(mode, std::time::Duration::ZERO).await
     }
@@ -354,7 +354,7 @@ pub(super) mod tests {
                 )
         };
         mount(
-            serde_json::json!({"type": "openOrders"}),
+            serde_json::json!({"type": OPEN_ORDERS_INFO}),
             serde_json::json!([]),
         )
         .mount(&server)

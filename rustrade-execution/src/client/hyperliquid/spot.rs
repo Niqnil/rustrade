@@ -1179,13 +1179,13 @@ async fn spot_order_status(
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
         return Ok(Some(VenueOrderStatus::Unknown));
     };
-    let coin = record.order.coin.as_str();
+    let coin = record.update.order.coin.as_str();
     let pairs = spot_coins.covering([coin]).await;
     let instrument = spot_pair(&pairs, coin)?.map(spot_pair_to_instrument);
     Ok(status_from_record(key, &record, instrument))
 }
 
-/// The client order ids `openOrders` (weight 20) lists on the spot `instruments`, for a
+/// The client order ids `frontendOpenOrders` (weight 20) lists on the spot `instruments`, for a
 /// reconnect's check of the orders held as live. An order on a spot coin missing from `spotMeta` is
 /// left out (see `listed_cids`).
 ///
@@ -1664,7 +1664,7 @@ mod tests {
                     ]}),
                 ),
                 (
-                    serde_json::json!({"type": "openOrders"}),
+                    serde_json::json!({"type": "frontendOpenOrders"}),
                     serde_json::json!([]),
                 ),
             ] {
@@ -2410,7 +2410,7 @@ mod tests {
     }
 
     /// Open-order rows on a perpetual, an indexed spot coin, PURR/USDC and an outcome coin, in
-    /// the `openOrders` response's shape. Values are synthetic.
+    /// the open-order listing's shape. Values are synthetic.
     fn open_order_rows(spot_coin: &str) -> Vec<OpenOrder> {
         serde_json::from_value(serde_json::json!([
             {"coin": "BTC", "side": "B", "limitPx": "50000", "sz": "0.1", "oid": 1,
