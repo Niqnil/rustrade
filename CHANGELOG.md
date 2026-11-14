@@ -504,7 +504,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     request the SDK fails: the SDK's error does not keep the answer's headers.
 
 - **Breaking: new `TimeInForce::Unreported`, and clients read back a time in force they cannot
-  name as it, not as a guess** (`rustrade-execution`, #897). A report used to put a plausible time
+  name as it, not as a guess** (`rustrade-execution`, #950). A report used to put a plausible time
   in force on an order whose real one it did not know, so a reader could not tell a guess from the
   venue's word.
   - `TimeInForce::Unreported` (and `TimeInForceKind::Unreported`) is only read back, never placed.
