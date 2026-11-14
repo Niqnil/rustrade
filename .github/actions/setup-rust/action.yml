@@ -1,0 +1,33 @@
+name: Set up Rust
+description: >-
+  Install the toolchain and components that rust-toolchain.toml pins, and set CI's Cargo defaults.
+  Run it after checkout: rustup reads the toolchain file from the working directory.
+
+runs:
+  using: composite
+  steps:
+    # With no toolchain argument, `rustup toolchain install` installs the one the toolchain file
+    # names, with its profile and components (rustup 1.28 and later; the runner images ship it).
+    # The version lives in that file alone, so a toolchain bump is a one-line change there, and
+    # local builds and CI use the same compiler and the same lints.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: rustup toolchain install --no-self-update
+      env:
+        RUSTUP_PERMIT_COPY_RENAME: 1
+
+    - name: Show the toolchain
+      shell: bash
+      run: rustc --version && cargo --version
+
+    # CI builds from scratch, so incremental artefacts would only enlarge the cache. A job's own
+    # setting wins.
+    - name: Set Cargo defaults
+      shell: bash
+      run: |
+        if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+          echo CARGO_INCREMENTAL=0 >> "$GITHUB_ENV"
+        fi
+        if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+          echo CARGO_TERM_COLOR=always >> "$GITHUB_ENV"
+        fi

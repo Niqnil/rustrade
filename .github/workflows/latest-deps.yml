@@ -48,8 +48,8 @@ jobs:
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       # Distinct cache key: this job mutates Cargo.lock, so it must not share the
       # `--locked` jobs' caches.
