@@ -540,8 +540,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     beside them; a snapshot serialised without it reads as stating no term.
   - **Hyperliquid states the terms its reads carry.** An open-order listing states every term,
     less the quantity on a row without `origSz`, the kind on a row whose type is missing,
-    unknown or triggered, and a time in force it reads as `Unreported`. An account-stream update
-    states its quantity and price.
+    unknown or triggered, the price on a row whose type is missing or unknown (its `limitPx` may
+    be a market trigger's worst fill price), and a time in force it reads as `Unreported`. An
+    account-stream update carries no type, so it states only its quantity.
   - **Every other producer states no term yet**, the engine's own snapshots and the simulated
     venue included. The engine reads only each report's order, as before.
 

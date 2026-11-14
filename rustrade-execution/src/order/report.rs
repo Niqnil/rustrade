@@ -31,11 +31,11 @@ pub struct ReportedTerms {
     /// [`Order::quantity`] is the order's total quantity as the venue holds it now, filled part
     /// included.
     pub quantity: bool,
-    /// [`Order::price`] is the venue's limit price, for an order whose kind carries one.
+    /// [`Order::price`] is the venue's limit price, `None` when the order has none.
     ///
-    /// On a kind with no limit price it may hold whatever the venue reports in that place (a
-    /// market order's worst fill price, say), so a reader takes it only for an order it knows has
-    /// a limit.
+    /// A producer states it only when its report says what the order is: a venue may put another
+    /// price in the same place for an order with no limit, such as a market order's worst fill
+    /// price.
     pub price: bool,
     /// [`Order::kind`] is the venue's order kind, with its trigger or trailing terms.
     pub kind: bool,
@@ -105,7 +105,15 @@ impl ReportedTerms {
 /// report, or a stand-in.
 ///
 /// Serialized as the order's own fields, with `reported` beside them; a missing `reported` reads
-/// as [`ReportedTerms::NONE`].
+/// as [`ReportedTerms::NONE`]. That flattened layout needs a self-describing format, such as JSON,
+/// to read back, and it is why [`Order`] has no field named `reported`.
+///
+/// # Reading the flags
+///
+/// A reader treats a [`TimeInForce::Unreported`] or an
+/// [`OrderKind::ConditionalUnresolved`](crate::order::OrderKind::ConditionalUnresolved) as not
+/// stated, whatever [`reported`](Self::reported) says. [`new`](Self::new) never states either, but
+/// the fields are public, and a report deserialized or built as a literal is taken as it is.
 ///
 /// # Producer obligations
 ///
@@ -279,5 +287,63 @@ mod tests {
         let old: UnindexedOrderReport =
             serde_json::from_value(serde_json::Value::Object(fields)).unwrap();
         assert_eq!(old, OrderReport::state_only(report.order));
+    }
+
+    /// An account event and an account snapshot carrying reports read back from their JSON text:
+    /// an ended order with a trigger and no limit price, keyed by indices, through the flattened
+    /// layout.
+    #[test]
+    fn test_account_event_and_snapshot_round_trip_through_json_text() {
+        use crate::{
+            AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
+            order::state::Cancelled, position::PositionReport,
+        };
+        use rustrade_integration::collection::snapshot::Snapshot;
+
+        let order: OrderSnapshot = Order {
+            key: OrderKey {
+                exchange: ExchangeIndex::new(1),
+                instrument: InstrumentIndex::new(2),
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new("cid"),
+            },
+            side: Side::Sell,
+            price: None,
+            quantity: dec!(3),
+            kind: OrderKind::Stop {
+                trigger_price: dec!(95.5),
+            },
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            state: OrderState::inactive(Cancelled::new(
+                OrderId::new("venue-id"),
+                DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+                Some(dec!(1)),
+            )),
+        };
+        let report = OrderReport::new(order, ReportedTerms::ALL.with_time_in_force(false));
+
+        let event = AccountEvent::new(
+            ExchangeIndex::new(1),
+            AccountEventKind::OrderSnapshot(Snapshot(report.clone())),
+        );
+        let text = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<AccountEvent>(&text).unwrap(), event);
+
+        let snapshot = AccountSnapshot::new(
+            ExchangeIndex::new(1),
+            Vec::new(),
+            vec![InstrumentAccountSnapshot::new(
+                InstrumentIndex::new(2),
+                vec![report],
+                true,
+                PositionReport::Unreported,
+                None,
+            )],
+        );
+        let text = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AccountSnapshot>(&text).unwrap(),
+            snapshot
+        );
     }
 }
