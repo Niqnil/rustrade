@@ -8173,6 +8173,62 @@ mod tests {
             .collect()
     }
 
+    /// `fetch_open_orders` returns the orders `GET /api/v3/openOrders` lists, on the terms each
+    /// row states, whether it asks for every symbol at once or for the instruments named, and
+    /// holds each as live.
+    #[tokio::test]
+    async fn fetch_open_orders_returns_the_listed_orders_and_holds_them_live() {
+        for instruments in [vec![], vec![InstrumentNameExchange::new("BTCUSDT")]] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([order_row("listed", "NEW")])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = <BinanceSpot as ExecutionClient>::new(
+                BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+            );
+            client.rest = rest_at(&server);
+
+            let orders = client.fetch_open_orders(&instruments).await.unwrap();
+
+            let listed: Vec<_> = orders
+                .iter()
+                .map(|order| {
+                    (
+                        order.key.cid.clone(),
+                        order.key.instrument.clone(),
+                        order.quantity,
+                        order.price,
+                        order.state.filled_quantity,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                listed,
+                vec![(
+                    ClientOrderId::new("listed"),
+                    InstrumentNameExchange::new("BTCUSDT"),
+                    Decimal::from(2),
+                    Some(Decimal::from(100)),
+                    Decimal::ONE,
+                )],
+                "{instruments:?}"
+            );
+            assert!(
+                client
+                    .known_live
+                    .lock()
+                    .contains(&ClientOrderId::new("listed")),
+                "{instruments:?}: held as live"
+            );
+        }
+    }
+
     /// A balance read is stamped [`REST_BALANCE_LAG`] before the request that read it was sent,
     /// never when the answer arrives: Binance's REST view can trail its stream, and a stream
     /// event the read does not yet show must stay more recent than it. A read refused for a rate
