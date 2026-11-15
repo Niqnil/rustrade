@@ -369,8 +369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A test hook to change a resting order on the simulated venue from outside any client**
   (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as
-  `amend_order` would, under the same rules, and reports it only on the account stream, for a test
-  of how a consumer learns of an order changed without it. A running `MockExchange` takes it as
+  `amend_order` would, under the same rules (the venue's `AmendConfig` included), and reports it
+  only on the account stream, for a test of how a consumer learns of an order changed without it. A running `MockExchange` takes it as
   `MockExchangeRequest::modify_externally`. `RestingOrder` gains `kept_place_since`: the time an
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 

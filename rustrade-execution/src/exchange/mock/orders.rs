@@ -108,6 +108,10 @@ pub struct RestingOrder {
     /// An amend that keeps the order's place still stamps [`Open::time_exchange`] with when the
     /// venue made it, so the place is kept here. `None` for every other order, which joined its
     /// queue at its `time_exchange`: see [`queued_at`](Self::queued_at).
+    ///
+    /// Read only for an order on a queue: [`OpenOrders::insert`] and
+    /// [`OpenOrders::from_entries`] rank a queued order by it as given, and ignore it for a held
+    /// order or one with no price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_place_since: Option<DateTime<Utc>>,
 }
@@ -290,6 +294,10 @@ pub struct OpenOrders {
 impl OpenOrders {
     /// Inserts `resting`, the order with what is held against it and its own deadline if any,
     /// unless an order is already resting under its [`ClientOrderId`].
+    ///
+    /// A priced order joins its queue behind every order at its price whose
+    /// [`queued_at`](RestingOrder::queued_at) is no later than its own: price, then that time,
+    /// then insertion.
     ///
     /// # Errors
     /// [`AlreadyResting`], carrying `resting` back untouched, if an order is already held under
@@ -1287,6 +1295,12 @@ mod tests {
 
         let mut rebuilt = OpenOrders::from_entries(open.entries()).unwrap();
         assert_eq!(resting_cids(&rebuilt, Side::Buy), ["first", "second"]);
+        // Serialised and read back, as a saved venue is, the place is kept too.
+        let saved = serde_json::to_string(&open.entries()).unwrap();
+        let restored =
+            OpenOrders::from_entries(serde_json::from_str::<Vec<OpenOrderEntry>>(&saved).unwrap())
+                .unwrap();
+        assert_eq!(resting_cids(&restored, Side::Buy), ["first", "second"]);
 
         // A second kept amend keeps the first place, not the first amend's stamp.
         let mut again = stamped;

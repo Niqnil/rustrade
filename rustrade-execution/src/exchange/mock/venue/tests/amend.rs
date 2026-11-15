@@ -897,6 +897,12 @@ fn a_venue_that_reassigns_ids_names_the_old_one_and_reports_its_own_fill_under_i
     assert_eq!(resting(&venue, "resting").state.id, answer.open.id);
     assert_eq!(venue.order_sequence(), sequence + 1);
     assert!(!venue.amend_support().keeps_id);
+    // The stream's report of the order, the last event the answer follows, names the new id.
+    let reported = outcome.events.last().expect("the order is reported");
+    assert_eq!(
+        order_of(reported).state,
+        OrderState::active(answer.open.clone())
+    );
 }
 
 #[test]

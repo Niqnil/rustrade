@@ -4375,9 +4375,10 @@ impl SimulatedVenue {
         &mut self,
         mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
     ) -> OpenOutcome {
-        // Only a limit order's price is a limit. Cleared once, here, so that no record of an order
-        // whose price is ignored can say otherwise.
-        if request.state.kind != OrderKind::Limit {
+        // A market order's price is ignored. Cleared once, here, so that no record of it can name a
+        // limit it did not have. Another kind keeps its price: a stop-limit's is its limit, and
+        // its refusal says what was sent.
+        if request.state.kind == OrderKind::Market {
             request.state.price = None;
         }
         // Chosen here so one path holds one snapshot: threading both through would allow two copies
@@ -4500,6 +4501,10 @@ impl SimulatedVenue {
     /// account stream hears of it: the returned events are those `amend_order` reports, ending
     /// with the order's snapshot, and no client is answered.
     ///
+    /// The rules include [`MockExecutionConfig::amend`]: a change it does not allow a client is
+    /// refused here too, as is a change to an order seeded through
+    /// [`MockExecutionConfig::initial_state`].
+    ///
     /// # Errors
     /// What `amend_order` would answer the same amend with, changing nothing.
     pub fn modify_externally(
@@ -4528,6 +4533,12 @@ impl SimulatedVenue {
             ),
         };
         let outcome = self.amend_order(request);
+        // Every refusal comes before the amend moves anything, so a refused one reports nothing.
+        debug_assert!(
+            outcome.response.state.is_ok() || outcome.events.is_empty(),
+            "SimulatedVenue refused an external modification of {cid} after reporting {:?}",
+            outcome.events
+        );
         outcome.response.state.map(|_| outcome.events)
     }
 
@@ -8712,6 +8723,31 @@ mod tests {
             OrderState::Inactive(InactiveOrderState::OpenFailed(_))
         ));
         assert_eq!(refused.response.price, None);
+    }
+
+    /// Only a market order's price is cleared: a stop-limit's price is its limit, so the refusal
+    /// of one this venue does not take says what was sent.
+    #[test]
+    fn a_refused_stop_limit_is_answered_with_its_price() {
+        let mut venue = make_venue("100", "10000000");
+        let mut request = buy_request("0.01", market_prices("50000"));
+        request.state.kind = OrderKind::StopLimit {
+            trigger_price: d("49000"),
+        };
+        request.state.price = Some(d("49500"));
+        request.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+
+        let refused = venue.open_order(request);
+
+        assert!(
+            matches!(
+                refused.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "{:?}",
+            refused.response.state
+        );
+        assert_eq!(refused.response.price, Some(d("49500")));
     }
 
     /// `advance_time` sets the instant everything a request produces after it is stamped with.
