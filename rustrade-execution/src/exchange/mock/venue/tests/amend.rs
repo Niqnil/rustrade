@@ -286,6 +286,129 @@ fn a_refused_external_modification_changes_nothing() {
     ));
 }
 
+/// The venue's own interface is not its client's API: a change from outside is made on a venue
+/// whose client may amend nothing, and in more than one field at once.
+#[test]
+fn an_external_modification_is_made_where_the_client_may_amend_nothing() {
+    let mut venue = resting_buy_amending(AmendConfig::NONE);
+    let both = AmendPatch::default()
+        .with_price(d("47000"))
+        .with_quantity(d("2"));
+    assert!(matches!(
+        amend_refusal(&amend(&mut venue, "resting", both)),
+        AmendRefusal::Unsupported { .. }
+    ));
+
+    let events = venue.modify_externally(&cid("resting"), both).unwrap();
+
+    let after = resting(&venue, "resting");
+    assert_eq!((after.price, after.quantity), (Some(d("47000")), d("2")));
+    let reported = events.last().expect("the order is reported");
+    assert_eq!(order_of(reported), &after.map_state(OrderState::active));
+    assert_eq!(
+        free_quote(&venue),
+        d("1000000") - d("94018.8"),
+        "2 at 47,000 and its 2bp maker fee held"
+    );
+}
+
+/// What the book refuses a client's amend it refuses a change from outside too, changing and
+/// reporting nothing.
+#[test]
+fn an_external_modification_the_book_refuses_changes_nothing() {
+    // A post-only order the new price would cross.
+    let (mut venue, _) = venue_resting_one_buy("47000");
+    let _ = venue.open_order(limit_request("maker", Side::Buy, "1", "48000", post_only()));
+    let (before, free) = (resting(&venue, "maker"), free_quote(&venue));
+    assert!(matches!(
+        venue.modify_externally(&cid("maker"), price("49200")),
+        Err(OrderError::AmendRefused(AmendRefusal::WouldTakeLiquidity))
+    ));
+    assert_eq!(
+        (resting(&venue, "maker"), free_quote(&venue)),
+        (before, free)
+    );
+
+    // More than the account can afford.
+    let mut venue = resting_buy();
+    let (before, free) = (resting(&venue, "resting"), free_quote(&venue));
+    assert!(matches!(
+        venue.modify_externally(&cid("resting"), quantity("30")),
+        Err(OrderError::Rejected(ApiError::BalanceInsufficient(..)))
+    ));
+    assert_eq!(
+        (resting(&venue, "resting"), free_quote(&venue)),
+        (before, free)
+    );
+
+    // A price change on a market the venue no longer trusts.
+    let mut venue = venue_waiting();
+    let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "90", gtc()));
+    advance(&mut venue, time(12));
+    let (before, free) = (resting(&venue, "resting"), free_quote(&venue));
+    assert!(matches!(
+        venue.modify_externally(&cid("resting"), price("95")),
+        Err(OrderError::AmendRefused(AmendRefusal::Venue(_)))
+    ));
+    assert_eq!(
+        (resting(&venue, "resting"), free_quote(&venue)),
+        (before, free)
+    );
+}
+
+/// A change from outside that the market crosses trades as a client's amend does, and reports the
+/// order filled.
+#[test]
+fn an_external_modification_through_the_market_fills_and_reports_the_order_filled() {
+    let mut venue = resting_buy();
+
+    let events = venue
+        .modify_externally(&cid("resting"), price("49200"))
+        .unwrap();
+
+    let [_paid, _received, traded, ended] = events.as_slice() else {
+        panic!("the balances, the trade, then the order: {events:?}");
+    };
+    assert_eq!(trade_of(traded).quantity, d("1"));
+    assert_eq!(filled_price(order_of(ended)), d("49100"));
+    assert!(venue.account.is_filled(&cid("resting")));
+}
+
+/// A change from outside keeps or loses the order's place in the queue by the book's rule, as a
+/// client's amend does.
+#[test]
+fn an_external_modification_keeps_or_loses_the_orders_place_as_an_amend_does() {
+    let mut venue = resting_buy();
+    let _ = venue.open_order(limit_request("behind", Side::Buy, "1", "48000", gtc()));
+
+    venue
+        .modify_externally(&cid("resting"), quantity("0.5"))
+        .unwrap();
+    assert_eq!(queue(&venue, Side::Buy), ["resting", "behind"]);
+
+    venue
+        .modify_externally(&cid("resting"), quantity("2"))
+        .unwrap();
+    assert_eq!(queue(&venue, Side::Buy), ["behind", "resting"]);
+}
+
+/// On a venue that reassigns ids, the order changed from outside is reported under its new id,
+/// which the book then holds it by.
+#[test]
+fn an_external_modification_on_a_venue_that_reassigns_ids_reports_the_new_id() {
+    let mut venue = resting_buy_amending(AmendConfig::FULL.with_reassign_id(true));
+    let old = resting(&venue, "resting").state.id;
+
+    let events = venue
+        .modify_externally(&cid("resting"), price("47000"))
+        .unwrap();
+
+    let held = resting(&venue, "resting");
+    assert_ne!(held.state.id, old);
+    let reported = events.last().expect("the order is reported");
+    assert_eq!(order_of(reported), &held.map_state(OrderState::active));
+}
+
 #[test]
 fn a_price_amend_goes_behind_the_orders_already_at_its_new_price() {
     let mut venue = resting_buy();
@@ -477,6 +600,24 @@ fn a_margin_amend_borrows_only_what_it_adds_and_repays_what_it_no_longer_needs()
         Balance::new_margin(d("0.5"), Decimal::ZERO, d("0.5"), Decimal::ZERO),
         "what is no longer held is repaid, as a cancel repays it"
     );
+}
+
+/// A change from outside that borrows reports the debt as a client's amend does.
+#[test]
+fn an_external_modification_that_borrows_reports_the_debt() {
+    let mut venue = margin_market_venue("0", "100000");
+    let _ = venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+
+    let events = venue
+        .modify_externally(&cid("rest"), quantity("2"))
+        .unwrap();
+
+    assert_eq!(
+        balance_of(&events[0]).balance,
+        Balance::new_margin(d("2"), Decimal::ZERO, d("2"), Decimal::ZERO),
+        "one more borrowed for the one more held"
+    );
+    assert_eq!(debt_updates(&events), 1, "{events:?}");
 }
 
 #[test]
@@ -933,6 +1074,55 @@ fn an_order_seeded_through_the_initial_state_is_not_amended() {
 
     assert_venue_refusal(&outcome);
     assert_eq!(resting(&venue, "seeded").price, Some(d("100")));
+}
+
+/// A seeded order holds nothing, so changed from outside it takes what it now needs, as an
+/// arriving order does, and pays for its fill once, from that hold.
+#[test]
+fn an_order_seeded_through_the_initial_state_can_be_changed_from_outside() {
+    let config = spot_config_holding(
+        "1",
+        "1000",
+        seeded_gtd("seeded", "100", time(0), time(1000)),
+    );
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    assert_eq!(
+        free_quote(&venue),
+        d("1000"),
+        "a seeded order holds nothing"
+    );
+
+    let events = venue
+        .modify_externally(&cid("seeded"), price("99"))
+        .unwrap();
+
+    let [restated, reported] = events.as_slice() else {
+        panic!("the hold taken, then the order: {events:?}");
+    };
+    assert_eq!(
+        balance_of(restated).balance,
+        Balance::new(d("1000"), d("1000") - d("0.99"))
+    );
+    let after = resting(&venue, "seeded");
+    assert_eq!(after.price, Some(d("99")));
+    assert_eq!(order_of(reported), &after.map_state(OrderState::active));
+
+    // Filled at its limit, it pays the 0.99 it holds, and nothing more.
+    let _ = venue.apply_market(
+        &instrument_name(),
+        MarketObservation::new(book("97", "98")),
+        time(1),
+    );
+    assert!(venue.account.is_filled(&cid("seeded")));
+    let balances = venue.balances(&[base(), quote()]);
+    let [btc, usdt] = balances.as_slice() else {
+        panic!("both balances");
+    };
+    assert_eq!(btc.balance.total, d("1.01"));
+    assert_eq!(
+        usdt.balance,
+        Balance::new(d("1000") - d("0.99"), d("1000") - d("0.99"))
+    );
 }
 
 #[test]

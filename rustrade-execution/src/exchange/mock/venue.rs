@@ -31,8 +31,8 @@ use crate::{
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         report::{OrderReport, ReportedTerms, UnindexedOrderReport},
         request::{
-            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
-            UnindexedOrderResponseCancel,
+            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, ReduceOnly,
+            UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
         },
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -4422,8 +4422,8 @@ impl SimulatedVenue {
     ///
     /// The amend is checked against the order as this venue holds it, not against the
     /// [`current`](crate::order::amend::RequestAmend::current) its sender tracked: by
-    /// [`AmendPatch::apply`](crate::order::amend::AmendPatch::apply), then by
-    /// [`amend_support`](Self::amend_support). An amend whose
+    /// [`AmendPatch::apply`](crate::order::amend::AmendPatch::apply), then by what the client may
+    /// ask, [`amend_support`](Self::amend_support), then by the book. An amend whose
     /// [`id`](crate::order::amend::RequestAmend::id) names another venue order id than the order
     /// now has is rejected, as an amend of an order the venue no longer addresses that way.
     ///
@@ -4452,13 +4452,21 @@ impl SimulatedVenue {
     /// keeps its id, even on a venue configured to reassign one.
     ///
     /// # Refused, changing nothing
-    /// - [`AmendRefusal`] from the checks above, or [`AmendRefusal::WouldTakeLiquidity`] for a
-    ///   post-only order whose new price the market crosses.
+    /// - [`AmendRefusal`] from [`AmendPatch::apply`](crate::order::amend::AmendPatch::apply),
+    ///   which refuses [`modify_externally`](Self::modify_externally) too.
+    ///
+    /// What the client asked, before the book is consulted:
+    /// - [`AmendRefusal`] from [`amend_support`](Self::amend_support).
+    /// - [`AmendRefusal::Venue`] for an order seeded through
+    ///   [`MockExecutionConfig::initial_state`]: the venue took nothing for it to recommit.
+    ///
+    /// The book's, which refuse [`modify_externally`](Self::modify_externally) too:
+    /// - [`AmendRefusal::WouldTakeLiquidity`] for a post-only order whose new price the market
+    ///   crosses.
     /// - [`AmendRefusal::Venue`] for an order the venue holds for a later bar or a fresh market,
-    ///   one seeded through [`MockExecutionConfig::initial_state`] (the venue took nothing for it
-    ///   to recommit), an option order, and, on a market that is stale under
-    ///   [`StaleMarketPolicy::Wait`], a price amend or an amend of an order the market crosses.
-    ///   A quantity-only amend of an order the stale market does not reach is made.
+    ///   an option order, and, on a market that is stale under [`StaleMarketPolicy::Wait`], a
+    ///   price amend or an amend of an order the market crosses. A quantity-only amend of an
+    ///   order the stale market does not reach is made.
     /// - The shortability check an arriving CFD sell gets, for an amend that raises a sell's
     ///   quantity or reprices it to cross the market.
     /// - [`ApiError::BalanceInsufficient`], or a borrow limit, as for an arriving order, when the
@@ -4496,72 +4504,74 @@ impl SimulatedVenue {
     /// venue, such as in the venue's own interface: a test hook for how a consumer learns of an
     /// order changed without it.
     ///
-    /// It is the amend [`amend_order`](Self::amend_order) makes, under the same rules, refusals
-    /// and queue priority, with `patch` applied to the order as this venue holds it. Only the
-    /// account stream hears of it: the returned events are those `amend_order` reports, ending
-    /// with the order's snapshot, and no client is answered.
+    /// The change never passes through a client, so the client's own checks do not apply to it:
+    /// [`MockExecutionConfig::amend`] is what a client may ask to amend, and an external change is
+    /// made whatever it declares, on a venue that amends nothing through its client included. It
+    /// may also change an order seeded through [`MockExecutionConfig::initial_state`], which then
+    /// holds what the order as changed needs, as an order this venue booked does.
     ///
-    /// The rules include [`MockExecutionConfig::amend`]: a change it does not allow a client is
-    /// refused here too, as is a change to an order seeded through
-    /// [`MockExecutionConfig::initial_state`].
+    /// Everything else is the book's, and is as [`amend_order`](Self::amend_order) describes:
+    /// `patch` is applied to the order as this venue holds it; the venue's refusals (an order held
+    /// for a later bar or a fresh market, an option order, a stale market, a post-only order the
+    /// market crosses, shortability, and what the account cannot afford) refuse it too; and it
+    /// trades, keeps or loses its place in the queue, takes a reassigned id, and is reported
+    /// alike. Only the account stream hears of it: the returned events are those `amend_order`
+    /// reports, ending with the order's snapshot, and no client is answered.
     ///
     /// # Errors
-    /// What `amend_order` would answer the same amend with, changing nothing.
+    /// [`AmendPatch::apply`]'s refusal, the venue's refusal, or for an order the venue no longer
+    /// holds the reason a cancel would give, changing nothing and reporting nothing.
+    ///
+    /// # Panics
+    /// As [`amend_order`](Self::amend_order).
     pub fn modify_externally(
         &mut self,
         cid: &ClientOrderId,
         patch: AmendPatch,
     ) -> Result<Vec<UnindexedAccountEvent>, UnindexedOrderError> {
-        let Some(order) = self.account.orders().get(cid) else {
-            return Err(self.cancel_missing_reason(cid));
-        };
-        let request = OrderRequestAmend {
-            key: order.key.clone(),
-            state: RequestAmend::new(
-                order.state.id.clone(),
-                patch,
-                AmendTarget {
-                    side: order.side,
-                    price: order.price,
-                    quantity: order.quantity,
-                    kind: order.kind,
-                    time_in_force: order.time_in_force,
-                    // Not kept on the venue's orders, and not read by its amend.
-                    reduce_only: None,
-                },
-                order.state.filled_quantity,
-            ),
-        };
-        let outcome = self.amend_order(request);
+        let (order, reservation) = self.amendable(cid)?;
+        // The patch never reads reduce-only, which the venue does not keep on its orders.
+        let amended = patch
+            .apply(&amend_target(&order, None), order.state.filled_quantity)
+            .map_err(OrderError::AmendRefused)?;
+        let mut events = Vec::new();
+        let result = self.amend_on_book(order, reservation, amended, &mut events);
         // Every refusal comes before the amend moves anything, so a refused one reports nothing.
         debug_assert!(
-            outcome.response.state.is_ok() || outcome.events.is_empty(),
-            "SimulatedVenue refused an external modification of {cid} after reporting {:?}",
-            outcome.events
+            result.is_ok() || events.is_empty(),
+            "SimulatedVenue refused an external modification of {cid} after reporting {events:?}"
         );
-        outcome.response.state.map(|_| outcome.events)
+        result?;
+        self.refresh_next_interest_if_loans_changed();
+        self.report_debt_changes(&mut events);
+        Ok(events)
     }
 
-    /// [`amend_order`](Self::amend_order)'s work, pushing what the amend reports onto `events`.
+    /// The order resting under `cid` and what the venue holds against it, cloned out so the ledger
+    /// can be borrowed mutably while the order stays on the book: a refused amend leaves it, its
+    /// queue position and its hold exactly as they were. For an order the venue no longer holds,
+    /// the reason a cancel would give.
+    fn amendable(
+        &self,
+        cid: &ClientOrderId,
+    ) -> Result<(OpenOrder, Option<Reservation>), UnindexedOrderError> {
+        match self.account.orders().resting_order(cid) {
+            Some(RestingOrder {
+                order, reservation, ..
+            }) => Ok((order.clone(), reservation.clone())),
+            None => Err(self.cancel_missing_reason(cid)),
+        }
+    }
+
+    /// [`amend_order`](Self::amend_order)'s work, pushing what the amend reports onto `events`: the
+    /// checks of the client's request, then [`amend_on_book`](Self::amend_on_book).
     fn amend_resting(
         &mut self,
         request: &OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
         events: &mut Vec<UnindexedAccountEvent>,
     ) -> Result<Amended, UnindexedOrderError> {
         let cid = &request.key.cid;
-        let instrument = &request.key.instrument;
-        let time_exchange = self.time_exchange();
-        let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
-
-        // Cloned out, so the ledger can be borrowed mutably below. The order stays on the book
-        // until the amend succeeds: a refusal leaves it, its queue position and its hold exactly
-        // as they were.
-        let (order, reservation) = match self.account.orders().resting_order(cid) {
-            Some(RestingOrder {
-                order, reservation, ..
-            }) => (order.clone(), reservation.clone()),
-            None => return Err(self.cancel_missing_reason(cid)),
-        };
+        let (order, reservation) = self.amendable(cid)?;
 
         if request.state.id.contradicts(&order.state.id) {
             return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
@@ -4571,12 +4581,55 @@ impl SimulatedVenue {
                 ),
             )));
         }
-        let Some(reservation) = reservation else {
-            return Err(refuse(format!(
+        // Checked against the order as this venue holds it, the patch first, then what the client
+        // may ask to amend. Reduce-only is the one term the venue does not keep on its orders, so
+        // it is read from the request.
+        let current = amend_target(&order, request.state.current.reduce_only);
+        let filled = order.state.filled_quantity;
+        let amended = request
+            .state
+            .patch
+            .apply(&current, filled)
+            .map_err(OrderError::AmendRefused)?;
+        self.amend
+            .support()
+            .permits(&RequestAmend::new(
+                order.state.id.clone(),
+                request.state.patch,
+                current,
+                filled,
+            ))
+            .map_err(OrderError::AmendRefused)?;
+        if reservation.is_none() {
+            return Err(OrderError::AmendRefused(AmendRefusal::Venue(format!(
                 "{cid} was seeded through initial_state, so SimulatedVenue holds nothing against \
                  it to recommit"
-            )));
-        };
+            ))));
+        }
+
+        self.amend_on_book(order, reservation, amended, events)
+    }
+
+    /// The book's part of an amend, a client's or an external one: amends `order`, resting on the
+    /// book against `reservation`, to `amended`, the terms its patch leaves it with, pushing what
+    /// the amend reports onto `events`.
+    ///
+    /// An order holding no reservation, one seeded through `initial_state`, takes what the order
+    /// as amended needs afresh, as an arriving order does.
+    ///
+    /// Every refusal comes before anything moves, so a refused amend pushes nothing.
+    fn amend_on_book(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        amended: AmendTarget,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) -> Result<Amended, UnindexedOrderError> {
+        let cid = &order.key.cid;
+        let instrument = &order.key.instrument;
+        let time_exchange = self.time_exchange();
+        let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
+
         // Only a limit order the venue booked on the book is queued: a held order waits for a
         // bar or a fresh market, and an order with no price never rests. An immediate order
         // never rests either, so every order past this check works until cancelled or a date.
@@ -4592,31 +4645,7 @@ impl SimulatedVenue {
             )));
         }
 
-        // Checked against the order as this venue holds it. Reduce-only is the one term the venue
-        // does not keep on its orders, so it is read from the request.
         let filled = order.state.filled_quantity;
-        let current = AmendTarget {
-            side: order.side,
-            price: order.price,
-            quantity: order.quantity,
-            kind: order.kind,
-            time_in_force: order.time_in_force,
-            reduce_only: request.state.current.reduce_only,
-        };
-        let amended = request
-            .state
-            .patch
-            .apply(&current, filled)
-            .map_err(OrderError::AmendRefused)?;
-        self.amend
-            .support()
-            .permits(&RequestAmend::new(
-                order.state.id.clone(),
-                request.state.patch,
-                current,
-                filled,
-            ))
-            .map_err(OrderError::AmendRefused)?;
         let Some(limit) = amended.price else {
             unreachable!("SimulatedVenue queued {cid} without a limit price");
         };
@@ -4658,7 +4687,7 @@ impl SimulatedVenue {
         if raised || (repriced && marketable) {
             let sale = ShortSale {
                 instrument,
-                exchange: request.key.exchange,
+                exchange: order.key.exchange,
                 side: order.side,
                 kind: order.kind,
                 price: amended.price,
@@ -4676,7 +4705,7 @@ impl SimulatedVenue {
         };
         let (committed, trade, remainder) = match self.reenter(
             &candidate,
-            Some(reservation),
+            reservation,
             limit,
             Release::Market(&market),
             &terms,
@@ -8410,6 +8439,19 @@ fn first_unseeded_order_id(account: &AccountState) -> u128 {
 /// one of them.
 fn booked_report(order: UnindexedOrderSnapshot) -> UnindexedOrderReport {
     OrderReport::new(order, ReportedTerms::ALL)
+}
+
+/// What an amend of `order` is checked against: the order as the venue holds it, with
+/// `reduce_only`, the one term the venue does not keep on its orders.
+fn amend_target(order: &OpenOrder, reduce_only: Option<ReduceOnly>) -> AmendTarget {
+    AmendTarget {
+        side: order.side,
+        price: order.price,
+        quantity: order.quantity,
+        kind: order.kind,
+        time_in_force: order.time_in_force,
+        reduce_only,
+    }
 }
 
 #[cfg(test)]

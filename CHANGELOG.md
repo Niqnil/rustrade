@@ -368,10 +368,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
 
 - **A test hook to change a resting order on the simulated venue from outside any client**
-  (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as
-  `amend_order` would, under the same rules (the venue's `AmendConfig` included), and reports it
-  only on the account stream, for a test of how a consumer learns of an order changed without it. A running `MockExchange` takes it as
-  `MockExchangeRequest::modify_externally`. `RestingOrder` gains `kept_place_since`: the time an
+  (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
+  change made in the venue's own interface would, and reports it only on the account stream, for a
+  test of how a consumer learns of an order changed without it. The change never passes through a
+  client, so the venue's `AmendConfig` (what a client may ask to amend) does not limit it, and it
+  may change an order seeded through `initial_state`, which then holds what it needs. The book's
+  rules apply as to `amend_order`: the venue's refusals, trading, queue priority, a reassigned id
+  and the reported events. A running `MockExchange` takes it as
+  `MockExchangeRequest::modify_externally`, whose events go to the account stream. `RestingOrder` gains `kept_place_since`: the time an
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed

@@ -504,6 +504,10 @@ impl TimeInForceRules {
 /// - **Refused** with [`AmendRefusal::Venue`](crate::error::AmendRefusal::Venue): an order the
 ///   venue is holding for a later bar or a fresh market, an order seeded through
 ///   [`MockExecutionConfig::initial_state`], and an option order.
+/// - **Changed outside the client.**
+///   [`SimulatedVenue::modify_externally`](crate::exchange::mock::SimulatedVenue::modify_externally)
+///   is not limited by this, which says what a client may ask to amend. The rules above that are
+///   the book's still apply to it, and it can change a seeded order.
 ///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
 /// start from [`AmendConfig::FULL`] or [`AmendConfig::NONE`] and the `with_*` methods. A field

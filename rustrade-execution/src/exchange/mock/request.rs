@@ -153,7 +153,8 @@ impl MockExchangeRequest {
     }
 
     /// A request to amend the order resting under `cid` as if from outside any client: see
-    /// [`MockExchangeRequestKind::ModifyExternally`].
+    /// [`MockExchangeRequestKind::ModifyExternally`]. What the change reports goes to the account
+    /// stream; `response_tx` hears only whether it was made.
     pub fn modify_externally(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
