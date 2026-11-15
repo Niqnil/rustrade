@@ -26,9 +26,10 @@ use crate::{
     market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
-        amend::{AmendSupport, AmendTarget, Amended, RequestAmend},
+        UnindexedOrderSnapshot,
+        amend::{AmendPatch, AmendSupport, AmendTarget, Amended, RequestAmend},
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::OrderReport,
+        report::{OrderReport, ReportedTerms, UnindexedOrderReport},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
             UnindexedOrderResponseCancel,
@@ -2548,9 +2549,9 @@ impl SimulatedVenue {
 
         self.account.ack_expired(expired_order.clone());
 
-        events.push(self.build_account_event(Snapshot(OrderReport::state_only(
-            UnindexedOrder::from(expired_order),
-        ))));
+        events.push(
+            self.build_account_event(Snapshot(booked_report(UnindexedOrder::from(expired_order)))),
+        );
         events
     }
 
@@ -3004,7 +3005,7 @@ impl SimulatedVenue {
             let filled = filled.map_state(OrderState::fully_filled);
 
             self.push_committed(&mut events, committed, Some(trade));
-            events.push(self.build_account_event(Snapshot(OrderReport::state_only(filled))));
+            events.push(self.build_account_event(Snapshot(booked_report(filled))));
         }
 
         events
@@ -3239,7 +3240,7 @@ impl SimulatedVenue {
 
         let mut events = Vec::with_capacity(4);
         self.push_committed(&mut events, committed, Some(trade));
-        events.push(self.build_account_event(Snapshot(OrderReport::state_only(terminal))));
+        events.push(self.build_account_event(Snapshot(booked_report(terminal))));
         events
     }
 
@@ -3270,6 +3271,7 @@ impl SimulatedVenue {
             order,
             reservation,
             deadline,
+            ..
         }: RestingOrder,
         limit: Decimal,
         release: Release<'_>,
@@ -3338,7 +3340,7 @@ impl SimulatedVenue {
 
         let mut events = Vec::with_capacity(4);
         self.push_committed(&mut events, committed, trade);
-        events.push(self.build_account_event(Snapshot(OrderReport::state_only(terminal))));
+        events.push(self.build_account_event(Snapshot(booked_report(terminal))));
         events
     }
 
@@ -4113,9 +4115,9 @@ impl SimulatedVenue {
             },
         };
         self.account.ack_cancelled(cancelled.clone());
-        events.push(self.build_account_event(Snapshot(OrderReport::state_only(
-            UnindexedOrder::from(cancelled),
-        ))));
+        events.push(
+            self.build_account_event(Snapshot(booked_report(UnindexedOrder::from(cancelled)))),
+        );
 
         events
     }
@@ -4354,8 +4356,9 @@ impl SimulatedVenue {
     /// order can be reported `FullyFilled`; an open that rests reports `[balance]` alone -- the
     /// reservation now held against it -- and no trade, because nothing traded.
     ///
-    /// A Market order has no limit price, and any price it carries is ignored, so the venue prices
-    /// it from whichever market its [`VenueRegime`] gives it -- its own on a
+    /// A Market order has no limit price, and any price it carries is ignored: every record of it,
+    /// the answer included, carries `price: None`. The venue prices it from whichever market its
+    /// [`VenueRegime`] gives it -- its own on a
     /// [`MarketDriven`](VenueRegime::MarketDriven) venue, and
     /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
@@ -4370,8 +4373,13 @@ impl SimulatedVenue {
     /// boundary not after the instant it was asked from, or a negative interest.
     pub fn open_order(
         &mut self,
-        request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
     ) -> OpenOutcome {
+        // Only a limit order's price is a limit. Cleared once, here, so that no record of an order
+        // whose price is ignored can say otherwise.
+        if request.state.kind != OrderKind::Limit {
+            request.state.price = None;
+        }
         // Chosen here so one path holds one snapshot: threading both through would allow two copies
         // to disagree, with nothing to arbitrate.
         let market = self.pricing_market(&request);
@@ -4428,17 +4436,19 @@ impl SimulatedVenue {
     /// - otherwise it rests whole at its new price and quantity.
     ///
     /// The order keeps its place in the queue only when its quantity is lowered and its price is
-    /// left alone. Any other amend files it behind every order at its new price, and stamps its
-    /// [`Open::time_exchange`] with the amend's instant.
+    /// left alone. Any other amend files it behind every order at its new price. Either way its
+    /// [`Open::time_exchange`] is stamped with the amend's instant, as when the venue last changed
+    /// it: the place in the queue is the book's to keep, not the stamp's.
     ///
     /// A margin order keeps its loan, borrowing more only for what the amend adds; what it no
     /// longer needs is repaid only on a venue that repays when an order is cancelled, as when a
     /// fill costs less than was held. Interest the amend's borrow is charged waits for a trade,
     /// as an arriving order's does, only while the order has traded nothing.
     ///
-    /// Returns the balances the amend restated, then the fill and interest it reported, then,
-    /// for an order the amend filled outright, the order's terminal snapshot. An order filled
-    /// outright keeps its id, even on a venue configured to reassign one.
+    /// Returns the balances the amend restated, then the fill and interest it reported, then the
+    /// order's snapshot: as it now rests, or, for an order the amend filled outright, terminal.
+    /// Each states every term of the order, from the venue's own book. An order filled outright
+    /// keeps its id, even on a venue configured to reassign one.
     ///
     /// # Refused, changing nothing
     /// - [`AmendRefusal`] from the checks above, or [`AmendRefusal::WouldTakeLiquidity`] for a
@@ -4479,6 +4489,46 @@ impl SimulatedVenue {
                 state,
             },
         }
+    }
+
+    /// Amends the order resting under `cid` by `patch` as if from outside any client of this
+    /// venue, such as in the venue's own interface: a test hook for how a consumer learns of an
+    /// order changed without it.
+    ///
+    /// It is the amend [`amend_order`](Self::amend_order) makes, under the same rules, refusals
+    /// and queue priority, with `patch` applied to the order as this venue holds it. Only the
+    /// account stream hears of it: the returned events are those `amend_order` reports, ending
+    /// with the order's snapshot, and no client is answered.
+    ///
+    /// # Errors
+    /// What `amend_order` would answer the same amend with, changing nothing.
+    pub fn modify_externally(
+        &mut self,
+        cid: &ClientOrderId,
+        patch: AmendPatch,
+    ) -> Result<Vec<UnindexedAccountEvent>, UnindexedOrderError> {
+        let Some(order) = self.account.orders().get(cid) else {
+            return Err(self.cancel_missing_reason(cid));
+        };
+        let request = OrderRequestAmend {
+            key: order.key.clone(),
+            state: RequestAmend::new(
+                order.state.id.clone(),
+                patch,
+                AmendTarget {
+                    side: order.side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    kind: order.kind,
+                    time_in_force: order.time_in_force,
+                    // Not kept on the venue's orders, and not read by its amend.
+                    reduce_only: None,
+                },
+                order.state.filled_quantity,
+            ),
+        };
+        let outcome = self.amend_order(request);
+        outcome.response.state.map(|_| outcome.events)
     }
 
     /// [`amend_order`](Self::amend_order)'s work, pushing what the amend reports onto `events`.
@@ -4670,7 +4720,7 @@ impl SimulatedVenue {
                 ),
             };
             self.account.ack_filled(ended.clone());
-            events.push(self.build_account_event(Snapshot(OrderReport::state_only(
+            events.push(self.build_account_event(Snapshot(booked_report(
                 ended.map_state(OrderState::fully_filled),
             ))));
             return Ok(Amended::new(
@@ -4682,14 +4732,12 @@ impl SimulatedVenue {
             ));
         };
 
+        // Priority is the book's to keep (see `Rank`), so the order's own stamp says when the venue
+        // last changed it, as a venue's report of an amended order does, whichever way it ranks.
         let rank = if !repriced && amended.quantity < order.quantity {
             Rank::Kept
         } else {
             Rank::Lost
-        };
-        let opened_at = match rank {
-            Rank::Kept => order.state.time_exchange,
-            Rank::Lost => time_exchange,
         };
         // Minted only now the amend has succeeded, so a refused amend uses up no id.
         let (id, previous_id) = if self.amend.reassign_id {
@@ -4698,11 +4746,13 @@ impl SimulatedVenue {
         } else {
             (order.state.id, None)
         };
-        let open = Open::new(id, opened_at, filled_total);
+        let open = Open::new(id, time_exchange, filled_total);
         let booked = Order {
             state: open.clone(),
             ..candidate
         };
+        // The book reports the order as it now rests, as it reports every other change to it.
+        let report = booked_report(booked.clone().map_state(OrderState::active));
         let answer = Amended::new(
             open,
             booked.price,
@@ -4716,6 +4766,7 @@ impl SimulatedVenue {
                 refused.order.key.cid
             );
         }
+        events.push(self.build_account_event(Snapshot(report)));
         Ok(answer)
     }
 
@@ -4897,7 +4948,7 @@ impl SimulatedVenue {
 
         let mut orders_by_instrument: FnvHashMap<_, Vec<_>> = orders_by_instrument
             .into_iter()
-            .map(|(instrument, orders)| (instrument, orders.map(OrderReport::state_only).collect()))
+            .map(|(instrument, orders)| (instrument, orders.map(booked_report).collect()))
             .collect();
 
         // Every instrument with an order, and every CFD and option whether or not it has one: a
@@ -8344,6 +8395,12 @@ fn first_unseeded_order_id(account: &AccountState) -> u128 {
         .map_or(0, |highest| u128::from(highest) + 1)
 }
 
+/// A report of `order` from the venue's own book, which is where its terms live, so it states every
+/// one of them.
+fn booked_report(order: UnindexedOrderSnapshot) -> UnindexedOrderReport {
+    OrderReport::new(order, ReportedTerms::ALL)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -8443,8 +8500,12 @@ mod tests {
     fn order_of(
         event: &UnindexedAccountEvent,
     ) -> &Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+        &report_of(event).order
+    }
+
+    fn report_of(event: &UnindexedAccountEvent) -> &UnindexedOrderReport {
         match &event.kind {
-            AccountEventKind::OrderSnapshot(report) => &report.0.order,
+            AccountEventKind::OrderSnapshot(report) => &report.0,
             other => panic!("expected an order snapshot, got: {other:?}"),
         }
     }
@@ -8621,6 +8682,36 @@ mod tests {
         let trades = venue.trades(before);
         assert_eq!(trades.len(), 1, "the venue must acknowledge its own trade");
         assert_eq!(trades[0].price, d("50000"));
+    }
+
+    /// A market order's price is ignored, so its answer carries none, whether it fills or is
+    /// refused: a record of it never names a limit it did not have.
+    #[test]
+    fn a_market_order_is_answered_with_no_price_whatever_its_request_carried() {
+        let mut venue = make_venue("100", "10000000");
+        let priced = |quantity: &str| {
+            let mut request = buy_request(quantity, market_prices("50000"));
+            request.state.price = Some(d("1"));
+            request
+        };
+
+        let filled = venue.open_order(priced("0.01"));
+        assert!(
+            matches!(
+                filled.response.state,
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "{:?}",
+            filled.response.state
+        );
+        assert_eq!(filled.response.price, None);
+
+        let refused = venue.open_order(priced("0"));
+        assert!(matches!(
+            refused.response.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+        ));
+        assert_eq!(refused.response.price, None);
     }
 
     /// `advance_time` sets the instant everything a request produces after it is stamped with.
@@ -10998,11 +11089,21 @@ mod tests {
 
         let venue = SimulatedVenue::new(&config, spot_instruments());
 
-        let cids = venue
+        let reports = venue
             .account_snapshot()
             .instruments
             .into_iter()
             .flat_map(|instrument| instrument.orders)
+            .collect::<Vec<_>>();
+        // Seeded stating nothing, but listed from the venue's own book, which states every term.
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.reported == ReportedTerms::ALL),
+            "{reports:?}"
+        );
+        let cids = reports
+            .into_iter()
             .map(|order| order.order.key.cid)
             .collect::<Vec<_>>();
 

@@ -202,8 +202,10 @@ fn a_price_amend_moves_the_hold_and_answers_with_the_amended_order() {
 
     let outcome = amend(&mut venue, "resting", price("47000"));
 
-    let [restated] = outcome.events.as_slice() else {
-        panic!("an amend that trades nothing restates its hold alone: {outcome:?}");
+    let [restated, reported] = outcome.events.as_slice() else {
+        panic!(
+            "an amend that trades nothing restates its hold, then reports the order: {outcome:?}"
+        );
     };
     assert_eq!(
         balance_of(restated).balance,
@@ -223,6 +225,65 @@ fn a_price_amend_moves_the_hold_and_answers_with_the_amended_order() {
     let after = resting(&venue, "resting");
     assert_eq!(after.price, Some(d("47000")));
     assert_eq!(after.state, answer.open);
+    let report = report_of(reported);
+    assert_eq!(
+        report.order,
+        after.clone().map_state(OrderState::active),
+        "the order as it now rests"
+    );
+    assert_eq!(
+        report.reported,
+        ReportedTerms::ALL,
+        "from the venue's own book"
+    );
+}
+
+/// An order changed from outside any client is amended as `amend_order` amends it, and only the
+/// account stream hears of it: the restated hold, then the order as it now rests.
+#[test]
+fn an_external_modification_amends_the_order_and_reports_it_on_the_stream() {
+    let mut venue = resting_buy();
+    let before = resting(&venue, "resting");
+
+    let events = venue
+        .modify_externally(&cid("resting"), price("47000"))
+        .unwrap();
+
+    let [restated, reported] = events.as_slice() else {
+        panic!("the restated hold, then the order: {events:?}");
+    };
+    assert_eq!(
+        balance_of(restated).balance,
+        Balance::new(d("1000000"), d("1000000") - d("47009.4"))
+    );
+    let after = resting(&venue, "resting");
+    assert_eq!(after.price, Some(d("47000")));
+    assert_eq!(
+        after.state,
+        Open::new(before.state.id, time(2), Decimal::ZERO)
+    );
+    let report = report_of(reported);
+    assert_eq!(report.order, after.map_state(OrderState::active));
+    assert_eq!(report.reported, ReportedTerms::ALL);
+}
+
+/// An external modification the venue refuses changes nothing, and says why as an amend's answer
+/// would.
+#[test]
+fn a_refused_external_modification_changes_nothing() {
+    let mut venue = resting_buy();
+    let before = resting(&venue, "resting");
+
+    assert!(matches!(
+        venue.modify_externally(&cid("resting"), quantity("0")),
+        Err(OrderError::AmendRefused(_))
+    ));
+    assert_eq!(resting(&venue, "resting"), before);
+
+    assert!(matches!(
+        venue.modify_externally(&cid("absent"), price("47000")),
+        Err(OrderError::Rejected(_))
+    ));
 }
 
 #[test]
@@ -238,18 +299,21 @@ fn a_price_amend_goes_behind_the_orders_already_at_its_new_price() {
 }
 
 #[test]
-fn a_quantity_decrease_keeps_the_orders_place_and_arrival() {
+fn a_quantity_decrease_keeps_the_orders_place_and_is_stamped_at_the_amend() {
     let mut venue = resting_buy();
     let _ = venue.open_order(limit_request("behind", Side::Buy, "1", "48000", gtc()));
     let before = resting(&venue, "resting");
+    assert_eq!(before.state.time_exchange, time(1));
 
     let outcome = amend(&mut venue, "resting", quantity("0.5"));
 
-    assert_eq!(
-        amended(&outcome).open.time_exchange,
-        before.state.time_exchange
-    );
-    assert_eq!(resting(&venue, "resting").state, before.state);
+    let stamped = Open::new(before.state.id.clone(), time(2), Decimal::ZERO);
+    assert_eq!(amended(&outcome).open, stamped);
+    assert_eq!(resting(&venue, "resting").state, stamped);
+    let [.., reported] = outcome.events.as_slice() else {
+        panic!("the order is reported: {outcome:?}");
+    };
+    assert_eq!(order_of(reported).state, OrderState::active(stamped));
     assert_eq!(queue(&venue, Side::Buy), ["resting", "behind"]);
     assert_eq!(
         free_quote(&venue),
@@ -312,8 +376,11 @@ fn a_price_amend_through_a_thin_market_rests_what_is_left_under_its_id() {
 
     let outcome = amend(&mut venue, "resting", price("49200"));
 
-    let [paid, _received, traded] = outcome.events.as_slice() else {
-        panic!("the balances then the trade: {:?}", outcome.events);
+    let [paid, _received, traded, reported] = outcome.events.as_slice() else {
+        panic!(
+            "the balances, the trade, then the order: {:?}",
+            outcome.events
+        );
     };
     assert_eq!(
         balance_of(paid).balance,
@@ -329,6 +396,11 @@ fn a_price_amend_through_a_thin_market_rests_what_is_left_under_its_id() {
     assert_eq!(answer.open, Open::new(id, time(2), d("0.4")));
     assert_eq!(answer.price, Some(d("49200")));
     assert_eq!(resting(&venue, "resting").state, answer.open);
+    assert_eq!(
+        order_of(reported).state,
+        OrderState::active(answer.open.clone()),
+        "reported as it rests, carrying the part the amend filled"
+    );
 }
 
 /// An order that has paid its ticket pays none again on an amend that trades part of it, nor
