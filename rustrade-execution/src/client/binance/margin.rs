@@ -76,15 +76,16 @@ use super::rules::RulesLoader;
 use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
-    BinanceTimeInForce, FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SharedDedupCache, TrailingOrderError, Unclassified, UnrecoveredFills, WeightPool, WireInt,
-    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
-    classify_rest_query_error, convert_ended_order, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, new_dedup_cache, optional_decimal, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    rest_read_with_retry, trailing_params, unreadable_answer,
+    BinanceTimeInForce, FILL_RECOVERY_TIMEOUT_SECS, ListedOrder, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
+    RateLimitTracker, RequestKind, SharedDedupCache, TrailingOrderError, Unclassified,
+    UnrecoveredFills, WeightPool, WireInt, answer_time, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_ended_order, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
+    new_dedup_cache, optional_decimal, placed_order_state, recovered_order_cids,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, rest_read_with_retry,
+    trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -107,7 +108,6 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::{OrderReport, UnindexedOrderReport},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
@@ -1164,11 +1164,11 @@ impl BinanceMargin {
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, listing) = result?;
-                self.remember_live(&listing.orders);
+                self.remember_live(listing.orders.iter().map(|listed| &listed.order));
                 let wrapped = listing
                     .orders
                     .into_iter()
-                    .map(active_order_snapshot)
+                    .map(ListedOrder::into_report)
                     .collect();
                 let isolated = balances_by_symbol.remove(&inst);
                 if isolated.is_none() {
@@ -1500,11 +1500,11 @@ impl ExecutionClient for BinanceMargin {
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, listing) = result?;
-                self.remember_live(&listing.orders);
+                self.remember_live(listing.orders.iter().map(|listed| &listed.order));
                 let wrapped = listing
                     .orders
                     .into_iter()
-                    .map(active_order_snapshot)
+                    .map(ListedOrder::into_report)
                     .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
                     inst,
@@ -1604,7 +1604,7 @@ impl ExecutionClient for BinanceMargin {
                 Vec::with_capacity(capacity),
                 |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
                  (_, listing)| async move {
-                    acc.extend(listing.orders);
+                    acc.extend(listing.orders.into_iter().map(|listed| listed.order));
                     Ok(acc)
                 },
             )
@@ -1639,7 +1639,7 @@ impl ExecutionClient for BinanceMargin {
         .try_fold(
             Vec::with_capacity(instruments.len()),
             |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, listing)| async move {
-                acc.extend(listing.orders);
+                acc.extend(listing.orders.into_iter().map(|listed| listed.order));
                 Ok(acc)
             },
         )
@@ -2833,7 +2833,7 @@ async fn listed_margin_open_cids(
             RequestKind::Essential,
         )
         .await?;
-        listed.extend(listing.orders.into_iter().map(|order| order.key.cid));
+        listed.extend(listing.orders.into_iter().map(|entry| entry.order.key.cid));
     }
     Ok(listed)
 }
@@ -3148,18 +3148,6 @@ fn filter_and_convert_margin_balances(
             convert_margin_balance_entry(b, time)
         })
         .collect()
-}
-
-/// Wrap a fetched `Open` order as an `OrderState::active` snapshot for `account_snapshot`.
-///
-/// `account_snapshot` reports open orders wrapped in `OrderState::active(..)`, whereas
-/// `fetch_open_orders` returns the bare `Open` — both share
-/// [`fetch_margin_open_orders_for_instrument`], so this is the single wrap used by the cross and
-/// isolated snapshot paths.
-fn active_order_snapshot(
-    o: Order<ExchangeId, InstrumentNameExchange, Open>,
-) -> UnindexedOrderReport {
-    OrderReport::state_only(o.map_state(OrderState::active))
 }
 
 /// Convert one side (base or quote) of an isolated `assets[]` entry into a margin [`AssetBalance`].

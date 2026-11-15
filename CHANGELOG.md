@@ -607,6 +607,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     account-stream update carries no type, so it states only its quantity.
   - **The simulated venue states every term** of each order it reports, in snapshots and its
     account snapshot alike, since its own book is where the terms live.
+  - **Binance spot and margin state the terms their reads carry.** An account-stream report and an
+    open-order row state every term, less a limit price that is zero or missing on a kind that
+    has one, a kind the row leaves unresolved (filled in from the order the client placed, or left
+    `ConditionalUnresolved`), and a time in force read as `Unreported`. A report or row stamped
+    with this host's clock, because Binance sent no time, states none.
+  - **A Binance keep-priority amend that kept the client order id is reported as the order's new
+    state**, on its new quantity, where it was logged and dropped. The stream's deduplication now
+    tells a report's stated terms apart, so the amend is not taken for a replay of the order's
+    acknowledgement. An amend under a new client order id is still logged and dropped: the engine
+    knows the order by its old id.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
