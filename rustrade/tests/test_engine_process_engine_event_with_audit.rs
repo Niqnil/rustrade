@@ -31,6 +31,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
+            order::terms::OrderTerms,
             position::{OmsMode, PositionDrift, PositionExited, SplitRoundingPolicy},
             trading::TradingState,
         },
@@ -61,7 +62,7 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         amend::{AmendPatch, AmendTarget, Amended},
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
-        report::OrderReport,
+        report::{OrderReport, ReportedTerms},
         request::{
             CancelThenOpen, CancelThenOpenError, OrderAmend, OrderRequestCancel, OrderRequestOpen,
             OrderResponseAmend, OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
@@ -2757,6 +2758,152 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
     let order = order(&engine);
     assert_eq!(order.price, Some(dec!(44_000)));
     assert_eq!(order.state, ActiveOrderState::Open(amended));
+}
+
+/// An order changed at the venue is tracked on the terms the venue reports for it, and the change
+/// is an output: an order snapshot stating a new quantity and price is adopted, and the next amend
+/// is built from those terms. An account snapshot listing the order with another time in force is
+/// not adopted but reported as diverged.
+#[test]
+fn test_an_order_changed_at_the_venue_is_adopted_and_reported() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let known = InstrumentIndex(1);
+    let open = open_request(known, "rest");
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open.clone()))),
+    );
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(_))
+    ));
+    let order =
+        |state: Open, price: Decimal, quantity: Decimal, time_in_force: TimeInForce| Order {
+            key: open.key.clone(),
+            side: open.state.side,
+            price: Some(price),
+            quantity,
+            kind: open.state.kind,
+            time_in_force,
+            state: OrderState::active(state),
+        };
+    let working = |days| Open {
+        id: VenueOrderId::Assigned(OrderId::new("venue-1")),
+        time_exchange: time_plus_days(STARTING_TIMESTAMP, days),
+        filled_quantity: dec!(0.25),
+    };
+    let gtc = open.state.time_in_force;
+    let outputs = |engine: &mut TestEngine, kind| {
+        let audit = process_with_audit(
+            engine,
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                exchange: ExchangeIndex(0),
+                kind,
+            })),
+        );
+        let EngineAudit::Process(audit) = audit.event else {
+            panic!("expected a processed event");
+        };
+        audit.outputs.into_iter().collect::<Vec<_>>()
+    };
+
+    // The acknowledgement echoes the request and states nothing.
+    let acked = outputs(
+        &mut engine,
+        AccountEventKind::OrderSnapshot(Snapshot(OrderReport::state_only(order(
+            working(1),
+            dec!(45_000),
+            dec!(1),
+            gtc,
+        )))),
+    );
+    assert!(acked.is_empty(), "{acked:?}");
+
+    // The venue reports the order resized and repriced.
+    let changed = outputs(
+        &mut engine,
+        AccountEventKind::OrderSnapshot(Snapshot(OrderReport::new(
+            order(working(2), dec!(44_000), dec!(3), gtc),
+            ReportedTerms::ALL,
+        ))),
+    );
+    let [EngineOutput::OrderTermsChanged(changed)] = changed.as_slice() else {
+        panic!("expected one OrderTermsChanged, got {changed:?}");
+    };
+    let terms = |price, quantity, time_in_force| OrderTerms {
+        price: Some(price),
+        quantity,
+        kind: OrderKind::Limit,
+        time_in_force,
+    };
+    assert_eq!(changed.key, open.key);
+    assert_eq!(changed.from, terms(dec!(45_000), dec!(1), gtc));
+    assert_eq!(changed.to, terms(dec!(44_000), dec!(3), gtc));
+
+    // The next amend starts from the terms the venue reported.
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendAmendRequests(OneOrMany::One(OrderAmend {
+            key: open.key.clone(),
+            state: AmendPatch::default().with_price(dec!(43_000)),
+        }))),
+    );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Amend(sent)) => {
+            assert_eq!(sent.state.current.price, Some(dec!(44_000)));
+            assert_eq!(sent.state.current.quantity, dec!(3));
+        }
+        other => panic!("expected the amend to be sent, got {other:?}"),
+    }
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderAmended(OrderResponseAmend {
+                key: open.key.clone(),
+                state: Ok(Amended::new(
+                    working(3),
+                    Some(dec!(43_000)),
+                    dec!(3),
+                    OrderKind::Limit,
+                    None,
+                )),
+            }),
+        })),
+    );
+
+    // A listing of the order with another time in force: the engine keeps its own.
+    let ioc = TimeInForce::ImmediateOrCancel;
+    let listed = outputs(
+        &mut engine,
+        AccountEventKind::Snapshot(AccountSnapshot {
+            exchange: ExchangeIndex(0),
+            balances: vec![],
+            instruments: vec![InstrumentAccountSnapshot::new(
+                known,
+                vec![OrderReport::new(
+                    order(working(4), dec!(43_000), dec!(3), ioc),
+                    ReportedTerms::ALL,
+                )],
+                false,
+                PositionReport::Unreported,
+                None,
+            )],
+        }),
+    );
+    let [EngineOutput::OrderTermsDiverged(diverged)] = listed.as_slice() else {
+        panic!("expected one OrderTermsDiverged, got {listed:?}");
+    };
+    assert_eq!(diverged.key, open.key);
+    assert_eq!(diverged.tracked, terms(dec!(43_000), dec!(3), gtc));
+    assert_eq!(diverged.reported, terms(dec!(43_000), dec!(3), ioc));
+    assert_eq!(diverged.terms, ReportedTerms::NONE.with_time_in_force(true));
+    assert!(!diverged.amend_in_flight);
+    let tracked = &engine.state.instruments.instrument_index(&known).orders.0[&open.key.cid];
+    assert_eq!(tracked.time_in_force, gtc);
+    assert_eq!(tracked.state, ActiveOrderState::Open(working(4)));
 }
 
 /// An order the engine did not send, adopted from the venue's listing, is amended with its

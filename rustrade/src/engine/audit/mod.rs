@@ -252,9 +252,16 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
             UpdateFromAccountOutput::FillsApplied(applied) => applied
-                .fee_conversion
-                .map(EngineOutput::FeeConversion)
+                .terms_changed
                 .into_iter()
+                .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed)))
+                .chain(
+                    applied
+                        .terms_diverged
+                        .into_iter()
+                        .map(|diverged| EngineOutput::OrderTermsDiverged(Box::new(diverged))),
+                )
+                .chain(applied.fee_conversion.map(EngineOutput::FeeConversion))
                 .chain(
                     applied
                         .capped
@@ -272,10 +279,19 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::UntrackedExchange(untracked) => {
                 Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
-            UpdateFromAccountOutput::PositionDrift(drift) => drift
+            UpdateFromAccountOutput::AccountSnapshot { drift, applied } => applied
+                .terms_changed
                 .into_iter()
-                .fold(Self::with_event(event), |audit, drift| {
-                    audit.add_output(EngineOutput::PositionDrift(drift))
+                .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed)))
+                .chain(
+                    applied
+                        .terms_diverged
+                        .into_iter()
+                        .map(|diverged| EngineOutput::OrderTermsDiverged(Box::new(diverged))),
+                )
+                .chain(drift.into_iter().map(EngineOutput::PositionDrift))
+                .fold(Self::with_event(event), |audit, output| {
+                    audit.add_output(output)
                 }),
             UpdateFromAccountOutput::Checkpoint(checkpoint) => {
                 Self::with_output(event, EngineOutput::Checkpoint(checkpoint))

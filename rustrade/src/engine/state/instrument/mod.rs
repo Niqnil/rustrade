@@ -4,7 +4,11 @@ use crate::{
         state::{
             fee::FeeConversion,
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-            order::{Orders, manager::OrderManager},
+            order::{
+                Orders,
+                manager::OrderManager,
+                terms::{OrderTermsChanged, OrderTermsDiverged},
+            },
             position::{
                 CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
                 PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
@@ -737,13 +741,15 @@ fn reduce_only_position() -> ReduceOnly {
     ReduceOnly::Position
 }
 
-/// What applying the fills of one account event did to an instrument's positions.
+/// What applying one account event did to an instrument: to its positions, through the fills it
+/// applied, and to its orders' terms.
 ///
 /// Returned by [`InstrumentState::update_from_trade`] for one fill, and by
-/// [`InstrumentState::update_from_order_snapshot`] for the fills it replays.
+/// [`InstrumentState::update_from_order_snapshot`] for the fills it replays and the terms the
+/// snapshot changed or left diverged.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex> {
+pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex, ExchangeKey = ExchangeIndex> {
     /// The position a fill closed, if any. Of fills replayed together, only the last one's: see
     /// [`InstrumentState::update_from_order_snapshot`].
     pub exited: Option<PositionExited<AssetKey, InstrumentKey>>,
@@ -753,22 +759,54 @@ pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex> {
     /// fill. Set only by [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account),
     /// which does the valuing, never by this type's own methods.
     pub fee_conversion: Option<FeeConversion<AssetKey, InstrumentKey>>,
+    /// The terms the engine adopted from the event's order reports, one per order changed. See
+    /// [`OrderManager::update_from_order_snapshot`].
+    ///
+    /// `#[serde(default)]` so outputs serialised before this field existed still load.
+    #[serde(default = "Vec::new")]
+    pub terms_changed: Vec<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
+    /// The terms the event's order reports stated and the engine did not adopt, one per order.
+    ///
+    /// `#[serde(default)]` so outputs serialised before this field existed still load.
+    #[serde(default = "Vec::new")]
+    pub terms_diverged: Vec<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
 }
 
-impl<AssetKey, InstrumentKey> Default for FillsApplied<AssetKey, InstrumentKey> {
+impl<AssetKey, InstrumentKey, ExchangeKey> Default
+    for FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
+{
     fn default() -> Self {
         Self {
             exited: None,
             capped: Vec::new(),
             fee_conversion: None,
+            terms_changed: Vec::new(),
+            terms_diverged: Vec::new(),
         }
     }
 }
 
-impl<AssetKey, InstrumentKey> FillsApplied<AssetKey, InstrumentKey> {
-    /// `true` if no fill closed a position, none was capped, and no third-asset fee was valued.
+impl<AssetKey, InstrumentKey, ExchangeKey> FillsApplied<AssetKey, InstrumentKey, ExchangeKey> {
+    /// `true` if no fill closed a position, none was capped, no third-asset fee was valued, and no
+    /// order's terms were changed or left diverged.
     pub fn is_empty(&self) -> bool {
-        self.exited.is_none() && self.capped.is_empty() && self.fee_conversion.is_none()
+        self.exited.is_none()
+            && self.capped.is_empty()
+            && self.fee_conversion.is_none()
+            && self.terms_changed.is_empty()
+            && self.terms_diverged.is_empty()
+    }
+
+    /// Nothing applied but the terms one order snapshot changed or left diverged.
+    fn with_terms(
+        changed: Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
+        diverged: Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
+    ) -> Self {
+        Self {
+            terms_changed: changed.into_iter().collect(),
+            terms_diverged: diverged.into_iter().collect(),
+            ..Self::default()
+        }
     }
 }
 
@@ -1125,7 +1163,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
     /// Each order the snapshot lists is applied as an order snapshot, using timestamps where
-    /// relevant so the most recent order state wins.
+    /// relevant so the most recent order state wins. Returns the terms those reports changed or
+    /// left diverged, and nothing else: a position a replayed fill closed is not returned.
     ///
     /// # Orders the snapshot leaves out
     ///
@@ -1151,18 +1190,20 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_account_snapshot(
         &mut self,
         snapshot: &InstrumentAccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>,
-    ) where
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
+    where
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
         AssetKey: Debug + Clone + PartialEq,
     {
-        // Only each report's order is read: no term a report states is adopted yet.
-        for OrderReport { order, .. } in &snapshot.orders {
-            // PositionExited from deferred fill replay is not propagated here: the
-            // Snapshot event path in EngineState::update_from_account already returns
-            // None unconditionally. This is a pre-existing limitation — snapshot
-            // reconciliation at startup does not emit PositionExit output events.
-            let _ = self.update_from_order_snapshot(Snapshot(order));
+        let mut terms = FillsApplied::default();
+        for report in &snapshot.orders {
+            // Only the terms each report changed or left diverged are returned. PositionExited
+            // from deferred fill replay is not: snapshot reconciliation at startup does not emit
+            // PositionExit output events, a known limitation.
+            let applied = self.update_from_order_snapshot(Snapshot(report));
+            terms.terms_changed.extend(applied.terms_changed);
+            terms.terms_diverged.extend(applied.terms_diverged);
         }
 
         let open_at_resync = std::mem::take(&mut self.orders_open_at_resync);
@@ -1210,6 +1251,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         }
 
         self.cleanup_routing_tables();
+        terms
     }
 
     /// Records the orders that are `Open` as the account stream begins to resynchronise, making
@@ -1477,28 +1519,45 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// counter records it and why they are counted apart.
     pub fn update_from_order_snapshot(
         &mut self,
-        order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
-    ) -> FillsApplied<AssetKey, InstrumentKey>
+        report: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         ExchangeKey: Debug + Clone,
         AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
     {
-        self.replay_order_snapshot(order, &[])
+        self.replay_order_snapshot(report, &[])
+    }
+
+    /// [`Self::update_from_order_snapshot`] for a snapshot stating none of its terms, as most
+    /// producers send: only its state is applied.
+    #[cfg(test)]
+    pub(crate) fn update_from_state_only_snapshot(
+        &mut self,
+        order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
+    where
+        ExchangeKey: Debug + Clone,
+        AssetKey: Debug + Clone + PartialEq,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        self.update_from_order_snapshot(Snapshot(&OrderReport::state_only(order.0.clone())))
     }
 
     /// [`Self::update_from_order_snapshot`], with the fills in `reduce_only_fills` taken as sent
     /// as each says when it replays them. See [`Self::replay_trade`].
     pub(crate) fn replay_order_snapshot(
         &mut self,
-        order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
+        report: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
         reduce_only_fills: &[(TradeId, ReduceOnly)],
-    ) -> FillsApplied<AssetKey, InstrumentKey>
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         ExchangeKey: Debug + Clone,
         AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
     {
+        let order = Snapshot(&report.0.order);
+
         // Count a rejected open before anything downstream consumes the snapshot. This is the
         // difference between "the strategy chose not to trade" and "this session could not
         // trade", and once the snapshot is dropped nothing can tell the two apart. Debug rather
@@ -1563,17 +1622,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map(|o| matches!(o.state, ActiveOrderState::Open(_)))
             .unwrap_or(false);
 
-        // Whether this update ends the order's life at the exchange. An explicitly terminal state,
-        // or an `Open` with nothing left to fill -- some venues report a completed order that way
-        // rather than with a distinct state, and it denotes the same fact.
-        let update_retires_order = match &order.0.state {
-            OrderState::Inactive(_) => !order.0.state.is_outcome_unknown(),
-            OrderState::Active(ActiveOrderState::Open(open)) => {
-                open.quantity_remaining(order.0.quantity).is_zero()
-            }
-            OrderState::Active(_) => false,
-        };
-
         // Two kinds of update settle the CID <-> OrderId mapping, and both must drive (a) and
         // (b) below: a transition out of OpenInFlight that carries the exchange OrderId, which
         // learns the mapping, and a terminal update on an order tracked as Open, which is about
@@ -1592,8 +1640,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // working needs neither: its mapping is already indexed and no pruning is coming, so
         // widening this would pay a `ClientOrderId` clone on every call to re-insert what is
         // already there.
+        //
+        // Whether the update ends the order's life at the exchange is `Orders`' decision: an
+        // explicitly terminal state, or an `Open` with nothing left to fill of the quantity tracked
+        // once the snapshot's terms are applied. Some venues report a completed order that way
+        // rather than with a distinct state, and it denotes the same fact.
+        let applied = self.orders.update_from_order_snapshot(report);
+        self.cleanup_routing_tables();
+
         let ack_exchange_id: Option<OrderId> =
-            if currently_open_in_flight || (currently_open && update_retires_order) {
+            if currently_open_in_flight || (currently_open && applied.retired) {
                 match &order.0.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
                     OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
@@ -1604,9 +1660,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             } else {
                 None
             };
-
-        self.orders.update_from_order_snapshot(order);
-        self.cleanup_routing_tables();
+        let terms = FillsApplied::with_terms(applied.changed, applied.diverged);
 
         // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
         // that were waiting on it.
@@ -1642,7 +1696,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     .collect();
                 self.pending_fills.retain(|f| f.order_id != exchange_id);
 
-                let mut applied = FillsApplied::default();
+                let mut applied = terms;
                 for fill in deferred {
                     debug!(
                         order_id = %fill.order_id,
@@ -1677,7 +1731,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
-        FillsApplied::default()
+        terms
     }
 
     /// Updates the instrument state from an
@@ -2487,7 +2541,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
-    ) -> FillsApplied<AssetKey, InstrumentKey>
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
@@ -2507,7 +2561,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
         reduce_only_fills: &[(TradeId, ReduceOnly)],
-    ) -> FillsApplied<AssetKey, InstrumentKey>
+    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
@@ -2841,7 +2895,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         FillsApplied {
             exited,
             capped: capped.into_iter().collect(),
-            fee_conversion: None,
+            ..FillsApplied::default()
         }
     }
 
@@ -3384,7 +3438,7 @@ mod tests {
         exchange_id: &OrderId,
         position_id: Option<&PositionId>,
     ) {
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -3396,7 +3450,7 @@ mod tests {
             state.position_ids.insert(cid.clone(), position_id.clone());
         }
 
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(Open::new(
                 VenueOrderId::Assigned(exchange_id.clone()),
@@ -3473,7 +3527,7 @@ mod tests {
 
         // A cancel is sent but not yet acked. The order is still working at the venue, so it can
         // still fill — the race the `CancelInFlight` arm of the scan exists for.
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(CancelInFlight {
                 order: Some(Open::new(
@@ -3556,7 +3610,7 @@ mod tests {
         let exchange_id = OrderId::new("oid-1");
         let position_id = PositionId::new("strategy-chosen");
 
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -3583,7 +3637,7 @@ mod tests {
         let exchange_id = OrderId::new("oid-1");
         let position_id = PositionId::new("strategy-chosen");
 
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -3591,7 +3645,7 @@ mod tests {
         state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
 
         // The ack arrives and carries the exchange OrderId, settling the mapping.
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(Open::new(
                 VenueOrderId::Assigned(exchange_id.clone()),
@@ -3617,7 +3671,7 @@ mod tests {
     fn a_fill_of_another_origin_is_not_queued_behind_an_order_awaiting_its_ack() {
         for origin in [TradeOrigin::Liquidation, TradeOrigin::External] {
             let mut state = instrument_state(OmsMode::Hedging);
-            state.update_from_order_snapshot(Snapshot(&order(
+            state.update_from_state_only_snapshot(Snapshot(&order(
                 ClientOrderId::new("cid-1"),
                 OrderState::active(OpenInFlight::new(TIME_SENT)),
             )));
@@ -3749,7 +3803,7 @@ mod tests {
     #[test]
     fn a_hedged_forced_fill_is_routed_while_an_order_awaits_its_ack() {
         let mut state = hedged_positions(&[("long", dec!(5))], &[]);
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             ClientOrderId::new("cid-1"),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -4214,7 +4268,7 @@ mod tests {
         cid: &ClientOrderId,
         exchange_id: &OrderId,
     ) {
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(Open::new(
                 VenueOrderId::Assigned(exchange_id.clone()),
@@ -4236,7 +4290,7 @@ mod tests {
         cid: &ClientOrderId,
         exchange_id: &OrderId,
     ) {
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::inactive(Cancelled::new(
                 exchange_id.clone(),
@@ -4346,7 +4400,7 @@ mod tests {
         // `pending_fills` whenever one of these exists — but a buffered fill is only released by
         // an ack for an order still tracked in `orders`, so a fill for the already-retired A would
         // never be replayed and never dropped.
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             ClientOrderId::new("cid-c"),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -4571,7 +4625,7 @@ mod tests {
 
         // In flight before the resync began: never recorded.
         let opening = ClientOrderId::new("cid-opening");
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             opening.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -4585,7 +4639,7 @@ mod tests {
         rest_order_at_exchange(&mut state, &cancelling, &cancelling_oid, None);
 
         state.begin_account_resync();
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cancelling.clone(),
             OrderState::active(CancelInFlight {
                 order: None,
@@ -4628,13 +4682,13 @@ mod tests {
     fn an_order_the_venue_never_named_survives_a_complete_snapshot_that_leaves_it_out() {
         let mut state = instrument_state(OmsMode::Netting);
         let cid = ClientOrderId::new("cid-unnamed");
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
         let resting =
             ActiveOrderState::Open(Open::new(VenueOrderId::ClientAssigned, TIME, Decimal::ZERO));
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::Active(resting.clone()),
         )));
@@ -4690,7 +4744,7 @@ mod tests {
             let mut resting = listed(&cid, &OrderId::new("oid-1"));
             resting.key.exchange = ExchangeIndex(index);
             resting.key.instrument = InstrumentIndex(index);
-            instrument.update_from_order_snapshot(Snapshot(&resting));
+            instrument.update_from_state_only_snapshot(Snapshot(&resting));
         }
 
         engine
@@ -6196,7 +6250,7 @@ mod tests {
         reduce_only: ReduceOnly,
     ) {
         send_in_flight(state, cid, reduce_only);
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(Open::new(
                 VenueOrderId::Assigned(exchange_id.clone()),
@@ -6212,7 +6266,7 @@ mod tests {
         cid: &ClientOrderId,
         reduce_only: ReduceOnly,
     ) {
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
@@ -6466,7 +6520,7 @@ mod tests {
         let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
         let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
         send_in_flight(&mut state, &cid, ReduceOnly::Position);
-        state.update_from_order_snapshot(Snapshot(&order(
+        state.update_from_state_only_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::fully_filled(Filled::new(exchange_id.clone(), TIME, dec!(1), None)),
         )));
@@ -6699,7 +6753,7 @@ mod tests {
         );
         assert_eq!(state.pending_fills.len(), 1);
 
-        let applied = state.update_from_order_snapshot(Snapshot(&order(
+        let applied = state.update_from_state_only_snapshot(Snapshot(&order(
             cid,
             OrderState::active(Open::new(
                 VenueOrderId::Assigned(exchange_id),

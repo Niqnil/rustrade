@@ -21,7 +21,12 @@ use crate::{
                 ExpiryHandling, FillsApplied, LongOptionExpiry, OptionSplitPlan, ReduceOnlyCapped,
                 data::InstrumentDataState, filter::InstrumentFilter,
             },
-            order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
+            order::{
+                Orders,
+                in_flight_recorder::InFlightRequestRecorder,
+                manager::OrderManager,
+                terms::{OrderTermsChanged, OrderTermsDiverged},
+            },
             position::{
                 EngineCheckpoint, Position, PositionDrift, PositionExited, PositionId,
                 SplitRoundingPolicy, TradeOutcome,
@@ -536,12 +541,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 }
             }
             AccountStreamEvent::Item(event) => {
-                // Never taken for a snapshot, whose arm yields no exit, so the drift check below
-                // always runs for one.
                 let applied = self.state.update_from_account(event);
-                if !applied.is_empty() {
-                    return UpdateFromAccountOutput::FillsApplied(applied);
-                }
                 if let AccountEventKind::VenueCheckpoint(venue) = &event.kind {
                     // Every account event the venue sent before this one is applied, so the
                     // engine's positions are those the venue's snapshot holds.
@@ -551,10 +551,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     )));
                 }
                 let AccountEventKind::Snapshot(snapshot) = &event.kind else {
-                    return UpdateFromAccountOutput::None;
+                    return if applied.is_empty() {
+                        UpdateFromAccountOutput::None
+                    } else {
+                        UpdateFromAccountOutput::FillsApplied(applied)
+                    };
                 };
                 let drift = self.state.position_drift(snapshot);
-                if drift.is_empty() {
+                if drift.is_empty() && applied.is_empty() {
                     return UpdateFromAccountOutput::None;
                 }
                 for drift in &drift {
@@ -566,7 +570,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                         "venue account snapshot reports a different position than the engine holds"
                     );
                 }
-                UpdateFromAccountOutput::PositionDrift(drift)
+                UpdateFromAccountOutput::AccountSnapshot { drift, applied }
             }
         }
     }
@@ -2047,6 +2051,29 @@ pub enum EngineOutput<
     /// between them, and what to do, is the caller's.
     PositionDrift(PositionDrift<InstrumentKey>),
 
+    /// A venue reported terms for an order the engine tracks that differ from those it tracked,
+    /// and the engine adopted them: the order changed at the venue, other than by an amend the
+    /// engine sent. See [`OrderTermsChanged`] and
+    /// [`OrderManager::update_from_order_snapshot`] for what is adopted.
+    ///
+    /// Only terms the report says the venue stated
+    /// ([`ReportedTerms`](rustrade_execution::order::report::ReportedTerms)) are read, so a venue
+    /// whose reports state none never produces this. Emitted for the account event carrying the
+    /// report, an order snapshot or an account snapshot, before any other output of that event.
+    ///
+    /// **Boxed**, because it carries the order's terms twice and is rare.
+    OrderTermsChanged(Box<OrderTermsChanged<ExchangeKey, InstrumentKey>>),
+
+    /// A venue reported terms for an order the engine tracks that the engine did not adopt: a
+    /// change of kind or time in force, or terms matching neither side of an amend in flight. The
+    /// engine goes on tracking the order on its own terms. See [`OrderTermsDiverged`].
+    ///
+    /// Emitted after any [`OrderTermsChanged`](Self::OrderTermsChanged) of the same report. What to
+    /// do (look the order up, cancel it, carry on) is the caller's.
+    ///
+    /// **Boxed**, as [`OrderTermsChanged`](Self::OrderTermsChanged).
+    OrderTermsDiverged(Box<OrderTermsDiverged<ExchangeKey, InstrumentKey>>),
+
     /// A simulated venue's checkpoint reached the engine, and this is the engine's answer: the
     /// venue's state and the engine's positions on that venue, at the same point in the account
     /// stream. See [`EngineCheckpoint`] for how to restore both from it.
@@ -2303,8 +2330,12 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     None,
     OnDisconnect(OnDisconnect),
 
-    /// The event's fills closed a position, the engine cut a reduce-only fill, or it valued a
-    /// third-asset fee. Never empty. Each becomes an [`EngineOutput`]:
+    /// The event's fills closed a position, the engine cut a reduce-only fill, it valued a
+    /// third-asset fee, or the event's order report changed an order's terms or left them
+    /// diverged. Never empty, and never for an account snapshot, which is
+    /// [`AccountSnapshot`](Self::AccountSnapshot). Each becomes an [`EngineOutput`]:
+    /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged) and
+    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged), then
     /// [`FeeConversion`](EngineOutput::FeeConversion), then
     /// [`ReduceOnlyCapped`](EngineOutput::ReduceOnlyCapped) for each cut, then
     /// [`PositionExit`](EngineOutput::PositionExit).
@@ -2314,9 +2345,21 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     /// `on_disconnect` was **not** called. See [`UntrackedExchange`].
     UntrackedExchange(UntrackedExchange),
 
-    /// An account snapshot reported positions that differ from the engine's, one per instrument.
-    /// See [`EngineOutput::PositionDrift`].
-    PositionDrift(Vec<PositionDrift<InstrumentKey>>),
+    /// An account snapshot reported positions that differ from the engine's, or orders whose
+    /// terms the engine adopted or left diverged. Never both empty.
+    ///
+    /// `applied` carries only the snapshot's order terms: a position a replayed fill closed while
+    /// the snapshot was applied is not reported. Each becomes an [`EngineOutput`]:
+    /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged) and
+    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged) for each order, then
+    /// [`PositionDrift`](EngineOutput::PositionDrift) for each instrument.
+    AccountSnapshot {
+        /// The positions that differ from the engine's, one per instrument. See
+        /// [`EngineOutput::PositionDrift`].
+        drift: Vec<PositionDrift<InstrumentKey>>,
+        /// The order terms the snapshot changed or left diverged.
+        applied: FillsApplied<AssetIndex, InstrumentKey>,
+    },
 
     /// A simulated venue's checkpoint, answered with the engine's positions. See
     /// [`EngineOutput::Checkpoint`].

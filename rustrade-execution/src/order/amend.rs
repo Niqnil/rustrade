@@ -138,6 +138,9 @@ pub struct AmendTarget {
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub kind: OrderKind,
+    /// [`TimeInForce::Unreported`] when the venue never stated it, for an order the engine
+    /// adopted from a report that did not. A client that sends the whole order again must not
+    /// send that stand-in: read it with [`AmendTarget::known_time_in_force`].
     pub time_in_force: TimeInForce,
     /// As the order was opened with: see [`RequestOpen::reduce_only`](super::request::RequestOpen::reduce_only).
     ///
@@ -157,6 +160,18 @@ impl AmendTarget {
     /// again without it could turn a reduce-only order into one that opens a position.
     pub fn known_reduce_only(&self) -> Result<ReduceOnly, AmendRefusal> {
         self.reduce_only.ok_or(AmendRefusal::ReduceOnlyUnknown)
+    }
+
+    /// The order's time in force, for a client that must send it again with the amend.
+    ///
+    /// # Errors
+    /// [`AmendRefusal::TimeInForceUnknown`] when it is [`TimeInForce::Unreported`]: the venue
+    /// never stated it, and every client refuses to send that stand-in.
+    pub fn known_time_in_force(&self) -> Result<TimeInForce, AmendRefusal> {
+        match self.time_in_force {
+            TimeInForce::Unreported => Err(AmendRefusal::TimeInForceUnknown),
+            time_in_force => Ok(time_in_force),
+        }
     }
 }
 
@@ -450,6 +465,22 @@ mod tests {
             current,
             dec!(0),
         )
+    }
+
+    #[test]
+    fn a_time_in_force_the_venue_never_stated_is_not_known() {
+        assert_eq!(
+            limit().known_time_in_force(),
+            Ok(TimeInForce::GoodUntilCancelled { post_only: false })
+        );
+        let unreported = AmendTarget {
+            time_in_force: TimeInForce::Unreported,
+            ..limit()
+        };
+        assert_eq!(
+            unreported.known_time_in_force(),
+            Err(AmendRefusal::TimeInForceUnknown)
+        );
     }
 
     #[test]
