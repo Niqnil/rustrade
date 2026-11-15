@@ -593,15 +593,18 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         .asset_index_mut(&balance.asset)
                         .update_from_balance(Snapshot(balance))
                 }
+                let mut applied = FillsApplied::default();
                 for instrument in &snapshot.instruments {
                     let instrument_state = self
                         .instruments
                         .instrument_index_mut(&instrument.instrument);
 
-                    instrument_state.update_from_account_snapshot(instrument);
+                    applied
+                        .terms
+                        .extend(instrument_state.update_from_account_snapshot(instrument));
                     instrument_state.data.process(event);
                 }
-                FillsApplied::default()
+                applied
             }
             AccountEventKind::BalanceSnapshot(balance) => {
                 self.assets
@@ -624,9 +627,8 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 // race in OmsMode::Hedging). update_from_trade side effects (tearsheet,
                 // position removal) are correct regardless; this ensures the output event
                 // also reaches EngineOutput::PositionExit consumers.
-                // Only the report's order is read: no term it states is adopted yet.
-                let applied = instrument_state
-                    .replay_order_snapshot(Snapshot(&order.value().order), reduce_only_fills);
+                let applied =
+                    instrument_state.replay_order_snapshot(order.as_ref(), reduce_only_fills);
                 instrument_state.data.process(event);
                 applied
             }

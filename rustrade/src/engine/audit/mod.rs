@@ -2,10 +2,12 @@ use crate::{
     engine::{
         Engine, EngineOutput, UpdateFromAccountOutput, UpdateFromMarketOutput,
         audit::context::EngineContext, clock::EngineClock, error::UnrecoverableEngineError,
+        state::order::terms::OrderTermsApplied,
     },
     strategy::{on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled},
 };
 use derive_more::Constructor;
+use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::{FeedEnded, Terminal, collection::none_one_or_many::NoneOneOrMany};
 use serde::{Deserialize, Serialize};
 
@@ -251,10 +253,8 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::OnDisconnect(disconnect) => {
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
-            UpdateFromAccountOutput::FillsApplied(applied) => applied
-                .fee_conversion
-                .map(EngineOutput::FeeConversion)
-                .into_iter()
+            UpdateFromAccountOutput::FillsApplied(applied) => term_outputs(applied.terms)
+                .chain(applied.fee_conversion.map(EngineOutput::FeeConversion))
                 .chain(
                     applied
                         .capped
@@ -272,10 +272,10 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::UntrackedExchange(untracked) => {
                 Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
-            UpdateFromAccountOutput::PositionDrift(drift) => drift
-                .into_iter()
-                .fold(Self::with_event(event), |audit, drift| {
-                    audit.add_output(EngineOutput::PositionDrift(drift))
+            UpdateFromAccountOutput::AccountSnapshot { drift, terms } => term_outputs(terms)
+                .chain(drift.into_iter().map(EngineOutput::PositionDrift))
+                .fold(Self::with_event(event), |audit, output| {
+                    audit.add_output(output)
                 }),
             UpdateFromAccountOutput::Checkpoint(checkpoint) => {
                 Self::with_output(event, EngineOutput::Checkpoint(checkpoint))
@@ -345,6 +345,24 @@ impl<Event, Output> ProcessAudit<Event, Output> {
         self.shutdown = true;
         self
     }
+}
+
+/// The outputs for `terms`: an [`EngineOutput::OrderTermsChanged`] per order changed, then an
+/// [`EngineOutput::OrderTermsDiverged`] per order diverged.
+fn term_outputs<OnTradingDisabled, OnDisconnect>(
+    terms: OrderTermsApplied<ExchangeIndex, InstrumentIndex>,
+) -> impl Iterator<Item = EngineOutput<OnTradingDisabled, OnDisconnect>> {
+    let OrderTermsApplied {
+        changed, diverged, ..
+    } = terms;
+    changed
+        .into_iter()
+        .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed)))
+        .chain(
+            diverged
+                .into_iter()
+                .map(|diverged| EngineOutput::OrderTermsDiverged(Box::new(diverged))),
+        )
 }
 
 impl<Event, Output> From<ProcessAudit<Event, Output>> for EngineAudit<Event, Output> {

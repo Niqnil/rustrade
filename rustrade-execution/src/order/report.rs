@@ -60,6 +60,22 @@ impl ReportedTerms {
         time_in_force: true,
     };
 
+    /// Whether no term is stated.
+    pub const fn is_none(self) -> bool {
+        !self.quantity && !self.price && !self.kind && !self.time_in_force
+    }
+
+    /// The terms stated in either `self` or `other`.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            quantity: self.quantity || other.quantity,
+            price: self.price || other.price,
+            kind: self.kind || other.kind,
+            time_in_force: self.time_in_force || other.time_in_force,
+        }
+    }
+
     /// These terms with [`quantity`](Self::quantity) set to `reported`.
     #[must_use]
     pub const fn with_quantity(self, reported: bool) -> Self {
@@ -233,6 +249,27 @@ mod tests {
                 .with_kind(false)
                 .with_time_in_force(false),
             ReportedTerms::NONE
+        );
+    }
+
+    #[test]
+    fn test_union_and_is_none() {
+        assert!(ReportedTerms::NONE.is_none());
+        let none = ReportedTerms::NONE;
+        for one in [
+            none.with_quantity(true),
+            none.with_price(true),
+            none.with_kind(true),
+            none.with_time_in_force(true),
+        ] {
+            assert!(!one.is_none(), "{one:?}");
+            assert_eq!(none.union(one), one);
+            assert_eq!(one.union(none), one);
+            assert_eq!(one.union(ReportedTerms::ALL), ReportedTerms::ALL);
+        }
+        assert_eq!(
+            none.with_quantity(true).union(none.with_kind(true)),
+            none.with_quantity(true).with_kind(true)
         );
     }
 

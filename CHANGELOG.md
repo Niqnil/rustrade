@@ -367,6 +367,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for orders between the check and expiry; one exercise's proceeds do not fund another.
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
 
+- **The engine tracks an order on the terms the venue states for it, and reports a change**
+  (`rustrade`). An order changed at the venue other than by the engine's own amend (in the
+  venue's interface, by another API client, or by the venue) was tracked on its old terms: its
+  remaining quantity was counted against the wrong total, an order resized to what filled was not
+  retired, and the next amend was built from stale values.
+  - **What is adopted**, and only where the report's `ReportedTerms` say the venue stated it: the
+    total quantity; the limit price of a kind with a fixed one; the trigger of a stop or
+    take-profit, within the same kind; and the venue's kind or time in force for an order tracked
+    with the stand-in `OrderKind::ConditionalUnresolved` (of the same family, bringing its limit
+    price with it) or `TimeInForce::Unreported`. A trailing order's moving stop, or a restated
+    activation price, is no change.
+  - **What is not:** a change of kind or time in force, of a trailing order's offsets, or a limit
+    price reported gone. The engine keeps its terms and reports the difference.
+  - **When:** from the venue's first report of an order whose open is in flight; from a report
+    superseding the working state held, unless stamped earlier than it; and behind a cancel in
+    flight, where the order is not retired, since the cancel's answer ends it (a refused cancel
+    retires an order the adopted terms left nothing to fill). Nothing is adopted while an amend is
+    in flight: the amend's answer settles the terms.
+  - **New outputs:** `EngineOutput::OrderTermsChanged` (`key`, `from`, `to`) for terms adopted,
+    and `EngineOutput::OrderTermsDiverged` (`key`, `tracked`, `reported`, `terms`,
+    `amend_in_flight`) for terms not adopted, including terms matching neither side of an amend in
+    flight. Both are emitted for an order snapshot and for an account snapshot, ahead of that
+    event's other outputs. A divergence that persists is reported again with each report stating
+    the term. Their types, `OrderTerms` and `OrderTermsApplied` (the changes and divergences of one
+    or more reports) are in `engine::state::order::terms`.
+  - **New `ReportedTerms::union` and `ReportedTerms::is_none`** (`rustrade-execution`).
+  - **New `AmendTarget::known_time_in_force`** (`rustrade-execution`), refusing with
+    `AmendRefusal::TimeInForceUnknown` for an order whose time in force the venue never stated, for
+    a client that must send the whole order again to amend it.
+
 - **A test hook to change a resting order on the simulated venue from outside any client**
   (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
   change made in the venue's own interface would, and reports it only on the account stream, for a
@@ -379,6 +409,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed
+- **Breaking: the engine's order snapshot path takes the whole report and returns what it did**
+  (`rustrade`).
+  - `OrderManager::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` and returns a
+    `SnapshotApplied` (whether it retired the order, and the `OrderTermsApplied` it changed or
+    left diverged). `InstrumentState::update_from_order_snapshot` takes a `Snapshot<&OrderReport>`
+    too, and `InstrumentState::update_from_account_snapshot` returns the `OrderTermsApplied` of its
+    reports.
+  - `FillsApplied` gains a `terms` field (an `OrderTermsApplied`, defaulting when deserialised)
+    and a third type parameter, `ExchangeKey`, defaulting to `ExchangeIndex`.
+  - `UpdateFromAccountOutput::PositionDrift(drift)` is replaced by
+    `UpdateFromAccountOutput::AccountSnapshot { drift, terms }`, which carries the snapshot's
+    order terms alongside its position drift.
+  - **An order is retired against the quantity tracked, not the snapshot's.** A snapshot that
+    does not state its quantity no longer retires an order on a quantity that may be an echo of
+    the placement. Every arm now retires at or below zero remaining, so an order reported filled
+    beyond its quantity is retired (with a warning) rather than kept. While an amend is in flight,
+    an order is retired only once nothing is left of the greater of its quantity and the amend's.
+  - `OrderKind::is_conditional_unresolved` is public (`rustrade-execution`).
 - **Breaking: `MockExecutionConfig` is built with `new` and `with_*` setters** (`rustrade-execution`,
   #921). Adding a setting no longer breaks every caller.
   - It is `#[non_exhaustive]`: outside `rustrade-execution`, a struct literal (including one with
@@ -560,9 +608,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The simulated venue states every term** of each order it reports, in snapshots and its
     account snapshot alike, since its own book is where the terms live.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
-    reads only each report's order, as before.
+    adopts the terms a report states (see Added, "The engine tracks an order on the terms the
+    venue states").
 
 ### Fixed
+
+- **A completed order keeps its fill routing when it had an amend or a cancel in flight**
+  (`rustrade`). A snapshot completing an order restores its live routing for a fill reported
+  after it, but only did so for an order tracked `Open`; one completed with a request in flight
+  left a late fill to the bounded fallback for retired orders.
 
 - **The simulated venue answers a market order with no price** (`rustrade-execution`). A market
   order's price is ignored, but its answer, and its record once filled or cancelled, carried the

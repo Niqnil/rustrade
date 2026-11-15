@@ -1,8 +1,9 @@
-use crate::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
+use crate::engine::state::order::{SnapshotApplied, in_flight_recorder::InFlightRequestRecorder};
 use rustrade_execution::order::{
     Order,
+    report::OrderReport,
     request::{OrderResponseAmend, OrderResponseCancel},
-    state::{ActiveOrderState, OrderState},
+    state::ActiveOrderState,
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use std::fmt::Debug;
@@ -55,10 +56,41 @@ where
     /// the venue supplies one; see its own documentation for what a creation stamp costs here. The
     /// fill invariant narrows that cost, it does not remove it: it cannot order two snapshots that
     /// report the same cumulative fill, which is every snapshot of an order resting unfilled.
+    ///
+    /// # Terms
+    ///
+    /// The order's price, quantity, kind and time in force are taken from a snapshot only as far
+    /// as its [`ReportedTerms`](rustrade_execution::order::report::ReportedTerms) say the venue
+    /// stated them, under the rules in [`terms`](super::terms): a new quantity, a fixed limit
+    /// price, or a fixed trigger within the same kind, and the venue's value for a stand-in the
+    /// order holds. A change of kind or time in force is not adopted but reported as diverged.
+    /// A term the snapshot does not state is never read, so retirement is decided against the
+    /// quantity tracked once the snapshot's terms are applied.
+    ///
+    /// Terms are adopted:
+    /// - from the venue's first report of an order whose open is in flight;
+    /// - from a snapshot superseding the `Open` state held, unless it is stamped earlier than that
+    ///   state: one admitted for a higher fill alone may predate a change already applied;
+    /// - likewise behind a cancel in flight, though the order is not retired there: the cancel's
+    ///   answer ends it.
+    ///
+    /// While an amend is in flight nothing is adopted, since the amend's answer settles the
+    /// terms. The order is retired only once nothing is left of the greater of its quantity and
+    /// the amend's, and a snapshot stating terms that match neither the order before the amend nor
+    /// after it is reported as diverged.
+    ///
+    /// An order is retired when a superseding snapshot leaves it nothing to fill, including one
+    /// that reports more filled than its quantity, which is also warned of.
+    ///
+    /// An untracked order is tracked on the snapshot's terms as they stand, stated or not.
+    ///
+    /// Returns what the snapshot did: whether it retired the order, and the terms it changed or
+    /// left diverged.
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
-        snapshot: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
-    ) where
+        snapshot: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
+    ) -> SnapshotApplied<ExchangeKey, InstrumentKey>
+    where
         AssetKey: Debug + Clone;
 
     fn update_from_cancel_response<AssetKey>(

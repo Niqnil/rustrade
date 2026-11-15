@@ -682,6 +682,11 @@ pub enum AmendRefusal {
     #[error("the order's reduce-only flag is not known, and the amend would have to send it")]
     ReduceOnlyUnknown,
 
+    /// The client sends the whole order again to amend it, and the order's time in force is not
+    /// known: see [`AmendTarget::known_time_in_force`](crate::order::amend::AmendTarget::known_time_in_force).
+    #[error("the order's time in force is not known, and the amend would have to send it")]
+    TimeInForceUnknown,
+
     /// The order is not tracked as working: unknown, or ended.
     #[error("the order is not tracked")]
     Untracked,

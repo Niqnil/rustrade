@@ -383,7 +383,7 @@ pub enum OrderKind {
 impl OrderKind {
     /// Whether this is an [`OrderKind::ConditionalUnresolved`], which leaves open whether the
     /// order trails.
-    pub(crate) fn is_conditional_unresolved(&self) -> bool {
+    pub fn is_conditional_unresolved(&self) -> bool {
         matches!(self, Self::ConditionalUnresolved { .. })
     }
 }

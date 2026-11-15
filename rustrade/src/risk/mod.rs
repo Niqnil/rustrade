@@ -158,7 +158,9 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     /// An order whose reduce-only flag is not known
     /// ([`AmendTarget::reduce_only`](rustrade_execution::order::amend::AmendTarget::reduce_only)
     /// is `None`) is projected as [`ReduceOnly::No`]: an open that may add exposure, the cautious
-    /// reading.
+    /// reading. An order whose time in force the venue never stated is projected with
+    /// [`TimeInForce::Unreported`](rustrade_execution::order::TimeInForce::Unreported), so a check
+    /// that reads the time in force sees that stand-in.
     fn check_amends(
         &self,
         state: &Self::State,
