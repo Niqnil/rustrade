@@ -375,20 +375,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **What is adopted**, and only where the report's `ReportedTerms` say the venue stated it: the
     total quantity; the limit price of a kind with a fixed one; the trigger of a stop or
     take-profit, within the same kind; and the venue's kind or time in force for an order tracked
-    with the stand-in `OrderKind::ConditionalUnresolved` (of the same family) or
-    `TimeInForce::Unreported`. A trailing order's moving stop, or a restated activation price, is
-    no change.
+    with the stand-in `OrderKind::ConditionalUnresolved` (of the same family, bringing its limit
+    price with it) or `TimeInForce::Unreported`. A trailing order's moving stop, or a restated
+    activation price, is no change.
   - **What is not:** a change of kind or time in force, of a trailing order's offsets, or a limit
     price reported gone. The engine keeps its terms and reports the difference.
   - **When:** from the venue's first report of an order whose open is in flight; from a report
     superseding the working state held, unless stamped earlier than it; and behind a cancel in
-    flight, where the order is not retired, since the cancel's answer ends it. Nothing is adopted
-    while an amend is in flight: the amend's answer settles the terms.
+    flight, where the order is not retired, since the cancel's answer ends it (a refused cancel
+    retires an order the adopted terms left nothing to fill). Nothing is adopted while an amend is
+    in flight: the amend's answer settles the terms.
   - **New outputs:** `EngineOutput::OrderTermsChanged` (`key`, `from`, `to`) for terms adopted,
     and `EngineOutput::OrderTermsDiverged` (`key`, `tracked`, `reported`, `terms`,
     `amend_in_flight`) for terms not adopted, including terms matching neither side of an amend in
     flight. Both are emitted for an order snapshot and for an account snapshot, ahead of that
-    event's other outputs. Their types, and `OrderTerms`, are in `engine::state::order::terms`.
+    event's other outputs. A divergence that persists is reported again with each report stating
+    the term. Their types, `OrderTerms` and `OrderTermsApplied` (the changes and divergences of one
+    or more reports) are in `engine::state::order::terms`.
+  - **New `ReportedTerms::union` and `ReportedTerms::is_none`** (`rustrade-execution`).
   - **New `AmendTarget::known_time_in_force`** (`rustrade-execution`), refusing with
     `AmendRefusal::TimeInForceUnknown` for an order whose time in force the venue never stated, for
     a client that must send the whole order again to amend it.
@@ -408,14 +412,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: the engine's order snapshot path takes the whole report and returns what it did**
   (`rustrade`).
   - `OrderManager::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` and returns a
-    `SnapshotApplied` (whether it retired the order, and the terms it changed or left diverged).
-    `InstrumentState::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` too, and
-    `InstrumentState::update_from_account_snapshot` returns the terms its reports changed.
-  - `FillsApplied` gains `terms_changed` and `terms_diverged`, and a third type parameter,
-    `ExchangeKey`, defaulting to `ExchangeIndex`. It is `#[non_exhaustive]` and its fields default
-    when deserialised.
+    `SnapshotApplied` (whether it retired the order, and the `OrderTermsApplied` it changed or
+    left diverged). `InstrumentState::update_from_order_snapshot` takes a `Snapshot<&OrderReport>`
+    too, and `InstrumentState::update_from_account_snapshot` returns the `OrderTermsApplied` of its
+    reports.
+  - `FillsApplied` gains a `terms` field (an `OrderTermsApplied`, defaulting when deserialised)
+    and a third type parameter, `ExchangeKey`, defaulting to `ExchangeIndex`.
   - `UpdateFromAccountOutput::PositionDrift(drift)` is replaced by
-    `UpdateFromAccountOutput::AccountSnapshot { drift, applied }`, which carries the snapshot's
+    `UpdateFromAccountOutput::AccountSnapshot { drift, terms }`, which carries the snapshot's
     order terms alongside its position drift.
   - **An order is retired against the quantity tracked, not the snapshot's.** A snapshot that
     does not state its quantity no longer retires an order on a quantity that may be an echo of

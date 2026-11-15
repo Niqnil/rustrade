@@ -106,6 +106,11 @@ pub struct OrderTermsChanged<ExchangeKey, InstrumentKey> {
 ///   the amend nor after it. The engine adopts nothing from a report while an amend is in flight:
 ///   the amend's answer settles the terms.
 ///
+/// The engine keeps no record of a divergence it has reported, so a divergence that persists is
+/// reported again for every report that states the term, an account snapshot listing the order
+/// included. A consumer acting on it once deduplicates on [`key`](Self::key) and
+/// [`reported`](Self::reported).
+///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
@@ -120,6 +125,44 @@ pub struct OrderTermsDiverged<ExchangeKey, InstrumentKey> {
     pub terms: ReportedTerms,
     /// Whether an amend was in flight when the report arrived.
     pub amend_in_flight: bool,
+}
+
+/// The terms order reports changed, and those they stated that the engine did not adopt: what
+/// applying one or more order reports did to the orders' terms.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Each field defaults
+/// when deserialised, through a path, so that the key types need no `Default`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct OrderTermsApplied<ExchangeKey, InstrumentKey> {
+    /// The terms adopted, one per order changed.
+    #[serde(default = "Vec::new")]
+    pub changed: Vec<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
+    /// The terms not adopted, one per order whose report stated them.
+    #[serde(default = "Vec::new")]
+    pub diverged: Vec<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
+}
+
+impl<ExchangeKey, InstrumentKey> Default for OrderTermsApplied<ExchangeKey, InstrumentKey> {
+    fn default() -> Self {
+        Self {
+            changed: Vec::new(),
+            diverged: Vec::new(),
+        }
+    }
+}
+
+impl<ExchangeKey, InstrumentKey> OrderTermsApplied<ExchangeKey, InstrumentKey> {
+    /// Whether no order's terms were changed or left diverged.
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.diverged.is_empty()
+    }
+
+    /// Append what `other` applied, after what this holds.
+    pub fn extend(&mut self, other: Self) {
+        self.changed.extend(other.changed);
+        self.diverged.extend(other.diverged);
+    }
 }
 
 /// What the engine takes from a report: the terms to track, and those left diverged.
@@ -170,7 +213,7 @@ pub(crate) fn reconcile(
 
     Reconciled {
         terms: *tracked,
-        diverged: union(adopted.diverged, in_flight),
+        diverged: adopted.diverged.union(in_flight),
     }
 }
 
@@ -306,15 +349,17 @@ fn family_of(kind: &OrderKind) -> Option<ConditionalFamily> {
 /// Whether `kind` carries a limit price fixed when the order is placed, which a venue can change.
 ///
 /// A [`TrailingStopLimit`](OrderKind::TrailingStopLimit)'s limit follows its stop, so it has none.
+/// Nor, for this purpose, does a stand-in
+/// [`ConditionalUnresolved`](OrderKind::ConditionalUnresolved): a family with a limit includes a
+/// trailing stop-limit, so its price is read only once a report resolves the kind.
 fn has_fixed_limit(kind: &OrderKind) -> bool {
-    match kind {
+    matches!(
+        kind,
         OrderKind::Limit
-        | OrderKind::StopLimit { .. }
-        | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. } => true,
-        OrderKind::ConditionalUnresolved { family, .. } => family.has_limit_price(),
-        _ => false,
-    }
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfitLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. }
+    )
 }
 
 /// `terms` with `patch` applied, field by field, without [`AmendPatch::apply`]'s checks: what the
@@ -339,15 +384,6 @@ fn amended(terms: &OrderTerms, patch: &AmendPatch) -> OrderTerms {
         kind,
         time_in_force: terms.time_in_force,
     }
-}
-
-/// The terms either set names.
-fn union(a: ReportedTerms, b: ReportedTerms) -> ReportedTerms {
-    ReportedTerms::NONE
-        .with_quantity(a.quantity || b.quantity)
-        .with_price(a.price || b.price)
-        .with_kind(a.kind || b.kind)
-        .with_time_in_force(a.time_in_force || b.time_in_force)
 }
 
 #[cfg(test)]
@@ -636,12 +672,10 @@ mod tests {
         }
     }
 
-    /// A stand-in kind still says whether the order has a limit, so a price stated without the
-    /// kind is read for a family with one and ignored for a family without.
+    /// A stand-in kind's family with a limit includes a trailing stop-limit, whose limit moves,
+    /// so a price stated without resolving the kind is not read.
     #[test]
-    fn a_stand_in_kinds_limit_is_read_by_its_family() {
-        let stated = ReportedTerms::NONE.with_price(true);
-
+    fn a_stand_in_kinds_price_is_read_only_once_its_kind_is_resolved() {
         let tracked = terms(
             Some(dec!(80)),
             dec!(2),
@@ -652,17 +686,14 @@ mod tests {
             dec!(2),
             unresolved(ConditionalFamily::StopLimit),
         );
-        assert_eq!(
-            reconcile(&tracked, &reported, stated, None),
-            adopted(reported)
-        );
 
-        let tracked = terms(Some(dec!(80)), dec!(2), unresolved(ConditionalFamily::Stop));
-        let reported = terms(Some(dec!(81)), dec!(2), unresolved(ConditionalFamily::Stop));
-        assert_eq!(
-            reconcile(&tracked, &reported, stated, None),
-            adopted(tracked)
-        );
+        for stated in [ReportedTerms::NONE.with_price(true), ReportedTerms::ALL] {
+            assert_eq!(
+                reconcile(&tracked, &reported, stated, None),
+                adopted(tracked),
+                "{stated:?}"
+            );
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::{
                 Orders,
                 in_flight_recorder::InFlightRequestRecorder,
                 manager::OrderManager,
-                terms::{OrderTermsChanged, OrderTermsDiverged},
+                terms::{OrderTermsApplied, OrderTermsChanged, OrderTermsDiverged},
             },
             position::{
                 EngineCheckpoint, Position, PositionDrift, PositionExited, PositionId,
@@ -570,7 +570,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                         "venue account snapshot reports a different position than the engine holds"
                     );
                 }
-                UpdateFromAccountOutput::AccountSnapshot { drift, applied }
+                UpdateFromAccountOutput::AccountSnapshot {
+                    drift,
+                    terms: applied.terms,
+                }
             }
         }
     }
@@ -2348,8 +2351,8 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     /// An account snapshot reported positions that differ from the engine's, or orders whose
     /// terms the engine adopted or left diverged. Never both empty.
     ///
-    /// `applied` carries only the snapshot's order terms: a position a replayed fill closed while
-    /// the snapshot was applied is not reported. Each becomes an [`EngineOutput`]:
+    /// A position a replayed fill closed while the snapshot was applied is not reported. Each
+    /// becomes an [`EngineOutput`]:
     /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged) and
     /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged) for each order, then
     /// [`PositionDrift`](EngineOutput::PositionDrift) for each instrument.
@@ -2358,7 +2361,7 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
         /// [`EngineOutput::PositionDrift`].
         drift: Vec<PositionDrift<InstrumentKey>>,
         /// The order terms the snapshot changed or left diverged.
-        applied: FillsApplied<AssetIndex, InstrumentKey>,
+        terms: OrderTermsApplied<ExchangeIndex, InstrumentKey>,
     },
 
     /// A simulated venue's checkpoint, answered with the engine's positions. See

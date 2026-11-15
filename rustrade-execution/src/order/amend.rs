@@ -139,8 +139,8 @@ pub struct AmendTarget {
     pub quantity: Decimal,
     pub kind: OrderKind,
     /// [`TimeInForce::Unreported`] when the venue never stated it, for an order the engine
-    /// adopted from a report that did not. A client that sends the whole order again must not
-    /// send that stand-in: read it with [`AmendTarget::known_time_in_force`].
+    /// adopted from a report that did not. A client that sends the whole order again to amend it
+    /// must read it with [`AmendTarget::known_time_in_force`], which refuses that stand-in.
     pub time_in_force: TimeInForce,
     /// As the order was opened with: see [`RequestOpen::reduce_only`](super::request::RequestOpen::reduce_only).
     ///
@@ -166,7 +166,7 @@ impl AmendTarget {
     ///
     /// # Errors
     /// [`AmendRefusal::TimeInForceUnknown`] when it is [`TimeInForce::Unreported`]: the venue
-    /// never stated it, and every client refuses to send that stand-in.
+    /// never stated it, and that stand-in is never sent to a venue.
     pub fn known_time_in_force(&self) -> Result<TimeInForce, AmendRefusal> {
         match self.time_in_force {
             TimeInForce::Unreported => Err(AmendRefusal::TimeInForceUnknown),

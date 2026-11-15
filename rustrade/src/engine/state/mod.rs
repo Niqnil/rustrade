@@ -599,9 +599,9 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         .instruments
                         .instrument_index_mut(&instrument.instrument);
 
-                    let terms = instrument_state.update_from_account_snapshot(instrument);
-                    applied.terms_changed.extend(terms.terms_changed);
-                    applied.terms_diverged.extend(terms.terms_diverged);
+                    applied
+                        .terms
+                        .extend(instrument_state.update_from_account_snapshot(instrument));
                     instrument_state.data.process(event);
                 }
                 applied

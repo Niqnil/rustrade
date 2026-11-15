@@ -1,7 +1,9 @@
 use crate::engine::state::order::{
     in_flight_recorder::InFlightRequestRecorder,
     manager::OrderManager,
-    terms::{OrderTerms, OrderTermsChanged, OrderTermsDiverged, Reconciled, reconcile},
+    terms::{
+        OrderTerms, OrderTermsApplied, OrderTermsChanged, OrderTermsDiverged, Reconciled, reconcile,
+    },
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
@@ -12,7 +14,7 @@ use rustrade_execution::{
         Order, OrderKey,
         amend::AmendPatch,
         id::{ClientOrderId, OrderId, VenueOrderId},
-        report::{OrderReport, ReportedTerms},
+        report::OrderReport,
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, OrderResponseAmend,
             OrderResponseCancel,
@@ -49,42 +51,28 @@ pub struct SnapshotApplied<ExchangeKey, InstrumentKey> {
     /// The snapshot ended the order, and it is no longer tracked: the caller owes the routing
     /// prune of any retirement.
     pub retired: bool,
-    /// The terms adopted from the snapshot, if it changed any.
-    pub changed: Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-    /// The terms the snapshot stated and the engine did not adopt, if any.
-    pub diverged: Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
+    /// The terms the snapshot changed, or stated and the engine did not adopt.
+    pub terms: OrderTermsApplied<ExchangeKey, InstrumentKey>,
 }
 
 impl<ExchangeKey, InstrumentKey> Default for SnapshotApplied<ExchangeKey, InstrumentKey> {
     fn default() -> Self {
-        Self {
-            retired: false,
-            changed: None,
-            diverged: None,
-        }
+        Self::working(OrderTermsApplied::default())
     }
 }
 
 impl<ExchangeKey, InstrumentKey> SnapshotApplied<ExchangeKey, InstrumentKey> {
-    fn working(
-        changed: Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-        diverged: Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
-    ) -> Self {
+    fn working(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
             retired: false,
-            changed,
-            diverged,
+            terms,
         }
     }
 
-    fn retired(
-        changed: Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-        diverged: Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
-    ) -> Self {
+    fn retired(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
             retired: true,
-            changed,
-            diverged,
+            terms,
         }
     }
 }
@@ -520,7 +508,7 @@ where
                     "OrderManager received inactive order snapshot for tracked order - removing"
                 );
                 self.1.insert(entry.remove().key.cid);
-                return SnapshotApplied::retired(None, None);
+                return SnapshotApplied::retired(OrderTermsApplied::default());
             }
 
             // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
@@ -550,13 +538,13 @@ where
                 );
                 // The venue's first report of the order: what it says of the terms is the first
                 // word the venue has given on them, so there is no earlier stamp to order against.
-                let (changed, diverged) = reconcile_terms(current_entry.get_mut(), report, None);
+                let terms = reconcile_terms(current_entry.get_mut(), report, None);
                 if nothing_left(&open, current_entry.get().quantity, &snapshot.key) {
                     self.1.insert(current_entry.remove().key.cid);
-                    return SnapshotApplied::retired(changed, diverged);
+                    return SnapshotApplied::retired(terms);
                 }
                 current_entry.get_mut().state = ActiveOrderState::Open(open);
-                SnapshotApplied::working(changed, diverged)
+                SnapshotApplied::working(terms)
             }
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::CancelInFlight(update)) => {
                 debug!(
@@ -607,10 +595,10 @@ where
                 if current.is_superseded_by(&open) {
                     // Terms are taken only from a report stamped no earlier than the state held: an
                     // earlier one admitted for its higher fill may predate a change already applied.
-                    let (changed, diverged) = if open.time_exchange >= current.time_exchange {
+                    let terms = if open.time_exchange >= current.time_exchange {
                         reconcile_terms(current_entry.get_mut(), report, None)
                     } else {
-                        (None, None)
+                        OrderTermsApplied::default()
                     };
 
                     // A venue may report a completed fill as an Open snapshot with nothing left to
@@ -634,7 +622,7 @@ where
                             "OrderManager removing an Open order a more recent snapshot reports as fully filled"
                         );
                         self.1.insert(current_entry.remove().key.cid);
-                        return SnapshotApplied::retired(changed, diverged);
+                        return SnapshotApplied::retired(terms);
                     }
 
                     debug!(
@@ -646,7 +634,7 @@ where
                         "OrderManager updating an Open order from a more recent snapshot"
                     );
                     current_entry.get_mut().state = ActiveOrderState::Open(open);
-                    SnapshotApplied::working(changed, diverged)
+                    SnapshotApplied::working(terms)
                 } else {
                     debug!(
                         exchange = ?snapshot.key.exchange,
@@ -743,16 +731,16 @@ where
                     .as_ref()
                     .is_none_or(|current| update.time_exchange >= current.time_exchange);
                 let time_sent = current.time_sent;
-                let (changed, diverged) = if in_sequence {
+                let terms = if in_sequence {
                     reconcile_terms(current_entry.get_mut(), report, None)
                 } else {
-                    (None, None)
+                    OrderTermsApplied::default()
                 };
                 current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(update),
                     time_sent,
                 });
-                SnapshotApplied::working(changed, diverged)
+                SnapshotApplied::working(terms)
             }
             (ActiveOrderState::CancelInFlight(_), ActiveOrderState::CancelInFlight(_)) => {
                 warn!(
@@ -805,10 +793,10 @@ where
                 // Nothing is adopted while the amend is in flight: its answer settles the terms. A
                 // report matching neither the order before the amend nor after it is reported.
                 let patch = current.patch;
-                let (_, diverged) = if open.time_exchange >= current.order.time_exchange {
+                let terms = if open.time_exchange >= current.order.time_exchange {
                     reconcile_terms(current_entry.get_mut(), report, Some(&patch))
                 } else {
-                    (None, None)
+                    OrderTermsApplied::default()
                 };
                 // The venue may already have made a raise and filled beyond the old total, as in
                 // `update_from_fill`.
@@ -826,12 +814,12 @@ where
                         "OrderManager removing an AmendInFlight order a more recent snapshot reports as fully filled"
                     );
                     self.1.insert(current_entry.remove().key.cid);
-                    return SnapshotApplied::retired(None, diverged);
+                    return SnapshotApplied::retired(terms);
                 }
                 if let ActiveOrderState::AmendInFlight(amend) = &mut current_entry.get_mut().state {
                     amend.order = open;
                 }
-                SnapshotApplied::working(None, diverged)
+                SnapshotApplied::working(terms)
             }
             // A cancel supersedes the amend: the order is cancelled whatever the amend's answer.
             (
@@ -941,6 +929,20 @@ where
             (ActiveOrderState::CancelInFlight(in_flight_cancel), Err(error)) => {
                 // Expected, keep move to Open
                 if let Some(open) = &in_flight_cancel.order {
+                    // Terms adopted behind the cancel may have left the order nothing to fill,
+                    // which the cancel's answer was to settle. Refused, the order has ended.
+                    if nothing_left(open, order.get().quantity, &response.key) {
+                        debug!(
+                            exchange = ?response.key.exchange,
+                            instrument = ?response.key.instrument,
+                            strategy = %response.key.strategy,
+                            cid = %response.key.cid,
+                            ?error,
+                            "OrderManager received Err(Cancelled) for an order with nothing left to fill - removing"
+                        );
+                        self.1.insert(order.remove().key.cid);
+                        return;
+                    }
                     debug!(
                         exchange = ?response.key.exchange,
                         instrument = ?response.key.instrument,
@@ -1147,22 +1149,20 @@ fn reconcile_terms<ExchangeKey, AssetKey, InstrumentKey>(
     order: &mut Order<ExchangeKey, InstrumentKey, ActiveOrderState>,
     report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
     amend: Option<&AmendPatch>,
-) -> (
-    Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-    Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
-)
+) -> OrderTermsApplied<ExchangeKey, InstrumentKey>
 where
     ExchangeKey: Debug + Clone,
     InstrumentKey: Debug + Clone,
 {
-    if report.reported == ReportedTerms::NONE {
-        return (None, None);
+    let mut applied = OrderTermsApplied::default();
+    if report.reported.is_none() {
+        return applied;
     }
     let tracked = OrderTerms::of(order);
     let reported = OrderTerms::of(&report.order);
     let Reconciled { terms, diverged } = reconcile(&tracked, &reported, report.reported, amend);
 
-    let changed = (terms != tracked).then(|| {
+    if terms != tracked {
         terms.apply_to(order);
         info!(
             exchange = ?order.key.exchange,
@@ -1173,14 +1173,14 @@ where
             to = ?terms,
             "OrderManager adopted the terms a venue reported for an order it tracks"
         );
-        OrderTermsChanged {
+        applied.changed.push(OrderTermsChanged {
             key: order.key.clone(),
             from: tracked,
             to: terms,
-        }
-    });
+        });
+    }
 
-    let diverged = (diverged != ReportedTerms::NONE).then(|| {
+    if !diverged.is_none() {
         warn!(
             exchange = ?order.key.exchange,
             instrument = ?order.key.instrument,
@@ -1192,16 +1192,16 @@ where
             amend_in_flight = amend.is_some(),
             "OrderManager received terms for an order it tracks that it does not adopt"
         );
-        OrderTermsDiverged {
+        applied.diverged.push(OrderTermsDiverged {
             key: order.key.clone(),
             tracked: terms,
             reported,
             terms: diverged,
             amend_in_flight: amend.is_some(),
-        }
-    });
+        });
+    }
 
-    (changed, diverged)
+    applied
 }
 
 /// Whether `open` leaves nothing to fill of `quantity`, the order's total.
@@ -3538,6 +3538,7 @@ mod tests {
         use super::*;
         use rustrade_execution::order::{
             amend::{AmendPatch, AmendTarget, RequestAmend},
+            report::ReportedTerms,
             request::{OrderRequestAmend, ReduceOnly},
             state::AmendInFlight,
         };
@@ -3612,6 +3613,16 @@ mod tests {
             orders.0.get(&cid()).expect("tracked")
         }
 
+        fn terms_of(
+            changed: Option<OrderTermsChanged<ExchangeId, u64>>,
+            diverged: Option<OrderTermsDiverged<ExchangeId, u64>>,
+        ) -> OrderTermsApplied<ExchangeId, u64> {
+            OrderTermsApplied {
+                changed: changed.into_iter().collect(),
+                diverged: diverged.into_iter().collect(),
+            }
+        }
+
         /// A later report stating the order's terms changes them, says so, and the order's fills
         /// are then counted against the new total.
         #[test]
@@ -3624,10 +3635,10 @@ mod tests {
             );
             assert_eq!(
                 applied,
-                SnapshotApplied::working(
+                SnapshotApplied::working(terms_of(
                     changed(limit(dec!(1), dec!(1)), limit(dec!(2), dec!(3))),
                     None
-                )
+                ))
             );
             let order = tracked_order(&orders);
             assert_eq!((order.price, order.quantity), (Some(dec!(2)), dec!(3)));
@@ -3688,10 +3699,10 @@ mod tests {
                 );
                 assert_eq!(
                     applied,
-                    SnapshotApplied::retired(
+                    SnapshotApplied::retired(terms_of(
                         changed(limit(dec!(1), dec!(2)), limit(dec!(1), quantity)),
                         None
-                    ),
+                    )),
                     "{quantity}"
                 );
                 assert!(orders.0.is_empty(), "{quantity}");
@@ -3715,10 +3726,10 @@ mod tests {
             );
             assert_eq!(
                 applied,
-                SnapshotApplied::working(
+                SnapshotApplied::working(terms_of(
                     changed(limit(dec!(1), dec!(1)), limit(dec!(0.9), dec!(1))),
                     None
-                )
+                ))
             );
             assert_eq!(
                 tracked_order(&orders).state,
@@ -3746,10 +3757,10 @@ mod tests {
                 );
                 assert_eq!(
                     applied,
-                    SnapshotApplied::working(
+                    SnapshotApplied::working(terms_of(
                         changed(limit(dec!(1), dec!(1)), limit(dec!(1), dec!(0.5))),
                         None
-                    ),
+                    )),
                     "{held:?}"
                 );
                 assert_eq!(
@@ -3776,6 +3787,33 @@ mod tests {
             );
             assert_eq!(applied, SnapshotApplied::default());
             assert_eq!(tracked_order(&orders).quantity, dec!(1));
+        }
+
+        /// A cancel refused after terms adopted behind it left the order nothing to fill ends the
+        /// order, as a refused amend does, rather than restoring it as working.
+        #[test]
+        fn a_refused_cancel_retires_an_order_its_adopted_terms_left_nothing_to_fill() {
+            let mut orders = tracked(
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(
+                    Some(open_at(0, dec!(0.5))),
+                    TIME_SENT,
+                )),
+                dec!(1),
+            );
+            apply(
+                &mut orders,
+                &report(
+                    open_at(1, dec!(0.5)),
+                    dec!(1),
+                    dec!(0.5),
+                    ReportedTerms::ALL,
+                ),
+            );
+            assert_eq!(tracked_order(&orders).quantity, dec!(0.5));
+
+            orders.update_from_cancel_response(&response_cancel_err(cid()));
+            assert!(orders.0.is_empty());
+            assert!(orders.1.contains(&cid()));
         }
 
         /// While an amend is in flight nothing is adopted: a report of the order before or after
@@ -3819,7 +3857,7 @@ mod tests {
             );
             assert_eq!(
                 applied,
-                SnapshotApplied::working(
+                SnapshotApplied::working(terms_of(
                     None,
                     Some(OrderTermsDiverged {
                         key: order(cid(), ()).key,
@@ -3828,7 +3866,7 @@ mod tests {
                         terms: ReportedTerms::NONE.with_quantity(true),
                         amend_in_flight: true,
                     })
-                )
+                ))
             );
 
             let applied = apply(
@@ -3865,7 +3903,7 @@ mod tests {
             let applied = apply(&mut orders, &reported);
             assert_eq!(
                 applied,
-                SnapshotApplied::working(
+                SnapshotApplied::working(terms_of(
                     changed(limit(dec!(1), dec!(1)), limit(dec!(1), dec!(2))),
                     Some(OrderTermsDiverged {
                         key: order(cid(), ()).key,
@@ -3874,7 +3912,7 @@ mod tests {
                         terms: ReportedTerms::NONE.with_kind(true),
                         amend_in_flight: false,
                     })
-                )
+                ))
             );
             assert_eq!(tracked_order(&orders).kind, OrderKind::Limit);
         }

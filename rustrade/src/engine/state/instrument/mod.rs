@@ -4,11 +4,7 @@ use crate::{
         state::{
             fee::FeeConversion,
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-            order::{
-                Orders,
-                manager::OrderManager,
-                terms::{OrderTermsChanged, OrderTermsDiverged},
-            },
+            order::{Orders, manager::OrderManager, terms::OrderTermsApplied},
             position::{
                 CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
                 PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
@@ -759,17 +755,12 @@ pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex, ExchangeKey =
     /// fill. Set only by [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account),
     /// which does the valuing, never by this type's own methods.
     pub fee_conversion: Option<FeeConversion<AssetKey, InstrumentKey>>,
-    /// The terms the engine adopted from the event's order reports, one per order changed. See
+    /// The terms the event's order report changed, or stated and the engine did not adopt. See
     /// [`OrderManager::update_from_order_snapshot`].
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load.
-    #[serde(default = "Vec::new")]
-    pub terms_changed: Vec<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-    /// The terms the event's order reports stated and the engine did not adopt, one per order.
-    ///
-    /// `#[serde(default)]` so outputs serialised before this field existed still load.
-    #[serde(default = "Vec::new")]
-    pub terms_diverged: Vec<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
+    #[serde(default = "OrderTermsApplied::default")]
+    pub terms: OrderTermsApplied<ExchangeKey, InstrumentKey>,
 }
 
 impl<AssetKey, InstrumentKey, ExchangeKey> Default
@@ -780,8 +771,7 @@ impl<AssetKey, InstrumentKey, ExchangeKey> Default
             exited: None,
             capped: Vec::new(),
             fee_conversion: None,
-            terms_changed: Vec::new(),
-            terms_diverged: Vec::new(),
+            terms: OrderTermsApplied::default(),
         }
     }
 }
@@ -793,18 +783,13 @@ impl<AssetKey, InstrumentKey, ExchangeKey> FillsApplied<AssetKey, InstrumentKey,
         self.exited.is_none()
             && self.capped.is_empty()
             && self.fee_conversion.is_none()
-            && self.terms_changed.is_empty()
-            && self.terms_diverged.is_empty()
+            && self.terms.is_empty()
     }
 
-    /// Nothing applied but the terms one order snapshot changed or left diverged.
-    fn with_terms(
-        changed: Option<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-        diverged: Option<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
-    ) -> Self {
+    /// Nothing applied but `terms`.
+    pub(crate) fn with_terms(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
-            terms_changed: changed.into_iter().collect(),
-            terms_diverged: diverged.into_iter().collect(),
+            terms,
             ..Self::default()
         }
     }
@@ -1190,20 +1175,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_account_snapshot(
         &mut self,
         snapshot: &InstrumentAccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>,
-    ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
+    ) -> OrderTermsApplied<ExchangeKey, InstrumentKey>
     where
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
         AssetKey: Debug + Clone + PartialEq,
     {
-        let mut terms = FillsApplied::default();
+        let mut terms = OrderTermsApplied::default();
         for report in &snapshot.orders {
             // Only the terms each report changed or left diverged are returned. PositionExited
             // from deferred fill replay is not: snapshot reconciliation at startup does not emit
             // PositionExit output events, a known limitation.
-            let applied = self.update_from_order_snapshot(Snapshot(report));
-            terms.terms_changed.extend(applied.terms_changed);
-            terms.terms_diverged.extend(applied.terms_diverged);
+            terms.extend(self.update_from_order_snapshot(Snapshot(report)).terms);
         }
 
         let open_at_resync = std::mem::take(&mut self.orders_open_at_resync);
@@ -1655,7 +1638,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         } else {
             None
         };
-        let terms = FillsApplied::with_terms(applied.changed, applied.diverged);
+        let terms = FillsApplied::with_terms(applied.terms);
 
         // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
         // that were waiting on it.
