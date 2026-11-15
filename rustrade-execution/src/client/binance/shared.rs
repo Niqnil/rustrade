@@ -31,7 +31,7 @@ use crate::{
         ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
         TrailingOffsetType, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::OrderReport,
+        report::{OrderReport, ReportedTerms, UnindexedOrderReport},
         request::UnindexedOrderResponseCancel,
         state::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
@@ -1929,6 +1929,30 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     instrument: &InstrumentNameExchange,
     known: KnownKinds<'_>,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    convert_listed_order(o, exchange, instrument, known).map(|listed| listed.order)
+}
+
+/// An open order from a REST row, with the terms the row states (see [`stated_terms`]).
+#[derive(Debug)]
+pub(crate) struct ListedOrder {
+    pub(crate) order: Order<ExchangeId, InstrumentNameExchange, Open>,
+    pub(crate) reported: ReportedTerms,
+}
+
+impl ListedOrder {
+    /// The order as an account snapshot reports it.
+    pub(crate) fn into_report(self) -> UnindexedOrderReport {
+        OrderReport::new(self.order.map_state(OrderState::active), self.reported)
+    }
+}
+
+/// [`convert_open_order`], keeping the terms the row states.
+fn convert_listed_order<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    known: KnownKinds<'_>,
+) -> Option<ListedOrder> {
     match o.status() {
         Some(status) if rest_order_is_open(status) => {}
         Some(status) => {
@@ -1941,7 +1965,8 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         }
     }
     let row = convert_order_row(o, exchange, instrument, known)?;
-    Some(row.map_state(|row| {
+    let reported = row.state.reported;
+    let order = row.map_state(|row| {
         // A live order's fill only grows, so an unknown one reads as nothing filled until the
         // account stream reports more.
         Open::new(
@@ -1949,7 +1974,8 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
             row.time_exchange,
             row.filled_qty.unwrap_or(Decimal::ZERO),
         )
-    }))
+    });
+    Some(ListedOrder { order, reported })
 }
 
 /// How an order that has ended did end, from a REST order row such as `GET /api/v3/order`'s or
@@ -2236,6 +2262,9 @@ struct OrderRow {
     time_exchange: DateTime<Utc>,
     /// `None` when Binance did not report it.
     filled_qty: Option<Decimal>,
+    /// Which of the row's terms are the venue's: see [`stated_terms`]. The kind is not when it is
+    /// the one the client knew the order by, rather than the row's.
+    reported: ReportedTerms,
 }
 
 /// The kind the client knows an order by, from its client order id: from placing it, from an
@@ -2281,7 +2310,7 @@ fn convert_order_row<T: BinanceOrderFields>(
     };
     let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
     let order_type = o.order_type();
-    let kind = match order_type {
+    let (kind, kind_known) = match order_type {
         Some(t) => {
             // decode_order_kind already logs a warning on what it cannot describe
             let decoded = decode_order_kind(
@@ -2293,10 +2322,11 @@ fn convert_order_row<T: BinanceOrderFields>(
             )?;
             // Each lookup takes and releases its own lock, so the note logs with none held.
             let (kind, note) = resolve_kind(exchange, &cid, decoded, || known(&cid));
+            let kind_known = note.as_ref().is_some_and(|note| note.resolved);
             if let Some(note) = note {
                 note.log();
             }
-            kind
+            (kind, kind_known)
         }
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
@@ -2317,17 +2347,22 @@ fn convert_order_row<T: BinanceOrderFields>(
     // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
     // partially-filled order this fetch exists to reconcile. For an order that has ended it is
     // when it ended.
-    let time_exchange = match o
-        .update_time()
-        .or_else(|| o.time())
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
+    let venue_time = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+    let update_time = venue_time(o.update_time());
+    let time_exchange = match update_time.or_else(|| venue_time(o.time())) {
         Some(ts) => ts,
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing/unparseable time, using now");
             Utc::now()
         }
     };
+    // Only `update_time` is the venue's time for the row's terms. `time` is when the order was
+    // created, before any amend changed them, and this host's clock is no venue time at all.
+    let reported = match update_time {
+        Some(_) => stated_terms(TimeSource::Venue, &kind, price, quantity),
+        None => ReportedTerms::NONE,
+    };
+    let reported = reported.with_kind(reported.kind && !kind_known);
 
     Some(Order {
         key: OrderKey::new(
@@ -2347,6 +2382,7 @@ fn convert_order_row<T: BinanceOrderFields>(
             order_id,
             time_exchange,
             filled_qty,
+            reported,
         },
     })
 }
@@ -2354,7 +2390,7 @@ fn convert_order_row<T: BinanceOrderFields>(
 /// One symbol's `openOrders` rows after conversion.
 #[derive(Debug)]
 pub(crate) struct OpenOrderListing {
-    pub(crate) orders: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+    pub(crate) orders: Vec<ListedOrder>,
     /// Whether `orders` shows every row the venue listed under the `clientOrderId` it was placed
     /// with. This is the `orders_complete` an account snapshot built from the listing may claim.
     pub(crate) complete: bool,
@@ -2378,7 +2414,7 @@ pub(crate) fn convert_open_order_listing<T: BinanceOrderFields>(
     let orders = rows
         .iter()
         .filter_map(|row| {
-            let order = convert_open_order(row, exchange, instrument, known);
+            let order = convert_listed_order(row, exchange, instrument, known);
             complete &= order.is_some() && row.client_order_id().is_some();
             order
         })
@@ -2741,7 +2777,8 @@ pub(crate) struct ExecutionReport {
     #[serde(rename = "c")]
     pub(crate) client_order_id: Option<String>,
     /// `C`: on a `CANCELED` report, the cancelled order's client order id; on a `REPLACED` one, the
-    /// id the amend replaced. An empty string on every other report.
+    /// id the amend replaced, or an empty string when the amend kept it (observed on spot testnet).
+    /// An empty string on every other report.
     #[serde(rename = "C")]
     pub(crate) orig_client_order_id: Option<String>,
     /// `T`: transaction time, in milliseconds.
@@ -2982,7 +3019,7 @@ pub(crate) fn convert_execution_report(
                 symbol,
                 cid,
                 order_id,
-                time_exchange,
+                (time_exchange, time_source),
             ));
         }
         "TRADE" => {
@@ -3085,7 +3122,7 @@ pub(crate) fn convert_execution_report(
                     symbol,
                     cid,
                     order_id,
-                    time_exchange,
+                    (time_exchange, time_source),
                 ));
             } else {
                 trace!(
@@ -3158,18 +3195,35 @@ pub(crate) fn convert_execution_report(
             ));
         }
         "REPLACED" => {
-            // An amend (Order Amend Keep Priority): the order stays live with a new quantity and,
-            // unless the amend chose one, a new client order id in `c`; `C` holds the old one.
-            // This library sends no amends, so one came from outside it, and the engine, which
-            // knows the order by its old id, cannot follow it. A cancel-replace is not this: it
-            // reports `CANCELED` for the original and `NEW` for the replacement.
-            warn!(
-                %exchange, %symbol, %order_id,
-                client_order_id = %cid,
-                previous_client_order_id = report.orig_client_order_id.as_deref().unwrap_or(""),
-                "Binance order amended outside this client - the engine still holds it under its \
-                 old id and quantity"
-            );
+            // An amend (Order Amend Keep Priority): the order stays live under the same `orderId`
+            // with a smaller total quantity (`q`). An amend that kept the client order id leaves
+            // `C` empty and is reported as the order's new state. Spot alone offers the amend;
+            // margin has no amend request, but its stream sends the same report shape, so a
+            // margin report is read the same way. One that took a new client order
+            // id names it in `c` and the old one in `C`; the engine knows the order by the old id
+            // and cannot follow it. A cancel-replace is not this: it reports `CANCELED` for the
+            // original and `NEW` for the replacement.
+            let renamed_from = report
+                .orig_client_order_id
+                .as_deref()
+                .filter(|previous| !previous.is_empty() && *previous != cid.0.as_str());
+            match renamed_from {
+                None => buf.extend(convert_order_snapshot(
+                    report,
+                    exchange,
+                    symbol,
+                    cid,
+                    order_id,
+                    (time_exchange, time_source),
+                )),
+                Some(previous) => warn!(
+                    %exchange, %symbol, %order_id,
+                    client_order_id = %cid,
+                    previous_client_order_id = previous,
+                    "Binance order amended under a new client order id - the engine still holds \
+                     it under its old id and quantity"
+                ),
+            }
         }
         _ => {
             // PENDING_NEW and PENDING_CANCEL are transient; the terminal state
@@ -3217,7 +3271,7 @@ fn convert_order_snapshot(
     symbol: InstrumentNameExchange,
     cid: ClientOrderId,
     order_id: OrderId,
-    time_exchange: DateTime<Utc>,
+    (time_exchange, time_source): (DateTime<Utc>, TimeSource),
 ) -> Option<UnindexedAccountEvent> {
     // parse_side already logs a warning on unknown values.
     let Some(side) = report.side.as_deref().and_then(parse_side) else {
@@ -3325,12 +3379,38 @@ fn convert_order_snapshot(
         )),
     };
 
+    let reported = stated_terms(time_source, &order.kind, order.price, order.quantity);
     Some(UnindexedAccountEvent::new(
         exchange,
         AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
-            OrderReport::state_only(order),
+            OrderReport::new(order, reported),
         )),
     ))
+}
+
+/// The terms a Binance order report states: every one its fields carry, when its time is the
+/// venue's, and none when the time is this host's, since the engine orders reports by that time.
+///
+/// - **Price.** A kind that carries no limit price states that it has none. A kind that carries
+///   one states its price only when the report gave a non-zero one: a zero or unreadable price is
+///   not the venue's limit.
+/// - **Quantity.** A zero quantity is not stated. Binance reports one for an order sized in the
+///   quote asset (`quoteOrderQty`), whose base quantity is not known until it fills.
+/// - **Kind and time in force.** A kind or time in force the report left unresolved is cleared
+///   by [`OrderReport::new`]. A REST row also clears the kind when the client filled it in from
+///   the order it placed ([`convert_order_row`]).
+fn stated_terms(
+    time_source: TimeSource,
+    kind: &OrderKind,
+    price: Option<Decimal>,
+    quantity: Decimal,
+) -> ReportedTerms {
+    match time_source {
+        TimeSource::Venue => ReportedTerms::ALL
+            .with_price(!kind_has_limit_price(kind) || price.is_some_and(|price| !price.is_zero()))
+            .with_quantity(!quantity.is_zero()),
+        TimeSource::Host => ReportedTerms::NONE,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5368,6 +5448,46 @@ mod tests {
         }
     }
 
+    /// A listed row states its terms when it carries `updateTime`, the venue's time for them, and
+    /// none when it carries only `time`, its creation, or no time at all. A limit row's zero
+    /// price is not the venue's limit, nor is a zero quantity the venue's quantity.
+    #[test]
+    fn a_listed_row_states_its_terms_only_on_the_venues_time() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let stated = |row: serde_json::Value| {
+            let rows = [spot_row(row)];
+            let listing =
+                convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc, &|_| None);
+            let [listed] = <[ListedOrder; 1]>::try_from(listing.orders).expect("one order");
+            listed.into_report().reported
+        };
+        let limit = |extra| order_row("LIMIT", "NEW", extra);
+        assert_eq!(
+            stated(limit(serde_json::json!({"price": "95"}))),
+            ReportedTerms::ALL
+        );
+        assert_eq!(
+            stated(limit(
+                serde_json::json!({"price": "95", "updateTime": null})
+            )),
+            ReportedTerms::NONE
+        );
+        assert_eq!(
+            stated(limit(
+                serde_json::json!({"price": "95", "updateTime": null, "time": null})
+            )),
+            ReportedTerms::NONE
+        );
+        assert_eq!(
+            stated(limit(serde_json::json!({}))),
+            ReportedTerms::ALL.with_price(false)
+        );
+        assert_eq!(
+            stated(limit(serde_json::json!({"price": "95", "origQty": "0"}))),
+            ReportedTerms::ALL.with_quantity(false)
+        );
+    }
+
     /// A trailing STOP_LOSS_LIMIT row lists as a fixed-limit trailing stop with its limit price;
     /// a zero stopPrice is no activation price.
     #[test]
@@ -5385,7 +5505,7 @@ mod tests {
             ))];
             let listing =
                 convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc, &|_| None);
-            let [order] = listing.orders.as_slice() else {
+            let [ListedOrder { order, .. }] = listing.orders.as_slice() else {
                 panic!("one order: {:?}", listing.orders);
             };
             assert_eq!(
@@ -5501,7 +5621,7 @@ mod tests {
         let described: Vec<_> = listing
             .orders
             .iter()
-            .map(|order| (order.key.cid.0.as_str(), order.kind, order.price))
+            .map(|ListedOrder { order, .. }| (order.key.cid.0.as_str(), order.kind, order.price))
             .collect();
         assert_eq!(
             described,
@@ -5574,7 +5694,9 @@ mod tests {
             let kinds: Vec<_> = listing
                 .orders
                 .iter()
-                .map(|order| (order.key.cid.0.as_str(), order.kind, order.price))
+                .map(|ListedOrder { order, .. }| {
+                    (order.key.cid.0.as_str(), order.kind, order.price)
+                })
                 .collect();
             let limit = family.has_limit_price().then_some(dec!(95));
             assert_eq!(
@@ -5593,6 +5715,13 @@ mod tests {
                 ],
                 "{order_type}"
             );
+            // The row's own kind is the venue's; the one the client knew the order by is not.
+            let kinds_stated: Vec<_> = listing
+                .orders
+                .into_iter()
+                .map(|listed| listed.into_report().reported.kind)
+                .collect();
+            assert_eq!(kinds_stated, [true, false, false], "{order_type}");
         }
     }
 

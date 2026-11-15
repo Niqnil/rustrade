@@ -1957,10 +1957,39 @@ mod tests {
         }
     }
 
-    /// An amend leaves the order live, so its report emits no event, but it is reported loudly: the
-    /// engine still holds the order under its old id and quantity.
+    /// A margin report states its terms, and one that names the order under its own id is read
+    /// as the order's new state, as on spot: the report shape is the same.
     #[test]
-    fn margin_ws_amend_report_is_logged_without_an_event() {
+    fn margin_ws_report_states_its_terms_and_a_same_id_amend_is_the_new_state() {
+        for (exec_type, quantity) in [("NEW", "1"), ("REPLACED", "0.5")] {
+            let frame = push(serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+                "x": exec_type, "X": "NEW", "i": 8_i64, "c": "cid-3", "C": "",
+                "p": "47000", "q": quantity, "f": "GTC", "z": "0",
+                "T": 1_700_000_000_000_i64,
+            }));
+            let buf = delivered(&frame, &StreamAccount::Cross);
+            let [event] = buf.as_slice() else {
+                panic!("{exec_type}: expected one event, got {buf:?}")
+            };
+            let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
+                panic!("{exec_type}: expected OrderSnapshot, got {:?}", event.kind)
+            };
+            assert_eq!(
+                (snap.0.order.quantity, snap.0.reported),
+                (
+                    Decimal::from_str(quantity).unwrap(),
+                    crate::order::report::ReportedTerms::ALL
+                ),
+                "{exec_type}"
+            );
+        }
+    }
+
+    /// An amend under a new client order id leaves the order live, so its report emits no event,
+    /// but it is reported loudly: the engine still holds the order under its old id and quantity.
+    #[test]
+    fn margin_ws_amend_under_a_new_id_is_logged_without_an_event() {
         let frame = push(serde_json::json!({
             "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
             "x": "REPLACED", "X": "NEW", "i": 8_i64, "c": "amended", "C": "cid-3",
@@ -1973,7 +2002,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("amended outside this client")),
+                .any(|m| m.contains("amended under a new client order id")),
             "{messages:?}"
         );
     }

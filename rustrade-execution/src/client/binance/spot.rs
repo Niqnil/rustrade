@@ -48,11 +48,11 @@ use super::server_time::{ServerTime, SigningClock, default_server_time_sync, rea
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
     BinanceTimeInForce, CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
-    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
-    RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, ListedOrder,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing,
+    PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents,
+    UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time,
+    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
@@ -85,7 +85,6 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::OrderReport,
         request::{
             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
             UnindexedOrderResponseCancel,
@@ -965,7 +964,7 @@ async fn listed_open_cids(
             RequestKind::Essential,
         )
         .await?;
-        listed.extend(listing.orders.into_iter().map(|order| order.key.cid));
+        listed.extend(listing.orders.into_iter().map(|entry| entry.order.key.cid));
     }
     Ok(listed)
 }
@@ -1167,11 +1166,11 @@ impl ExecutionClient for BinanceSpot {
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, listing) = result?;
-                self.remember_live(&listing.orders);
+                self.remember_live(listing.orders.iter().map(|listed| &listed.order));
                 let wrapped = listing
                     .orders
                     .into_iter()
-                    .map(|o| OrderReport::state_only(o.map_state(OrderState::active)))
+                    .map(ListedOrder::into_report)
                     .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
                     inst,
@@ -1879,7 +1878,7 @@ impl ExecutionClient for BinanceSpot {
         }))
             .buffer_unordered(8)
             .try_fold(Vec::with_capacity(instruments.len()), |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, listing)| async move {
-                acc.extend(listing.orders);
+                acc.extend(listing.orders.into_iter().map(|listed| listed.order));
                 Ok(acc)
             })
             .await
@@ -3084,6 +3083,7 @@ mod tests {
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::error::StreamTerminationReason;
+    use crate::order::report::{OrderReport, ReportedTerms, UnindexedOrderReport};
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use smol_str::SmolStr;
 
@@ -3940,6 +3940,7 @@ mod tests {
             id: SmolStr::from("12345"),
             kind: DedupEventKind::OrderState {
                 filled_quantity: Decimal::ZERO,
+                stated_terms: 0,
             },
         };
         assert!(!is_duplicate(&cache, key2));
@@ -3956,6 +3957,7 @@ mod tests {
             id: SmolStr::from("12345"),
             kind: DedupEventKind::OrderState {
                 filled_quantity: Decimal::from_str(filled).unwrap(),
+                stated_terms: 0,
             },
         };
 
@@ -5003,18 +5005,128 @@ mod tests {
         );
     }
 
-    /// An amended order is still live, so an amend report must not retire it.
-    #[test]
-    fn an_amend_report_produces_nothing() {
-        for exec_type in ["REPLACED", "REPLACE"] {
-            let report = ExecutionReport {
-                execution_type: Some(exec_type.to_string()),
-                order_status: Some("NEW".to_string()),
-                orig_client_order_id: Some("client-0".to_string()),
-                ..make_base_report()
-            };
-            assert!(convert(report).is_empty(), "{exec_type}");
+    /// A resting limit order's report, as the stream sends it for `exec_type`.
+    fn resting_report(exec_type: &str, quantity: &str) -> ExecutionReport {
+        ExecutionReport {
+            execution_type: Some(exec_type.to_string()),
+            order_status: Some("NEW".to_string()),
+            side: Some("BUY".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some(quantity.to_string()),
+            time_in_force: Some("GTC".to_string()),
+            cumulative_filled_quantity: Some("0".to_string()),
+            orig_client_order_id: Some(String::new()),
+            ..make_base_report()
         }
+    }
+
+    /// The order report a converted report produced, if it produced one.
+    fn order_report(events: Vec<UnindexedAccountEvent>) -> Option<UnindexedOrderReport> {
+        match sole_event(events)?.kind {
+            AccountEventKind::OrderSnapshot(snapshot) => Some(snapshot.0),
+            other => panic!("expected an order snapshot, got {other:?}"),
+        }
+    }
+
+    /// An amend that kept the client order id (`C` empty, or naming the same id) is the order's
+    /// new state: a live order on the venue's new quantity, every term stated. With nothing
+    /// filled in between, it is still not taken for a replay of the order's acknowledgement,
+    /// while a replay of the amend itself is.
+    #[test]
+    fn an_amend_that_keeps_the_client_order_id_reports_the_order_on_its_new_terms() {
+        use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
+        for previous in [Some(""), Some("client-1"), None] {
+            let amend = ExecutionReport {
+                orig_client_order_id: previous.map(str::to_string),
+                transaction_time: Some(1_700_000_002_000),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(amend.clone())).expect("an amend report");
+            assert_eq!(report.order.key.cid, ClientOrderId::new("client-1"));
+            assert_eq!(report.order.quantity, Decimal::from_str("0.002").unwrap());
+            assert!(
+                matches!(
+                    report.order.state,
+                    OrderState::Active(crate::order::state::ActiveOrderState::Open(_))
+                ),
+                "{:?}",
+                report.order.state
+            );
+            assert_eq!(report.reported, ReportedTerms::ALL, "C = {previous:?}");
+
+            let cache = new_dedup_cache();
+            let key = |report: ExecutionReport| {
+                let events = convert(report);
+                dedup_key_from_event(&events[0]).expect("an order snapshot has a key")
+            };
+            assert!(!is_duplicate(&cache, key(resting_report("NEW", "0.003"))));
+            assert!(
+                !is_duplicate(&cache, key(amend.clone())),
+                "the amend is new"
+            );
+            assert!(is_duplicate(&cache, key(amend)), "its replay is not");
+        }
+    }
+
+    /// An amend under a new client order id names it in `c` and the old one in `C`. The engine
+    /// knows the order by the old id, so nothing is reported for it; an unknown execution type
+    /// reports nothing either.
+    #[test]
+    fn an_amend_under_a_new_client_order_id_produces_nothing() {
+        let renamed = ExecutionReport {
+            orig_client_order_id: Some("client-0".to_string()),
+            ..resting_report("REPLACED", "0.002")
+        };
+        assert!(convert(renamed).is_empty());
+        assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
+    }
+
+    /// A report states its terms only when its time is the venue's, an amend's included. A limit
+    /// price is stated only when the report carried one; a kind without a limit states that it
+    /// has none. A zero quantity is not stated.
+    #[test]
+    fn a_report_states_its_terms_only_on_the_venues_time() {
+        let stated = |report| order_report(convert(report)).expect("a report").reported;
+        assert_eq!(stated(resting_report("NEW", "0.003")), ReportedTerms::ALL);
+
+        let host_time = ExecutionReport {
+            transaction_time: None,
+            event_time: None,
+            ..resting_report("NEW", "0.003")
+        };
+        assert_eq!(stated(host_time), ReportedTerms::NONE);
+        let event_time = ExecutionReport {
+            transaction_time: None,
+            event_time: Some(1_700_000_000_000),
+            ..resting_report("NEW", "0.003")
+        };
+        assert_eq!(stated(event_time), ReportedTerms::ALL);
+        let amend_on_host_time = ExecutionReport {
+            transaction_time: None,
+            event_time: None,
+            ..resting_report("REPLACED", "0.002")
+        };
+        assert_eq!(stated(amend_on_host_time), ReportedTerms::NONE);
+        assert_eq!(
+            stated(resting_report("NEW", "0")),
+            ReportedTerms::ALL.with_quantity(false),
+            "an order sized in the quote asset"
+        );
+
+        let zero_price = ExecutionReport {
+            price: Some("0".to_string()),
+            ..resting_report("NEW", "0.003")
+        };
+        assert_eq!(stated(zero_price), ReportedTerms::ALL.with_price(false));
+        let market = ExecutionReport {
+            order_type: Some("MARKET".to_string()),
+            price: Some("0".to_string()),
+            ..resting_report("NEW", "0.003")
+        };
+        let report = order_report(convert(market)).expect("a report");
+        assert_eq!(report.order.price, None);
+        assert_eq!(report.reported, ReportedTerms::ALL);
     }
 
     // ---------------------------------------------------------------------------
@@ -8071,6 +8183,62 @@ mod tests {
                     .map(|(_, value)| value.into_owned())
             })
             .collect()
+    }
+
+    /// `fetch_open_orders` returns the orders `GET /api/v3/openOrders` lists, on the terms each
+    /// row states, whether it asks for every symbol at once or for the instruments named, and
+    /// holds each as live.
+    #[tokio::test]
+    async fn fetch_open_orders_returns_the_listed_orders_and_holds_them_live() {
+        for instruments in [vec![], vec![InstrumentNameExchange::new("BTCUSDT")]] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([order_row("listed", "NEW")])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = <BinanceSpot as ExecutionClient>::new(
+                BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+            );
+            client.rest = rest_at(&server);
+
+            let orders = client.fetch_open_orders(&instruments).await.unwrap();
+
+            let listed: Vec<_> = orders
+                .iter()
+                .map(|order| {
+                    (
+                        order.key.cid.clone(),
+                        order.key.instrument.clone(),
+                        order.quantity,
+                        order.price,
+                        order.state.filled_quantity,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                listed,
+                vec![(
+                    ClientOrderId::new("listed"),
+                    InstrumentNameExchange::new("BTCUSDT"),
+                    Decimal::from(2),
+                    Some(Decimal::from(100)),
+                    Decimal::ONE,
+                )],
+                "{instruments:?}"
+            );
+            assert!(
+                client
+                    .known_live
+                    .lock()
+                    .contains(&ClientOrderId::new("listed")),
+                "{instruments:?}: held as live"
+            );
+        }
     }
 
     /// A balance read is stamped [`REST_BALANCE_LAG`] before the request that read it was sent,

@@ -17,19 +17,23 @@
 //! [`UnindexedAccountEvent`], never on any SDK's wire types.
 
 use crate::{
-    AccountEventKind, UnindexedAccountEvent, margin_debt::MarginDebtKind, order::state::OrderState,
+    AccountEventKind, UnindexedAccountEvent,
+    margin_debt::MarginDebtKind,
+    order::{report::UnindexedOrderReport, state::OrderState},
 };
 use lru::LruCache;
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 /// Size of the LRU dedup cache. 10k entries covers ~hours of high-frequency
-/// trading at typical fill rates; each entry is ~100-104 bytes (`DedupKey` =
-/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 24 (8-aligned by `Notice`'s `i64`) = 72
-/// bytes, plus
-/// `LruCache` node overhead: 2 linked-list pointers 16 + hashbrown slot ~12-16
-/// ≈ 28-32 bytes). At 10k: ~1.0 MB.
+/// trading at typical fill rates; each entry is ~125-130 bytes (`DedupKey` is 96 bytes
+/// with every client enabled, measured with `size_of`, plus `LruCache` node overhead:
+/// 2 linked-list pointers 16 + hashbrown slot ~12-16 ≈ 28-32 bytes). At 10k: ~1.3 MB.
 /// At very high fill rates (>333 distinct fills/sec sustained during the 30s
 /// recovery window), LRU eviction could allow a fill to pass dedup twice.
 /// Increase this constant if such volumes are expected.
@@ -54,10 +58,16 @@ pub(crate) enum DedupEventKind {
     /// for an untracked order, which `OrderManager`'s vacant-entry arm inserts as a live resting
     /// order. Suppressing the replay is what keeps that order retired.
     ///
+    /// `stated_terms` is a fingerprint of the terms the report states as the venue's (see
+    /// [`stated_terms_fingerprint`]), so that a change made at the venue with nothing filled in
+    /// between, such as a quantity cut, is not taken for a replay of the report before it. A
+    /// replay states the same terms, so it still collides.
+    ///
     /// `Decimal`'s `Hash` normalises before hashing and its `Eq` is numeric, so `1.0` and `1.00`
     /// are the same key — the representation a venue happens to send does not split it.
     OrderState {
         filled_quantity: Decimal,
+        stated_terms: u64,
     },
     Cancelled,
     /// A funding payment, keyed on its instrument and funding time because the venue gives it no
@@ -122,6 +132,32 @@ pub(crate) fn new_dedup_cache() -> SharedDedupCache {
     )))
 }
 
+/// A fingerprint of the terms `report` states as the venue's: each stated term's value, hashed.
+/// `0` for a report that states none, so a state-only report keys as it always did.
+///
+/// A 64-bit hash can collide, which would drop one report as a replay of another for the same
+/// order at the same fill; at that width the chance is negligible next to the cache's own limits.
+fn stated_terms_fingerprint(report: &UnindexedOrderReport) -> u64 {
+    let reported = report.reported;
+    if reported.is_none() {
+        return 0;
+    }
+    let order = &report.order;
+    let mut hasher = DefaultHasher::new();
+    reported.hash(&mut hasher);
+    reported
+        .quantity
+        .then_some(order.quantity)
+        .hash(&mut hasher);
+    reported.price.then_some(order.price).hash(&mut hasher);
+    reported.kind.then_some(order.kind).hash(&mut hasher);
+    reported
+        .time_in_force
+        .then_some(order.time_in_force)
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Extract a dedup key from an account event, if applicable.
 /// Returns None for events that don't need deduplication (e.g. balance snapshots).
 pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<DedupKey> {
@@ -156,6 +192,7 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
                             },
                             kind: DedupEventKind::OrderState {
                                 filled_quantity: open.filled_quantity,
+                                stated_terms: stated_terms_fingerprint(&snap.0),
                             },
                         }),
                         _ => None,
