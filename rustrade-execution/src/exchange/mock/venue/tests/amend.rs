@@ -1125,6 +1125,97 @@ fn an_order_seeded_through_the_initial_state_can_be_changed_from_outside() {
     );
 }
 
+/// The venue seeded through `initial_state` with [`seeded_gtd`] at 100 for 0.01, of which
+/// `filled` has already filled, holding 1 BTC and 1,000 USDT, and configured to amend as `amend`
+/// says.
+fn seeded_venue(filled: &str, amend: AmendConfig) -> SimulatedVenue {
+    let mut order = seeded_gtd("seeded", "100", time(0), time(1000));
+    order.state = OrderState::active(Open::new(
+        VenueOrderId::Assigned(OrderId::new("seeded")),
+        time(0),
+        d(filled),
+    ));
+    let config = spot_config_holding("1", "1000", order).with_amend(amend);
+    SimulatedVenue::new_market_driven(&config, spot_instruments())
+}
+
+/// A client's amend is checked as the client asked before the book is consulted: a patch that
+/// does not apply, or that the client may not ask, is refused as such, even for a seeded order.
+#[test]
+fn a_seeded_orders_amend_is_refused_first_for_what_the_client_asked() {
+    let mut venue = seeded_venue("0", AmendConfig::NONE);
+    assert_eq!(
+        *amend_refusal(&amend(&mut venue, "seeded", quantity("0"))),
+        AmendRefusal::QuantityNotAboveFilled {
+            filled: Decimal::ZERO
+        }
+    );
+    assert_eq!(
+        *amend_refusal(&amend(&mut venue, "seeded", price("99"))),
+        AmendRefusal::Unsupported {
+            field: AmendField::Price
+        }
+    );
+}
+
+/// A seeded order changed from outside to more than the account can afford is refused, takes no
+/// hold, and reports nothing.
+#[test]
+fn an_external_modification_of_a_seeded_order_the_account_cannot_afford_changes_nothing() {
+    let mut venue = seeded_venue("0", AmendConfig::FULL);
+    let before = resting(&venue, "seeded");
+
+    assert!(matches!(
+        venue.modify_externally(&cid("seeded"), quantity("20")),
+        Err(OrderError::Rejected(ApiError::BalanceInsufficient(..)))
+    ));
+    assert_eq!(resting(&venue, "seeded"), before);
+    assert_eq!(free_quote(&venue), d("1000"));
+}
+
+/// The hold a seeded order takes when changed from outside is released when it is cancelled.
+#[test]
+fn a_seeded_order_changed_from_outside_releases_its_hold_when_cancelled() {
+    let mut venue = seeded_venue("0", AmendConfig::FULL);
+    venue
+        .modify_externally(&cid("seeded"), price("99"))
+        .unwrap();
+    assert_eq!(free_quote(&venue), d("1000") - d("0.99"));
+
+    let cancelled = venue.cancel_order(OrderRequestCancel {
+        key: limit_request("seeded", Side::Buy, "0.01", "99", gtc()).key,
+        state: RequestCancel { id: None },
+    });
+
+    assert!(cancelled.response.state.is_ok(), "{cancelled:?}");
+    assert_eq!(free_quote(&venue), d("1000"));
+}
+
+/// A seeded order that arrived part-filled holds only what it has left when changed from outside,
+/// and its fill pays only for that.
+#[test]
+fn a_part_filled_seeded_order_changed_from_outside_holds_and_pays_only_its_remainder() {
+    let mut venue = seeded_venue("0.004", AmendConfig::FULL);
+
+    venue
+        .modify_externally(&cid("seeded"), price("99"))
+        .unwrap();
+    assert_eq!(free_quote(&venue), d("1000") - d("0.594"), "0.006 at 99");
+
+    let _ = venue.apply_market(
+        &instrument_name(),
+        MarketObservation::new(book("97", "98")),
+        time(1),
+    );
+    assert!(venue.account.is_filled(&cid("seeded")));
+    let balances = venue.balances(&[base(), quote()]);
+    let [btc, usdt] = balances.as_slice() else {
+        panic!("both balances");
+    };
+    assert_eq!(btc.balance.total, d("1.006"));
+    assert_eq!(usdt.balance.total, d("1000") - d("0.594"));
+}
+
 #[test]
 fn on_a_stale_market_a_price_amend_is_refused_and_a_quantity_amend_is_made() {
     let mut venue = venue_waiting();

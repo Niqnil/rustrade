@@ -516,7 +516,9 @@ pub enum VenueRegime {
 ///   They cannot? For spot that is a mis-specified fixture, and it **panics**, in the same class
 ///   as an absent balance; a CFD order is instead cancelled at fill, as described under the
 ///   reserved balances below. Cancelling one releases nothing and restates no balance, and neither does
-///   retiring one at its deadline. Such an order may also arrive **part-filled**, carrying an
+///   retiring one at its deadline. Changed by [`SimulatedVenue::modify_externally`], it takes a
+///   hold from `free`, and is then held, cancelled and filled as an order this venue booked is.
+///   Such an order may also arrive **part-filled**, carrying an
 ///   [`Open::filled_quantity`] this venue did not produce: only the remainder ever trades here,
 ///   and a fill that completes it reports no `avg_price`, because the price of the part that
 ///   traded elsewhere is not something this venue can know. An order **this** venue part-filled
@@ -4508,7 +4510,10 @@ impl SimulatedVenue {
     /// [`MockExecutionConfig::amend`] is what a client may ask to amend, and an external change is
     /// made whatever it declares, on a venue that amends nothing through its client included. It
     /// may also change an order seeded through [`MockExecutionConfig::initial_state`], which then
-    /// holds what the order as changed needs, as an order this venue booked does.
+    /// holds what the order as changed needs, as an order this venue booked does. That hold is
+    /// taken from the seeded `free` balance, which this venue treats as the order's to draw on: if
+    /// the seeded balances already keep the order's own hold out of `free`, as a copy of a live
+    /// account does, the order is held for twice.
     ///
     /// Everything else is the book's, and is as [`amend_order`](Self::amend_order) describes:
     /// `patch` is applied to the order as this venue holds it; the venue's refusals (an order held
