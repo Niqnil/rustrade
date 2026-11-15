@@ -2347,18 +2347,21 @@ fn convert_order_row<T: BinanceOrderFields>(
     // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
     // partially-filled order this fetch exists to reconcile. For an order that has ended it is
     // when it ended.
-    let (time_exchange, time_source) = match o
-        .update_time()
-        .or_else(|| o.time())
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(ts) => (ts, TimeSource::Venue),
+    let venue_time = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+    let update_time = venue_time(o.update_time());
+    let time_exchange = match update_time.or_else(|| venue_time(o.time())) {
+        Some(ts) => ts,
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing/unparseable time, using now");
-            (Utc::now(), TimeSource::Host)
+            Utc::now()
         }
     };
-    let reported = stated_terms(time_source, &kind, price);
+    // Only `update_time` is the venue's time for the row's terms. `time` is when the order was
+    // created, before any amend changed them, and this host's clock is no venue time at all.
+    let reported = match update_time {
+        Some(_) => stated_terms(TimeSource::Venue, &kind, price, quantity),
+        None => ReportedTerms::NONE,
+    };
     let reported = reported.with_kind(reported.kind && !kind_known);
 
     Some(Order {
@@ -3194,7 +3197,9 @@ pub(crate) fn convert_execution_report(
         "REPLACED" => {
             // An amend (Order Amend Keep Priority): the order stays live under the same `orderId`
             // with a smaller total quantity (`q`). An amend that kept the client order id leaves
-            // `C` empty and is reported as the order's new state. One that took a new client order
+            // `C` empty and is reported as the order's new state. Spot alone offers the amend;
+            // margin has no amend request, but its stream sends the same report shape, so a
+            // margin report is read the same way. One that took a new client order
             // id names it in `c` and the old one in `C`; the engine knows the order by the old id
             // and cannot follow it. A cancel-replace is not this: it reports `CANCELED` for the
             // original and `NEW` for the replacement.
@@ -3374,7 +3379,7 @@ fn convert_order_snapshot(
         )),
     };
 
-    let reported = stated_terms(time_source, &order.kind, order.price);
+    let reported = stated_terms(time_source, &order.kind, order.price, order.quantity);
     Some(UnindexedAccountEvent::new(
         exchange,
         AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
@@ -3386,17 +3391,24 @@ fn convert_order_snapshot(
 /// The terms a Binance order report states: every one its fields carry, when its time is the
 /// venue's, and none when the time is this host's, since the engine orders reports by that time.
 ///
-/// The limit price is stated for a kind that has none (it has none), and for one that has one
-/// only when the report carried it; a zero or unreadable price is not the venue's limit. A kind
-/// or time in force the report left unresolved is cleared by [`OrderReport::new`].
+/// - **Price.** A kind that carries no limit price states that it has none. A kind that carries
+///   one states its price only when the report gave a non-zero one: a zero or unreadable price is
+///   not the venue's limit.
+/// - **Quantity.** A zero quantity is not stated. Binance reports one for an order sized in the
+///   quote asset (`quoteOrderQty`), whose base quantity is not known until it fills.
+/// - **Kind and time in force.** A kind or time in force the report left unresolved is cleared
+///   by [`OrderReport::new`]. A REST row also clears the kind when the client filled it in from
+///   the order it placed ([`convert_order_row`]).
 fn stated_terms(
     time_source: TimeSource,
     kind: &OrderKind,
     price: Option<Decimal>,
+    quantity: Decimal,
 ) -> ReportedTerms {
     match time_source {
         TimeSource::Venue => ReportedTerms::ALL
-            .with_price(!kind_has_limit_price(kind) || price.is_some_and(|price| !price.is_zero())),
+            .with_price(!kind_has_limit_price(kind) || price.is_some_and(|price| !price.is_zero()))
+            .with_quantity(!quantity.is_zero()),
         TimeSource::Host => ReportedTerms::NONE,
     }
 }
@@ -5436,9 +5448,9 @@ mod tests {
         }
     }
 
-    /// A listed row states its terms when its time is the venue's (`updateTime`, else `time`),
-    /// and none when neither is there and the row is stamped with this host's clock. A limit
-    /// row's zero price is not the venue's limit.
+    /// A listed row states its terms when it carries `updateTime`, the venue's time for them, and
+    /// none when it carries only `time`, its creation, or no time at all. A limit row's zero
+    /// price is not the venue's limit, nor is a zero quantity the venue's quantity.
     #[test]
     fn a_listed_row_states_its_terms_only_on_the_venues_time() {
         let btc = InstrumentNameExchange::new("BTCUSDT");
@@ -5458,7 +5470,7 @@ mod tests {
             stated(limit(
                 serde_json::json!({"price": "95", "updateTime": null})
             )),
-            ReportedTerms::ALL
+            ReportedTerms::NONE
         );
         assert_eq!(
             stated(limit(
@@ -5469,6 +5481,10 @@ mod tests {
         assert_eq!(
             stated(limit(serde_json::json!({}))),
             ReportedTerms::ALL.with_price(false)
+        );
+        assert_eq!(
+            stated(limit(serde_json::json!({"price": "95", "origQty": "0"}))),
+            ReportedTerms::ALL.with_quantity(false)
         );
     }
 

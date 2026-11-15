@@ -5036,9 +5036,9 @@ mod tests {
     #[test]
     fn an_amend_that_keeps_the_client_order_id_reports_the_order_on_its_new_terms() {
         use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
-        for previous in ["", "client-1"] {
+        for previous in [Some(""), Some("client-1"), None] {
             let amend = ExecutionReport {
-                orig_client_order_id: Some(previous.to_string()),
+                orig_client_order_id: previous.map(str::to_string),
                 transaction_time: Some(1_700_000_002_000),
                 ..resting_report("REPLACED", "0.002")
             };
@@ -5082,8 +5082,9 @@ mod tests {
         assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
     }
 
-    /// A report states its terms only when its time is the venue's. A limit price is stated only
-    /// when the report carried one; a kind without a limit states that it has none.
+    /// A report states its terms only when its time is the venue's, an amend's included. A limit
+    /// price is stated only when the report carried one; a kind without a limit states that it
+    /// has none. A zero quantity is not stated.
     #[test]
     fn a_report_states_its_terms_only_on_the_venues_time() {
         let stated = |report| order_report(convert(report)).expect("a report").reported;
@@ -5101,6 +5102,17 @@ mod tests {
             ..resting_report("NEW", "0.003")
         };
         assert_eq!(stated(event_time), ReportedTerms::ALL);
+        let amend_on_host_time = ExecutionReport {
+            transaction_time: None,
+            event_time: None,
+            ..resting_report("REPLACED", "0.002")
+        };
+        assert_eq!(stated(amend_on_host_time), ReportedTerms::NONE);
+        assert_eq!(
+            stated(resting_report("NEW", "0")),
+            ReportedTerms::ALL.with_quantity(false),
+            "an order sized in the quote asset"
+        );
 
         let zero_price = ExecutionReport {
             price: Some("0".to_string()),
