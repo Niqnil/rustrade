@@ -103,6 +103,17 @@ pub struct RestingOrder {
     /// see [`expires_at`](Self::expires_at).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<DateTime<Utc>>,
+    /// When the order joined its price's queue, where that is not its [`Open::time_exchange`].
+    ///
+    /// An amend that keeps the order's place still stamps [`Open::time_exchange`] with when the
+    /// venue made it, so the place is kept here. `None` for every other order, which joined its
+    /// queue at its `time_exchange`: see [`queued_at`](Self::queued_at).
+    ///
+    /// Read only for an order on a queue: [`OpenOrders::insert`] and
+    /// [`OpenOrders::from_entries`] rank a queued order by it as given, and ignore it for a held
+    /// order or one with no price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_place_since: Option<DateTime<Utc>>,
 }
 
 impl RestingOrder {
@@ -112,6 +123,7 @@ impl RestingOrder {
             order,
             reservation,
             deadline: None,
+            kept_place_since: None,
         }
     }
 
@@ -119,6 +131,14 @@ impl RestingOrder {
     #[must_use]
     pub fn with_deadline(self, deadline: Option<DateTime<Utc>>) -> Self {
         Self { deadline, ..self }
+    }
+
+    /// When the order joined its price's queue, which ranks it behind the orders at its price that
+    /// joined before it: [`kept_place_since`](Self::kept_place_since), else its
+    /// [`Open::time_exchange`].
+    pub fn queued_at(&self) -> DateTime<Utc> {
+        self.kept_place_since
+            .unwrap_or(self.order.state.time_exchange)
     }
 
     /// The instant the order retires at of its own accord, or `None` if it works until cancelled:
@@ -166,8 +186,9 @@ struct QueuePosition {
     /// The order's price, ranked for its side: negated on the buy side, so the **highest** bid and
     /// the **lowest** offer both sort first.
     price_rank: Decimal,
-    /// When the venue accepted the order. Earlier is matched first, at equal price.
-    time_exchange: DateTime<Utc>,
+    /// When the order joined the queue ([`RestingOrder::queued_at`]). Earlier is matched first,
+    /// at equal price.
+    queued_at: DateTime<Utc>,
     /// Insertion sequence, which breaks the tie between two orders accepted at the same instant.
     ///
     /// Without it two such orders compare equal and a `BTreeMap` keeps only one of them.
@@ -175,13 +196,13 @@ struct QueuePosition {
 }
 
 impl QueuePosition {
-    fn new(side: Side, price: Decimal, time_exchange: DateTime<Utc>, seq: u64) -> Self {
+    fn new(side: Side, price: Decimal, queued_at: DateTime<Utc>, seq: u64) -> Self {
         Self {
             price_rank: match side {
                 Side::Buy => -price,
                 Side::Sell => price,
             },
-            time_exchange,
+            queued_at,
             seq,
         }
     }
@@ -274,6 +295,10 @@ impl OpenOrders {
     /// Inserts `resting`, the order with what is held against it and its own deadline if any,
     /// unless an order is already resting under its [`ClientOrderId`].
     ///
+    /// A priced order joins its queue behind every order at its price whose
+    /// [`queued_at`](RestingOrder::queued_at) is no later than its own: price, then that time,
+    /// then insertion.
+    ///
     /// # Errors
     /// [`AlreadyResting`], carrying `resting` back untouched, if an order is already held under
     /// its id. The book is left exactly as it was: the order already resting keeps its queue
@@ -303,14 +328,14 @@ impl OpenOrders {
         }
 
         if queue {
-            Self::enqueue(&mut self.queues, &mut self.seq, &resting.order);
+            Self::enqueue(&mut self.queues, &mut self.seq, &resting);
         }
 
         vacant.insert(resting);
         Ok(())
     }
 
-    /// Files `order` behind everything already queued at its price and instant, if it has a
+    /// Files `resting` behind everything already queued at its price and instant, if it has a
     /// price. Takes the two fields it writes rather than `self`, so a caller holding a borrow of
     /// [`by_id`](Self::by_id) can still call it.
     fn enqueue(
@@ -319,8 +344,9 @@ impl OpenOrders {
             BTreeMap<QueuePosition, ClientOrderId>,
         >,
         seq: &mut u64,
-        order: &OpenOrder,
+        resting: &RestingOrder,
     ) {
+        let order = &resting.order;
         let Some(price) = order.price else {
             return;
         };
@@ -329,7 +355,7 @@ impl OpenOrders {
             .entry((order.key.instrument.clone(), order.side))
             .or_default()
             .insert(
-                QueuePosition::new(order.side, price, order.state.time_exchange, *seq),
+                QueuePosition::new(order.side, price, resting.queued_at(), *seq),
                 order.key.cid.clone(),
             );
     }
@@ -342,8 +368,9 @@ impl OpenOrders {
     /// order's, and only its price, quantity and state differ. Its deadline is therefore the
     /// same, and stays indexed.
     ///
-    /// - [`Rank::Kept`] leaves it where it was in its queue. Its price and
-    ///   [`Open::time_exchange`] must be the queued order's: they are where it was filed.
+    /// - [`Rank::Kept`] leaves it where it was in its queue. Its price must be the queued order's,
+    ///   which is where it was filed. Its [`Open::time_exchange`] may move: the instant it joined
+    ///   the queue is kept as [`RestingOrder::kept_place_since`].
     /// - [`Rank::Lost`] files it behind every order queued at its price and
     ///   [`Open::time_exchange`], as [`insert`](Self::insert) files an arriving order.
     ///
@@ -354,8 +381,8 @@ impl OpenOrders {
     ///
     /// # Panics
     /// If `order` is not the queued order amended (another side, kind or time in force), or if
-    /// [`Rank::Kept`] is asked for with another price or [`Open::time_exchange`]. Either would
-    /// leave the order filed in its queue under terms its entry no longer has.
+    /// [`Rank::Kept`] is asked for with another price. Either would leave the order filed in its
+    /// queue under terms its entry no longer has.
     pub fn amend(
         &mut self,
         order: OpenOrder,
@@ -378,28 +405,31 @@ impl OpenOrders {
             "OpenOrders amended {cid} into a different order: only its price, quantity and state \
              may change"
         );
-        match rank {
-            Rank::Kept => assert!(
-                before.price == order.price
-                    && before.state.time_exchange == order.state.time_exchange,
-                "OpenOrders kept {cid}'s queue position while moving its price or arrival, which \
-                 is where that position is filed"
-            ),
-            Rank::Lost => {
-                self.dequeue(before);
-                Self::enqueue(&mut self.queues, &mut self.seq, &order);
-            }
-        }
         // The deadline was fixed when the order was accepted, and an amend does not move it, so
         // its entry among the deadlines stands as it was.
-        self.by_id.insert(
-            cid,
-            RestingOrder {
-                order,
-                reservation,
-                deadline: replaced.deadline,
-            },
-        );
+        let mut amended = RestingOrder {
+            order,
+            reservation,
+            deadline: replaced.deadline,
+            kept_place_since: None,
+        };
+        match rank {
+            Rank::Kept => {
+                assert!(
+                    before.price == amended.order.price,
+                    "OpenOrders kept {cid}'s queue position while moving its price, which is \
+                     where that position is filed"
+                );
+                let queued_at = replaced.queued_at();
+                amended.kept_place_since =
+                    (queued_at != amended.order.state.time_exchange).then_some(queued_at);
+            }
+            Rank::Lost => {
+                self.dequeue(&replaced);
+                Self::enqueue(&mut self.queues, &mut self.seq, &amended);
+            }
+        }
+        self.by_id.insert(cid, amended);
         Ok(replaced)
     }
 
@@ -548,7 +578,7 @@ impl OpenOrders {
         if self.unqueued.remove(&order.key.cid) || order.price.is_none() {
             self.unhold(order);
         } else {
-            self.dequeue(order);
+            self.dequeue(resting);
         }
 
         if let Some(expiry) = resting.expires_at() {
@@ -609,7 +639,8 @@ impl OpenOrders {
         }
     }
 
-    fn dequeue(&mut self, order: &OpenOrder) {
+    fn dequeue(&mut self, resting: &RestingOrder) {
+        let order = &resting.order;
         let Some(price) = order.price else {
             // Never queued — see the type's note on orders with no price and held orders.
             return;
@@ -624,13 +655,13 @@ impl OpenOrders {
         // per instrument and side, and an order appears in exactly one, so this is a scan of one
         // instrument's book rather than of every open order.
         let position = queue
-            .range(QueuePosition::new(order.side, price, order.state.time_exchange, 0)..)
+            .range(QueuePosition::new(order.side, price, resting.queued_at(), 0)..)
             .find(|(_, queued)| *queued == &order.key.cid)
             .map(|(position, _)| *position);
 
         // A priced order is queued by `insert` and dequeued only from here, so failing to find one
-        // means its `price`, `side` or `state.time_exchange` changed while it was on the book: the
-        // range above no longer covers where it was filed. That silently leaves a queued id with no
+        // means its `price`, `side` or `queued_at` changed while it was on the book: the range
+        // above no longer covers where it was filed. That silently leaves a queued id with no
         // order behind it, which `resting` then silently filters out — invisible in both
         // directions, and it would corrupt price-time priority for every later match. Asserted
         // rather than tolerated, because there is no correct way to carry on from it.
@@ -640,7 +671,7 @@ impl OpenOrders {
              mutated while it was on the book",
             order.key.cid,
             order.side,
-            order.state.time_exchange
+            resting.queued_at()
         );
 
         if let Some(position) = position {
@@ -1240,6 +1271,73 @@ mod tests {
             (dec!(0.5), Some(reservation(dec!(50))), smaller.state)
         );
         assert_eq!(open.len(), 2);
+    }
+
+    /// An amend that keeps its place but is stamped later still ranks where it joined the queue,
+    /// ahead of an order that joined after it and before the amend, and keeps that place through
+    /// its book's entries. Removing it then takes it off the queue.
+    #[test]
+    fn a_kept_place_outlives_a_later_stamp_and_the_books_entries() {
+        let mut open = book([
+            order("first", Side::Buy, Some(dec!(100)), 1_000),
+            order("second", Side::Buy, Some(dec!(100)), 2_000),
+        ]);
+        let mut stamped = order("first", Side::Buy, Some(dec!(100)), 3_000);
+        stamped.quantity = dec!(0.5);
+
+        open.amend(stamped.clone(), None, Rank::Kept).unwrap();
+
+        assert_eq!(resting_cids(&open, Side::Buy), ["first", "second"]);
+        let first = open.resting_order(&ClientOrderId::new("first")).unwrap();
+        assert_eq!(first.order.state.time_exchange, at(3_000));
+        assert_eq!(first.kept_place_since, Some(at(1_000)));
+        assert_eq!(first.queued_at(), at(1_000));
+
+        let mut rebuilt = OpenOrders::from_entries(open.entries()).unwrap();
+        assert_eq!(resting_cids(&rebuilt, Side::Buy), ["first", "second"]);
+        // Serialised and read back, as a saved venue is, the place is kept too.
+        let saved = serde_json::to_string(&open.entries()).unwrap();
+        let restored =
+            OpenOrders::from_entries(serde_json::from_str::<Vec<OpenOrderEntry>>(&saved).unwrap())
+                .unwrap();
+        assert_eq!(resting_cids(&restored, Side::Buy), ["first", "second"]);
+
+        // A second kept amend keeps the first place, not the first amend's stamp.
+        let mut again = stamped;
+        again.quantity = dec!(0.25);
+        again.state.time_exchange = at(4_000);
+        rebuilt.amend(again, None, Rank::Kept).unwrap();
+        let first = rebuilt.resting_order(&ClientOrderId::new("first")).unwrap();
+        assert_eq!(first.kept_place_since, Some(at(1_000)));
+
+        rebuilt.remove(&ClientOrderId::new("first")).unwrap();
+        assert_eq!(resting_cids(&rebuilt, Side::Buy), ["second"]);
+    }
+
+    /// An amend that loses its place forgets the one it kept before: it joins its queue at its
+    /// new stamp.
+    #[test]
+    fn an_amend_that_loses_its_rank_forgets_a_kept_place() {
+        let mut open = book([
+            order("first", Side::Buy, Some(dec!(100)), 1_000),
+            order("second", Side::Buy, Some(dec!(100)), 2_000),
+        ]);
+        let mut kept = order("first", Side::Buy, Some(dec!(100)), 3_000);
+        kept.quantity = dec!(0.5);
+        open.amend(kept, None, Rank::Kept).unwrap();
+
+        open.amend(
+            order("first", Side::Buy, Some(dec!(100)), 4_000),
+            None,
+            Rank::Lost,
+        )
+        .unwrap();
+
+        let first = open.resting_order(&ClientOrderId::new("first")).unwrap();
+        assert_eq!(first.kept_place_since, None);
+        assert_eq!(resting_cids(&open, Side::Buy), ["second", "first"]);
+        open.remove(&ClientOrderId::new("first")).unwrap();
+        assert_eq!(resting_cids(&open, Side::Buy), ["second"]);
     }
 
     #[test]

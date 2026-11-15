@@ -3694,7 +3694,8 @@ mod tests {
             .collect()
     }
 
-    /// An amend reaches the venue, which moves the order and restates its hold before answering.
+    /// An amend reaches the venue, which moves the order, then restates its hold and reports the
+    /// order as it now rests before answering.
     #[tokio::test]
     async fn an_amend_moves_a_resting_order_and_restates_its_hold_first() {
         let mut harness = Harness::new(
@@ -3719,7 +3720,7 @@ mod tests {
         let events = harness.rest_events().await;
         assert_eq!(
             events.iter().map(label).collect::<Vec<_>>(),
-            vec!["balance", "account_other", "market", "after_drain"]
+            vec!["balance", "order", "account_other", "market", "after_drain"]
         );
         assert_eq!(amend_outcomes(&events), vec![Ok(Some(dec!(2)))]);
     }

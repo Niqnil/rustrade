@@ -2,9 +2,11 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
-    error::UnindexedApiError,
+    error::{UnindexedApiError, UnindexedOrderError},
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
+        amend::AmendPatch,
+        id::ClientOrderId,
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
             UnindexedOrderResponseCancel,
@@ -150,6 +152,25 @@ impl MockExchangeRequest {
         )
     }
 
+    /// A request to amend the order resting under `cid` as if from outside any client: see
+    /// [`MockExchangeRequestKind::ModifyExternally`]. What the change reports goes to the account
+    /// stream; `response_tx` hears only whether it was made.
+    pub fn modify_externally(
+        time_request: DateTime<Utc>,
+        response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
+        cid: ClientOrderId,
+        patch: AmendPatch,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::ModifyExternally {
+                response_tx,
+                cid,
+                patch,
+            },
+        )
+    }
+
     pub fn open_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<
@@ -213,6 +234,14 @@ pub enum MockExchangeRequestKind {
     AmendOrder {
         response_tx: oneshot::Sender<UnindexedOrderResponseAmend>,
         request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
+    },
+    /// A test hook: amend the order resting under `cid` by `patch` as if from outside any client,
+    /// reporting only on the account stream, and answer whether it was made. See
+    /// [`SimulatedVenue::modify_externally`](crate::exchange::mock::SimulatedVenue::modify_externally).
+    ModifyExternally {
+        response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
+        cid: ClientOrderId,
+        patch: AmendPatch,
     },
     OpenOrder {
         response_tx:

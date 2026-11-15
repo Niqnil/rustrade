@@ -194,9 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **What it amends:** price and total quantity, alone or together. It has no conditional orders,
     so it never amends a trigger price.
   - **Queue priority:** the order keeps its place only when its quantity is lowered and its price
-    is left alone. Any other amend moves it behind every order at its new price, and restamps its
-    `Open::time_exchange` with the amend's time. `amend_support` declares
-    `AmendPriority::KeptOnQuantityDecrease`.
+    is left alone. Any other amend moves it behind every order at its new price. `amend_support`
+    declares `AmendPriority::KeptOnQuantityDecrease`.
+  - **Reported:** every amend stamps the order's `Open::time_exchange` with the amend's time,
+    whether or not it keeps its place, and the account stream reports the amended order's
+    `OrderSnapshot` after the balances it restated, before the answer. On a venue configured with
+    `reassign_id`, that snapshot names the new id.
   - **Cost:** the order's hold is released and the amended order costed afresh against the
     venue's current market, as one change.
     - A new price that crosses the market trades as a taker, up to the size the market has. The
@@ -363,6 +366,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Known limitations:** one check at the instant set, against the market held then; no cut-off
     for orders between the check and expiry; one exercise's proceeds do not fund another.
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
+
+- **A test hook to change a resting order on the simulated venue from outside any client**
+  (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
+  change made in the venue's own interface would, and reports it only on the account stream, for a
+  test of how a consumer learns of an order changed without it. The change never passes through a
+  client, so the venue's `AmendConfig` (what a client may ask to amend) does not limit it, and it
+  may change an order seeded through `initial_state`, which then holds what it needs. The book's
+  rules apply as to `amend_order`: the venue's refusals, trading, queue priority, a reassigned id
+  and the reported events. A running `MockExchange` takes it as
+  `MockExchangeRequest::modify_externally`, whose events go to the account stream. `RestingOrder` gains `kept_place_since`: the time an
+  order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed
 - **Breaking: `MockExecutionConfig` is built with `new` and `with_*` setters** (`rustrade-execution`,
@@ -543,10 +557,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unknown or triggered, the price on a row whose type is missing or unknown (its `limitPx` may
     be a market trigger's worst fill price), and a time in force it reads as `Unreported`. An
     account-stream update carries no type, so it states only its quantity.
-  - **Every other producer states no term yet**, the engine's own snapshots and the simulated
-    venue included. The engine reads only each report's order, as before.
+  - **The simulated venue states every term** of each order it reports, in snapshots and its
+    account snapshot alike, since its own book is where the terms live.
+  - **Every other producer states no term yet**, the engine's own snapshots included. The engine
+    reads only each report's order, as before.
 
 ### Fixed
+
+- **The simulated venue answers a market order with no price** (`rustrade-execution`). A market
+  order's price is ignored, but its answer, and its record once filled or cancelled, carried the
+  price its request did, while a held one carried none. Every record of a market order now
+  carries `price: None`.
 
 - **A Hyperliquid order that fills in part when placed is no longer reported fully filled**
   (`rustrade-execution`, `hyperliquid` feature). Hyperliquid answers such a placement `filled`,

@@ -451,6 +451,14 @@ impl MockExchange {
                 let outcome = self.venue.amend_order(request);
                 emit.respond(outcome.events, response_tx, outcome.response);
             }
+            MockExchangeRequestKind::ModifyExternally {
+                response_tx,
+                cid,
+                patch,
+            } => match self.venue.modify_externally(&cid, patch) {
+                Ok(events) => emit.respond(events, response_tx, Ok(())),
+                Err(error) => emit.respond(Vec::new(), response_tx, Err(error)),
+            },
             MockExchangeRequestKind::OpenOrder {
                 response_tx,
                 request,
@@ -1959,6 +1967,47 @@ mod tests {
         assert_eq!(restated.0.balance.free, d("52000"));
 
         drop(client);
+        paper.stop().await;
+    }
+
+    /// A resting order changed from outside any client is reported only on the account stream:
+    /// the restated hold, then the order as it now rests, stating every term. The hook's own
+    /// answer comes after them.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_venue_reports_an_external_modification_on_its_stream() {
+        use crate::order::{amend::AmendPatch, report::ReportedTerms};
+
+        let mut paper = Paper::start(spot_config("0", "100000", FeeModelConfig::default()));
+        paper.observe(priced("50000"));
+        let rest = limit_request("rest", Side::Buy, "1", "49000", gtc());
+        let _ = paper.open(rest.clone()).await;
+        assert!(matches!(
+            paper.next_event().await.kind,
+            AccountEventKind::BalanceSnapshot(_)
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        paper
+            .request_tx
+            .send(MockExchangeRequest::modify_externally(
+                Utc::now(),
+                response_tx,
+                rest.key.cid.clone(),
+                AmendPatch::default().with_price(d("48000")),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            paper.next_event().await.kind,
+            AccountEventKind::BalanceSnapshot(_)
+        ));
+        let AccountEventKind::OrderSnapshot(report) = paper.next_event().await.kind else {
+            panic!("the order is reported as it now rests");
+        };
+        assert_eq!(report.0.order.key, rest.key);
+        assert_eq!(report.0.order.price, Some(d("48000")));
+        assert_eq!(report.0.reported, ReportedTerms::ALL);
+        assert_eq!(response_rx.await.expect("the hook is answered"), Ok(()));
         paper.stop().await;
     }
 

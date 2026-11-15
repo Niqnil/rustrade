@@ -498,9 +498,16 @@ impl TimeInForceRules {
 /// - **Crossing the market.** An amend whose new price crosses the market trades as a taker, as an
 ///   arriving limit order does, and what is left rests at the new price. A post-only order's
 ///   amend that would cross is refused instead.
+/// - **Reported.** The account stream reports the amended order's snapshot, stating every term,
+///   with its [`Open::time_exchange`](crate::order::state::Open::time_exchange) stamped at the
+///   amend whichever way it ranks.
 /// - **Refused** with [`AmendRefusal::Venue`](crate::error::AmendRefusal::Venue): an order the
 ///   venue is holding for a later bar or a fresh market, an order seeded through
 ///   [`MockExecutionConfig::initial_state`], and an option order.
+/// - **Changed outside the client.**
+///   [`SimulatedVenue::modify_externally`](crate::exchange::mock::SimulatedVenue::modify_externally)
+///   is not limited by this, which says what a client may ask to amend. The other rules above
+///   are the book's and apply to it too, except that it can change a seeded order.
 ///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
 /// start from [`AmendConfig::FULL`] or [`AmendConfig::NONE`] and the `with_*` methods. A field
@@ -521,6 +528,9 @@ pub struct AmendConfig {
     /// one. A fill the amend itself makes is reported under the old id, and an amend that fills
     /// the order outright reassigns none. Priority still follows the rule above: a quantity
     /// decrease at the same price keeps the order's place under its new id.
+    ///
+    /// The account stream's snapshot of the amended order names the new id, and arrives before
+    /// the answer that says which id it replaced, as a live venue's stream can.
     pub reassign_id: bool,
 }
 
