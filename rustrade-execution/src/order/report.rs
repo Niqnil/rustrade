@@ -1,4 +1,8 @@
-use crate::order::{Order, OrderSnapshot, TimeInForce, state::OrderState};
+use crate::{
+    order::{Order, OrderKind, OrderSnapshot, TimeInForce, state::OrderState},
+    trade::TimeSource,
+};
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
@@ -111,6 +115,44 @@ impl ReportedTerms {
             ..self
         }
     }
+
+    /// The terms a report states when it read the order's quantity, price, kind and time in force
+    /// from the venue: every one, when `time_source` says its state timestamp is the venue's, and
+    /// none when it is this host's, since a reader orders reports by that time (see
+    /// [`OrderReport`]'s producer obligations).
+    ///
+    /// - **Price.** A `kind` that carries no limit price ([`OrderKind::has_limit_price`]) states
+    ///   that it has none. One that carries a limit states `price` only when it is non-zero: a
+    ///   zero or missing price is not the venue's limit. For a kind without one, the producer
+    ///   leaves its order's price `None`, whatever the venue's message holds there, so that the
+    ///   price it states agrees with the order.
+    /// - **Quantity.** A zero `quantity` is not stated. A venue reports one for an order sized
+    ///   another way, such as by quote-asset amount or notional value, whose quantity is not known
+    ///   until it fills.
+    /// - **Kind and time in force** are stated as read. [`OrderReport::new`] clears an
+    ///   [`OrderKind::ConditionalUnresolved`] kind and a [`TimeInForce::Unreported`] time in
+    ///   force. A producer that filled a term in from elsewhere, such as the order it placed,
+    ///   clears that flag itself.
+    ///
+    /// `TimeSource::Venue` means the timestamp is the venue's time of these terms. A producer
+    /// whose timestamp is the venue's but not the time of the terms uses [`NONE`](Self::NONE)
+    /// instead. An order's creation time is such a timestamp on a venue that changes an order's
+    /// terms in place. It is the time of the terms only on a venue that never does, where a
+    /// change makes a new order.
+    #[must_use]
+    pub fn from_venue_read(
+        time_source: TimeSource,
+        kind: &OrderKind,
+        price: Option<Decimal>,
+        quantity: Decimal,
+    ) -> Self {
+        match time_source {
+            TimeSource::Venue => Self::ALL
+                .with_price(!kind.has_limit_price() || price.is_some_and(|price| !price.is_zero()))
+                .with_quantity(!quantity.is_zero()),
+            TimeSource::Host => Self::NONE,
+        }
+    }
 }
 
 /// An order as a venue reported it, and which of its terms the report states.
@@ -127,7 +169,7 @@ impl ReportedTerms {
 /// # Reading the flags
 ///
 /// A reader treats a [`TimeInForce::Unreported`] or an
-/// [`OrderKind::ConditionalUnresolved`](crate::order::OrderKind::ConditionalUnresolved) as not
+/// [`OrderKind::ConditionalUnresolved`] as not
 /// stated, whatever [`reported`](Self::reported) says. [`new`](Self::new) never states either, but
 /// the fields are public, and a report deserialized or built as a literal is taken as it is.
 ///
@@ -164,7 +206,7 @@ pub struct OrderReport<
 impl<ExchangeKey, AssetKey, InstrumentKey> OrderReport<ExchangeKey, AssetKey, InstrumentKey> {
     /// A report of `order` stating the terms in `reported`, less any the order holds as a
     /// stand-in: a [`TimeInForce::Unreported`] or an
-    /// [`OrderKind::ConditionalUnresolved`](crate::order::OrderKind::ConditionalUnresolved).
+    /// [`OrderKind::ConditionalUnresolved`].
     pub fn new(
         order: Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
         reported: ReportedTerms,
@@ -204,6 +246,33 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_instrument::Side;
+
+    /// A venue read states every term on the venue's time and none on this host's. A limit kind
+    /// states its price only when it is non-zero, a kind without a limit states that it has
+    /// none, and a zero quantity is not stated.
+    #[test]
+    fn a_venue_read_states_its_terms_on_the_venues_time() {
+        use crate::trade::TimeSource;
+        let read = |time_source, kind, price, quantity| {
+            ReportedTerms::from_venue_read(time_source, &kind, price, quantity)
+        };
+        let limit = |price| read(TimeSource::Venue, OrderKind::Limit, price, dec!(1));
+        assert_eq!(limit(Some(dec!(95))), ReportedTerms::ALL);
+        assert_eq!(limit(Some(dec!(0))), ReportedTerms::ALL.with_price(false));
+        assert_eq!(limit(None), ReportedTerms::ALL.with_price(false));
+        assert_eq!(
+            read(TimeSource::Venue, OrderKind::Market, None, dec!(1)),
+            ReportedTerms::ALL
+        );
+        assert_eq!(
+            read(TimeSource::Venue, OrderKind::Limit, Some(dec!(95)), dec!(0)),
+            ReportedTerms::ALL.with_quantity(false)
+        );
+        assert_eq!(
+            read(TimeSource::Host, OrderKind::Limit, Some(dec!(95)), dec!(1)),
+            ReportedTerms::NONE
+        );
+    }
 
     fn order(kind: OrderKind, time_in_force: TimeInForce) -> UnindexedOrderReport {
         let order = Order {

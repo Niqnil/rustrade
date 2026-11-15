@@ -54,6 +54,7 @@ use rustrade_execution::{
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, StrategyId},
+        report::{ReportedTerms, UnindexedOrderReport},
         request::RequestOpen,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
@@ -630,6 +631,162 @@ async fn test_snapshot_lists_a_crypto_order_under_its_client_id_and_complete() {
         ),
     )
     .await;
+}
+
+/// The terms an order rests on, as `(quantity, price, kind, time in force)`.
+fn terms(
+    report: &UnindexedOrderReport,
+) -> (
+    rust_decimal::Decimal,
+    Option<rust_decimal::Decimal>,
+    OrderKind,
+    TimeInForce,
+) {
+    let order = &report.order;
+    (order.quantity, order.price, order.kind, order.time_in_force)
+}
+
+/// What the account stream and an account snapshot report about a resting order placed with
+/// `request`: the stream's first snapshot of it within ten seconds, if any, and the snapshot's
+/// listing of it. The order is cancelled before either is returned, so a failed assertion on them
+/// leaves nothing resting.
+async fn reports_of_a_resting_order(
+    instrument: &InstrumentNameExchange,
+    request: RequestOpen,
+) -> (Option<UnindexedOrderReport>, Option<UnindexedOrderReport>) {
+    let client = AlpacaClient::new(test_config());
+    let instruments = [instrument.clone()];
+    let mut stream = client
+        .account_stream(&[], &instruments)
+        .await
+        .expect("account_stream failed");
+    let cid = ClientOrderId::new(format!(
+        "test-terms-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = OrderKey {
+        exchange: ExchangeId::AlpacaBroker,
+        instrument,
+        strategy: StrategyId::new("test-strategy"),
+        cid: cid.clone(),
+    };
+
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: request,
+        })
+        .await;
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!(
+            "{instrument} limit order did not rest: {:?}",
+            response.state
+        );
+    };
+
+    let streamed = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            if let AccountEventKind::OrderSnapshot(snapshot) = event.kind
+                && snapshot.0.order.key.cid == cid
+            {
+                return Some(snapshot.0);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let listed = client
+        .account_snapshot(&[], &instruments)
+        .await
+        .expect("account_snapshot failed")
+        .instruments
+        .into_iter()
+        .flat_map(|snapshot| snapshot.orders)
+        .find(|order| order.order.key.cid == cid);
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open.id.clone()),
+            },
+        })
+        .await;
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+    await_no_open_orders(&client, instrument).await;
+    (streamed, listed)
+}
+
+/// A resting crypto order is reported on the terms it was placed with, every one stated, by the
+/// account stream and by an account snapshot alike. Crypto trades around the clock, so the
+/// stream acknowledges it at any hour.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_resting_crypto_order_states_its_terms() {
+    init_logging();
+    let request = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1000.00)),
+        dec!(0.01),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
+    let expected = (
+        request.quantity,
+        request.price,
+        request.kind,
+        request.time_in_force,
+    );
+    let (streamed, listed) = reports_of_a_resting_order(&btc_instrument(), request).await;
+
+    let streamed = streamed.expect("the stream reports the order");
+    assert_eq!(streamed.reported, ReportedTerms::ALL, "{streamed:?}");
+    assert_eq!(terms(&streamed), expected);
+    let listed = listed.expect("the account snapshot lists the order");
+    assert_eq!(listed.reported, ReportedTerms::ALL, "{listed:?}");
+    assert_eq!(terms(&listed), expected);
+}
+
+/// A resting equity order is listed on the terms it was placed with, every one stated. Outside
+/// market hours it waits for the session, so the stream's report of it, if any, is checked only
+/// when it comes.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_resting_equity_order_states_its_terms() {
+    init_logging();
+    let request = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
+    let expected = (
+        request.quantity,
+        request.price,
+        request.kind,
+        request.time_in_force,
+    );
+    let (streamed, listed) = reports_of_a_resting_order(&spy_instrument(), request).await;
+
+    match streamed {
+        Some(streamed) => {
+            assert_eq!(streamed.reported, ReportedTerms::ALL, "{streamed:?}");
+            assert_eq!(terms(&streamed), expected);
+        }
+        None => println!("the stream did not report the equity order within ten seconds"),
+    }
+    let listed = listed.expect("the account snapshot lists the order");
+    assert_eq!(listed.reported, ReportedTerms::ALL, "{listed:?}");
+    assert_eq!(terms(&listed), expected);
 }
 
 #[tokio::test]

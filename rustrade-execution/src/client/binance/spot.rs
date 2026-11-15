@@ -48,11 +48,11 @@ use super::server_time::{ServerTime, SigningClock, default_server_time_sync, rea
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
     BinanceTimeInForce, CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, ListedOrder,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing,
-    PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents,
-    UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time,
-    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
+    RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
@@ -61,6 +61,7 @@ use super::shared::{
     recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
     rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
+use crate::client::listed_order::ListedOrder;
 use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{

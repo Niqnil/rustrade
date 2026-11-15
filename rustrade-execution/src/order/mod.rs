@@ -386,6 +386,27 @@ impl OrderKind {
     pub fn is_conditional_unresolved(&self) -> bool {
         matches!(self, Self::ConditionalUnresolved { .. })
     }
+
+    /// Whether orders of this kind carry a limit price in [`Order::price`]: a limit order, a
+    /// stop-limit or take-profit-limit, and a trailing stop whose limit is fixed when placed.
+    ///
+    /// A [`TrailingStopLimit`](Self::TrailingStopLimit) carries none: its limit follows from its
+    /// stop and `limit_offset`. An unresolved conditional answers for its
+    /// [`family`](ConditionalFamily::has_limit_price).
+    pub fn has_limit_price(&self) -> bool {
+        match self {
+            Self::Limit
+            | Self::StopLimit { .. }
+            | Self::TakeProfitLimit { .. }
+            | Self::TrailingStopFixedLimit { .. } => true,
+            Self::Market
+            | Self::Stop { .. }
+            | Self::TakeProfit { .. }
+            | Self::TrailingStop { .. }
+            | Self::TrailingStopLimit { .. } => false,
+            Self::ConditionalUnresolved { family, .. } => family.has_limit_price(),
+        }
+    }
 }
 
 /// Which conditional order an [`OrderKind::ConditionalUnresolved`] is, before whether its trigger
@@ -618,6 +639,63 @@ mod tests {
             serde_json::from_str::<TimeInForceKind>(&json).unwrap(),
             TimeInForceKind::Unreported
         );
+    }
+
+    /// Only the kinds whose limit sits in the order's `price` carry one; a trailing stop-limit's
+    /// limit follows from its stop.
+    #[test]
+    fn order_kind_has_limit_price() {
+        let trigger_price = dec!(100);
+        let (offset, offset_type) = (dec!(1), TrailingOffsetType::Absolute);
+        for (kind, expected) in [
+            (OrderKind::Market, false),
+            (OrderKind::Limit, true),
+            (OrderKind::Stop { trigger_price }, false),
+            (OrderKind::StopLimit { trigger_price }, true),
+            (OrderKind::TakeProfit { trigger_price }, false),
+            (OrderKind::TakeProfitLimit { trigger_price }, true),
+            (
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type,
+                    activation_price: None,
+                },
+                false,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset,
+                    offset_type,
+                    stop_price: trigger_price,
+                    limit_offset: offset,
+                },
+                false,
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset,
+                    offset_type,
+                    activation_price: None,
+                },
+                true,
+            ),
+            (
+                OrderKind::ConditionalUnresolved {
+                    family: ConditionalFamily::StopLimit,
+                    trigger_price: None,
+                },
+                true,
+            ),
+            (
+                OrderKind::ConditionalUnresolved {
+                    family: ConditionalFamily::Stop,
+                    trigger_price: None,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(kind.has_limit_price(), expected, "{kind}");
+        }
     }
 
     #[test]
