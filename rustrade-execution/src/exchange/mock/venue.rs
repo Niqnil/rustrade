@@ -515,13 +515,14 @@ pub enum VenueRegime {
 ///   ledger then — so the seeded balances must cover it, exactly as they must cover a market order.
 ///   They cannot? For spot that is a mis-specified fixture, and it **panics**, in the same class
 ///   as an absent balance; a CFD order is instead cancelled at fill, as described under the
-///   reserved balances below. Cancelling one releases nothing and restates no balance, and neither does
-///   retiring one at its deadline. Changed by [`SimulatedVenue::modify_externally`], it takes a
-///   hold from `free`, and is then held, cancelled and filled as an order this venue booked is.
-///   Such an order may also arrive **part-filled**, carrying an
-///   [`Open::filled_quantity`] this venue did not produce: only the remainder ever trades here,
-///   and a fill that completes it reports no `avg_price`, because the price of the part that
-///   traded elsewhere is not something this venue can know. An order **this** venue part-filled
+///   reserved balances below. Until it is changed, cancelling one releases nothing and restates no
+///   balance, and neither does retiring one at its deadline. Changed by
+///   [`SimulatedVenue::modify_externally`], it takes a hold from the seeded `free`, and is then
+///   held, cancelled and filled as an order this venue booked is; seeded balances that already
+///   keep its own hold out of `free` then hold it twice. A seeded order may also arrive
+///   **part-filled**, carrying an [`Open::filled_quantity`] this venue did not produce: only the
+///   remainder ever trades here, and a fill that completes it reports no `avg_price`, because the
+///   price of the part that traded elsewhere is not something this venue can know. An order **this** venue part-filled
 ///   before resting is the same shape, and reports no `avg_price` for the same reason — the two
 ///   fills were struck at different prices and this state carries one of them.
 /// - **A CFD position seeded by `initial_state` is where the venue's ledger starts, and must carry
@@ -4512,8 +4513,8 @@ impl SimulatedVenue {
     /// may also change an order seeded through [`MockExecutionConfig::initial_state`], which then
     /// holds what the order as changed needs, as an order this venue booked does. That hold is
     /// taken from the seeded `free` balance, which this venue treats as the order's to draw on: if
-    /// the seeded balances already keep the order's own hold out of `free`, as a copy of a live
-    /// account does, the order is held for twice.
+    /// the seeded balances already keep the order's own hold out of `free`, the order is held
+    /// twice.
     ///
     /// Everything else is the book's, and is as [`amend_order`](Self::amend_order) describes:
     /// `patch` is applied to the order as this venue holds it; the venue's refusals (an order held
