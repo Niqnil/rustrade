@@ -21,6 +21,7 @@
 use super::server_time::{ServerTime, SigningClock};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
+    client::listed_order::ListedOrder,
     error::{
         ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError, OrderField,
         PrecisionLimit, PrecisionViolation, StreamTerminationReason, UnindexedClientError,
@@ -31,7 +32,7 @@ use crate::{
         ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
         TrailingOffsetType, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::{OrderReport, ReportedTerms, UnindexedOrderReport},
+        report::{OrderReport, ReportedTerms},
         request::UnindexedOrderResponseCancel,
         state::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
@@ -1755,23 +1756,6 @@ fn sampled(seen: &AtomicU64) -> (u64, bool) {
     (count, count == 1 || count.is_multiple_of(1000))
 }
 
-/// Whether orders of `kind` carry a limit price in Binance's `price` field, which reads zero on
-/// every other kind.
-fn kind_has_limit_price(kind: &OrderKind) -> bool {
-    match kind {
-        OrderKind::Limit
-        | OrderKind::StopLimit { .. }
-        | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. } => true,
-        OrderKind::Market
-        | OrderKind::Stop { .. }
-        | OrderKind::TakeProfit { .. }
-        | OrderKind::TrailingStop { .. } => false,
-        OrderKind::ConditionalUnresolved { family, .. } => family.has_limit_price(),
-    }
-}
-
 /// The [`TimeInForce`] of a Binance order of type `order_type` reported with `timeInForce` `tif`.
 ///
 /// - A `LIMIT_MAKER` order is post-only, which Binance expresses as the order type, not as its
@@ -1930,20 +1914,6 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     known: KnownKinds<'_>,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
     convert_listed_order(o, exchange, instrument, known).map(|listed| listed.order)
-}
-
-/// An open order from a REST row, with the terms the row states (see [`stated_terms`]).
-#[derive(Debug)]
-pub(crate) struct ListedOrder {
-    pub(crate) order: Order<ExchangeId, InstrumentNameExchange, Open>,
-    pub(crate) reported: ReportedTerms,
-}
-
-impl ListedOrder {
-    /// The order as an account snapshot reports it.
-    pub(crate) fn into_report(self) -> UnindexedOrderReport {
-        OrderReport::new(self.order.map_state(OrderState::active), self.reported)
-    }
 }
 
 /// [`convert_open_order`], keeping the terms the row states.
@@ -2262,7 +2232,7 @@ struct OrderRow {
     time_exchange: DateTime<Utc>,
     /// `None` when Binance did not report it.
     filled_qty: Option<Decimal>,
-    /// Which of the row's terms are the venue's: see [`stated_terms`]. The kind is not when it is
+    /// Which of the row's terms are the venue's: see [`ReportedTerms::from_venue_read`]. The kind is not when it is
     /// the one the client knew the order by, rather than the row's.
     reported: ReportedTerms,
 }
@@ -2334,7 +2304,7 @@ fn convert_order_row<T: BinanceOrderFields>(
         }
     };
     // Binance reports a price of zero on kinds that carry no limit price.
-    let price = if kind_has_limit_price(&kind) {
+    let price = if kind.has_limit_price() {
         o.price().and_then(|s| Decimal::from_str(s).ok())
     } else {
         None
@@ -2359,7 +2329,7 @@ fn convert_order_row<T: BinanceOrderFields>(
     // Only `update_time` is the venue's time for the row's terms. `time` is when the order was
     // created, before any amend changed them, and this host's clock is no venue time at all.
     let reported = match update_time {
-        Some(_) => stated_terms(TimeSource::Venue, &kind, price, quantity),
+        Some(_) => ReportedTerms::from_venue_read(TimeSource::Venue, &kind, price, quantity),
         None => ReportedTerms::NONE,
     };
     let reported = reported.with_kind(reported.kind && !kind_known);
@@ -3316,7 +3286,7 @@ fn convert_order_snapshot(
     )?;
     // Binance sends "0" as the price of kinds that carry no limit price, so read it only on the
     // kinds that do.
-    let price = if kind_has_limit_price(&kind) {
+    let price = if kind.has_limit_price() {
         match report.price.as_deref() {
             Some(p) => match Decimal::from_str(p) {
                 Ok(v) if !v.is_zero() => Some(v),
@@ -3379,38 +3349,16 @@ fn convert_order_snapshot(
         )),
     };
 
-    let reported = stated_terms(time_source, &order.kind, order.price, order.quantity);
+    // Binance reports a zero quantity for an order sized in the quote asset (`quoteOrderQty`),
+    // which `from_venue_read` leaves unstated.
+    let reported =
+        ReportedTerms::from_venue_read(time_source, &order.kind, order.price, order.quantity);
     Some(UnindexedAccountEvent::new(
         exchange,
         AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
             OrderReport::new(order, reported),
         )),
     ))
-}
-
-/// The terms a Binance order report states: every one its fields carry, when its time is the
-/// venue's, and none when the time is this host's, since the engine orders reports by that time.
-///
-/// - **Price.** A kind that carries no limit price states that it has none. A kind that carries
-///   one states its price only when the report gave a non-zero one: a zero or unreadable price is
-///   not the venue's limit.
-/// - **Quantity.** A zero quantity is not stated. Binance reports one for an order sized in the
-///   quote asset (`quoteOrderQty`), whose base quantity is not known until it fills.
-/// - **Kind and time in force.** A kind or time in force the report left unresolved is cleared
-///   by [`OrderReport::new`]. A REST row also clears the kind when the client filled it in from
-///   the order it placed ([`convert_order_row`]).
-fn stated_terms(
-    time_source: TimeSource,
-    kind: &OrderKind,
-    price: Option<Decimal>,
-    quantity: Decimal,
-) -> ReportedTerms {
-    match time_source {
-        TimeSource::Venue => ReportedTerms::ALL
-            .with_price(!kind_has_limit_price(kind) || price.is_some_and(|price| !price.is_zero()))
-            .with_quantity(!quantity.is_zero()),
-        TimeSource::Host => ReportedTerms::NONE,
-    }
 }
 
 // ---------------------------------------------------------------------------

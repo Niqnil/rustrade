@@ -105,6 +105,11 @@ pub mod venue_clock;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod reconnect_budget;
 
+// An open order from a venue's order listing, with the terms the listing states. Gated on the
+// clients that use it.
+#[cfg(any(feature = "alpaca", feature = "binance"))]
+pub(crate) mod listed_order;
+
 // A REST stub on the test's own runtime, for the reconnect tests on a paused clock.
 #[cfg(all(test, any(feature = "alpaca", feature = "binance")))]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable

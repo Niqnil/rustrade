@@ -393,6 +393,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the term. Their types, `OrderTerms` and `OrderTermsApplied` (the changes and divergences of one
     or more reports) are in `engine::state::order::terms`.
   - **New `ReportedTerms::union` and `ReportedTerms::is_none`** (`rustrade-execution`).
+  - **New `ReportedTerms::from_venue_read`** (`rustrade-execution`), the terms a report states
+    when it read an order's terms from the venue: every one on the venue's time, none on this
+    host's, less a zero or missing limit price on a kind that has one and a zero quantity. A
+    producer, a client written outside this crate included, builds its flags with it.
+  - **New `OrderKind::has_limit_price`** (`rustrade-execution`): whether orders of the kind carry
+    a limit price in `Order::price`. A `TrailingStopLimit` carries none, since its limit follows
+    from its stop.
   - **New `AmendTarget::known_time_in_force`** (`rustrade-execution`), refusing with
     `AmendRefusal::TimeInForceUnknown` for an order whose time in force the venue never stated, for
     a client that must send the whole order again to amend it.
@@ -618,6 +625,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     tells a report's stated terms apart, so the amend is not taken for a replay of the order's
     acknowledgement. An amend under a new client order id is still logged and dropped: the engine
     knows the order by its old id.
+  - **Alpaca states the terms its reads carry.** An account-stream snapshot and an open order in
+    `account_snapshot` state every term, less a limit price that does not parse and a time in
+    force read as `Unreported`. One stamped with this host's clock, because Alpaca sent no time,
+    states none. A listed order without `updated_at` states its terms on `created_at`: Alpaca
+    never changes an order's terms in place, as a replace is a new order.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
