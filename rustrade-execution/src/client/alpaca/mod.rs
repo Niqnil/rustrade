@@ -4594,15 +4594,6 @@ fn convert_activity_to_trade(
 ///
 /// The payload is the order as it stands at the event, so the snapshot states every term it
 /// reads (see [`ReportedTerms::from_venue_read`]) unless the event's time is this host's.
-/// An order's limit price, read from Alpaca's `limit_price` only for a `kind` that carries one
-/// ([`OrderKind::has_limit_price`]), so that a report never holds a price for a kind its stated
-/// flags say has none. A price that does not parse reads as `None`.
-fn limit_price(kind: &OrderKind, limit_price: Option<&str>) -> Option<Decimal> {
-    limit_price
-        .filter(|_| kind.has_limit_price())
-        .and_then(|s| Decimal::from_str(s).ok())
-}
-
 fn ws_order_snapshot(
     order: &AlpacaOrderWs<'_>,
     instrument: InstrumentNameExchange,
@@ -5007,6 +4998,14 @@ fn parse_side(s: &str) -> Option<Side> {
             None
         }
     }
+}
+
+/// An order's limit price, read from Alpaca's `limit_price` only for a `kind` that carries one
+/// ([`OrderKind::has_limit_price`]), so that a report never holds a price for a kind its stated
+/// flags say has none. A price that does not parse reads as `None`.
+fn limit_price(kind: &OrderKind, raw: Option<&str>) -> Option<Decimal> {
+    raw.filter(|_| kind.has_limit_price())
+        .and_then(|s| Decimal::from_str(s).ok())
 }
 
 fn parse_order_kind(
