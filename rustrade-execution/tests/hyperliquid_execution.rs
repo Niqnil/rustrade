@@ -614,7 +614,12 @@ async fn test_hip3_order_round_trip() {
         .find(|entry| entry.instrument == instrument)
         .expect("the requested instrument is listed");
     assert!(entry.orders_complete);
-    assert!(entry.orders.iter().any(|order| order.key.cid == key.cid));
+    assert!(
+        entry
+            .orders
+            .iter()
+            .any(|order| order.order.key.cid == key.cid)
+    );
     assert!(
         snapshot
             .balances
@@ -1211,9 +1216,9 @@ async fn test_order_is_reported_under_its_client_id() {
     let listed = entry
         .orders
         .iter()
-        .find(|order| order.key.cid == order_cid)
+        .find(|order| order.order.key.cid == order_cid)
         .unwrap_or_else(|| panic!("snapshot does not list {order_cid}: {:?}", entry.orders));
-    match &listed.state {
+    match &listed.order.state {
         OrderState::Active(ActiveOrderState::Open(open)) => assert_eq!(open.id, venue_id),
         other => panic!("listed order is not Open: {other:?}"),
     }
@@ -1241,10 +1246,10 @@ async fn test_order_is_reported_under_its_client_id() {
         while let Some(event) = stream.next().await {
             if let rustrade_execution::AccountEventKind::OrderSnapshot(snapshot) = event.kind {
                 let order = snapshot.0;
-                if order.key.cid != order_cid {
+                if order.order.key.cid != order_cid {
                     continue;
                 }
-                match order.state {
+                match order.order.state {
                     OrderState::Active(ActiveOrderState::Open(_)) => saw_open = true,
                     OrderState::Inactive(InactiveOrderState::Cancelled(_)) => saw_cancelled = true,
                     _ => {}
@@ -1270,7 +1275,10 @@ async fn test_order_is_reported_under_its_client_id() {
         .expect("a requested instrument is listed even with nothing open");
     assert!(entry.orders_complete);
     assert!(
-        entry.orders.iter().all(|order| order.key.cid != order_cid),
+        entry
+            .orders
+            .iter()
+            .all(|order| order.order.key.cid != order_cid),
         "the cancelled order is still listed"
     );
 }

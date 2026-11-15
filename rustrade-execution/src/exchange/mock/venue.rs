@@ -28,6 +28,7 @@ use crate::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
         amend::{AmendSupport, AmendTarget, Amended, RequestAmend},
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
             UnindexedOrderResponseCancel,
@@ -2547,7 +2548,9 @@ impl SimulatedVenue {
 
         self.account.ack_expired(expired_order.clone());
 
-        events.push(self.build_account_event(Snapshot(UnindexedOrder::from(expired_order))));
+        events.push(self.build_account_event(Snapshot(OrderReport::state_only(
+            UnindexedOrder::from(expired_order),
+        ))));
         events
     }
 
@@ -3001,7 +3004,7 @@ impl SimulatedVenue {
             let filled = filled.map_state(OrderState::fully_filled);
 
             self.push_committed(&mut events, committed, Some(trade));
-            events.push(self.build_account_event(Snapshot(filled)));
+            events.push(self.build_account_event(Snapshot(OrderReport::state_only(filled))));
         }
 
         events
@@ -3236,7 +3239,7 @@ impl SimulatedVenue {
 
         let mut events = Vec::with_capacity(4);
         self.push_committed(&mut events, committed, Some(trade));
-        events.push(self.build_account_event(Snapshot(terminal)));
+        events.push(self.build_account_event(Snapshot(OrderReport::state_only(terminal))));
         events
     }
 
@@ -3335,7 +3338,7 @@ impl SimulatedVenue {
 
         let mut events = Vec::with_capacity(4);
         self.push_committed(&mut events, committed, trade);
-        events.push(self.build_account_event(Snapshot(terminal)));
+        events.push(self.build_account_event(Snapshot(OrderReport::state_only(terminal))));
         events
     }
 
@@ -4110,7 +4113,9 @@ impl SimulatedVenue {
             },
         };
         self.account.ack_cancelled(cancelled.clone());
-        events.push(self.build_account_event(Snapshot(UnindexedOrder::from(cancelled))));
+        events.push(self.build_account_event(Snapshot(OrderReport::state_only(
+            UnindexedOrder::from(cancelled),
+        ))));
 
         events
     }
@@ -4665,9 +4670,9 @@ impl SimulatedVenue {
                 ),
             };
             self.account.ack_filled(ended.clone());
-            events.push(
-                self.build_account_event(Snapshot(ended.map_state(OrderState::fully_filled))),
-            );
+            events.push(self.build_account_event(Snapshot(OrderReport::state_only(
+                ended.map_state(OrderState::fully_filled),
+            ))));
             return Ok(Amended::new(
                 Open::new(order.state.id, time_exchange, candidate.quantity),
                 candidate.price,
@@ -4892,7 +4897,7 @@ impl SimulatedVenue {
 
         let mut orders_by_instrument: FnvHashMap<_, Vec<_>> = orders_by_instrument
             .into_iter()
-            .map(|(instrument, orders)| (instrument, orders.collect()))
+            .map(|(instrument, orders)| (instrument, orders.map(OrderReport::state_only).collect()))
             .collect();
 
         // Every instrument with an order, and every CFD and option whether or not it has one: a
@@ -8439,7 +8444,7 @@ mod tests {
         event: &UnindexedAccountEvent,
     ) -> &Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         match &event.kind {
-            AccountEventKind::OrderSnapshot(order) => &order.0,
+            AccountEventKind::OrderSnapshot(report) => &report.0.order,
             other => panic!("expected an order snapshot, got: {other:?}"),
         }
     }
@@ -10982,7 +10987,10 @@ mod tests {
         let mut config = spot_config("10", "10000000", FeeModelConfig::default());
         config.initial_state.instruments = vec![InstrumentAccountSnapshot {
             instrument: instrument_name(),
-            orders: CIDS.into_iter().map(resting).collect(),
+            orders: CIDS
+                .into_iter()
+                .map(|cid| OrderReport::state_only(resting(cid)))
+                .collect(),
             orders_complete: true,
             position: PositionReport::Unreported,
             isolated: None,
@@ -10995,7 +11003,7 @@ mod tests {
             .instruments
             .into_iter()
             .flat_map(|instrument| instrument.orders)
-            .map(|order| order.key.cid)
+            .map(|order| order.order.key.cid)
             .collect::<Vec<_>>();
 
         let mut expected = CIDS.map(ClientOrderId::new).to_vec();
@@ -11030,11 +11038,11 @@ mod tests {
             }),
         };
 
-        let seeded_venue = |orders| {
+        let seeded_venue = |orders: Vec<UnindexedOrder>| {
             let mut config = spot_config("10", "10000000", FeeModelConfig::default());
             config.initial_state.instruments = vec![InstrumentAccountSnapshot {
                 instrument: instrument_name(),
-                orders,
+                orders: orders.into_iter().map(OrderReport::state_only).collect(),
                 orders_complete: true,
                 position: PositionReport::Unreported,
                 isolated: None,
@@ -12147,7 +12155,7 @@ mod tests {
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
-            orders[0].state,
+            orders[0].order.state,
             OrderState::Inactive(InactiveOrderState::Cancelled(_))
         ));
     }
@@ -12776,7 +12784,7 @@ mod tests {
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
-            orders[0].state,
+            orders[0].order.state,
             OrderState::Inactive(InactiveOrderState::Expired(_))
         ));
     }
@@ -13595,7 +13603,7 @@ mod tests {
             .instruments
             .iter()
             .flat_map(|instrument| &instrument.orders)
-            .filter(|order| order.key.cid == ClientOrderId::new("resting"))
+            .filter(|order| order.order.key.cid == ClientOrderId::new("resting"))
             .count();
         assert_eq!(
             listed, 1,
@@ -16114,7 +16122,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             AccountEventKind::OrderSnapshot(order)
-                if matches!(order.0.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
+                if matches!(order.0.order.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
         )));
         assert_eq!(free_quote(&venue), d("10000"));
         assert!(venue.account.orders().is_empty());

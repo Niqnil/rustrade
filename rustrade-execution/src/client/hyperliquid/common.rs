@@ -8,13 +8,14 @@
 use crate::client::hyperliquid::error::{map_sdk_error, order_outcome_unknown, order_rejection};
 use crate::error::{OrderError, UnindexedClientError, UnindexedOrderError};
 use crate::order::{
-    Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedOrderSnapshot,
+    Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
     state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
 };
 use crate::{
     InstrumentAccountSnapshot, UnindexedAccountEvent,
     balance::{AssetBalance, Balance},
+    order::report::{OrderReport, ReportedTerms, UnindexedOrderReport},
     position::PositionReport,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -302,9 +303,29 @@ pub struct OrderTerms {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReadTerms {
     pub(super) kind: OrderKind,
+    /// Whether `kind` is the order's kind as the venue named it, rather than the `Limit` read for
+    /// a record that names none, names one [`OrderKind`] has no variant for, or has triggered.
+    pub(super) kind_reported: bool,
     /// The limit price, `None` on a kind with none.
     pub(super) price: Option<Decimal>,
+    /// Whether `price` is the order's limit price as the venue holds it: the record says what the
+    /// order is, by a type [`OrderKind`] names or by having triggered into a limit order. Without
+    /// that, `limitPx` may be a market trigger's worst fill price rather than a limit price.
+    pub(super) price_reported: bool,
     pub(super) time_in_force: TimeInForce,
+}
+
+impl ReadTerms {
+    /// The terms a record with these read terms states, given whether it carried the order's
+    /// total quantity: kind and price as [`kind_reported`](Self::kind_reported) and
+    /// [`price_reported`](Self::price_reported) say, and a time in force unless
+    /// [`TimeInForce::Unreported`] ([`OrderReport::new`] clears that one).
+    fn reported(&self, quantity_reported: bool) -> ReportedTerms {
+        ReportedTerms::ALL
+            .with_quantity(quantity_reported)
+            .with_kind(self.kind_reported)
+            .with_price(self.price_reported)
+    }
 }
 
 impl OrderTerms {
@@ -323,16 +344,19 @@ impl OrderTerms {
     ///   `TakeProfit` (`"Take Profit Market"`) or `TakeProfitLimit`, the trigger kinds with
     ///   `triggerPx`. With no `orderType`, the order is read as `Limit`, as is one whose type
     ///   names no [`OrderKind`] (with a `warn!`): [`OrderKind`] has no variant for a kind not
-    ///   reported.
+    ///   reported, so [`ReadTerms::kind_reported`] says that `Limit` is a stand-in.
     /// - **A triggered order** is read as the `Limit` order it placed, which `frontendOpenOrders`
     ///   lists under the same id with that order's time in force (`Gtc`, as seen on testnet) but
-    ///   with the trigger price gone (`"0.0"`), so the trigger kind could not be reported. It is
-    ///   recognised by `triggerCondition` being exactly `"Triggered"`, as seen on testnet. Should
-    ///   the venue word it otherwise, the row is a trigger order without a positive trigger price,
-    ///   which does not convert, and the `warn!` names the `triggerCondition` it carried.
+    ///   with the trigger price gone (`"0.0"`). The trigger kind cannot be reported, so
+    ///   [`ReadTerms::kind_reported`] is `false`. A triggered order is recognised by
+    ///   `triggerCondition` being exactly `"Triggered"`, as seen on testnet. Should the venue word
+    ///   it otherwise, the row is a trigger order without a positive trigger price, which does not
+    ///   convert, and the `warn!` names the `triggerCondition` it carried.
     /// - **Price.** `limitPx`, except on a stop or take-profit market order waiting for its
     ///   trigger: its `limitPx` is the worst price the market order it places may fill at, chosen
-    ///   by whoever placed it, not a limit price, so the order reports none.
+    ///   by whoever placed it, not a limit price, so the order reports none. With no `orderType`,
+    ///   or one [`OrderKind`] does not name, `limitPx` could be either, so
+    ///   [`ReadTerms::price_reported`] is `false`.
     /// - **Time in force.** `Gtc`, `Alo` and `Ioc` are read as `GoodUntilCancelled`,
     ///   `GoodUntilCancelled` post-only and `ImmediateOrCancel`. Anything else, `null` on a trigger
     ///   order included, is [`TimeInForce::Unreported`] rather than a guess.
@@ -349,39 +373,52 @@ impl OrderTerms {
             price
         };
         let triggered = self.trigger_condition.as_deref() == Some("Triggered");
-        let (kind, price) = match order_type {
-            None | Some("Limit") => (OrderKind::Limit, Some(limit_px)),
-            Some(_) if triggered => (OrderKind::Limit, Some(limit_px)),
+        // `kind_reported` is false where `Limit` stands in for a kind the record does not give:
+        // no `orderType`, one `OrderKind` has no variant for, or a triggered order whose trigger
+        // kind the listing no longer shows. `price_reported` is false where the record does not
+        // say whether `limitPx` is a limit price: no `orderType`, or one `OrderKind` does not name.
+        let (kind, price, kind_reported, price_reported) = match order_type {
+            Some("Limit") => (OrderKind::Limit, Some(limit_px), true, true),
+            None => (OrderKind::Limit, Some(limit_px), false, false),
+            Some(_) if triggered => (OrderKind::Limit, Some(limit_px), false, true),
             Some("Stop Market") => (
                 OrderKind::Stop {
                     trigger_price: trigger()?,
                 },
                 None,
+                true,
+                true,
             ),
             Some("Stop Limit") => (
                 OrderKind::StopLimit {
                     trigger_price: trigger()?,
                 },
                 Some(limit_px),
+                true,
+                true,
             ),
             Some("Take Profit Market") => (
                 OrderKind::TakeProfit {
                     trigger_price: trigger()?,
                 },
                 None,
+                true,
+                true,
             ),
             Some("Take Profit Limit") => (
                 OrderKind::TakeProfitLimit {
                     trigger_price: trigger()?,
                 },
                 Some(limit_px),
+                true,
+                true,
             ),
             Some(other) => {
                 warn!(
                     order_type = other,
                     "Hyperliquid order type names no OrderKind - reading the order as Limit"
                 );
-                (OrderKind::Limit, Some(limit_px))
+                (OrderKind::Limit, Some(limit_px), false, false)
             }
         };
         let time_in_force = match self.tif.as_deref() {
@@ -399,7 +436,9 @@ impl OrderTerms {
         };
         Some(ReadTerms {
             kind,
+            kind_reported,
             price,
+            price_reported,
             time_in_force,
         })
     }
@@ -488,6 +527,32 @@ pub(super) fn open_order_to_order(
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    open_order_with_terms(row, exchange, instrument).map(|(order, _)| order)
+}
+
+/// [`open_order_to_order`], as a report that states the terms the row carries: its kind as
+/// [`OrderTerms::read`] says, its price and time in force, and its quantity when the row has
+/// `origSz` (without it the quantity is the remaining one, a stand-in).
+///
+/// The row's `timestamp`, which the report is stamped with, is the order's placement, and a
+/// modify places a new order with a new timestamp, so it is the time of the terms it lists.
+pub(super) fn open_order_to_report(
+    row: &OpenOrder,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<UnindexedOrderReport> {
+    open_order_with_terms(row, exchange, instrument)
+        .map(|(order, reported)| OrderReport::new(order.map_state(OrderState::active), reported))
+}
+
+fn open_order_with_terms(
+    row: &OpenOrder,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<(
+    Order<ExchangeId, InstrumentNameExchange, Open>,
+    ReportedTerms,
+)> {
     let parsed = (|| {
         let cid = record_cid(row.cloid.as_deref(), row.oid)?;
         let side = parse_side(&row.side)?;
@@ -513,7 +578,7 @@ pub(super) fn open_order_to_order(
         return None;
     };
 
-    Some(Order {
+    let order = Order {
         key: OrderKey {
             exchange,
             instrument,
@@ -530,7 +595,8 @@ pub(super) fn open_order_to_order(
             time_exchange,
             filled_quantity: (quantity - remaining).max(Decimal::ZERO),
         },
-    })
+    };
+    Some((order, terms.reported(row.orig_sz.is_some())))
 }
 
 /// Which instruments a read keeps: those in the slice it was given, or every one when the slice is
@@ -604,10 +670,10 @@ impl OpenOrderListing {
             if !filter.matches(&instrument) {
                 continue;
             }
-            let order = open_order_to_order(row, exchange, instrument.clone());
+            let report = open_order_to_report(row, exchange, instrument.clone());
             let snapshot = entry(&mut listing, &instrument);
-            match order {
-                Some(order) => snapshot.orders.push(order.into()),
+            match report {
+                Some(report) => snapshot.orders.push(report),
                 None => snapshot.orders_complete = false,
             }
         }
@@ -672,12 +738,13 @@ pub(super) fn order_update_to_account_event(
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
 ) -> Option<UnindexedAccountEvent> {
-    // The stream's records carry none of the order's terms.
-    let snapshot = order_update_to_order(update, &OrderTerms::UNREPORTED, exchange, instrument)?;
+    // The stream's records carry no type, trigger or time in force, so the report states only
+    // the quantity and price.
+    let report = order_update_to_order(update, &OrderTerms::UNREPORTED, exchange, instrument)?;
     Some(crate::AccountEvent::new(
         exchange,
         crate::AccountEventKind::OrderSnapshot(
-            rustrade_integration::collection::snapshot::Snapshot(snapshot),
+            rustrade_integration::collection::snapshot::Snapshot(report),
         ),
     ))
 }
@@ -686,6 +753,9 @@ pub(super) fn order_update_to_account_event(
 /// order it describes on `instrument`, keyed as [`record_cid`] says, with the kind, price and time
 /// in force `terms` give ([`OrderTerms::read`]).
 ///
+/// The report states the quantity (`origSz`, the total), the price, and the kind and time in
+/// force where `terms` give them. It is stamped with the record's `statusTimestamp`.
+///
 /// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
 /// parse or the status is not one [`OrderStatus::classify`] recognises.
 pub(super) fn order_update_to_order(
@@ -693,7 +763,7 @@ pub(super) fn order_update_to_order(
     terms: &OrderTerms,
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
-) -> Option<UnindexedOrderSnapshot> {
+) -> Option<UnindexedOrderReport> {
     let order = &update.order;
     let Some(status) = OrderStatus::classify(&update.status) else {
         warn!(%exchange, status = %update.status, oid = order.oid, "Unknown Hyperliquid order status - ignoring the update");
@@ -734,7 +804,7 @@ pub(super) fn order_update_to_order(
         }
     };
 
-    Some(Order {
+    let order = Order {
         key: OrderKey {
             exchange,
             instrument,
@@ -747,7 +817,8 @@ pub(super) fn order_update_to_order(
         kind: terms.kind,
         time_in_force: terms.time_in_force,
         state,
-    })
+    };
+    Some(OrderReport::new(order, terms.reported(true)))
 }
 
 pub fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {
@@ -1645,7 +1716,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 pub(super) mod info_tests {
     use super::*;
-    use crate::error::ApiError;
+    use crate::{error::ApiError, order::UnindexedOrderSnapshot};
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2076,6 +2147,10 @@ pub(super) mod info_tests {
     }
 
     fn snapshot_of(event: UnindexedAccountEvent) -> UnindexedOrderSnapshot {
+        report_of(event).order
+    }
+
+    fn report_of(event: UnindexedAccountEvent) -> UnindexedOrderReport {
         match event.kind {
             crate::AccountEventKind::OrderSnapshot(snapshot) => snapshot.0,
             other => panic!("expected an order snapshot, got {other:?}"),
@@ -2097,6 +2172,12 @@ pub(super) mod info_tests {
         assert_eq!(order.quantity, dec!(0.0075));
         // The update carries no time in force, so it reports none rather than a guess.
         assert_eq!(order.time_in_force, TimeInForce::Unreported);
+        // Nor a type, so neither its `Limit` nor its `limitPx`, which could as well be a market
+        // trigger's worst fill price, is stated: only its quantity is.
+        let report = report_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        assert_eq!(report.reported, ReportedTerms::NONE.with_quantity(true));
         match order.state {
             OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
                 assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("7001")));
@@ -2271,6 +2352,62 @@ pub(super) mod info_tests {
         );
     }
 
+    /// An `orderStatus` record, which carries the order's terms, states them: here all but the
+    /// time in force a trigger order waiting for its trigger is sent without.
+    #[test]
+    fn an_order_record_with_its_terms_states_them() {
+        let update = order_update("open", "null", "0.0075");
+        let report = order_update_to_order(
+            &update,
+            &terms(Some("Stop Limit"), None, "2077.5"),
+            ExchangeId::HyperliquidPerp,
+            eth(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.order.kind,
+            OrderKind::StopLimit {
+                trigger_price: dec!(2077.5)
+            }
+        );
+        assert_eq!(
+            report.reported,
+            ReportedTerms::ALL.with_time_in_force(false)
+        );
+    }
+
+    /// A listing row states every term it carries, and none it stands in for: the time in force
+    /// of a trigger order waiting for its trigger, and the kind of a triggered one.
+    #[test]
+    fn a_listed_order_states_the_terms_its_row_carries() {
+        let rows: Vec<OpenOrder> = serde_json::from_str(FRONTEND_OPEN_ORDERS).unwrap();
+        let reported = |row: &OpenOrder| {
+            let report = open_order_to_report(row, ExchangeId::HyperliquidPerp, eth()).unwrap();
+            assert!(matches!(
+                report.order.state,
+                OrderState::Active(crate::order::state::ActiveOrderState::Open(_))
+            ));
+            report.reported
+        };
+
+        assert_eq!(reported(&rows[0]), ReportedTerms::ALL);
+        assert_eq!(
+            reported(&rows[1]),
+            ReportedTerms::ALL.with_time_in_force(false)
+        );
+        // Triggered into a limit order: its trigger kind is gone, its limit price is stated.
+        assert_eq!(reported(&rows[2]), ReportedTerms::ALL.with_kind(false));
+
+        // A row without `origSz` lists its remaining quantity in its place.
+        let mut no_orig_sz = rows[0].clone();
+        no_orig_sz.orig_sz = None;
+        assert_eq!(
+            reported(&no_orig_sz),
+            ReportedTerms::ALL.with_quantity(false)
+        );
+    }
+
     fn terms(order_type: Option<&str>, tif: Option<&str>, trigger_px: &str) -> OrderTerms {
         OrderTerms {
             order_type: order_type.map(str::to_owned),
@@ -2296,6 +2433,9 @@ pub(super) mod info_tests {
             };
             let read = triggered.read(dec!(1605)).unwrap();
             assert_eq!(read.kind, OrderKind::Limit, "{order_type}");
+            assert!(!read.kind_reported, "{order_type}");
+            // It is a limit order now, so its `limitPx` is a limit price.
+            assert!(read.price_reported, "{order_type}");
             assert_eq!(read.price, Some(dec!(1605)), "{order_type}");
             assert_eq!(
                 read.time_in_force,
@@ -2339,6 +2479,8 @@ pub(super) mod info_tests {
                 .read(dec!(2172))
                 .unwrap();
             assert_eq!(read.kind, kind, "{order_type}");
+            assert!(read.kind_reported, "{order_type}");
+            assert!(read.price_reported, "{order_type}");
             // A market trigger's limitPx is its slippage bound, not a limit price.
             assert_eq!(
                 read.price,
@@ -2353,6 +2495,8 @@ pub(super) mod info_tests {
         for order_type in [None, Some("Scale")] {
             let read = terms(order_type, None, "0.0").read(dec!(1605)).unwrap();
             assert_eq!(read.kind, OrderKind::Limit, "{order_type:?}");
+            assert!(!read.kind_reported, "{order_type:?}");
+            assert!(!read.price_reported, "{order_type:?}");
             assert_eq!(read.price, Some(dec!(1605)), "{order_type:?}");
         }
     }
@@ -2438,6 +2582,11 @@ pub(super) mod info_tests {
         let eth_entry = listing.remove(&eth()).unwrap();
         assert!(eth_entry.orders_complete);
         assert_eq!(eth_entry.orders.len(), 2);
+        // `openOrders` rows carry no type or time in force, so only the quantity is stated.
+        assert_eq!(
+            eth_entry.orders[0].reported,
+            ReportedTerms::NONE.with_quantity(true)
+        );
 
         // Nothing open: the entry is what lets an order that ended offline be seen to be gone.
         let sol_entry = listing.remove(&sol).unwrap();

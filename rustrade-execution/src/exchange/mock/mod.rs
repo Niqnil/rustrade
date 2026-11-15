@@ -683,6 +683,7 @@ struct PendingEmission {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 pub(crate) mod fixtures {
+    use crate::order::report::OrderReport;
     use crate::{
         InstrumentAccountSnapshot, UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
@@ -787,7 +788,7 @@ pub(crate) mod fixtures {
                 balances: vec![funded(base(), d(btc)), funded(quote(), d(usdt))],
                 instruments: vec![InstrumentAccountSnapshot {
                     instrument: instrument_name(),
-                    orders: vec![order],
+                    orders: vec![OrderReport::state_only(order)],
                     orders_complete: true,
                     position: PositionReport::Unreported,
                     isolated: None,
@@ -1685,14 +1686,14 @@ mod tests {
             let event = paper.next_event().await;
             if let AccountEventKind::OrderSnapshot(order) = event.kind
                 && matches!(
-                    order.0.state,
+                    order.0.order.state,
                     OrderState::Inactive(InactiveOrderState::Expired(_))
                 )
             {
                 break order.0;
             }
         };
-        let OrderState::Inactive(InactiveOrderState::Expired(expired)) = expired.state else {
+        let OrderState::Inactive(InactiveOrderState::Expired(expired)) = expired.order.state else {
             unreachable!("matched above")
         };
         assert_eq!(expired.time_exchange, expiry, "retired at its own deadline");
@@ -2047,7 +2048,8 @@ mod tests {
                 .await
                 .expect("the account channel is open");
             if let AccountEventKind::OrderSnapshot(order) = event.kind
-                && let OrderState::Inactive(InactiveOrderState::Expired(expired)) = order.0.state
+                && let OrderState::Inactive(InactiveOrderState::Expired(expired)) =
+                    order.0.order.state
             {
                 break expired;
             }

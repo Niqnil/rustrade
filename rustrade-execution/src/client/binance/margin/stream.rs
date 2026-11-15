@@ -1620,14 +1620,14 @@ mod tests {
                 panic!("expected an order snapshot, got {event:?}");
             };
             assert_eq!(
-                snapshot.0.kind,
+                snapshot.0.order.kind,
                 OrderKind::TrailingStop {
                     offset: Decimal::from(25),
                     offset_type: TrailingOffsetType::BasisPoints,
                     activation_price: None,
                 }
             );
-            assert_eq!(snapshot.0.price, None);
+            assert_eq!(snapshot.0.order.price, None);
         }
     }
 
@@ -1671,11 +1671,11 @@ mod tests {
         match &buf[1].kind {
             AccountEventKind::OrderSnapshot(snap) => {
                 assert_eq!(
-                    snap.0.quantity,
+                    snap.0.order.quantity,
                     Decimal::from(2),
                     "the order's total quantity"
                 );
-                match &snap.0.state {
+                match &snap.0.order.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => {
                         assert_eq!(open.id.assigned().map(|id| id.0.as_str()), Some("12345"));
                         assert_eq!(
@@ -1735,11 +1735,11 @@ mod tests {
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
             AccountEventKind::OrderSnapshot(snap) => {
-                assert_eq!(snap.0.side, Side::Sell);
-                assert_eq!(snap.0.price, Some(Decimal::from(48_000)));
-                assert_eq!(snap.0.quantity, Decimal::from(1));
+                assert_eq!(snap.0.order.side, Side::Sell);
+                assert_eq!(snap.0.order.price, Some(Decimal::from(48_000)));
+                assert_eq!(snap.0.order.quantity, Decimal::from(1));
                 assert!(
-                    matches!(snap.0.state, OrderState::Active(_)),
+                    matches!(snap.0.order.state, OrderState::Active(_)),
                     "NEW should be an active (resting) order"
                 );
             }
@@ -1765,7 +1765,7 @@ mod tests {
             panic!("expected OrderSnapshot, got {:?}", event.kind)
         };
         assert_eq!(
-            snap.0.kind,
+            snap.0.order.kind,
             OrderKind::StopLimit {
                 trigger_price: Decimal::from(48_000)
             }
@@ -1803,7 +1803,7 @@ mod tests {
             unreachable!("checked by snapshot_kind")
         };
         assert_eq!(
-            snap.0.price,
+            snap.0.order.price,
             Some(Decimal::from(47_000)),
             "a stop-limit keeps its limit"
         );
@@ -1826,7 +1826,7 @@ mod tests {
         let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
             panic!("expected OrderSnapshot, got {:?}", event.kind)
         };
-        snap.0.kind
+        snap.0.order.kind
     }
 
     /// The unresolved kind of a `STOP_LOSS_LIMIT` triggered at 48000.
@@ -2088,7 +2088,7 @@ mod tests {
         events
             .iter()
             .filter_map(|ev| match &ev.kind {
-                AccountEventKind::OrderSnapshot(snap) => match &snap.0.state {
+                AccountEventKind::OrderSnapshot(snap) => match &snap.0.order.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => Some(open.filled_quantity),
                     _ => None,
                 },
@@ -3513,7 +3513,10 @@ mod tests {
             while kinds.len() < 3 {
                 let event = rx.recv().await.unwrap();
                 if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind {
-                    kinds.push((snapshot.0.key.cid.0.to_string(), snapshot.0.kind));
+                    kinds.push((
+                        snapshot.0.order.key.cid.0.to_string(),
+                        snapshot.0.order.kind,
+                    ));
                 }
             }
             kinds
@@ -3570,7 +3573,7 @@ mod tests {
             matches!(
                 &event.kind,
                 AccountEventKind::OrderSnapshot(snapshot)
-                    if snapshot.0.kind.is_conditional_unresolved()
+                    if snapshot.0.order.kind.is_conditional_unresolved()
             ),
             "{event:?}"
         );

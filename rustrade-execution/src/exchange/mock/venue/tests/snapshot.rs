@@ -132,7 +132,7 @@ fn a_restored_venue_carries_on_exactly_as_the_original_would() {
         expected.iter().any(|event| matches!(
             &event.kind,
             AccountEventKind::OrderSnapshot(order)
-                if order.value().key.cid == ClientOrderId::new("ask-gtd")
+                if order.value().order.key.cid == ClientOrderId::new("ask-gtd")
         )),
         "the offer expired: {expected:#?}"
     );
@@ -152,7 +152,9 @@ fn bids_at_one_price_fill_in_the_order_they_arrived_after_a_restore() {
     let cids = crossed
         .iter()
         .filter_map(|event| match &event.kind {
-            AccountEventKind::OrderSnapshot(order) => Some(order.value().key.cid.0.to_string()),
+            AccountEventKind::OrderSnapshot(order) => {
+                Some(order.value().order.key.cid.0.to_string())
+            }
             _ => None,
         })
         .dedup()

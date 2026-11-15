@@ -24,6 +24,7 @@ use crate::{
     order::{
         Order, UnindexedOrderKey,
         id::ClientOrderId,
+        report::OrderReport,
         state::{ActiveOrderState, Open, OrderState},
     },
 };
@@ -203,13 +204,17 @@ pub(super) fn status_from_record(
         debug!(cid = %key.cid, asked = %key.instrument, coin = %record.update.order.coin, "Hyperliquid order is on another instrument than asked");
         return Some(VenueOrderStatus::Unknown);
     }
-    let Order {
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state,
+    let OrderReport {
+        order:
+            Order {
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+                ..
+            },
         ..
     } = order_update_to_order(
         &record.update,
@@ -281,6 +286,7 @@ pub(super) fn remember_snapshot(
         .instruments
         .iter()
         .flat_map(|instrument| &instrument.orders)
+        .map(|report| &report.order)
     {
         if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
             known.live(&order.key, order.quantity, order.kind, open);
@@ -896,6 +902,49 @@ pub(super) mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
+    /// A snapshot's open orders are held as live, and the orders it reports ended are not.
+    #[test]
+    fn a_snapshot_holds_its_open_orders_as_live() {
+        const ENDED: &str = "0f0e0d0c-0b0a-4908-8706-050403020100";
+        let order = |cid: &str, state: crate::order::state::UnindexedOrderState| {
+            OrderReport::state_only(Order {
+                key: key(cid),
+                side: rustrade_instrument::Side::Buy,
+                price: Some(dec!(60000)),
+                quantity: dec!(0.01),
+                kind: crate::order::OrderKind::Limit,
+                time_in_force: crate::order::TimeInForce::GoodUntilCancelled { post_only: false },
+                state,
+            })
+        };
+        let cancelled = InactiveOrderState::Cancelled(crate::order::state::Cancelled::new(
+            OrderId::new("43"),
+            chrono::Utc::now(),
+            Some(dec!(0)),
+        ));
+        let snapshot = crate::AccountSnapshot::new(
+            ExchangeId::HyperliquidPerp,
+            Vec::new(),
+            vec![crate::InstrumentAccountSnapshot::new(
+                btc(),
+                vec![
+                    order(CID, OrderState::active(open())),
+                    order(ENDED, OrderState::inactive(cancelled)),
+                ],
+                true,
+                crate::position::PositionReport::Unreported,
+                None,
+            )],
+        );
+        let known = KnownLiveOrders::shared(ExchangeId::HyperliquidPerp);
+
+        remember_snapshot(&known, &snapshot);
+
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new(CID)));
+        assert!(!known.contains(&ClientOrderId::new(ENDED)));
+    }
+
     /// Run the check task with a listing that lists nothing and a lookup that finds each order
     /// cancelled, holding one order on BTC.
     fn spawn_checks() -> (
@@ -956,9 +1005,9 @@ pub(super) mod tests {
             strategy: StrategyId::unknown(),
             ..key(CID)
         };
-        assert_eq!(order.key, held);
+        assert_eq!(order.order.key, held);
         assert!(matches!(
-            order.state,
+            order.order.state,
             OrderState::Inactive(InactiveOrderState::Cancelled(_))
         ));
         assert!(!known.lock().contains(&ClientOrderId::new(CID)));

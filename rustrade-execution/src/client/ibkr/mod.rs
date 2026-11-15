@@ -219,6 +219,7 @@ use crate::{
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -1119,7 +1120,9 @@ fn forward_order_updates(
                             make_order_from_status(&status, client_id, &ctx, pending_cancels);
                         Some(UnindexedAccountEvent {
                             exchange: ExchangeId::Ibkr,
-                            kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
+                            kind: AccountEventKind::OrderSnapshot(Snapshot::new(
+                                OrderReport::state_only(order),
+                            )),
                         })
                     }
                     None => {
@@ -2695,7 +2698,7 @@ impl ExecutionClient for IbkrClient {
             let (orders, orders_complete) = orders.take(&instrument);
             instrument_snapshots.push(InstrumentAccountSnapshot {
                 instrument,
-                orders,
+                orders: orders.into_iter().map(OrderReport::state_only).collect(),
                 orders_complete,
                 position,
                 isolated: None,
@@ -2705,7 +2708,7 @@ impl ExecutionClient for IbkrClient {
         instrument_snapshots.extend(orders.into_rest().map(|(instrument, (orders, complete))| {
             InstrumentAccountSnapshot {
                 instrument,
-                orders,
+                orders: orders.into_iter().map(OrderReport::state_only).collect(),
                 orders_complete: complete,
                 position: PositionReport::Unreported,
                 isolated: None,
@@ -5186,7 +5189,7 @@ mod order_reader_tests {
             panic!("the first order's fill is forwarded");
         };
         assert!(
-            matches!(first.kind, AccountEventKind::OrderSnapshot(Snapshot(ref order)) if !matches!(order.state, OrderState::Active(_))),
+            matches!(first.kind, AccountEventKind::OrderSnapshot(Snapshot(ref order)) if !matches!(order.order.state, OrderState::Active(_))),
             "{first:?}"
         );
         let Ok(event) = rx.try_recv() else {
@@ -5196,7 +5199,7 @@ mod order_reader_tests {
             panic!("an order snapshot, got {event:?}");
         };
         assert!(
-            matches!(order.state, OrderState::Active(_)),
+            matches!(order.order.state, OrderState::Active(_)),
             "it is the later, working order's: {order:?}"
         );
         assert!(

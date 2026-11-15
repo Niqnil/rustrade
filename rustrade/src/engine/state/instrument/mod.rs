@@ -25,6 +25,7 @@ use rustrade_execution::{
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId, VenueOrderId},
+        report::OrderReport,
         request::{OrderResponseAmend, OrderResponseCancel, ReduceOnly},
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
@@ -1155,7 +1156,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         InstrumentKey: Debug + Clone + PartialEq,
         AssetKey: Debug + Clone + PartialEq,
     {
-        for order in &snapshot.orders {
+        // Only each report's order is read: no term a report states is adopted yet.
+        for OrderReport { order, .. } in &snapshot.orders {
             // PositionExited from deferred fill replay is not propagated here: the
             // Snapshot event path in EngineState::update_from_account already returns
             // None unconditionally. This is a pre-existing limitation — snapshot
@@ -1168,7 +1170,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             let listed = snapshot
                 .orders
                 .iter()
-                .map(|order| &order.key.cid)
+                .map(|order| &order.order.key.cid)
                 .collect::<FnvHashSet<_>>();
 
             for (cid, id) in open_at_resync
@@ -2934,7 +2936,7 @@ where
                     return None;
                 };
 
-                Some(Order {
+                Some(OrderReport::state_only(Order {
                     key: OrderKey {
                         exchange,
                         instrument: instrument.name_exchange.clone(),
@@ -2947,7 +2949,7 @@ where
                     kind: *kind,
                     time_in_force: *time_in_force,
                     state: OrderState::active(open.clone()),
-                })
+                }))
             })
             .collect(),
         // The engine's own record, not a read of the venue: it leaves out orders in flight, and
@@ -4483,7 +4485,7 @@ mod tests {
     ) -> InstrumentAccountSnapshot<ExchangeIndex, AssetIndex, InstrumentIndex> {
         InstrumentAccountSnapshot {
             instrument: InstrumentIndex(0),
-            orders,
+            orders: orders.into_iter().map(OrderReport::state_only).collect(),
             orders_complete,
             position: PositionReport::Unreported,
             isolated: None,

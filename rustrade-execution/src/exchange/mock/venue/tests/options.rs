@@ -659,11 +659,11 @@ fn expiry_retires_the_orders_still_working_on_the_option() {
         .expect("the resting order is retired");
     assert!(
         matches!(
-            retired.state,
+            retired.order.state,
             UnindexedOrderState::Inactive(InactiveOrderState::Expired(_))
         ),
         "{:?}",
-        retired.state
+        retired.order.state
     );
     assert_eq!(
         balance(&venue, usd()).free,

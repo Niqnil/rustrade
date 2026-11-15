@@ -943,9 +943,9 @@ async fn test_cancel_produces_cancelled_not_expired() {
             if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind {
                 let order = snapshot.value();
                 // Match on order ID to find our order
-                if order.key.cid == order_cid {
-                    println!("Order event: {:?}", order.state);
-                    match &order.state {
+                if order.order.key.cid == order_cid {
+                    println!("Order event: {:?}", order.order.state);
+                    match &order.order.state {
                         OrderState::Inactive(InactiveOrderState::Cancelled(_)) => {
                             found_cancelled = true;
                             break;
@@ -2105,7 +2105,7 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
         entry.orders_complete
     );
     assert!(
-        entry.orders.iter().any(|order| order.key.cid == cid),
+        entry.orders.iter().any(|order| order.order.key.cid == cid),
         "{entry:?}"
     );
     assert!(entry.orders_complete, "{entry:?}");

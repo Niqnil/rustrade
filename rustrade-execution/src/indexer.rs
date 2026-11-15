@@ -16,6 +16,7 @@ use crate::{
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
         deadline::OrderDeadline,
+        report::{OrderReport, UnindexedOrderReport},
         request::{OrderResponseAmend, OrderResponseCancel},
         state::{InactiveOrderState, OrderState, UnindexedOrderState},
     },
@@ -117,7 +118,7 @@ impl AccountEventIndexer {
                 )
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
-                AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
+                AccountEventKind::OrderSnapshot(self.order_report(snapshot.0).map(Snapshot)?)
             }
             AccountEventKind::OrderAmended(response) => {
                 AccountEventKind::OrderAmended(self.order_response_amend(response)?)
@@ -245,7 +246,7 @@ impl AccountEventIndexer {
 
                 let orders = orders
                     .into_iter()
-                    .map(|order| self.order_snapshot(order))
+                    .map(|report| self.order_report(report))
                     .collect::<Result<Vec<_>, _>>()?;
 
                 // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
@@ -536,6 +537,17 @@ impl AccountEventIndexer {
             kind,
             time_in_force,
             state,
+        })
+    }
+
+    /// Index an order report: its order as [`Self::order_snapshot`] does, its
+    /// [`ReportedTerms`](crate::order::report::ReportedTerms) unchanged.
+    pub fn order_report(&self, report: UnindexedOrderReport) -> Result<OrderReport, IndexError> {
+        let OrderReport { order, reported } = report;
+
+        Ok(OrderReport {
+            order: self.order_snapshot(order)?,
+            reported,
         })
     }
 

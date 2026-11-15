@@ -336,11 +336,11 @@ fn refused<'a>(events: impl IntoIterator<Item = &'a EngineEvent<DataKind>>) -> V
                 kind: AccountEventKind::OrderSnapshot(snapshot),
                 ..
             })) if matches!(
-                snapshot.0.state,
+                snapshot.0.order.state,
                 OrderState::Inactive(InactiveOrderState::OpenFailed(_))
             ) =>
             {
-                Some(snapshot.0.key.cid.clone())
+                Some(snapshot.0.order.key.cid.clone())
             }
             _ => None,
         })
@@ -1006,8 +1006,8 @@ fn under_next_bar_finish_expires_an_order_still_held() {
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                 kind: AccountEventKind::OrderSnapshot(snapshot),
                 ..
-            })) if snapshot.0.key.cid == ClientOrderId::new("held")
-                && matches!(snapshot.0.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
+            })) if snapshot.0.order.key.cid == ClientOrderId::new("held")
+                && matches!(snapshot.0.order.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
         )),
         "the order is answered as expired: {:?}",
         events(&finished)
@@ -1853,11 +1853,11 @@ fn a_step_with_no_events_delivers_a_deadline_it_reaches() {
                 kind: AccountEventKind::OrderSnapshot(snapshot),
                 ..
             })) if matches!(
-                snapshot.0.state,
+                snapshot.0.order.state,
                 OrderState::Inactive(InactiveOrderState::Expired(_))
             ) =>
             {
-                Some(snapshot.0.key.cid.clone())
+                Some(snapshot.0.order.key.cid.clone())
             }
             _ => None,
         })

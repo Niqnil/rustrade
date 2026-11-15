@@ -2377,12 +2377,12 @@ mod tests {
         assert_eq!(event.exchange, ExchangeId::HyperliquidSpot);
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.key.instrument.as_ref(), "HYPE-USDC-SPOT");
-                assert_eq!(order.side, Side::Sell);
-                assert_eq!(order.price, Some(dec!(25.5)));
-                assert_eq!(order.quantity, dec!(10));
+                assert_eq!(order.order.key.instrument.as_ref(), "HYPE-USDC-SPOT");
+                assert_eq!(order.order.side, Side::Sell);
+                assert_eq!(order.order.price, Some(dec!(25.5)));
+                assert_eq!(order.order.quantity, dec!(10));
                 assert!(matches!(
-                    order.state,
+                    order.order.state,
                     crate::order::state::OrderState::Active(_)
                 ));
             }

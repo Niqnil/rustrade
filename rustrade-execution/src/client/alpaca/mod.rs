@@ -70,6 +70,7 @@ use crate::{
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::OrderReport,
         request::{OrderRequestCancel, OrderRequestOpen, ReduceOnly, UnindexedOrderResponseCancel},
         state::{
             ActiveOrderState, Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState,
@@ -1603,6 +1604,7 @@ impl ExecutionClient for AlpacaClient {
             for order in instrument_snapshots
                 .iter()
                 .flat_map(|snapshot| &snapshot.orders)
+                .map(|report| &report.order)
             {
                 if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
                     known.live(&order.key, order.quantity, order.kind, open);
@@ -4412,7 +4414,12 @@ fn build_instrument_snapshots(
         } else {
             PositionReport::Unreported
         };
-        InstrumentAccountSnapshot::new(instrument, listing.orders, listing.complete, position, None)
+        let orders = listing
+            .orders
+            .into_iter()
+            .map(OrderReport::state_only)
+            .collect();
+        InstrumentAccountSnapshot::new(instrument, orders, listing.complete, position, None)
     };
 
     // If instruments is empty, return all; otherwise filter to requested set.
@@ -4638,7 +4645,7 @@ fn ws_order_snapshot(
     Some(UnindexedAccountEvent::new(
         ExchangeId::AlpacaBroker,
         AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot(
-            order_snapshot,
+            OrderReport::state_only(order_snapshot),
         )),
     ))
 }
@@ -6783,7 +6790,7 @@ mod tests {
             panic!("first event must be the Trade, got {:?}", first.kind);
         };
         let AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot(
-            order,
+            report,
         )) = second.kind
         else {
             panic!(
@@ -6791,7 +6798,7 @@ mod tests {
                 second.kind
             );
         };
-        (trade, order)
+        (trade, report.order)
     }
 
     /// A fill carries the client order id its order was placed with, so a consumer can attribute
@@ -11776,8 +11783,11 @@ mod tests {
                     else {
                         panic!("an order snapshot: {event:?}");
                     };
-                    assert!(matches!(order.state, OrderState::Inactive(_)), "{order:?}");
-                    order.key.cid
+                    assert!(
+                        matches!(order.order.state, OrderState::Inactive(_)),
+                        "{order:?}"
+                    );
+                    order.order.key.cid
                 })
                 .collect();
             reported.sort();
@@ -12162,7 +12172,7 @@ mod tests {
             else {
                 panic!("done_for_day reports an order snapshot: {done:?}");
             };
-            let OrderState::Active(ActiveOrderState::Open(open)) = &order.state else {
+            let OrderState::Active(ActiveOrderState::Open(open)) = &order.order.state else {
                 panic!("open: {order:?}");
             };
             assert_eq!(open.filled_quantity, Decimal::ONE, "with what it filled");

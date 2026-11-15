@@ -39,6 +39,10 @@ pub mod bracket;
 /// [`AmendSupport`](amend::AmendSupport) and [`Amended`](amend::Amended).
 pub mod amend;
 
+/// An order as a venue reported it, with which of its terms the report states:
+/// [`OrderReport`](report::OrderReport) and [`ReportedTerms`](report::ReportedTerms).
+pub mod report;
+
 /// The deadline of an order sent with
 /// [`RequestOpen::cancel_after`](request::RequestOpen::cancel_after):
 /// [`OrderDeadline`](deadline::OrderDeadline).

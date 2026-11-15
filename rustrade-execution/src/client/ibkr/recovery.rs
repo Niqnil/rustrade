@@ -917,6 +917,7 @@ mod tests {
     use super::*;
     use crate::client::dedup::new_dedup_cache;
     use crate::client::ibkr::execution::EXECUTIONS_COVER;
+    use crate::order::report::OrderReport;
     use ibapi::{
         contracts::Contract,
         orders::{CommissionReport, Execution},
@@ -1307,20 +1308,22 @@ mod tests {
         let snapshot = |cid: &str, state| {
             UnindexedAccountEvent::new(
                 ExchangeId::Ibkr,
-                AccountEventKind::OrderSnapshot(crate::Snapshot::new(Order {
-                    key: OrderKey {
-                        exchange: ExchangeId::Ibkr,
-                        instrument: InstrumentNameExchange::new("AAPL"),
-                        strategy: StrategyId::unknown(),
-                        cid: ClientOrderId::new(cid),
+                AccountEventKind::OrderSnapshot(crate::Snapshot::new(OrderReport::state_only(
+                    Order {
+                        key: OrderKey {
+                            exchange: ExchangeId::Ibkr,
+                            instrument: InstrumentNameExchange::new("AAPL"),
+                            strategy: StrategyId::unknown(),
+                            cid: ClientOrderId::new(cid),
+                        },
+                        side: Side::Buy,
+                        price: Some(dec!(150)),
+                        quantity: dec!(10),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        state,
                     },
-                    side: Side::Buy,
-                    price: Some(dec!(150)),
-                    quantity: dec!(10),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    state,
-                })),
+                ))),
             )
         };
         let open = || {

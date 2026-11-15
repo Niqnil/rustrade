@@ -9,6 +9,7 @@ use crate::{
     order::{
         Order, UnindexedInactiveOrder,
         id::ClientOrderId,
+        report::OrderReport,
         state::{Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
@@ -1151,7 +1152,9 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
 
         let mut orders_open = OpenOrders::default();
         let mut orders_cancelled = FnvHashMap::default();
-        for order in instruments.into_iter().flat_map(|snapshot| snapshot.orders) {
+        for OrderReport { order, .. } in
+            instruments.into_iter().flat_map(|snapshot| snapshot.orders)
+        {
             match &order.state {
                 OrderState::Active(_) => {
                     // `as_open` yields `None` for an active order that is not yet open — an
@@ -1510,7 +1513,9 @@ mod tests {
         let mut orders = orders.into_iter();
         let first = orders.next().unwrap();
         let mut snapshot = spot_config_holding("1", "1000", first).initial_state;
-        snapshot.instruments[0].orders.extend(orders);
+        snapshot.instruments[0]
+            .orders
+            .extend(orders.map(OrderReport::state_only));
         snapshot
     }
 

@@ -395,7 +395,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
                     Some(snapshot.balance.time_exchange)
                 }
-                AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
+                AccountEventKind::OrderSnapshot(order) => order.0.order.state.time_exchange(),
                 AccountEventKind::OrderAmended(response) => response
                     .state
                     .as_ref()

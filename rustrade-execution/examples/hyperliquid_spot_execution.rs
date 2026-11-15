@@ -124,7 +124,7 @@ async fn main() {
                 for order in &inst.orders {
                     info!(
                         "  {} {:?} {} @ {:?}",
-                        inst.instrument, order.side, order.quantity, order.price
+                        inst.instrument, order.order.side, order.order.quantity, order.order.price
                     );
                 }
             }
