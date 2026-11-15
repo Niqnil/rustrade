@@ -4504,10 +4504,6 @@ fn convert_representable_open_order(o: &AlpacaOrderResponse) -> Option<ListedOrd
     if quantity.is_zero() {
         return None;
     }
-    let price = o
-        .limit_price
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok());
     let filled_qty = alpaca_filled_qty(&o.id, Some(&o.filled_qty)).unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &o.order_type,
@@ -4515,6 +4511,7 @@ fn convert_representable_open_order(o: &AlpacaOrderResponse) -> Option<ListedOrd
         o.trail_percent.as_deref(),
         o.trail_price.as_deref(),
     )?;
+    let price = limit_price(&kind, o.limit_price.as_deref());
     let time_in_force = parse_time_in_force(&o.time_in_force);
     let (time_exchange, time_source) = order_state_time(o);
     let reported = ReportedTerms::from_venue_read(time_source, &kind, price, quantity);
@@ -4597,6 +4594,15 @@ fn convert_activity_to_trade(
 ///
 /// The payload is the order as it stands at the event, so the snapshot states every term it
 /// reads (see [`ReportedTerms::from_venue_read`]) unless the event's time is this host's.
+/// An order's limit price, read from Alpaca's `limit_price` only for a `kind` that carries one
+/// ([`OrderKind::has_limit_price`]), so that a report never holds a price for a kind its stated
+/// flags say has none. A price that does not parse reads as `None`.
+fn limit_price(kind: &OrderKind, limit_price: Option<&str>) -> Option<Decimal> {
+    limit_price
+        .filter(|_| kind.has_limit_price())
+        .and_then(|s| Decimal::from_str(s).ok())
+}
+
 fn ws_order_snapshot(
     order: &AlpacaOrderWs<'_>,
     instrument: InstrumentNameExchange,
@@ -4610,7 +4616,6 @@ fn ws_order_snapshot(
         trace!(order_id = %order.id, "Alpaca WS: skipping notional order snapshot (qty=None)");
         return None;
     }
-    let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
     // A live order's fill only grows, so a frame that omits it (some lifecycle events may) reads
     // as nothing filled yet, without a warning; one that garbles it is still reported.
     let filled_qty = order
@@ -4623,6 +4628,7 @@ fn ws_order_snapshot(
         order.trail_percent,
         order.trail_price,
     )?;
+    let price = limit_price(&kind, order.limit_price);
     let time_in_force = parse_time_in_force(&order.time_in_force);
     let reported = ReportedTerms::from_venue_read(time_source, &kind, price, quantity);
 
@@ -7532,6 +7538,16 @@ mod tests {
         assert_eq!(reported(resp), ReportedTerms::ALL, "a market order");
 
         let mut resp = make_order_response("ord-1", "SPY");
+        resp.order_type = "market".to_string();
+        let snapshots = build_instrument_snapshots(vec![resp], Vec::new(), &[]);
+        let order = &snapshots[0].orders[0];
+        assert_eq!(
+            order.order.price, None,
+            "a market order holds no limit price"
+        );
+        assert_eq!(order.reported, ReportedTerms::ALL);
+
+        let mut resp = make_order_response("ord-1", "SPY");
         resp.limit_price = Some("garbled".to_string());
         assert_eq!(reported(resp), ReportedTerms::ALL.with_price(false));
 
@@ -7545,13 +7561,17 @@ mod tests {
     }
 
     /// A stream order snapshot states every term its payload carries when the event's time is
-    /// Alpaca's, its order's `updated_at` included, and none on this host's clock.
+    /// Alpaca's, its order's `updated_at` included, and none on this host's clock. An unreadable
+    /// limit price is not stated, and a market order holds none.
     #[test]
     fn a_stream_snapshot_states_its_terms_unless_its_time_is_the_hosts() {
-        let reported = |timestamp: Option<&'static str>, updated_at: Option<&'static str>| {
+        let snapshot = |timestamp: Option<&'static str>,
+                        updated_at: Option<&'static str>,
+                        edit: fn(&mut AlpacaOrderWs<'static>)| {
             let mut order = make_order_ws("ord-1", "AAPL", "buy", "0");
             order.status = SmolStr::new("new");
             order.updated_at = updated_at;
+            edit(&mut order);
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("new"),
                 execution_id: None,
@@ -7565,8 +7585,9 @@ mod tests {
             let AccountEventKind::OrderSnapshot(snapshot) = event.kind else {
                 panic!("expected OrderSnapshot, got {:?}", event.kind)
             };
-            snapshot.0.reported
+            snapshot.0
         };
+        let reported = |timestamp, updated_at| snapshot(timestamp, updated_at, |_| {}).reported;
         assert_eq!(
             reported(Some("2025-04-18T14:30:00Z"), None),
             ReportedTerms::ALL
@@ -7577,6 +7598,20 @@ mod tests {
             "on the order's updated_at"
         );
         assert_eq!(reported(None, None), ReportedTerms::NONE);
+
+        let garbled = snapshot(Some("2025-04-18T14:30:00Z"), None, |order| {
+            order.limit_price = Some("garbled");
+        });
+        assert_eq!(garbled.reported, ReportedTerms::ALL.with_price(false));
+
+        let market = snapshot(Some("2025-04-18T14:30:00Z"), None, |order| {
+            order.order_type = SmolStr::new("market");
+        });
+        assert_eq!(
+            market.order.price, None,
+            "a market order holds no limit price"
+        );
+        assert_eq!(market.reported, ReportedTerms::ALL);
     }
 
     /// A placement response without a status reads from what filled, as one with a live status

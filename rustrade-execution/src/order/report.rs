@@ -123,7 +123,9 @@ impl ReportedTerms {
     ///
     /// - **Price.** A `kind` that carries no limit price ([`OrderKind::has_limit_price`]) states
     ///   that it has none. One that carries a limit states `price` only when it is non-zero: a
-    ///   zero or missing price is not the venue's limit.
+    ///   zero or missing price is not the venue's limit. For a kind without one, the producer
+    ///   leaves its order's price `None`, whatever the venue's message holds there, so that the
+    ///   price it states agrees with the order.
     /// - **Quantity.** A zero `quantity` is not stated. A venue reports one for an order sized
     ///   another way, such as by quote-asset amount or notional value, whose quantity is not known
     ///   until it fills.
@@ -132,9 +134,12 @@ impl ReportedTerms {
     ///   force. A producer that filled a term in from elsewhere, such as the order it placed,
     ///   clears that flag itself.
     ///
-    /// A producer whose timestamp is the venue's but not the time of these terms (such as an
-    /// order's creation time, on a venue that changes an order's terms in place) states nothing:
-    /// it passes [`TimeSource::Host`] or uses [`NONE`](Self::NONE).
+    /// `TimeSource::Venue` means the timestamp is the venue's time of these terms. A producer
+    /// whose timestamp is the venue's but not the time of the terms uses [`NONE`](Self::NONE)
+    /// instead. An order's creation time is such a timestamp on a venue that changes an order's
+    /// terms in place. It is the time of the terms only on a venue that never does, where a
+    /// change makes a new order.
+    #[must_use]
     pub fn from_venue_read(
         time_source: TimeSource,
         kind: &OrderKind,

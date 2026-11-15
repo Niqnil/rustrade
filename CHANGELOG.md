@@ -629,7 +629,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `account_snapshot` state every term, less a limit price that does not parse and a time in
     force read as `Unreported`. One stamped with this host's clock, because Alpaca sent no time,
     states none. A listed order without `updated_at` states its terms on `created_at`: Alpaca
-    never changes an order's terms in place, as a replace is a new order.
+    never changes an order's terms in place, as a replace is a new order. An order of a kind
+    without a limit price holds none, whatever Alpaca's `limit_price` says.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
