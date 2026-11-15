@@ -580,6 +580,92 @@ mod tests {
     }
 
     #[test]
+    fn every_family_takes_its_own_kinds_only() {
+        let stated = ReportedTerms::NONE.with_kind(true);
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: dec!(1),
+            offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
+        };
+        let families = [
+            (ConditionalFamily::Stop, vec![stop(dec!(90)), trailing_stop]),
+            (
+                ConditionalFamily::StopLimit,
+                vec![
+                    OrderKind::StopLimit {
+                        trigger_price: dec!(90),
+                    },
+                    trailing_stop_limit(dec!(2), dec!(95)),
+                ],
+            ),
+            (
+                ConditionalFamily::TakeProfit,
+                vec![OrderKind::TakeProfit {
+                    trigger_price: dec!(90),
+                }],
+            ),
+            (
+                ConditionalFamily::TakeProfitLimit,
+                vec![OrderKind::TakeProfitLimit {
+                    trigger_price: dec!(90),
+                }],
+            ),
+        ];
+
+        for (family, kinds) in &families {
+            let tracked = terms(None, dec!(2), unresolved(*family));
+            for (other, other_kinds) in &families {
+                for kind in other_kinds {
+                    let reported = terms(None, dec!(2), *kind);
+                    let expected = if family == other {
+                        adopted(reported)
+                    } else {
+                        Reconciled {
+                            terms: tracked,
+                            diverged: stated,
+                        }
+                    };
+                    assert_eq!(
+                        reconcile(&tracked, &reported, stated, None),
+                        expected,
+                        "{family} given {kind}"
+                    );
+                }
+            }
+            assert!(!kinds.is_empty());
+        }
+    }
+
+    /// A stand-in kind still says whether the order has a limit, so a price stated without the
+    /// kind is read for a family with one and ignored for a family without.
+    #[test]
+    fn a_stand_in_kinds_limit_is_read_by_its_family() {
+        let stated = ReportedTerms::NONE.with_price(true);
+
+        let tracked = terms(
+            Some(dec!(80)),
+            dec!(2),
+            unresolved(ConditionalFamily::StopLimit),
+        );
+        let reported = terms(
+            Some(dec!(81)),
+            dec!(2),
+            unresolved(ConditionalFamily::StopLimit),
+        );
+        assert_eq!(
+            reconcile(&tracked, &reported, stated, None),
+            adopted(reported)
+        );
+
+        let tracked = terms(Some(dec!(80)), dec!(2), unresolved(ConditionalFamily::Stop));
+        let reported = terms(Some(dec!(81)), dec!(2), unresolved(ConditionalFamily::Stop));
+        assert_eq!(
+            reconcile(&tracked, &reported, stated, None),
+            adopted(tracked)
+        );
+    }
+
+    #[test]
     fn a_reported_stand_in_is_not_read_even_when_stated() {
         let tracked = terms(None, dec!(2), stop(dec!(90)));
         let reported = OrderTerms {
@@ -683,6 +769,19 @@ mod tests {
         assert_eq!(
             reconcile(&tracked, &unexplained, ReportedTerms::NONE, Some(&patch)),
             adopted(tracked)
+        );
+
+        // An amend changes no time in force, so a new one is diverged as it is with no amend.
+        let retimed = OrderTerms {
+            time_in_force: POST_ONLY,
+            ..after
+        };
+        assert_eq!(
+            reconcile(&tracked, &retimed, ReportedTerms::ALL, Some(&patch)),
+            Reconciled {
+                terms: tracked,
+                diverged: ReportedTerms::NONE.with_time_in_force(true),
+            }
         );
     }
 

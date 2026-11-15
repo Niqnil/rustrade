@@ -1603,7 +1603,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)))
             .unwrap_or(false);
 
-        // An order already tracked as `Open` whose life this update ends needs the same
+        // An order already working at the venue whose life this update ends needs the same
         // treatment, for the opposite reason. The mapping is not being learned here, it is about
         // to be destroyed: `Orders::update_from_order_snapshot` untracks the order, so the
         // `cleanup_routing_tables` call below prunes both `exchange_id_to_cid` and
@@ -1614,18 +1614,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // (handled by `currently_open_in_flight` above) or after it -- IBKR reports a working
         // `orderStatus` carrying `filled == quantity` while deliberately withholding the `Trade`
         // until the matching `CommissionReport` lands, and REST reconciliation can serialise an
-        // order that completed mid-request on any venue.
-        let currently_open = self
-            .orders
-            .0
-            .get(&order.0.key.cid)
-            .map(|o| matches!(o.state, ActiveOrderState::Open(_)))
-            .unwrap_or(false);
+        // order that completed mid-request on any venue. That holds for an order with an amend or
+        // a cancel in flight as much as for one resting `Open`: each has been acknowledged, so
+        // each has a mapping to lose.
 
         // Two kinds of update settle the CID <-> OrderId mapping, and both must drive (a) and
         // (b) below: a transition out of OpenInFlight that carries the exchange OrderId, which
-        // learns the mapping, and a terminal update on an order tracked as Open, which is about
-        // to lose it.
+        // learns the mapping, and a terminal update on an order the venue has acknowledged, which
+        // is about to lose it.
         //
         // FullyFilled is not an edge case: a venue that answers the REST open with an
         // already-filled order reports the fill and the ack in the same response, and never
@@ -1648,18 +1644,17 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         let applied = self.orders.update_from_order_snapshot(report);
         self.cleanup_routing_tables();
 
-        let ack_exchange_id: Option<OrderId> =
-            if currently_open_in_flight || (currently_open && applied.retired) {
-                match &order.0.state {
-                    OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
-                    OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
-                        Some(filled.id.clone())
-                    }
-                    _ => None,
+        let ack_exchange_id: Option<OrderId> = if currently_open_in_flight || applied.retired {
+            match &order.0.state {
+                OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
+                OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+                    Some(filled.id.clone())
                 }
-            } else {
-                None
-            };
+                _ => None,
+            }
+        } else {
+            None
+        };
         let terms = FillsApplied::with_terms(applied.changed, applied.diverged);
 
         // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
@@ -4337,6 +4332,43 @@ mod tests {
         );
         assert_eq!(state.tear_sheet.fills_routed_by_fallback, 0);
         assert_eq!(state.tear_sheet.fills_unmatched, 0);
+    }
+
+    /// An order completed while its amend or its cancel is in flight keeps its live routing for a
+    /// late fill, as a resting order completed does.
+    #[test]
+    fn an_order_completed_with_a_request_in_flight_keeps_its_live_routing() {
+        let cid = ClientOrderId::new("cid-a");
+        let oid = OrderId::new("oid-a");
+        let pos = PositionId::new("position-a");
+        let working = Open::new(VenueOrderId::Assigned(oid.clone()), TIME, Decimal::ZERO);
+
+        for in_flight in [
+            ActiveOrderState::AmendInFlight(rustrade_execution::order::state::AmendInFlight {
+                order: working.clone(),
+                patch: rustrade_execution::order::amend::AmendPatch::default()
+                    .with_price(dec!(101)),
+                time_sent: TIME_SENT,
+            }),
+            ActiveOrderState::CancelInFlight(CancelInFlight::new(Some(working.clone()), TIME_SENT)),
+        ] {
+            let mut state = instrument_state(OmsMode::Hedging);
+            rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
+            state.orders.0.get_mut(&cid).expect("tracked").state = in_flight.clone();
+
+            state.update_from_state_only_snapshot(Snapshot(&order(
+                cid.clone(),
+                OrderState::fully_filled(Filled::new(oid.clone(), TIME, dec!(10), None)),
+            )));
+
+            assert!(state.orders.0.is_empty(), "{in_flight:?}");
+            assert_eq!(
+                state.exchange_id_to_cid.get(&oid),
+                Some(&cid),
+                "{in_flight:?}"
+            );
+            assert_eq!(state.position_ids.get(&cid), Some(&pos), "{in_flight:?}");
+        }
     }
 
     #[test]

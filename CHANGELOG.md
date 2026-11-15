@@ -609,6 +609,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A completed order keeps its fill routing when it had an amend or a cancel in flight**
+  (`rustrade`). A snapshot completing an order restores its live routing for a fill reported
+  after it, but only did so for an order tracked `Open`; one completed with a request in flight
+  left a late fill to the bounded fallback for retired orders.
+
 - **The simulated venue answers a market order with no price** (`rustrade-execution`). A market
   order's price is ignored, but its answer, and its record once filled or cancelled, carried the
   price its request did, while a held one carried none. Every record of a market order now
