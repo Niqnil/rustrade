@@ -31,7 +31,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            order::terms::OrderTerms,
+            order::{applied::OrderNotAdoptedReason, terms::OrderTerms},
             position::{OmsMode, PositionDrift, PositionExited, SplitRoundingPolicy},
             trading::TradingState,
         },
@@ -2950,6 +2950,109 @@ fn test_an_adopted_order_is_amended_with_its_reduce_only_unknown() {
         }
         other => panic!("expected the amend to be sent, got {other:?}"),
     }
+}
+
+/// An order the venue reports working that the engine did not send is adopted and reported, from
+/// an order snapshot or an account snapshot, and one reported with no positive quantity is
+/// refused and reported, untracked.
+#[test]
+fn test_an_untracked_order_is_adopted_or_refused_observably() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let instrument = InstrumentIndex(1);
+    let order = |cid: &str, quantity: Decimal| {
+        let request = open_request(instrument, cid);
+        Order {
+            key: request.key,
+            side: request.state.side,
+            price: request.state.price,
+            quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state: OrderState::active(Open {
+                id: VenueOrderId::Assigned(OrderId::new(format!("venue-{cid}"))),
+                time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+                filled_quantity: dec!(0),
+            }),
+        }
+    };
+    let outputs = |engine: &mut TestEngine, kind| {
+        let audit = process_with_audit(
+            engine,
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                exchange: ExchangeIndex(0),
+                kind,
+            })),
+        );
+        let EngineAudit::Process(audit) = audit.event else {
+            panic!("expected a processed event");
+        };
+        audit.outputs.into_iter().collect::<Vec<_>>()
+    };
+    let tracked = |engine: &TestEngine, cid: &str| {
+        engine
+            .state
+            .instruments
+            .instrument_index(&instrument)
+            .orders
+            .get(&ClientOrderId::new(cid))
+            .cloned()
+    };
+
+    // An order snapshot of an order the engine never sent.
+    let streamed = order("streamed", dec!(1));
+    let adopted = outputs(
+        &mut engine,
+        AccountEventKind::OrderSnapshot(Snapshot(OrderReport::new(
+            streamed.clone(),
+            ReportedTerms::ALL,
+        ))),
+    );
+    let [EngineOutput::OrderAdopted(adopted)] = adopted.as_slice() else {
+        panic!("expected one OrderAdopted, got {adopted:?}");
+    };
+    assert_eq!(Some(&adopted.order), tracked(&engine, "streamed").as_ref());
+    assert_eq!(adopted.order.key, streamed.key);
+    assert_eq!(adopted.reported, ReportedTerms::ALL);
+
+    // An account snapshot listing one more, stating nothing, and one with no quantity.
+    let listed = order("listed", dec!(2));
+    let placeholder = order("placeholder", dec!(0));
+    let snapshot = outputs(
+        &mut engine,
+        AccountEventKind::Snapshot(AccountSnapshot {
+            exchange: ExchangeIndex(0),
+            balances: vec![],
+            instruments: vec![InstrumentAccountSnapshot::new(
+                instrument,
+                vec![
+                    OrderReport::state_only(streamed),
+                    OrderReport::state_only(listed.clone()),
+                    OrderReport::state_only(placeholder.clone()),
+                ],
+                false,
+                PositionReport::Unreported,
+                None,
+            )],
+        }),
+    );
+    let [
+        EngineOutput::OrderAdopted(adopted),
+        EngineOutput::OrderNotAdopted(refused),
+    ] = snapshot.as_slice()
+    else {
+        panic!("expected one OrderAdopted then one OrderNotAdopted, got {snapshot:?}");
+    };
+    assert_eq!(adopted.order.key, listed.key);
+    assert_eq!(adopted.reported, ReportedTerms::NONE);
+    assert_eq!(
+        tracked(&engine, "listed").map(|order| order.quantity),
+        Some(dec!(2))
+    );
+    assert_eq!(refused.order.key, placeholder.key);
+    assert_eq!(refused.reason, OrderNotAdoptedReason::QuantityNotPositive);
+    assert_eq!(tracked(&engine, "placeholder"), None);
 }
 
 /// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and

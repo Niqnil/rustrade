@@ -4,7 +4,7 @@ use crate::{
         state::{
             fee::FeeConversion,
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-            order::{Orders, manager::OrderManager, terms::OrderTermsApplied},
+            order::{Orders, applied::OrderReportsApplied, manager::OrderManager},
             position::{
                 CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
                 PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
@@ -738,11 +738,11 @@ fn reduce_only_position() -> ReduceOnly {
 }
 
 /// What applying one account event did to an instrument: to its positions, through the fills it
-/// applied, and to its orders' terms.
+/// applied, and to its orders.
 ///
 /// Returned by [`InstrumentState::update_from_trade`] for one fill, and by
-/// [`InstrumentState::update_from_order_snapshot`] for the fills it replays and the terms the
-/// snapshot changed or left diverged.
+/// [`InstrumentState::update_from_order_snapshot`] for the fills it replays and what the snapshot
+/// did to its order.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex, ExchangeKey = ExchangeIndex> {
@@ -755,12 +755,13 @@ pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex, ExchangeKey =
     /// fill. Set only by [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account),
     /// which does the valuing, never by this type's own methods.
     pub fee_conversion: Option<FeeConversion<AssetKey, InstrumentKey>>,
-    /// The terms the event's order report changed, or stated and the engine did not adopt. See
+    /// What the event's order report did to its order: the terms it changed, or stated and the
+    /// engine did not adopt, and the order adopted or refused when it was untracked. See
     /// [`OrderManager::update_from_order_snapshot`].
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load.
-    #[serde(default = "OrderTermsApplied::default")]
-    pub terms: OrderTermsApplied<ExchangeKey, InstrumentKey>,
+    #[serde(default = "OrderReportsApplied::default")]
+    pub orders: OrderReportsApplied<ExchangeKey, InstrumentKey>,
 }
 
 impl<AssetKey, InstrumentKey, ExchangeKey> Default
@@ -771,25 +772,25 @@ impl<AssetKey, InstrumentKey, ExchangeKey> Default
             exited: None,
             capped: Vec::new(),
             fee_conversion: None,
-            terms: OrderTermsApplied::default(),
+            orders: OrderReportsApplied::default(),
         }
     }
 }
 
 impl<AssetKey, InstrumentKey, ExchangeKey> FillsApplied<AssetKey, InstrumentKey, ExchangeKey> {
-    /// `true` if no fill closed a position, none was capped, no third-asset fee was valued, and no
-    /// order's terms were changed or left diverged.
+    /// `true` if no fill closed a position, none was capped, no third-asset fee was valued, no
+    /// order's terms were changed or left diverged, and no untracked order was adopted or refused.
     pub fn is_empty(&self) -> bool {
         self.exited.is_none()
             && self.capped.is_empty()
             && self.fee_conversion.is_none()
-            && self.terms.is_empty()
+            && self.orders.is_empty()
     }
 
-    /// Nothing applied but `terms`.
-    pub(crate) fn with_terms(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
+    /// Nothing applied but `orders`.
+    pub(crate) fn with_orders(orders: OrderReportsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
-            terms,
+            orders,
             ..Self::default()
         }
     }
@@ -1148,8 +1149,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
     /// Each order the snapshot lists is applied as an order snapshot, using timestamps where
-    /// relevant so the most recent order state wins. Returns the terms those reports changed or
-    /// left diverged, and nothing else: a position a replayed fill closed is not returned.
+    /// relevant so the most recent order state wins. Returns what those reports did to the
+    /// orders (the terms changed or left diverged, the untracked orders adopted or refused), and
+    /// nothing else: a position a replayed fill closed is not returned.
     ///
     /// # Orders the snapshot leaves out
     ///
@@ -1175,18 +1177,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_account_snapshot(
         &mut self,
         snapshot: &InstrumentAccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>,
-    ) -> OrderTermsApplied<ExchangeKey, InstrumentKey>
+    ) -> OrderReportsApplied<ExchangeKey, InstrumentKey>
     where
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
         AssetKey: Debug + Clone + PartialEq,
     {
-        let mut terms = OrderTermsApplied::default();
+        let mut orders = OrderReportsApplied::default();
         for report in &snapshot.orders {
-            // Only the terms each report changed or left diverged are returned. PositionExited
+            // Only what each report did to its order is returned. PositionExited
             // from deferred fill replay is not: snapshot reconciliation at startup does not emit
             // PositionExit output events, a known limitation.
-            terms.extend(self.update_from_order_snapshot(Snapshot(report)).terms);
+            orders.extend(self.update_from_order_snapshot(Snapshot(report)).orders);
         }
 
         let open_at_resync = std::mem::take(&mut self.orders_open_at_resync);
@@ -1233,7 +1235,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         }
 
         self.cleanup_routing_tables();
-        terms
+        orders
     }
 
     /// Records the orders that are `Open` as the account stream begins to resynchronise, making
@@ -1634,7 +1636,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         } else {
             None
         };
-        let terms = FillsApplied::with_terms(applied.terms);
+        let reports = FillsApplied::with_orders(applied.orders);
 
         // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
         // that were waiting on it.
@@ -1670,7 +1672,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     .collect();
                 self.pending_fills.retain(|f| f.order_id != exchange_id);
 
-                let mut applied = terms;
+                let mut applied = reports;
                 for fill in deferred {
                     debug!(
                         order_id = %fill.order_id,
@@ -1705,7 +1707,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
-        terms
+        reports
     }
 
     /// Updates the instrument state from an

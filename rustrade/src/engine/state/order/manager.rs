@@ -87,10 +87,14 @@ where
     /// An order is retired when a superseding snapshot leaves it nothing to fill, including one
     /// that reports more filled than its quantity, which is also warned of.
     ///
-    /// An untracked order is tracked on the snapshot's terms as they stand, stated or not.
+    /// An untracked order is tracked on the snapshot's terms as they stand, stated or not, and
+    /// returned as adopted when the snapshot is a venue's report rather than the engine's own
+    /// record of an open request. A venue's report of an untracked working order whose quantity is
+    /// zero or negative is not tracked, and is returned as not adopted: such a quantity is a
+    /// placeholder, and tracked it would read as an order with nothing left to fill.
     ///
-    /// Returns what the snapshot did: whether it retired the order, and the terms it changed or
-    /// left diverged.
+    /// Returns what the snapshot did: whether it retired the order, the terms it changed or left
+    /// diverged, and the order adopted or refused.
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
         snapshot: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
