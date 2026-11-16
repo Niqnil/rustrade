@@ -9,6 +9,7 @@
 
 use super::{
     LISTING_STALL_TIMEOUT, ListingLock, cancelled_at_expiry,
+    clock::OrderClock,
     execution::{self, EXECUTIONS_COVER, ExecutionRevision, try_decimal_or_warn},
     order::{self, OrderContext, OrderIdMap, PendingCancels, Registration},
     read_error, read_listing,
@@ -256,12 +257,14 @@ impl Tracked {
 /// order's, under an id since reused. That is warned about the first time `earlier` meets it.
 ///
 /// The ended order carries the IB order id when this client tracks the order, and otherwise IB's
-/// permanent id for it, since IB lists a completed order without its API order id.
+/// permanent id for it, since IB lists a completed order without its API order id. Its time is
+/// IB's completion time, or a stamp from `clock` when IB lists none.
 pub(super) fn ended_order<E>(
     key: &UnindexedOrderKey,
     completed: &CompletedOrder,
     tracked: Option<&Tracked>,
     earlier: &EarlierCompletions,
+    clock: &OrderClock,
     executed: impl FnOnce() -> Result<Option<Decimal>, E>,
 ) -> Result<OrderLookup, E> {
     let data = &completed.data;
@@ -329,7 +332,7 @@ pub(super) fn ended_order<E>(
         || OrderId::new(format_smolstr!("{}", data.order.perm_id)),
         |tracked| execution::ib_order_id(tracked.ib_id),
     );
-    let time = completed.time.unwrap_or_else(Utc::now);
+    let time = completed.time.unwrap_or_else(|| clock.now());
 
     let state = match &data.order_state.status {
         OrderStatusKind::Filled => {
@@ -398,6 +401,7 @@ pub(super) struct EndedOrderReader<'a> {
     order_ids: &'a OrderIdMap,
     pending_cancels: &'a PendingCancels,
     earlier: &'a EarlierCompletions,
+    clock: &'a OrderClock,
     /// The gateway's zone, in which a completed order's time that names none is read.
     session_zone: Option<Tz>,
     completed: OnceCell<CompletedOrders>,
@@ -412,6 +416,7 @@ impl<'a> EndedOrderReader<'a> {
         order_ids: &'a OrderIdMap,
         pending_cancels: &'a PendingCancels,
         earlier: &'a EarlierCompletions,
+        clock: &'a OrderClock,
         session_zone: Option<Tz>,
     ) -> Self {
         Self {
@@ -421,6 +426,7 @@ impl<'a> EndedOrderReader<'a> {
             order_ids,
             pending_cancels,
             earlier,
+            clock,
             session_zone,
             completed: OnceCell::new(),
             executed: OnceCell::new(),
@@ -463,9 +469,14 @@ impl<'a> EndedOrderReader<'a> {
             return Ok(OrderLookup::Unknown);
         }
         let tracked = Tracked::find(&key.cid, self.order_ids, self.pending_cancels);
-        ended_order(key, order, tracked.as_ref(), self.earlier, || {
-            Ok(self.executed()?.of(&key.cid))
-        })
+        ended_order(
+            key,
+            order,
+            tracked.as_ref(),
+            self.earlier,
+            self.clock,
+            || Ok(self.executed()?.of(&key.cid)),
+        )
     }
 
     fn executed(&self) -> Result<&ExecutedQuantities, UnindexedClientError> {
@@ -696,6 +707,7 @@ mod tests {
                 &order,
                 None,
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || -> Result<_, ()> { panic!("a filled order's fill is listed") },
             )
             .unwrap(),
@@ -733,6 +745,7 @@ mod tests {
                 &order,
                 None,
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || -> Result<_, ()> { panic!("a rejected order filled nothing") },
             )
             .unwrap(),
@@ -762,6 +775,7 @@ mod tests {
                     &order,
                     tracked,
                     &EarlierCompletions::new(),
+                    &OrderClock::default(),
                     || Ok::<_, ()>(executed),
                 )
                 .unwrap(),
@@ -808,9 +822,14 @@ mod tests {
         let order = orders.0.into_values().next().unwrap();
 
         let found = ended(
-            ended_order(&key("a"), &order, None, &EarlierCompletions::new(), || {
-                Ok::<_, ()>(None)
-            })
+            ended_order(
+                &key("a"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                &OrderClock::default(),
+                || Ok::<_, ()>(None),
+            )
             .unwrap(),
         );
         assert_eq!(
@@ -840,6 +859,7 @@ mod tests {
                 &order,
                 Some(&adopted),
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || Ok::<_, ()>(None),
             )
             .unwrap(),
@@ -880,6 +900,7 @@ mod tests {
                 &earlier,
                 Some(&placed_an_hour_ago),
                 &noted,
+                &OrderClock::default(),
                 || Ok::<_, ()>(None)
             )
             .unwrap(),
@@ -896,11 +917,38 @@ mod tests {
                 &later,
                 Some(&placed_an_hour_ago),
                 &noted,
+                &OrderClock::default(),
                 || Ok::<_, ()>(None)
             )
             .unwrap(),
             OrderLookup::Ended(_)
         ));
+    }
+
+    /// An order IB lists without a completion time is stamped by the client's clock, which never
+    /// goes back, not by the wall clock.
+    #[test]
+    fn an_order_listed_without_a_completion_time_takes_the_clients_stamp() {
+        let order = one(completed(API_CLIENT, "a", OrderStatusKind::Filled, "", ""));
+        assert_eq!(order.time, None);
+        let given = Utc::now() + chrono::Duration::hours(1);
+
+        let found = ended(
+            ended_order(
+                &key("a"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                &OrderClock::stamped_at(given),
+                || -> Result<_, ()> { panic!("a filled order's fill is listed") },
+            )
+            .unwrap(),
+        );
+
+        let InactiveOrderState::FullyFilled(filled) = found.state else {
+            panic!("not filled: {:?}", found.state)
+        };
+        assert_eq!(filled.time_exchange, given);
     }
 
     /// IB keeps an earlier order's completion in its listing, so each lookup of its reused client
@@ -948,6 +996,7 @@ mod tests {
                     &order,
                     Some(tracked),
                     &EarlierCompletions::new(),
+                    &OrderClock::default(),
                     || Ok::<_, ()>(None),
                 )
                 .unwrap(),
@@ -985,6 +1034,7 @@ mod tests {
                     &inactive,
                     None,
                     &EarlierCompletions::new(),
+                    &OrderClock::default(),
                     || Ok::<_, ()>(None)
                 )
                 .unwrap()
@@ -1001,12 +1051,14 @@ mod tests {
             "",
         ));
         assert!(matches!(
-            ended_order(&key("a"), &live, None, &EarlierCompletions::new(), || Ok::<
-                _,
-                (),
-            >(
-                None
-            ))
+            ended_order(
+                &key("a"),
+                &live,
+                None,
+                &EarlierCompletions::new(),
+                &OrderClock::default(),
+                || Ok::<_, ()>(None)
+            )
             .unwrap(),
             OrderLookup::NotEnded
         ));
@@ -1024,6 +1076,7 @@ mod tests {
                 &unreadable,
                 None,
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || Ok::<_, ()>(None)
             )
             .unwrap(),
@@ -1046,6 +1099,7 @@ mod tests {
                 &order,
                 Some(&placed),
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || Ok::<_, ()>(None),
             )
             .unwrap(),
@@ -1060,6 +1114,7 @@ mod tests {
                 &order,
                 Some(&placed),
                 &EarlierCompletions::new(),
+                &OrderClock::default(),
                 || Ok::<_, ()>(None),
             )
             .unwrap(),
@@ -1085,9 +1140,14 @@ mod tests {
 
         let order = one(completed(API_CLIENT, "a", OrderStatusKind::Filled, "", ""));
         let filled = ended(
-            ended_order(&key("a"), &order, None, &EarlierCompletions::new(), || {
-                Ok::<_, ()>(None)
-            })
+            ended_order(
+                &key("a"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                &OrderClock::default(),
+                || Ok::<_, ()>(None),
+            )
             .unwrap(),
         );
         release_ended(&filled, &order_ids, &pending_cancels);
@@ -1102,9 +1162,14 @@ mod tests {
             "",
         ));
         let cancelled = ended(
-            ended_order(&key("b"), &order, None, &EarlierCompletions::new(), || {
-                Ok::<_, ()>(None)
-            })
+            ended_order(
+                &key("b"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                &OrderClock::default(),
+                || Ok::<_, ()>(None),
+            )
             .unwrap(),
         );
         release_ended(&cancelled, &order_ids, &pending_cancels);

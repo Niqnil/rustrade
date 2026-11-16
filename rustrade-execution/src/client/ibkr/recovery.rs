@@ -34,6 +34,7 @@
 
 use super::{
     ListingLock,
+    clock::OrderClock,
     ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
     execution::{
         ExecutionBuffer, ExecutionRevision, ExecutionScope, executions_filter,
@@ -714,6 +715,9 @@ pub(super) struct RecoveryWatcher {
     pub(super) known: SharedKnownLiveOrders,
     pub(super) listings: ListingLock,
     pub(super) earlier_completions: EarlierCompletions,
+    /// Stamps an ended order IB lists without a completion time, as the client's other order
+    /// reports are stamped.
+    pub(super) clock: OrderClock,
     /// The gateway's zone, in which an order's time that names none is read.
     pub(super) session_zone: Option<chrono_tz::Tz>,
     pub(super) sink: EventSink,
@@ -864,6 +868,7 @@ impl RecoveryWatcher {
             &self.order_ids,
             &self.pending_cancels,
             &self.earlier_completions,
+            &self.clock,
             self.session_zone,
         );
         let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
