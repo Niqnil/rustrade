@@ -29,7 +29,7 @@ use crate::{
         UnindexedOrderSnapshot,
         amend::{AmendPatch, AmendSupport, AmendTarget, Amended, RequestAmend},
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::{OrderReport, ReportedTerms, UnindexedOrderReport},
+        report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, ReduceOnly,
             UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
@@ -4797,8 +4797,33 @@ impl SimulatedVenue {
             state: open.clone(),
             ..candidate
         };
-        // The book reports the order as it now rests, as it reports every other change to it.
-        let report = booked_report(booked.clone().map_state(OrderState::active));
+        // The book reports the order as it now rests, as it reports every other change to it,
+        // linked to the id it replaces. Restarted, the order under the old id has ended, which is
+        // reported after its replacement, as a producer holds such a report back.
+        let replaced = previous_id
+            .as_ref()
+            .and_then(VenueOrderId::assigned)
+            .cloned();
+        let ended_leg = replaced
+            .as_ref()
+            .filter(|_| self.amend.filled_restarts)
+            .map(|replaced| Order {
+                key: booked.key.clone(),
+                side: booked.side,
+                price: order.price,
+                quantity: order.quantity,
+                kind: order.kind,
+                time_in_force: order.time_in_force,
+                state: OrderState::inactive(Cancelled {
+                    id: replaced.clone(),
+                    time_exchange,
+                    filled_quantity: Some(filled_total),
+                }),
+            });
+        let mut report = booked_report(booked.clone().map_state(OrderState::active));
+        if let Some(replaced) = replaced {
+            report = report.with_replaces(Replaces::new(replaced));
+        }
         let answer = Amended::new(
             open,
             booked.price,
@@ -4813,6 +4838,9 @@ impl SimulatedVenue {
             );
         }
         events.push(self.build_account_event(Snapshot(report)));
+        if let Some(ended_leg) = ended_leg {
+            events.push(self.build_account_event(Snapshot(booked_report(ended_leg))));
+        }
         Ok(answer)
     }
 

@@ -1,5 +1,7 @@
 use crate::engine::state::order::{
-    applied::{OrderAdopted, OrderNotAdopted, OrderNotAdoptedReason, OrderReportsApplied},
+    applied::{
+        OrderAdopted, OrderNotAdopted, OrderNotAdoptedReason, OrderReplaced, OrderReportsApplied,
+    },
     in_flight_recorder::InFlightRequestRecorder,
     manager::OrderManager,
     terms::{OrderTerms, OrderTermsChanged, OrderTermsDiverged, Reconciled, reconcile},
@@ -13,13 +15,14 @@ use rustrade_execution::{
         Order, OrderKey,
         amend::AmendPatch,
         id::{ClientOrderId, OrderId, VenueOrderId},
-        report::{OrderReport, ReportedTerms},
+        report::{OrderReport, Replaces, ReportedTerms},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, OrderResponseAmend,
             OrderResponseCancel,
         },
         state::{
-            ActiveOrderState, AmendInFlight, CancelInFlight, InactiveOrderState, Open, OrderState,
+            ActiveOrderState, AmendInFlight, CancelInFlight, InactiveOrderState, Open,
+            OpenInFlight, OrderState,
         },
     },
 };
@@ -126,7 +129,35 @@ impl<ExchangeKey, InstrumentKey> SnapshotApplied<ExchangeKey, InstrumentKey> {
 /// The memory is bookkeeping, not order state: `Orders` serialises as its tracked orders alone,
 /// and two `Orders` that track the same orders are equal whatever each remembers.
 ///
+/// # Orders replaced at the venue
+///
+/// A venue may carry out a change to a working order by replacing it, under a new venue order id,
+/// a new client order id, or both. A report linking the replacement to the order replaced
+/// ([`OrderReport::replaces`]) keeps it one tracked order:
+/// - **A new venue order id** under the same client order id is followed when the link names the
+///   id held. The id held becomes one the order is known to have been replaced from (see
+///   [`TrackedOrder::superseded_ids`]).
+/// - **A new client order id**: the order replaced, found by the client order id the link names,
+///   or else by its venue order id, moves to the new one, keeping its strategy, its fills and
+///   its terms. Its old client order id is remembered as retired, so a late report under it is
+///   ignored. A cancel or amend in flight under the old id is dropped: the venue answers it under
+///   that id, which `Orders` no longer tracks. The order keeps the state the request was sent
+///   from, and the report is then applied to it.
+/// - **Late reports of the order replaced**, naming a venue order id the order was replaced from,
+///   are ignored: a working report, and an ended one, such as the cancel of the old order a venue
+///   reports alongside its replacement. A fill naming such an id still counts towards the order
+///   ([`Orders::update_from_fill`]).
+///
+/// Each replace followed is returned as an [`OrderReplaced`]. An unlinked report naming a
+/// different venue order id from the one held is still refused, as one client order id covering
+/// two venue orders. The engine's own amends need no link: an answer naming the venue order id it
+/// replaced ([`Amended::previous_id`](rustrade_execution::order::amend::Amended::previous_id))
+/// moves the order to its new id in the same way.
+///
 /// **Known limitations:**
+/// - Only the last [`MAX_SUPERSEDED_IDS`] venue order ids an order was replaced from are kept. A
+///   late ended report naming an older one ends the order, as an ended report naming an id never
+///   held does.
 /// - The audit replica sees no open requests, only the venue's reports, so it cannot tell an id
 ///   reused within the window from a late report. It ignores the new order where the engine
 ///   tracks it, until the id has left the window.
@@ -164,6 +195,8 @@ pub struct TrackedOrder<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentI
     pub order: Order<ExchangeKey, InstrumentKey, ActiveOrderState>,
     #[serde(default, skip_serializing_if = "TermsTimes::is_none")]
     terms_times: TermsTimes,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    superseded_ids: Vec<OrderId>,
 }
 
 impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
@@ -172,6 +205,7 @@ impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
         Self {
             order,
             terms_times: TermsTimes::default(),
+            superseded_ids: Vec::new(),
         }
     }
 
@@ -179,7 +213,57 @@ impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
     pub fn terms_times(&self) -> TermsTimes {
         self.terms_times
     }
+
+    /// The venue order ids this order was replaced from, oldest first: the last
+    /// [`MAX_SUPERSEDED_IDS`] (see "Orders replaced at the venue" on [`Orders`]).
+    ///
+    /// A late report naming one of them is of the order before a replace: a working or ended
+    /// report is ignored, and a fill counts towards the order. Serialized beside the order's
+    /// fields once any is set, as [`terms_times`](Self::terms_times) is.
+    pub fn superseded_ids(&self) -> &[OrderId] {
+        &self.superseded_ids
+    }
+
+    /// Whether `id` is a venue order id this order was replaced from.
+    fn is_superseded(&self, id: &OrderId) -> bool {
+        self.superseded_ids.contains(id)
+    }
+
+    /// Whether `id` names a venue order id this order was replaced from.
+    fn names_superseded(&self, id: &VenueOrderId) -> bool {
+        id.assigned().is_some_and(|id| self.is_superseded(id))
+    }
+
+    /// The venue order id the order is addressed by now, if the venue has named it.
+    fn current_id(&self) -> Option<&OrderId> {
+        self.order
+            .state
+            .open_meta()
+            .and_then(|open| open.id.assigned())
+    }
+
+    /// Record that the order was replaced from the venue order id `id`, forgetting the oldest
+    /// past [`MAX_SUPERSEDED_IDS`]. Nothing for the id the order is addressed by now, or one
+    /// already recorded.
+    fn supersede(&mut self, id: OrderId) {
+        if self.current_id() == Some(&id) || self.is_superseded(&id) {
+            return;
+        }
+        if self.superseded_ids.len() == MAX_SUPERSEDED_IDS {
+            self.superseded_ids.remove(0);
+        }
+        self.superseded_ids.push(id);
+    }
 }
+
+/// How many venue order ids a [`TrackedOrder`] keeps of those it was replaced from, so that a
+/// late report of the order before a replace is known for one (see "Orders replaced at the venue"
+/// on [`Orders`]).
+///
+/// A late report of a replaced order arrives within moments of its replacement, so the bound
+/// needs to span the replaces made in that time: a few, even for an order a strategy reprices
+/// on every tick. It costs at most this many venue order ids per tracked order.
+pub const MAX_SUPERSEDED_IDS: usize = 16;
 
 /// When the venue last stated each of an order's terms: the state timestamp of the latest report
 /// stating it, or of the venue's answer to an amend that set it. `None` for a term no report has
@@ -482,7 +566,8 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     /// # What it will not do
     ///
     /// Nothing happens unless the order is already tracked and working, `Open` or with an amend
-    /// in flight, under this exact venue [`OrderId`]. A fill for an untracked order cannot insert one, so this cannot resurrect an
+    /// in flight, under this exact venue [`OrderId`], or one it was replaced from (see "Orders
+    /// replaced at the venue" on [`Orders`]). A fill for an untracked order cannot insert one, so this cannot resurrect an
     /// order that has retired -- unlike an order snapshot, which reaches a vacant-entry arm that
     /// inserts. A fill arriving after its order retired is therefore safe to apply here, and is
     /// simply ignored.
@@ -499,7 +584,12 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     where
         InstrumentKey: Debug,
     {
-        let Some(TrackedOrder { order, .. }) = self.0.get_mut(cid) else {
+        let Some(TrackedOrder {
+            order,
+            superseded_ids,
+            ..
+        }) = self.0.get_mut(cid)
+        else {
             return false;
         };
         // While an amend raising the quantity is in flight, the venue may already have made it and
@@ -524,7 +614,11 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         // An order the venue never named has no id to agree with, so it cannot be advanced from
         // the fill stream at all. Reading two absent ids as a match is precisely the confusion
         // this comparison exists to prevent, so the absence is compared, not skipped.
-        if open.id.assigned() != Some(order_id) {
+        //
+        // A late fill of the order before a replace names an id it was replaced from, and counts:
+        // its cumulative is at most the order's, whether the venue carried the fills over or the
+        // producer added them back up, so taking the greater of the two never undercounts.
+        if open.id.assigned() != Some(order_id) && !superseded_ids.contains(order_id) {
             return false;
         }
         if filled_quantity <= open.filled_quantity {
@@ -590,9 +684,6 @@ where
         self.0.values().map(|tracked| &tracked.order)
     }
 
-    // One match over the tracked and the incoming state, an arm per pair. The lint counts each
-    // arm's log macro expansion, and splitting the match would scatter the transition table.
-    #[allow(clippy::cognitive_complexity)]
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
         snapshot: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
@@ -601,419 +692,21 @@ where
         AssetKey: Debug + Clone,
     {
         let Snapshot(report) = snapshot;
-        let snapshot = &report.order;
 
-        if self.is_failed_open_to_ignore(snapshot) {
+        if self.is_failed_open_to_ignore(&report.order) {
             return SnapshotApplied::default();
         }
 
-        let (mut current_entry, update) = match (
-            self.0.entry(snapshot.key.cid.clone()),
-            snapshot.to_active(),
-        ) {
-            // Order untracked: track it, or ignore it
-            (Entry::Vacant(entry), update) => {
-                return SnapshotApplied::working(update_untracked(
-                    entry,
-                    &mut self.1,
-                    report,
-                    update,
-                ));
-            }
-
-            // A refusal of a request under a client order id already in use says nothing about
-            // the order holding it, so it does not end that order. Unless the order tracked is
-            // that request's own, still in flight, which the refusal does end.
-            (Entry::Occupied(entry), None)
-                if is_duplicate_cid_refusal(&snapshot.state)
-                    && !matches!(entry.get().order.state, ActiveOrderState::OpenInFlight(_)) =>
-            {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received a duplicate ClientOrderId refusal for a tracked order it did not send - ignoring"
-                );
-                return SnapshotApplied::default();
-            }
-
-            // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
-            (Entry::Occupied(entry), None) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received inactive order snapshot for tracked order - removing"
-                );
-                self.1.insert(entry.remove().order.key.cid);
-                return SnapshotApplied::retired(OrderReportsApplied::default());
-            }
-
-            // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
-            (Entry::Occupied(entry), Some(update)) => (entry, update),
-        };
-
-        match (&current_entry.get().order.state, update.state) {
-            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received a duplicate OpenInFlight recording - ignoring"
-                );
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::Open(open)) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager transitioned an OpenInFlight order to Open"
-                );
-                // The venue's first report of the order: what it says of the terms is the first
-                // word the venue has given on them, so there is no earlier stamp to order against.
-                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
-                if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
-                    self.1.insert(current_entry.remove().order.key.cid);
-                    return SnapshotApplied::retired(terms);
-                }
-                current_entry.get_mut().order.state = ActiveOrderState::Open(open);
-                SnapshotApplied::working(terms)
-            }
-            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::CancelInFlight(update)) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager transitioned an OpenInFlight order to CancelInFlight"
-                );
-                current_entry.get_mut().order.state = ActiveOrderState::CancelInFlight(update);
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::Open(_), ActiveOrderState::OpenInFlight(_)) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received an OpenInFlight recording for an Open order - ignoring"
-                );
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::Open(current), ActiveOrderState::Open(open)) => {
-                // This order was reached by `ClientOrderId` alone. If both states name a venue
-                // order and the two disagree, one client id is covering two distinct exchange
-                // orders, and applying the update would overwrite a live order's price, quantity
-                // and cumulative fill -- or retire it outright -- on the strength of a different
-                // order's state.
-                //
-                // `contradicts` rejects only on positive evidence. An order the venue has not
-                // named carries nothing to compare, and two such orders are not shown to be the
-                // same order by both lacking an identifier.
-                if current.id.contradicts(&open.id) {
-                    error!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        tracked_id = %current.id,
-                        update_id = %open.id,
-                        "OrderManager received an Open snapshot naming a different exchange order than the one tracked under this ClientOrderId - ignoring"
-                    );
-                    return SnapshotApplied::default();
-                }
-
-                // Terms are ordered by their own time, whether or not the state supersedes the one
-                // held (see "Terms times" on `TrackedOrder`).
-                let superseded = current.is_superseded_by(&open);
-                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
-
-                if superseded {
-                    // A venue may report a completed fill as an Open snapshot with nothing left to
-                    // fill, rather than as a distinct terminal state. That order is finished, so
-                    // it stops being tracked -- exactly as the OpenInFlight -> Open arm above
-                    // already does. Retaining it would leave the strategy reading a resting order
-                    // that no longer exists on the exchange.
-                    //
-                    // Nested inside the ordering gate deliberately, so a snapshot that does not
-                    // supersede the tracked state cannot retire it. Note that an earlier-stamped
-                    // snapshot claiming a full fill does reach here: it reports a cumulative above
-                    // a live order's, which is exactly the evidence the fill key tests for, and
-                    // an order the venue has once reported complete cannot become live again.
-                    if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
-                        debug!(
-                            exchange = ?snapshot.key.exchange,
-                            instrument = ?snapshot.key.instrument,
-                            strategy = %snapshot.key.strategy,
-                            cid = %snapshot.key.cid,
-                            update = ?snapshot,
-                            "OrderManager removing an Open order a more recent snapshot reports as fully filled"
-                        );
-                        self.1.insert(current_entry.remove().order.key.cid);
-                        return SnapshotApplied::retired(terms);
-                    }
-
-                    debug!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update = ?snapshot,
-                        "OrderManager updating an Open order from a more recent snapshot"
-                    );
-                    current_entry.get_mut().order.state = ActiveOrderState::Open(open);
-                    SnapshotApplied::working(terms)
-                } else {
-                    debug!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update = ?snapshot,
-                        "OrderManager received an Open snapshot that does not supersede the state held - keeping the state, reading its terms"
-                    );
-                    // A quantity cut to what the state held has filled leaves nothing to fill.
-                    let tracked = &current_entry.get().order;
-                    let finished = !terms.changed.is_empty()
-                        && matches!(
-                            &tracked.state,
-                            ActiveOrderState::Open(held)
-                                if nothing_left(held, tracked.quantity, &snapshot.key)
-                        );
-                    if finished {
-                        debug!(
-                            exchange = ?snapshot.key.exchange,
-                            instrument = ?snapshot.key.instrument,
-                            strategy = %snapshot.key.strategy,
-                            cid = %snapshot.key.cid,
-                            update = ?snapshot,
-                            "OrderManager removing an Open order whose adopted terms leave nothing to fill"
-                        );
-                        self.1.insert(current_entry.remove().order.key.cid);
-                        return SnapshotApplied::retired(terms);
-                    }
-                    SnapshotApplied::working(terms)
-                }
-            }
-            (ActiveOrderState::Open(current), ActiveOrderState::CancelInFlight(mut update)) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager transitioned an Open order to CancelInFlight"
-                );
-
-                // Ensure next CancelInFlight.Open is populated and the most recent.
-                //
-                // A carried `Open` naming a different venue order is dropped rather than adopted,
-                // on the reasoning in the `Open` -> `Open` arm. The transition itself still
-                // happens: a cancel is in flight either way, and falling back to the tracked
-                // `Open` keeps this order's own state rather than a foreign one's.
-                let latest_open = update
-                    .order
-                    .take()
-                    .filter(|update| {
-                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
-                    })
-                    .unwrap_or_else(|| current.clone());
-
-                current_entry.get_mut().order.state =
-                    ActiveOrderState::CancelInFlight(CancelInFlight {
-                        order: Some(latest_open),
-                        time_sent: update.time_sent,
-                    });
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::CancelInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
-                error!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received an OpenInFlight recording for a CancelInFlight - ignoring"
-                );
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::CancelInFlight(current), ActiveOrderState::Open(update)) => {
-                // Reached by `ClientOrderId` alone; see the `Open` -> `Open` arm.
-                if current
-                    .order
-                    .as_ref()
-                    .is_some_and(|held| held.id.contradicts(&update.id))
-                {
-                    error!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update_id = %update.id,
-                        "OrderManager received an Open snapshot naming a different exchange order than the tracked CancelInFlight - ignoring"
-                    );
-                    return SnapshotApplied::default();
-                }
-
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received an Open order snapshot for a CancelInFlight - updating CancelInFlight.Open"
-                );
-
-                // Check if the update Open supersedes the one the cancel carries.
-                let update_open_is_latest = current
-                    .order
-                    .as_ref()
-                    .is_none_or(|current| current.is_superseded_by(&update));
-                let time_sent = current.time_sent;
-
-                // Terms are adopted as for an `Open` order, but the order is not retired whatever
-                // they leave it: the cancel's answer ends it.
-                let terms = reconcile_terms(current_entry.get_mut(), report, &update, None);
-                if update_open_is_latest {
-                    current_entry.get_mut().order.state =
-                        ActiveOrderState::CancelInFlight(CancelInFlight {
-                            order: Some(update),
-                            time_sent,
-                        });
-                }
-                SnapshotApplied::working(terms)
-            }
-            (ActiveOrderState::CancelInFlight(_), ActiveOrderState::CancelInFlight(_)) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received a duplicate CancelInFlight recording - ignoring"
-                );
-                SnapshotApplied::default()
-            }
-            (ActiveOrderState::AmendInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received an OpenInFlight recording for an AmendInFlight order - ignoring"
-                );
-                SnapshotApplied::default()
-            }
-            // The order keeps working while its amend is in flight: a later report of it advances
-            // the state the amend carries, and only the amend's own answer ends the amend.
-            (ActiveOrderState::AmendInFlight(current), ActiveOrderState::Open(open)) => {
-                if current.order.id.contradicts(&open.id) {
-                    error!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        tracked_id = %current.order.id,
-                        update_id = %open.id,
-                        "OrderManager received an Open snapshot naming a different exchange order than the tracked AmendInFlight - ignoring"
-                    );
-                    return SnapshotApplied::default();
-                }
-                let superseded = current.order.is_superseded_by(&open);
-                // Nothing is adopted while the amend is in flight: its answer settles the terms. A
-                // report matching neither the order before the amend nor after it is reported.
-                let patch = current.patch;
-                let terms = reconcile_terms(current_entry.get_mut(), report, &open, Some(&patch));
-                if !superseded {
-                    debug!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update = ?snapshot,
-                        "OrderManager received an Open snapshot that does not supersede the AmendInFlight state held - keeping the state, comparing its terms"
-                    );
-                    return SnapshotApplied::working(terms);
-                }
-                // The venue may already have made a raise and filled beyond the old total, as in
-                // `update_from_fill`.
-                let tracked = current_entry.get().order.quantity;
-                let quantity = patch
-                    .quantity
-                    .map_or(tracked, |amended| amended.max(tracked));
-                if nothing_left(&open, quantity, &snapshot.key) {
-                    debug!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update = ?snapshot,
-                        "OrderManager removing an AmendInFlight order a more recent snapshot reports as fully filled"
-                    );
-                    self.1.insert(current_entry.remove().order.key.cid);
-                    return SnapshotApplied::retired(terms);
-                }
-                if let ActiveOrderState::AmendInFlight(amend) =
-                    &mut current_entry.get_mut().order.state
-                {
-                    amend.order = open;
-                }
-                SnapshotApplied::working(terms)
-            }
-            // A cancel supersedes the amend: the order is cancelled whatever the amend's answer.
-            (
-                ActiveOrderState::AmendInFlight(current),
-                ActiveOrderState::CancelInFlight(mut update),
-            ) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager transitioned an AmendInFlight order to CancelInFlight"
-                );
-                let current = &current.order;
-                let latest_open = update
-                    .order
-                    .take()
-                    .filter(|update| {
-                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
-                    })
-                    .unwrap_or_else(|| current.clone());
-
-                current_entry.get_mut().order.state =
-                    ActiveOrderState::CancelInFlight(CancelInFlight {
-                        order: Some(latest_open),
-                        time_sent: update.time_sent,
-                    });
-                SnapshotApplied::default()
-            }
-            // An amend is recorded only by `record_in_flight_amend`, never by a snapshot.
-            (_, ActiveOrderState::AmendInFlight(_)) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received an AmendInFlight snapshot - ignoring"
-                );
-                SnapshotApplied::default()
-            }
+        // A replace at the venue moves the order to the ids the report names before the report
+        // is applied, so it is applied as a report of the order it replaces (see "Orders replaced
+        // at the venue").
+        let rekeyed = self.rekey_replaced(report);
+        let replaced = self.follow_replaced(report, rekeyed);
+        let mut applied = self.apply_report(report);
+        if let Some(replaced) = replaced {
+            applied.orders.replaced.insert(0, replaced);
         }
+        applied
     }
 
     fn update_from_cancel_response<AssetKey>(
@@ -1231,10 +924,12 @@ where
 
         // The answer must be for the venue order amended: under its previous identifier when the
         // venue issued a new one. Only two different assigned identifiers say it is not, as for
-        // snapshots: an order the venue had not named may be named in the answer.
+        // snapshots: an order the venue had not named may be named in the answer. A report linked
+        // to the order before the amend may already have moved it to the new identifier, which
+        // the answer then names as the order's.
         if let Some(held) = &held {
             let amended_id = amended.previous_id.as_ref().unwrap_or(&amended.open.id);
-            if held.id.contradicts(amended_id) {
+            if held.id.contradicts(amended_id) && !held.id.is_same_order_as(&amended.open.id) {
                 warn!(
                     exchange = ?response.key.exchange,
                     instrument = ?response.key.instrument,
@@ -1290,6 +985,14 @@ where
             ActiveOrderState::CancelInFlight(cancel) => cancel.order = Some(open),
             state => *state = ActiveOrderState::Open(open),
         }
+        // A late report of the order before the amend names the identifier it replaced.
+        if let Some(previous) = amended
+            .previous_id
+            .as_ref()
+            .and_then(VenueOrderId::assigned)
+        {
+            entry.get_mut().supersede(previous.clone());
+        }
         // The venue's answer states the terms just applied, at the time of the state it gives:
         // the whole order except its time in force, which an amend does not change.
         entry
@@ -1297,6 +1000,657 @@ where
             .terms_times
             .stated_at(ReportedTerms::ALL.with_time_in_force(false), time_exchange);
     }
+}
+
+impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey>
+where
+    ExchangeKey: Debug + Clone,
+    InstrumentKey: Debug + Clone,
+{
+    /// Move the order `report` replaces to the report's client order id, when the report links
+    /// one tracked under another (see "Orders replaced at the venue"), returning the client order
+    /// id it was tracked under.
+    ///
+    /// The order replaced is the one under the client order id the link names, or, when it names
+    /// none, the one addressed by its venue order id, now or before a replace. Nothing moves when
+    /// the report's own client order id is tracked, when the link names no order tracked, when
+    /// the order under the client order id named is addressed by another venue order id, or when
+    /// the report names no venue order.
+    fn rekey_replaced<AssetKey>(
+        &mut self,
+        report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> Option<ClientOrderId>
+    where
+        AssetKey: Debug,
+    {
+        let replaces = report.replaces.as_ref()?;
+        let key = &report.order.key;
+        if self.0.contains_key(&key.cid) || reported_id(&report.order.state).is_none() {
+            return None;
+        }
+        let names_replaced = |tracked: &TrackedOrder<ExchangeKey, InstrumentKey>| {
+            tracked.current_id() == Some(&replaces.id) || tracked.is_superseded(&replaces.id)
+        };
+        let old = match &replaces.cid {
+            // A link naming the report's own client order id finds nothing here: that id is not
+            // tracked (checked above).
+            Some(old) => {
+                let tracked = self.0.get(old)?;
+                // An order the venue has named is the one replaced only under the id named.
+                if tracked.current_id().is_some() && !names_replaced(tracked) {
+                    warn!(
+                        exchange = ?key.exchange,
+                        instrument = ?key.instrument,
+                        cid = %key.cid,
+                        replaced_cid = %old,
+                        replaced_id = %replaces.id,
+                        tracked = ?tracked.order,
+                        "OrderManager received a report replacing an order it tracks under another venue order id - not moving it"
+                    );
+                    return None;
+                }
+                old.clone()
+            }
+            None => self
+                .0
+                .iter()
+                .find(|(_, tracked)| names_replaced(tracked))
+                .map(|(cid, _)| cid.clone())?,
+        };
+
+        let mut tracked = self.0.remove(&old)?;
+        // A late report under the old id is ignored, as for any order retired.
+        self.1.insert(old.clone());
+        let held = std::mem::replace(
+            &mut tracked.order.state,
+            ActiveOrderState::OpenInFlight(OpenInFlight::new(DateTime::<Utc>::MIN_UTC)),
+        );
+        let dropped = matches!(
+            held,
+            ActiveOrderState::AmendInFlight(_) | ActiveOrderState::CancelInFlight(_)
+        );
+        // The venue answers a request in flight under the old id, which is no longer tracked, so
+        // the order goes back to the state the request was sent from.
+        tracked.order.state = match held {
+            ActiveOrderState::Open(open)
+            | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. })
+            | ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: Some(open), ..
+            }) => ActiveOrderState::Open(open),
+            ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: None,
+                time_sent,
+            }) => ActiveOrderState::OpenInFlight(OpenInFlight::new(time_sent)),
+            in_flight @ ActiveOrderState::OpenInFlight(_) => in_flight,
+        };
+        tracked.order.key.cid = key.cid.clone();
+        if dropped {
+            warn!(
+                exchange = ?key.exchange,
+                instrument = ?key.instrument,
+                strategy = %tracked.order.key.strategy,
+                cid = %key.cid,
+                replaced_cid = %old,
+                "OrderManager moved an order replaced at the venue to its new ClientOrderId, dropping the request in flight under the old one"
+            );
+        } else {
+            info!(
+                exchange = ?key.exchange,
+                instrument = ?key.instrument,
+                strategy = %tracked.order.key.strategy,
+                cid = %key.cid,
+                replaced_cid = %old,
+                "OrderManager moved an order replaced at the venue to its new ClientOrderId"
+            );
+        }
+        self.0.insert(key.cid.clone(), tracked);
+        Some(old)
+    }
+
+    /// Move the order tracked under `report`'s client order id to the venue order id the report
+    /// names, when the report links the one it holds (see "Orders replaced at the venue"),
+    /// recording the id replaced. Returns the replace followed, or the move to a new client order
+    /// id `rekeyed` made, if any.
+    ///
+    /// A report naming an id the order was already replaced from is late, and moves nothing. A
+    /// link naming an id the order is not addressed by moves nothing either, unless the venue has
+    /// not named the order, when the id is recorded as one it was replaced from.
+    fn follow_replaced<AssetKey>(
+        &mut self,
+        report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
+        rekeyed: Option<ClientOrderId>,
+    ) -> Option<OrderReplaced<ExchangeKey, InstrumentKey>> {
+        let replaces = report.replaces.as_ref()?;
+        let tracked = self.0.get_mut(&report.order.key.cid)?;
+        let reported = reported_id(&report.order.state)?;
+        let late = tracked.names_superseded(&reported);
+        let held = tracked.current_id().cloned();
+        let moved = !late
+            && reported.assigned() != Some(&replaces.id)
+            && held.as_ref().is_none_or(|held| held == &replaces.id);
+        if moved {
+            if let Some(open) = tracked.order.state.open_meta_mut() {
+                open.id = reported.clone();
+            }
+            tracked.supersede(replaces.id.clone());
+        }
+        let followed = moved && held.is_some();
+        if !followed && rekeyed.is_none() {
+            return None;
+        }
+        let key = &tracked.order.key;
+        info!(
+            exchange = ?key.exchange,
+            instrument = ?key.instrument,
+            strategy = %key.strategy,
+            cid = %key.cid,
+            id = %reported,
+            replaced_id = %replaces.id,
+            replaced_cid = ?rekeyed,
+            "OrderManager followed an order replaced at the venue"
+        );
+        let mut replaced = Replaces::new(replaces.id.clone());
+        if let Some(rekeyed) = rekeyed {
+            replaced = replaced.with_cid(rekeyed);
+        }
+        Some(OrderReplaced {
+            key: key.clone(),
+            id: reported,
+            replaced,
+        })
+    }
+
+    /// [`OrderManager::update_from_order_snapshot`] once a replace the report links is followed.
+    // One match over the tracked and the incoming state, an arm per pair. The lint counts each
+    // arm's log macro expansion, and splitting the match would scatter the transition table.
+    #[allow(clippy::cognitive_complexity)]
+    fn apply_report<AssetKey>(
+        &mut self,
+        report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> SnapshotApplied<ExchangeKey, InstrumentKey>
+    where
+        AssetKey: Debug + Clone,
+    {
+        let snapshot = &report.order;
+
+        let (mut current_entry, update) = match (
+            self.0.entry(snapshot.key.cid.clone()),
+            snapshot.to_active(),
+        ) {
+            // Order untracked: track it, or ignore it
+            (Entry::Vacant(entry), update) => {
+                return SnapshotApplied::working(update_untracked(
+                    entry,
+                    &mut self.1,
+                    report,
+                    update,
+                ));
+            }
+
+            // A refusal of a request under a client order id already in use says nothing about
+            // the order holding it, so it does not end that order. Unless the order tracked is
+            // that request's own, still in flight, which the refusal does end.
+            (Entry::Occupied(entry), None)
+                if is_duplicate_cid_refusal(&snapshot.state)
+                    && !matches!(entry.get().order.state, ActiveOrderState::OpenInFlight(_)) =>
+            {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received a duplicate ClientOrderId refusal for a tracked order it did not send - ignoring"
+                );
+                return SnapshotApplied::default();
+            }
+
+            // An ended report of the order before a replace, such as the cancel of the old order
+            // a venue reports alongside its replacement, says nothing of the order now
+            (Entry::Occupied(entry), None)
+                if reported_id(&snapshot.state)
+                    .is_some_and(|id| entry.get().names_superseded(&id)) =>
+            {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an ended report naming a venue order id the order was replaced from - ignoring"
+                );
+                return SnapshotApplied::default();
+            }
+
+            // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
+            (Entry::Occupied(entry), None) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received inactive order snapshot for tracked order - removing"
+                );
+                self.1.insert(entry.remove().order.key.cid);
+                return SnapshotApplied::retired(OrderReportsApplied::default());
+            }
+
+            // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
+            (Entry::Occupied(entry), Some(update)) => (entry, update),
+        };
+
+        match (&current_entry.get().order.state, update.state) {
+            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received a duplicate OpenInFlight recording - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::Open(open)) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager transitioned an OpenInFlight order to Open"
+                );
+                // The venue's first report of the order: what it says of the terms is the first
+                // word the venue has given on them, so there is no earlier stamp to order against.
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
+                if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
+                    self.1.insert(current_entry.remove().order.key.cid);
+                    return SnapshotApplied::retired(terms);
+                }
+                current_entry.get_mut().order.state = ActiveOrderState::Open(open);
+                SnapshotApplied::working(terms)
+            }
+            (ActiveOrderState::OpenInFlight(_), ActiveOrderState::CancelInFlight(update)) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager transitioned an OpenInFlight order to CancelInFlight"
+                );
+                current_entry.get_mut().order.state = ActiveOrderState::CancelInFlight(update);
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::Open(_), ActiveOrderState::OpenInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an OpenInFlight recording for an Open order - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::Open(current), ActiveOrderState::Open(open)) => {
+                // This order was reached by `ClientOrderId` alone. If both states name a venue
+                // order and the two disagree, one client id is covering two distinct exchange
+                // orders, and applying the update would overwrite a live order's price, quantity
+                // and cumulative fill -- or retire it outright -- on the strength of a different
+                // order's state.
+                //
+                // `contradicts` rejects only on positive evidence. An order the venue has not
+                // named carries nothing to compare, and two such orders are not shown to be the
+                // same order by both lacking an identifier.
+                if current.id.contradicts(&open.id) {
+                    if !is_late_replaced(current_entry.get(), &open.id, snapshot) {
+                        error!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            tracked_id = %current.id,
+                            update_id = %open.id,
+                            "OrderManager received an Open snapshot naming a different exchange order than the one tracked under this ClientOrderId - ignoring"
+                        );
+                    }
+                    return SnapshotApplied::default();
+                }
+
+                // Terms are ordered by their own time, whether or not the state supersedes the one
+                // held (see "Terms times" on `TrackedOrder`).
+                let superseded = current.is_superseded_by(&open);
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
+
+                if superseded {
+                    // A venue may report a completed fill as an Open snapshot with nothing left to
+                    // fill, rather than as a distinct terminal state. That order is finished, so
+                    // it stops being tracked -- exactly as the OpenInFlight -> Open arm above
+                    // already does. Retaining it would leave the strategy reading a resting order
+                    // that no longer exists on the exchange.
+                    //
+                    // Nested inside the ordering gate deliberately, so a snapshot that does not
+                    // supersede the tracked state cannot retire it. Note that an earlier-stamped
+                    // snapshot claiming a full fill does reach here: it reports a cumulative above
+                    // a live order's, which is exactly the evidence the fill key tests for, and
+                    // an order the venue has once reported complete cannot become live again.
+                    if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
+                        debug!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            update = ?snapshot,
+                            "OrderManager removing an Open order a more recent snapshot reports as fully filled"
+                        );
+                        self.1.insert(current_entry.remove().order.key.cid);
+                        return SnapshotApplied::retired(terms);
+                    }
+
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager updating an Open order from a more recent snapshot"
+                    );
+                    current_entry.get_mut().order.state = ActiveOrderState::Open(open);
+                    SnapshotApplied::working(terms)
+                } else {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager received an Open snapshot that does not supersede the state held - keeping the state, reading its terms"
+                    );
+                    // A quantity cut to what the state held has filled leaves nothing to fill.
+                    let tracked = &current_entry.get().order;
+                    let finished = !terms.changed.is_empty()
+                        && matches!(
+                            &tracked.state,
+                            ActiveOrderState::Open(held)
+                                if nothing_left(held, tracked.quantity, &snapshot.key)
+                        );
+                    if finished {
+                        debug!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            update = ?snapshot,
+                            "OrderManager removing an Open order whose adopted terms leave nothing to fill"
+                        );
+                        self.1.insert(current_entry.remove().order.key.cid);
+                        return SnapshotApplied::retired(terms);
+                    }
+                    SnapshotApplied::working(terms)
+                }
+            }
+            (ActiveOrderState::Open(current), ActiveOrderState::CancelInFlight(mut update)) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager transitioned an Open order to CancelInFlight"
+                );
+
+                // Ensure next CancelInFlight.Open is populated and the most recent.
+                //
+                // A carried `Open` naming a different venue order is dropped rather than adopted,
+                // on the reasoning in the `Open` -> `Open` arm. The transition itself still
+                // happens: a cancel is in flight either way, and falling back to the tracked
+                // `Open` keeps this order's own state rather than a foreign one's.
+                let latest_open = update
+                    .order
+                    .take()
+                    .filter(|update| {
+                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
+                    })
+                    .unwrap_or_else(|| current.clone());
+
+                current_entry.get_mut().order.state =
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: Some(latest_open),
+                        time_sent: update.time_sent,
+                    });
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::CancelInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
+                error!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an OpenInFlight recording for a CancelInFlight - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::CancelInFlight(current), ActiveOrderState::Open(update)) => {
+                // Reached by `ClientOrderId` alone; see the `Open` -> `Open` arm.
+                if current
+                    .order
+                    .as_ref()
+                    .is_some_and(|held| held.id.contradicts(&update.id))
+                {
+                    if !is_late_replaced(current_entry.get(), &update.id, snapshot) {
+                        error!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            update_id = %update.id,
+                            "OrderManager received an Open snapshot naming a different exchange order than the tracked CancelInFlight - ignoring"
+                        );
+                    }
+                    return SnapshotApplied::default();
+                }
+
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an Open order snapshot for a CancelInFlight - updating CancelInFlight.Open"
+                );
+
+                // Check if the update Open supersedes the one the cancel carries.
+                let update_open_is_latest = current
+                    .order
+                    .as_ref()
+                    .is_none_or(|current| current.is_superseded_by(&update));
+                let time_sent = current.time_sent;
+
+                // Terms are adopted as for an `Open` order, but the order is not retired whatever
+                // they leave it: the cancel's answer ends it.
+                let terms = reconcile_terms(current_entry.get_mut(), report, &update, None);
+                if update_open_is_latest {
+                    current_entry.get_mut().order.state =
+                        ActiveOrderState::CancelInFlight(CancelInFlight {
+                            order: Some(update),
+                            time_sent,
+                        });
+                }
+                SnapshotApplied::working(terms)
+            }
+            (ActiveOrderState::CancelInFlight(_), ActiveOrderState::CancelInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received a duplicate CancelInFlight recording - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+            (ActiveOrderState::AmendInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an OpenInFlight recording for an AmendInFlight order - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+            // The order keeps working while its amend is in flight: a later report of it advances
+            // the state the amend carries, and only the amend's own answer ends the amend.
+            (ActiveOrderState::AmendInFlight(current), ActiveOrderState::Open(open)) => {
+                if current.order.id.contradicts(&open.id) {
+                    if !is_late_replaced(current_entry.get(), &open.id, snapshot) {
+                        error!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            tracked_id = %current.order.id,
+                            update_id = %open.id,
+                            "OrderManager received an Open snapshot naming a different exchange order than the tracked AmendInFlight - ignoring"
+                        );
+                    }
+                    return SnapshotApplied::default();
+                }
+                let superseded = current.order.is_superseded_by(&open);
+                // Nothing is adopted while the amend is in flight: its answer settles the terms. A
+                // report matching neither the order before the amend nor after it is reported.
+                let patch = current.patch;
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, Some(&patch));
+                if !superseded {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager received an Open snapshot that does not supersede the AmendInFlight state held - keeping the state, comparing its terms"
+                    );
+                    return SnapshotApplied::working(terms);
+                }
+                // The venue may already have made a raise and filled beyond the old total, as in
+                // `update_from_fill`.
+                let tracked = current_entry.get().order.quantity;
+                let quantity = patch
+                    .quantity
+                    .map_or(tracked, |amended| amended.max(tracked));
+                if nothing_left(&open, quantity, &snapshot.key) {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager removing an AmendInFlight order a more recent snapshot reports as fully filled"
+                    );
+                    self.1.insert(current_entry.remove().order.key.cid);
+                    return SnapshotApplied::retired(terms);
+                }
+                if let ActiveOrderState::AmendInFlight(amend) =
+                    &mut current_entry.get_mut().order.state
+                {
+                    amend.order = open;
+                }
+                SnapshotApplied::working(terms)
+            }
+            // A cancel supersedes the amend: the order is cancelled whatever the amend's answer.
+            (
+                ActiveOrderState::AmendInFlight(current),
+                ActiveOrderState::CancelInFlight(mut update),
+            ) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager transitioned an AmendInFlight order to CancelInFlight"
+                );
+                let current = &current.order;
+                let latest_open = update
+                    .order
+                    .take()
+                    .filter(|update| {
+                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
+                    })
+                    .unwrap_or_else(|| current.clone());
+
+                current_entry.get_mut().order.state =
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: Some(latest_open),
+                        time_sent: update.time_sent,
+                    });
+                SnapshotApplied::default()
+            }
+            // An amend is recorded only by `record_in_flight_amend`, never by a snapshot.
+            (_, ActiveOrderState::AmendInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an AmendInFlight snapshot - ignoring"
+                );
+                SnapshotApplied::default()
+            }
+        }
+    }
+}
+
+/// The venue order id `state` names: a working order's, unless it carries no working state, or an
+/// ended order's. `None` for a failed open, and for an order in flight with no state reported.
+fn reported_id<AssetKey, InstrumentKey>(
+    state: &OrderState<AssetKey, InstrumentKey>,
+) -> Option<VenueOrderId> {
+    match state {
+        OrderState::Active(active) => active.open_meta().map(|open| open.id.clone()),
+        OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
+            Some(VenueOrderId::Assigned(cancelled.id.clone()))
+        }
+        OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+            Some(VenueOrderId::Assigned(filled.id.clone()))
+        }
+        OrderState::Inactive(InactiveOrderState::Expired(expired)) => {
+            Some(VenueOrderId::Assigned(expired.id.clone()))
+        }
+        OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => None,
+    }
+}
+
+/// Whether `id`, which a working report names in place of the id `tracked` holds, is one the
+/// order was replaced from: the report is of the order before a replace, and is ignored as late,
+/// which this logs. Otherwise the caller refuses it as a report of another order.
+fn is_late_replaced<ExchangeKey, AssetKey, InstrumentKey>(
+    tracked: &TrackedOrder<ExchangeKey, InstrumentKey>,
+    id: &VenueOrderId,
+    snapshot: &Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
+) -> bool
+where
+    ExchangeKey: Debug,
+    AssetKey: Debug,
+    InstrumentKey: Debug,
+{
+    let late = tracked.names_superseded(id);
+    if late {
+        debug!(
+            exchange = ?snapshot.key.exchange,
+            instrument = ?snapshot.key.instrument,
+            strategy = %snapshot.key.strategy,
+            cid = %snapshot.key.cid,
+            update = ?snapshot,
+            "OrderManager received a working report naming a venue order id the order was replaced from - ignoring"
+        );
+    }
+    late
 }
 
 /// Reconcile `tracked_order`'s terms with those `report` states (see [`terms`]), writing what is
@@ -4690,6 +5044,589 @@ mod tests {
             let applied = apply(&mut orders, &late);
             assert!(orders.get(&cid()).is_none());
             assert!(applied.orders.is_empty(), "{applied:?}");
+        }
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+    mod replaced {
+        use super::*;
+        use rustrade_execution::order::{
+            amend::{AmendPatch, AmendTarget, Amended, RequestAmend},
+            report::{Replaces, ReportedTerms},
+            request::{OrderRequestAmend, OrderResponseAmend, ReduceOnly},
+            state::{AmendInFlight, Cancelled, OpenInFlight},
+        };
+
+        fn t(secs: i64) -> DateTime<Utc> {
+            time_plus_secs(DateTime::<Utc>::MIN_UTC, secs)
+        }
+
+        fn old_cid() -> ClientOrderId {
+            ClientOrderId::new("old")
+        }
+
+        fn new_cid() -> ClientOrderId {
+            ClientOrderId::new("new")
+        }
+
+        fn id(id: &str) -> OrderId {
+            OrderId::new(id)
+        }
+
+        fn working(venue_id: &str, secs: i64, filled: Decimal) -> Open {
+            Open {
+                filled_quantity: filled,
+                ..open_assigned(venue_id, t(secs))
+            }
+        }
+
+        /// An order tracked under `cid` in `state`, 2 in total, for strategy "strategy".
+        fn tracked_as(cid: ClientOrderId, state: ActiveOrderState) -> Orders<ExchangeId, u64> {
+            let mut order = order(cid, state);
+            order.quantity = dec!(2);
+            order.key.strategy = StrategyId::new("strategy");
+            orders([order])
+        }
+
+        /// A report under `cid` in `state`, 2 in total at price 3, stating every term, linked by
+        /// `replaces` if set. Its strategy is unknown, as a venue's report of an order not placed
+        /// under that id has it.
+        fn report(
+            cid: ClientOrderId,
+            state: OrderState<u64, u64>,
+            replaces: Option<Replaces>,
+        ) -> OrderReport<ExchangeId, u64, u64> {
+            let mut order = order(cid, state);
+            order.quantity = dec!(2);
+            order.price = Some(dec!(3));
+            let report = OrderReport::new(order, ReportedTerms::ALL);
+            match replaces {
+                Some(replaces) => report.with_replaces(replaces),
+                None => report,
+            }
+        }
+
+        fn apply(
+            orders: &mut Orders<ExchangeId, u64>,
+            report: &OrderReport<ExchangeId, u64, u64>,
+        ) -> SnapshotApplied<ExchangeId, u64> {
+            orders.update_from_order_snapshot(Snapshot(report))
+        }
+
+        fn cancelled(venue_id: &str, secs: i64) -> OrderState<u64, u64> {
+            OrderState::inactive(Cancelled {
+                id: id(venue_id),
+                time_exchange: t(secs),
+                filled_quantity: Some(dec!(0.5)),
+            })
+        }
+
+        fn state_of(orders: &Orders<ExchangeId, u64>, cid: &ClientOrderId) -> ActiveOrderState {
+            orders.get(cid).expect("tracked").state.clone()
+        }
+
+        /// The order `orders` tracks under the replacement's cid, followed from "1" to "2".
+        fn followed() -> Orders<ExchangeId, u64> {
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+            );
+            let linked = report(
+                old_cid(),
+                OrderState::active(working("2", 1, dec!(0.5))),
+                Some(Replaces::new(id("1"))),
+            );
+            apply(&mut orders, &linked);
+            orders
+        }
+
+        /// A report linking a new venue order id to the one held moves the order to it, keeping
+        /// it one order: the old id is recorded, the report's terms adopted, and the replace
+        /// returned ahead of the change of terms.
+        #[test]
+        fn a_new_venue_order_id_linked_to_the_one_held_is_followed() {
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+            );
+            let linked = report(
+                old_cid(),
+                OrderState::active(working("2", 1, dec!(0.5))),
+                Some(Replaces::new(id("1"))),
+            );
+
+            let applied = apply(&mut orders, &linked);
+
+            assert!(!applied.retired);
+            let tracked = orders.tracked(&old_cid()).expect("tracked");
+            assert_eq!(
+                tracked.order.state,
+                ActiveOrderState::Open(working("2", 1, dec!(0.5)))
+            );
+            assert_eq!(tracked.order.price, Some(dec!(3)));
+            assert_eq!(tracked.order.key.strategy, StrategyId::new("strategy"));
+            assert_eq!(tracked.superseded_ids(), [id("1")]);
+            assert_eq!(
+                applied.orders.replaced,
+                vec![OrderReplaced {
+                    key: tracked.order.key.clone(),
+                    id: VenueOrderId::Assigned(id("2")),
+                    replaced: Replaces::new(id("1")),
+                }]
+            );
+            assert_eq!(applied.orders.changed.len(), 1, "{applied:?}");
+
+            // A later report repeating the link is of the order already followed.
+            let repeated = report(
+                old_cid(),
+                OrderState::active(working("2", 2, dec!(0.5))),
+                Some(Replaces::new(id("1"))),
+            );
+            let applied = apply(&mut orders, &repeated);
+            assert!(applied.orders.replaced.is_empty(), "{applied:?}");
+            assert_eq!(
+                orders.tracked(&old_cid()).unwrap().superseded_ids(),
+                [id("1")]
+            );
+        }
+
+        /// Followed, the order ignores late reports of itself under the id replaced, working or
+        /// ended, and is ended by a report of its new id.
+        #[test]
+        fn late_reports_naming_the_id_replaced_are_ignored() {
+            let mut orders = followed();
+            let held = state_of(&orders, &old_cid());
+
+            for late in [
+                OrderState::active(working("1", 5, dec!(1))),
+                cancelled("1", 5),
+                OrderState::fully_filled(Filled::new(id("1"), t(5), dec!(2), None)),
+            ] {
+                let applied = apply(&mut orders, &report(old_cid(), late.clone(), None));
+                assert_eq!(state_of(&orders, &old_cid()), held, "{late:?}");
+                assert_eq!(applied, SnapshotApplied::default(), "{late:?}");
+            }
+
+            // With an amend or a cancel in flight too.
+            for in_flight in [
+                ActiveOrderState::AmendInFlight(AmendInFlight {
+                    order: working("2", 1, dec!(0.5)),
+                    patch: AmendPatch::default().with_price(dec!(4)),
+                    time_sent: TIME_SENT,
+                }),
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(working("2", 1, dec!(0.5))),
+                    time_sent: TIME_SENT,
+                }),
+            ] {
+                let mut orders = followed();
+                orders.0.get_mut(&old_cid()).unwrap().order.state = in_flight.clone();
+                let late = report(
+                    old_cid(),
+                    OrderState::active(working("1", 5, dec!(1))),
+                    None,
+                );
+                apply(&mut orders, &late);
+                assert_eq!(state_of(&orders, &old_cid()), in_flight);
+            }
+
+            let applied = apply(&mut orders, &report(old_cid(), cancelled("2", 6), None));
+            assert!(applied.retired);
+            assert!(orders.get(&old_cid()).is_none());
+        }
+
+        /// Only a link naming the id held is followed: an unlinked report naming another venue
+        /// order, or one linked to an id the order is not addressed by, is refused as before.
+        #[test]
+        fn a_new_venue_order_id_not_linked_to_the_one_held_is_refused() {
+            for replaces in [None, Some(Replaces::new(id("9")))] {
+                let mut orders = tracked_as(
+                    old_cid(),
+                    ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+                );
+                let held = state_of(&orders, &old_cid());
+                let other = report(
+                    old_cid(),
+                    OrderState::active(working("2", 1, dec!(0.5))),
+                    replaces.clone(),
+                );
+
+                let applied = apply(&mut orders, &other);
+
+                assert_eq!(state_of(&orders, &old_cid()), held, "{replaces:?}");
+                assert!(applied.orders.is_empty(), "{replaces:?}");
+                assert!(
+                    orders
+                        .tracked(&old_cid())
+                        .unwrap()
+                        .superseded_ids()
+                        .is_empty()
+                );
+            }
+        }
+
+        /// An order the venue has not named yet takes the replacement's id as the venue's first,
+        /// and records the id linked as one replaced, so the old order's cancel cannot end it.
+        /// No replace is returned: no id of the order's was known to move from.
+        #[test]
+        fn an_order_the_venue_has_not_named_records_the_id_its_first_report_replaces() {
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::OpenInFlight(OpenInFlight {
+                    time_sent: TIME_SENT,
+                }),
+            );
+            let linked = report(
+                old_cid(),
+                OrderState::active(working("2", 1, dec!(0))),
+                Some(Replaces::new(id("1"))),
+            );
+
+            let applied = apply(&mut orders, &linked);
+
+            assert!(applied.orders.replaced.is_empty(), "{applied:?}");
+            let tracked = orders.tracked(&old_cid()).unwrap();
+            assert_eq!(
+                tracked.order.state,
+                ActiveOrderState::Open(working("2", 1, dec!(0)))
+            );
+            assert_eq!(tracked.superseded_ids(), [id("1")]);
+            apply(&mut orders, &report(old_cid(), cancelled("1", 2), None));
+            assert!(orders.get(&old_cid()).is_some());
+        }
+
+        /// A late fill naming the id replaced counts towards the order, never moving it back;
+        /// one naming a venue order it was never known by does not.
+        #[test]
+        fn a_fill_naming_the_id_replaced_counts_towards_the_order() {
+            let mut orders = followed();
+
+            assert!(!orders.update_from_fill(&old_cid(), &id("1"), dec!(0.4)));
+            assert!(!orders.update_from_fill(&old_cid(), &id("9"), dec!(1.5)));
+            assert_eq!(
+                state_of(&orders, &old_cid()),
+                ActiveOrderState::Open(working("2", 1, dec!(0.5)))
+            );
+
+            assert!(!orders.update_from_fill(&old_cid(), &id("1"), dec!(1.5)));
+            assert_eq!(
+                state_of(&orders, &old_cid()),
+                ActiveOrderState::Open(working("2", 1, dec!(1.5)))
+            );
+            assert!(orders.update_from_fill(&old_cid(), &id("1"), dec!(2)));
+            assert!(orders.get(&old_cid()).is_none());
+        }
+
+        /// A report under a new client order id linked to the order replaced moves that order to
+        /// it, found by the client order id named or, failing one, by its venue order id: one
+        /// order, with its strategy and fills, the old client order id retired so a late report
+        /// under it is ignored.
+        #[test]
+        fn a_new_client_order_id_linked_to_a_tracked_order_moves_it() {
+            // The venue order id changed too, kept, or the link named no client order id.
+            for (venue_id, replaces) in [
+                ("2", Replaces::new(id("1")).with_cid(old_cid())),
+                ("1", Replaces::new(id("1")).with_cid(old_cid())),
+                ("2", Replaces::new(id("1"))),
+            ] {
+                let mut orders = tracked_as(
+                    old_cid(),
+                    ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+                );
+                let linked = report(
+                    new_cid(),
+                    OrderState::active(working(venue_id, 1, dec!(0.5))),
+                    Some(replaces.clone()),
+                );
+
+                let applied = apply(&mut orders, &linked);
+
+                let case = format!("{venue_id} {replaces:?}");
+                assert!(orders.get(&old_cid()).is_none(), "{case}");
+                assert!(orders.1.contains(&old_cid()), "{case}");
+                let tracked = orders.tracked(&new_cid()).expect("moved");
+                assert_eq!(tracked.order.key.cid, new_cid());
+                assert_eq!(tracked.order.key.strategy, StrategyId::new("strategy"));
+                assert_eq!(
+                    tracked.order.state,
+                    ActiveOrderState::Open(working(venue_id, 1, dec!(0.5))),
+                    "{case}"
+                );
+                let superseded: &[OrderId] = if venue_id == "1" { &[] } else { &[id("1")] };
+                assert_eq!(tracked.superseded_ids(), superseded, "{case}");
+                assert_eq!(
+                    applied.orders.replaced,
+                    vec![OrderReplaced {
+                        key: tracked.order.key.clone(),
+                        id: VenueOrderId::Assigned(id(venue_id)),
+                        replaced: Replaces::new(id("1")).with_cid(old_cid()),
+                    }],
+                    "{case}"
+                );
+                assert!(applied.orders.adopted.is_empty(), "{case}");
+
+                // The old order's end, reported under its old client order id, ends nothing.
+                let applied = apply(&mut orders, &report(old_cid(), cancelled("1", 2), None));
+                assert!(orders.get(&new_cid()).is_some(), "{case}");
+                assert!(orders.get(&old_cid()).is_none(), "{case}");
+                assert!(!applied.retired, "{case}");
+            }
+        }
+
+        /// Moved to a new client order id, an order drops a cancel or amend in flight under the
+        /// old one, whose answer is then ignored, and takes the report's state.
+        #[test]
+        fn a_move_to_a_new_client_order_id_drops_the_request_in_flight() {
+            let before = working("1", 0, dec!(0.5));
+            for in_flight in [
+                ActiveOrderState::AmendInFlight(AmendInFlight {
+                    order: before.clone(),
+                    patch: AmendPatch::default().with_price(dec!(4)),
+                    time_sent: TIME_SENT,
+                }),
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(before.clone()),
+                    time_sent: TIME_SENT,
+                }),
+            ] {
+                let mut orders = tracked_as(old_cid(), in_flight.clone());
+                let linked = report(
+                    new_cid(),
+                    OrderState::active(working("2", 1, dec!(0.5))),
+                    Some(Replaces::new(id("1")).with_cid(old_cid())),
+                );
+
+                apply(&mut orders, &linked);
+
+                assert_eq!(
+                    state_of(&orders, &new_cid()),
+                    ActiveOrderState::Open(working("2", 1, dec!(0.5))),
+                    "{in_flight:?}"
+                );
+                assert!(!orders.has_request_in_flight(), "{in_flight:?}");
+
+                // The answer under the old id finds no order.
+                let order = order(old_cid(), ());
+                orders.update_from_amend_response(&OrderResponseAmend::<ExchangeId, u64, u64> {
+                    key: order.key,
+                    state: Ok(Amended::new(
+                        working("1", 2, dec!(0.5)),
+                        Some(dec!(4)),
+                        dec!(2),
+                        OrderKind::Limit,
+                        None,
+                    )),
+                });
+                assert_eq!(
+                    state_of(&orders, &new_cid()),
+                    ActiveOrderState::Open(working("2", 1, dec!(0.5)))
+                );
+                assert_eq!(orders.get(&new_cid()).unwrap().price, Some(dec!(3)));
+            }
+
+            // An order whose cancel went before the venue reported it waits for the report.
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: None,
+                    time_sent: TIME_SENT,
+                }),
+            );
+            let linked = report(
+                new_cid(),
+                OrderState::active(working("2", 1, dec!(0))),
+                Some(Replaces::new(id("1")).with_cid(old_cid())),
+            );
+            apply(&mut orders, &linked);
+            assert_eq!(
+                state_of(&orders, &new_cid()),
+                ActiveOrderState::Open(working("2", 1, dec!(0)))
+            );
+        }
+
+        /// No order moves when the client order id named holds an order the venue addresses by
+        /// another id, or when the link names no order tracked: the report is then of an order
+        /// the engine does not track, and is adopted as one.
+        #[test]
+        fn a_link_to_no_order_tracked_moves_nothing() {
+            for replaces in [
+                Replaces::new(id("1")).with_cid(old_cid()),
+                Replaces::new(id("7")),
+                Replaces::new(id("7")).with_cid(ClientOrderId::new("absent")),
+            ] {
+                let mut orders = tracked_as(
+                    old_cid(),
+                    ActiveOrderState::Open(working("5", 0, dec!(0.5))),
+                );
+                let linked = report(
+                    new_cid(),
+                    OrderState::active(working("2", 1, dec!(0))),
+                    Some(replaces.clone()),
+                );
+
+                let applied = apply(&mut orders, &linked);
+
+                assert_eq!(
+                    state_of(&orders, &old_cid()),
+                    ActiveOrderState::Open(working("5", 0, dec!(0.5))),
+                    "{replaces:?}"
+                );
+                assert!(orders.get(&new_cid()).is_some(), "{replaces:?}");
+                assert!(applied.orders.replaced.is_empty(), "{replaces:?}");
+                assert_eq!(applied.orders.adopted.len(), 1, "{replaces:?}");
+            }
+        }
+
+        /// A replacement first reported ended still moves the order, which it then ends.
+        #[test]
+        fn a_replacement_reported_ended_moves_and_ends_the_order() {
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+            );
+            let filled = report(
+                new_cid(),
+                OrderState::fully_filled(Filled::new(id("2"), t(1), dec!(2), None)),
+                Some(Replaces::new(id("1")).with_cid(old_cid())),
+            );
+
+            let applied = apply(&mut orders, &filled);
+
+            assert!(applied.retired);
+            assert!(orders.0.is_empty());
+            assert!(orders.1.contains(&old_cid()) && orders.1.contains(&new_cid()));
+            assert_eq!(applied.orders.replaced.len(), 1, "{applied:?}");
+            assert_eq!(applied.orders.replaced[0].key.cid, new_cid());
+        }
+
+        fn amend_request() -> OrderRequestAmend<ExchangeId, u64> {
+            let order = order(old_cid(), ());
+            OrderRequestAmend {
+                key: order.key,
+                state: RequestAmend::new(
+                    VenueOrderId::Assigned(id("1")),
+                    AmendPatch::default().with_price(dec!(4)),
+                    AmendTarget {
+                        side: order.side,
+                        price: order.price,
+                        quantity: dec!(2),
+                        kind: order.kind,
+                        time_in_force: order.time_in_force,
+                        reduce_only: Some(ReduceOnly::No),
+                    },
+                    dec!(0.5),
+                ),
+            }
+        }
+
+        fn amend_answer(previous: &str, now: &str) -> OrderResponseAmend<ExchangeId, u64, u64> {
+            OrderResponseAmend {
+                key: order(old_cid(), ()).key,
+                state: Ok(Amended::new(
+                    working(now, 2, dec!(0.5)),
+                    Some(dec!(4)),
+                    dec!(2),
+                    OrderKind::Limit,
+                    Some(VenueOrderId::Assigned(id(previous))),
+                )),
+            }
+        }
+
+        /// The engine's own amend answered under a new venue order id records the one it
+        /// replaced, whose late reports are then ignored, and is applied when a linked report
+        /// has already moved the order to the new id.
+        #[test]
+        fn an_amend_answered_under_a_new_venue_order_id_records_the_one_it_replaced() {
+            for linked_first in [false, true] {
+                let mut orders = tracked_as(
+                    old_cid(),
+                    ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+                );
+                orders.record_in_flight_amend(&amend_request(), TIME_SENT);
+                if linked_first {
+                    let linked = report(
+                        old_cid(),
+                        OrderState::active(working("2", 1, dec!(0.5))),
+                        Some(Replaces::new(id("1"))),
+                    );
+                    apply(&mut orders, &linked);
+                    assert!(
+                        matches!(
+                            state_of(&orders, &old_cid()),
+                            ActiveOrderState::AmendInFlight(AmendInFlight { order, .. })
+                                if order.id == VenueOrderId::Assigned(id("2"))
+                        ),
+                        "the stream moves the order before the answer"
+                    );
+                }
+
+                orders.update_from_amend_response(&amend_answer("1", "2"));
+
+                let tracked = orders.tracked(&old_cid()).unwrap();
+                assert_eq!(tracked.order.price, Some(dec!(4)), "{linked_first}");
+                assert_eq!(
+                    tracked.order.state,
+                    ActiveOrderState::Open(working("2", 2, dec!(0.5))),
+                    "{linked_first}"
+                );
+                assert_eq!(tracked.superseded_ids(), [id("1")], "{linked_first}");
+                apply(&mut orders, &report(old_cid(), cancelled("1", 3), None));
+                assert!(orders.get(&old_cid()).is_some(), "{linked_first}");
+            }
+
+            // An answer naming neither the order's id nor one it moved from is of another order.
+            let mut orders = followed();
+            orders.0.get_mut(&old_cid()).unwrap().order.state =
+                ActiveOrderState::AmendInFlight(AmendInFlight {
+                    order: working("2", 1, dec!(0.5)),
+                    patch: AmendPatch::default().with_price(dec!(4)),
+                    time_sent: TIME_SENT,
+                });
+            orders.update_from_amend_response(&amend_answer("8", "9"));
+            assert_eq!(orders.get(&old_cid()).unwrap().price, Some(dec!(3)));
+        }
+
+        /// The ids replaced are kept to a bound, oldest forgotten first, and the id the order is
+        /// addressed by is never among them.
+        #[test]
+        fn the_ids_replaced_are_bounded() {
+            let mut orders =
+                tracked_as(old_cid(), ActiveOrderState::Open(working("0", 0, dec!(0))));
+            for n in 1..=MAX_SUPERSEDED_IDS + 1 {
+                let linked = report(
+                    old_cid(),
+                    OrderState::active(working(&n.to_string(), n as i64, dec!(0))),
+                    Some(Replaces::new(id(&(n - 1).to_string()))),
+                );
+                apply(&mut orders, &linked);
+            }
+            let tracked = orders.0.get_mut(&old_cid()).unwrap();
+            let expected: Vec<OrderId> = (1..=MAX_SUPERSEDED_IDS)
+                .map(|n| id(&n.to_string()))
+                .collect();
+            assert_eq!(tracked.superseded_ids(), expected);
+
+            let current = tracked.current_id().cloned().unwrap();
+            tracked.supersede(current);
+            tracked.supersede(id("5"));
+            assert_eq!(tracked.superseded_ids(), expected);
+        }
+
+        /// The ids replaced are serialized beside the order once any is recorded, and read back.
+        #[test]
+        fn the_ids_replaced_round_trip_and_are_absent_until_one_is_recorded() {
+            let plain = tracked_as(old_cid(), ActiveOrderState::Open(working("1", 0, dec!(0))));
+            let json = serde_json::to_value(&plain).unwrap();
+            assert!(json["old"].get("superseded_ids").is_none(), "{json}");
+
+            let orders = followed();
+            let json = serde_json::to_value(&orders).unwrap();
+            assert_eq!(json["old"]["superseded_ids"], serde_json::json!(["1"]));
+            let back: Orders<ExchangeId, u64> = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                back.tracked(&old_cid()).unwrap().superseded_ids(),
+                [id("1")]
+            );
         }
     }
 }

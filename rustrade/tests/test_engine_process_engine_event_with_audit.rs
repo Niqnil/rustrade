@@ -62,7 +62,7 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         amend::{AmendPatch, AmendTarget, Amended},
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
-        report::{OrderReport, ReportedTerms},
+        report::{OrderReport, Replaces, ReportedTerms},
         request::{
             CancelThenOpen, CancelThenOpenError, OrderAmend, OrderRequestCancel, OrderRequestOpen,
             OrderResponseAmend, OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
@@ -3053,6 +3053,107 @@ fn test_an_untracked_order_is_adopted_or_refused_observably() {
     assert_eq!(refused.order.key, placeholder.key);
     assert_eq!(refused.reason, OrderNotAdoptedReason::QuantityNotPositive);
     assert_eq!(tracked(&engine, "placeholder"), None);
+}
+
+/// An order a venue reports replaced under a new client order id and venue order id moves to
+/// them, reported as one `OrderReplaced` ahead of the terms the replacement changed; the old
+/// order's cancel, reported under its old ids, then ends nothing.
+#[test]
+fn test_an_order_replaced_at_the_venue_is_followed_observably() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let instrument = InstrumentIndex(1);
+    let order = |cid: &str, price: Decimal, state: OrderState| {
+        let request = open_request(instrument, cid);
+        Order {
+            key: request.key,
+            side: request.state.side,
+            price: Some(price),
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state,
+        }
+    };
+    let working = |venue_id: &str, days| {
+        OrderState::active(Open {
+            id: VenueOrderId::Assigned(OrderId::new(venue_id)),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, days),
+            filled_quantity: dec!(0),
+        })
+    };
+    let outputs = |engine: &mut TestEngine, report: OrderReport| {
+        let audit = process_with_audit(
+            engine,
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                exchange: ExchangeIndex(0),
+                kind: AccountEventKind::OrderSnapshot(Snapshot(report)),
+            })),
+        );
+        let EngineAudit::Process(audit) = audit.event else {
+            panic!("expected a processed event");
+        };
+        audit.outputs.into_iter().collect::<Vec<_>>()
+    };
+    let tracked = |engine: &TestEngine, cid: &str| {
+        engine
+            .state
+            .instruments
+            .instrument_index(&instrument)
+            .orders
+            .get(&ClientOrderId::new(cid))
+            .cloned()
+    };
+
+    let resting = order("resting", dec!(44_000), working("venue-1", 1));
+    outputs(
+        &mut engine,
+        OrderReport::new(resting.clone(), ReportedTerms::ALL),
+    );
+
+    let replacement = order("replacement", dec!(44_500), working("venue-2", 2));
+    let replaced = outputs(
+        &mut engine,
+        OrderReport::new(replacement.clone(), ReportedTerms::ALL).with_replaces(
+            Replaces::new(OrderId::new("venue-1")).with_cid(resting.key.cid.clone()),
+        ),
+    );
+    let [
+        EngineOutput::OrderReplaced(replaced),
+        EngineOutput::OrderTermsChanged(changed),
+    ] = replaced.as_slice()
+    else {
+        panic!("expected one OrderReplaced then one OrderTermsChanged, got {replaced:?}");
+    };
+    assert_eq!(replaced.key.cid, replacement.key.cid);
+    assert_eq!(replaced.id, VenueOrderId::Assigned(OrderId::new("venue-2")));
+    assert_eq!(
+        replaced.replaced,
+        Replaces::new(OrderId::new("venue-1")).with_cid(resting.key.cid.clone())
+    );
+    assert_eq!(changed.key.cid, replacement.key.cid);
+    assert_eq!(tracked(&engine, "resting"), None);
+    assert_eq!(
+        tracked(&engine, "replacement").and_then(|order| order.price),
+        Some(dec!(44_500))
+    );
+
+    // The old order's cancel, under either cid, names the venue order id replaced.
+    for cid in ["resting", "replacement"] {
+        let cancelled = order(
+            cid,
+            dec!(44_000),
+            OrderState::inactive(Cancelled::new(
+                OrderId::new("venue-1"),
+                time_plus_days(STARTING_TIMESTAMP, 3),
+                Some(dec!(0)),
+            )),
+        );
+        let ended = outputs(&mut engine, OrderReport::state_only(cancelled));
+        assert!(ended.is_empty(), "{cid}: {ended:?}");
+        assert!(tracked(&engine, "replacement").is_some(), "{cid}");
+    }
 }
 
 /// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and

@@ -529,9 +529,24 @@ pub struct AmendConfig {
     /// the order outright reassigns none. Priority still follows the rule above: a quantity
     /// decrease at the same price keeps the order's place under its new id.
     ///
-    /// The account stream's snapshot of the amended order names the new id, and arrives before
-    /// the answer that says which id it replaced, as a live venue's stream can.
+    /// The account stream's snapshot of the amended order names the new id, links the old one
+    /// in [`OrderReport::replaces`](crate::order::report::OrderReport::replaces), and arrives
+    /// before the answer that says which id it replaced, as a live venue's stream can.
     pub reassign_id: bool,
+    /// With [`reassign_id`](Self::reassign_id): whether the order under its new id starts
+    /// afresh, as a venue that carries out an amend by cancelling the order and placing a new
+    /// one does, rather than going on as the same order under another id.
+    ///
+    /// The order under the old id then ends: after the snapshot of the amended order, the
+    /// account stream reports it cancelled under the old id, with the quantity filled under that
+    /// id. The amended order is still reported in totals, its filled quantity counting what
+    /// filled under the old id, as a client reports it after adding the venue's figures back up
+    /// (see [`OrderReport`](crate::order::report::OrderReport)'s producer obligations). So
+    /// what a reader sees differ is that report of the old id ending.
+    ///
+    /// Does nothing without [`reassign_id`](Self::reassign_id), or for an amend that fills the
+    /// order outright.
+    pub filled_restarts: bool,
 }
 
 impl Default for AmendConfig {
@@ -549,6 +564,7 @@ impl AmendConfig {
         quantity: AmendAllowed::Any,
         multi_field: true,
         reassign_id: false,
+        filled_restarts: false,
     };
 
     /// Nothing can be amended: every amend is refused, as a venue without amends refuses it.
@@ -557,6 +573,7 @@ impl AmendConfig {
         quantity: AmendAllowed::Unsupported,
         multi_field: false,
         reassign_id: false,
+        filled_restarts: false,
     };
 
     /// With [`price`](Self::price): whether the limit price may be amended.
@@ -586,6 +603,16 @@ impl AmendConfig {
     pub fn with_reassign_id(self, reassign_id: bool) -> Self {
         Self {
             reassign_id,
+            ..self
+        }
+    }
+
+    /// With [`filled_restarts`](Self::filled_restarts): whether an order given a new venue order
+    /// id starts afresh under it, the order under the old id reported cancelled.
+    #[must_use]
+    pub fn with_filled_restarts(self, filled_restarts: bool) -> Self {
+        Self {
+            filled_restarts,
             ..self
         }
     }

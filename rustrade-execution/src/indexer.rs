@@ -541,13 +541,19 @@ impl AccountEventIndexer {
     }
 
     /// Index an order report: its order as [`Self::order_snapshot`] does, its
-    /// [`ReportedTerms`](crate::order::report::ReportedTerms) unchanged.
+    /// [`ReportedTerms`](crate::order::report::ReportedTerms) and
+    /// [`Replaces`](crate::order::report::Replaces) link unchanged.
     pub fn order_report(&self, report: UnindexedOrderReport) -> Result<OrderReport, IndexError> {
-        let OrderReport { order, reported } = report;
+        let OrderReport {
+            order,
+            reported,
+            replaces,
+        } = report;
 
         Ok(OrderReport {
             order: self.order_snapshot(order)?,
             reported,
+            replaces,
         })
     }
 

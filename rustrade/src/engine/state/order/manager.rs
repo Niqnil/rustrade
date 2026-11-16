@@ -39,6 +39,12 @@ where
     /// Terminal snapshots are resolved by `ClientOrderId` alone with no such check, because the
     /// states they carry hold a plain `OrderId` that nothing compares for identity.
     ///
+    /// Two exceptions, for an order replaced at the venue (see "Orders replaced at the venue" on
+    /// [`Orders`](super::Orders)): a snapshot linked to the order it replaces
+    /// ([`OrderReport::replaces`]) moves the tracked order to the venue order id, and the client
+    /// order id, it names, and a snapshot naming a venue order id the order was replaced from,
+    /// working or terminal, is ignored as late. Each replace followed is returned.
+    ///
     /// # Ordering
     ///
     /// Successive `Open` states for one order are ordered by `Open::is_superseded_by`, and one that
@@ -93,8 +99,8 @@ where
     /// zero or negative is not tracked, and is returned as not adopted: such a quantity is a
     /// placeholder, and tracked it would read as an order with nothing left to fill.
     ///
-    /// Returns what the snapshot did: whether it retired the order, the terms it changed or left
-    /// diverged, and the order adopted or refused.
+    /// Returns what the snapshot did: whether it retired the order, the replace it followed, the
+    /// terms it changed or left diverged, and the order adopted or refused.
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
         snapshot: Snapshot<&OrderReport<ExchangeKey, AssetKey, InstrumentKey>>,
@@ -121,7 +127,12 @@ where
     ///   answer about another venue order: one whose
     ///   [`previous_id`](rustrade_execution::order::amend::Amended::previous_id), or else whose
     ///   order's identifier, contradicts the identifier tracked
-    ///   ([`VenueOrderId::contradicts`](rustrade_execution::order::id::VenueOrderId::contradicts)).
+    ///   ([`VenueOrderId::contradicts`](rustrade_execution::order::id::VenueOrderId::contradicts)),
+    ///   unless the order's identifier after the amend is the one tracked: a snapshot linked to
+    ///   the order before the amend may have moved the order to it first.
+    /// - A `previous_id` the venue assigned is recorded as an identifier the order was replaced
+    ///   from, so a late report naming it is ignored, as for a replace the venue reports (see
+    ///   "Orders replaced at the venue" on [`Orders`](super::Orders)).
     /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged, or stops
     ///   tracking it when fills while the amend was in flight left it nothing to fill.
     /// - An unknown outcome

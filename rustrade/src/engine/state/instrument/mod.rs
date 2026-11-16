@@ -755,9 +755,9 @@ pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex, ExchangeKey =
     /// fill. Set only by [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account),
     /// which does the valuing, never by this type's own methods.
     pub fee_conversion: Option<FeeConversion<AssetKey, InstrumentKey>>,
-    /// What the event's order report did to its order: the terms it changed, or stated and the
-    /// engine did not adopt, and the order adopted or refused when it was untracked. See
-    /// [`OrderManager::update_from_order_snapshot`].
+    /// What the event's order report did to its order: the replace it followed, the terms it
+    /// changed, or stated and the engine did not adopt, and the order adopted or refused when it
+    /// was untracked. See [`OrderManager::update_from_order_snapshot`].
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load.
     #[serde(default = "OrderReportsApplied::default")]
@@ -1454,6 +1454,21 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         })
     }
 
+    /// Move the routing of the order tracked under `from` to `to`: its position, the venue order
+    /// ids that reach it, and what it was sent as. For an order the venue replaced under a new
+    /// client order id, which `self.orders` has already moved.
+    fn rekey_order_routing(&mut self, from: &ClientOrderId, to: &ClientOrderId) {
+        if let Some(position_id) = self.position_ids.remove(from) {
+            self.position_ids.insert(to.clone(), position_id);
+        }
+        for cid in self.exchange_id_to_cid.values_mut() {
+            if cid == from {
+                *cid = to.clone();
+            }
+        }
+        self.reduce_only.rekey(from, to);
+    }
+
     /// Drop all order routing: what lets a fill find its order's position and what the order was
     /// sent as, and the fills waiting on an ack. For when the orders it routes for are dropped
     /// wholesale, as at expiry.
@@ -1576,7 +1591,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // replay in step (b) then calls update_from_trade, whose fast path finds the CID via
         // exchange_id_to_cid but gets None from position_ids, falling back to opening a spurious
         // position under the raw OrderId instead of the strategy's chosen PositionId.
-        let pre_update_pos_id = self.position_ids.get(&order.0.key.cid).cloned();
+        let mut pre_update_pos_id = self.position_ids.get(&order.0.key.cid).cloned();
 
         let currently_open_in_flight = self
             .orders
@@ -1613,6 +1628,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // qualify. The fill would then sit unreplayed for the rest of the run: the position never
         // opens while the balance is debited, leaving the two ledgers disagreeing.
         //
+        // So does a report that moves the order to a venue order id not yet indexed: one followed
+        // across a replace at the venue, or adopted from the venue's report. Fills on that id may
+        // have been parked while an open of another order was in flight. The ids the order was
+        // replaced from stay indexed to it, so a late fill on one still routes.
+        //
         // Nothing else qualifies. A steady-state `Open` -> `Open` update that leaves the order
         // working needs neither: its mapping is already indexed and no pruning is coming, so
         // widening this would pay a `ClientOrderId` clone on every call to re-insert what is
@@ -1623,19 +1643,32 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // once the snapshot's terms are applied. Some venues report a completed order that way
         // rather than with a distinct state, and it denotes the same fact.
         let applied = self.orders.update_from_order_snapshot(report);
+        // An order moved to a new client order id takes its routing with it, before the prune
+        // below takes that routing for a retired order's.
+        for replaced in &applied.orders.replaced {
+            if let Some(old) = &replaced.replaced.cid {
+                self.rekey_order_routing(old, &replaced.key.cid);
+            }
+        }
+        if pre_update_pos_id.is_none() {
+            pre_update_pos_id = self.position_ids.get(&order.0.key.cid).cloned();
+        }
         self.cleanup_routing_tables();
 
-        let ack_exchange_id: Option<OrderId> = if currently_open_in_flight || applied.retired {
-            match &order.0.state {
-                OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
-                OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
-                    Some(filled.id.clone())
+        let new_venue_id =
+            !applied.orders.replaced.is_empty() || !applied.orders.adopted.is_empty();
+        let ack_exchange_id: Option<OrderId> =
+            if currently_open_in_flight || applied.retired || new_venue_id {
+                match &order.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+                        Some(filled.id.clone())
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let reports = FillsApplied::with_orders(applied.orders);
 
         // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
@@ -1767,6 +1800,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// Updates the instrument state from the answer to an
     /// [`OrderRequestAmend`](rustrade_execution::order::request::OrderRequestAmend): see
     /// [`OrderManager::update_from_amend_response`].
+    ///
+    /// An answer applied under a new venue order id indexes it for fill routing, keeping the old
+    /// one, so a fill on either reaches the order's position, and, after an amend that left the
+    /// order nothing to fill, the retired-order routing (see [`Self::retired_routing`]).
     pub fn update_from_amend_response(
         &mut self,
         response: &OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>,
@@ -1775,7 +1812,28 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone,
     {
+        let cid = &response.key.cid;
+        let tracked = self.orders.get(cid).is_some();
         self.orders.update_from_amend_response::<AssetKey>(response);
+        // An amend answered with a new venue order id moves the order to it: indexed, so a fill
+        // on it routes, and demoted with the order's other ids if the amend retired it. The id
+        // the order had stays indexed, for a fill on it still to come.
+        if let Ok(amended) = &response.state
+            && let Some(id) = amended.open.id.assigned()
+        {
+            let applied = match self.orders.get(cid) {
+                Some(order) => order
+                    .state
+                    .open_meta()
+                    .is_some_and(|open| open.id.assigned() == Some(id)),
+                // Retired by this answer: one that leaves nothing to fill.
+                None => tracked,
+            };
+            if applied && self.exchange_id_to_cid.get(id) != Some(cid) {
+                self.exchange_id_to_cid.insert(id.clone(), cid.clone());
+                self.reduce_only.acknowledge(cid, id);
+            }
+        }
         // An amend that left nothing to fill retires the order.
         self.cleanup_routing_tables();
     }
@@ -3121,13 +3179,16 @@ fn on_borrow_period<AssetKey, InstrumentKey>(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
 mod tests {
     use super::*;
-    use crate::engine::state::EngineState;
+    use crate::engine::state::{EngineState, order::in_flight_recorder::InFlightRequestRecorder};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
         cash_flow::CashFlowLoan,
         order::{
             OrderKind, TimeInForce,
+            amend::{AmendPatch, AmendTarget, Amended, RequestAmend},
             id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
+            report::Replaces,
+            request::{OrderRequestAmend, ReduceOnly},
             state::{CancelInFlight, Cancelled, Filled, Open, OpenInFlight},
         },
         trade::{AssetFees, Trade, TradeId},
@@ -4272,6 +4333,233 @@ mod tests {
                 Some(Decimal::ZERO),
             )),
         )));
+    }
+
+    // --- Orders replaced at the venue ----------------------------------------------------------
+
+    /// A report of `cid` working as the venue order `exchange_id`, linked to the order it
+    /// replaces.
+    fn replacement(
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+        replaces: Replaces,
+    ) -> OrderReport<ExchangeIndex, AssetIndex, InstrumentIndex> {
+        OrderReport::state_only(order(
+            cid.clone(),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                Decimal::ZERO,
+            )),
+        ))
+        .with_replaces(replaces)
+    }
+
+    /// An order replaced at the venue keeps routing its fills to the position the strategy chose,
+    /// under its new venue order id and the one it was replaced from, under a new client order
+    /// id too, and after it retires.
+    #[test]
+    fn a_replaced_order_routes_fills_under_every_id_it_had() {
+        let old_cid = ClientOrderId::new("cid-1");
+        let new_cid = ClientOrderId::new("cid-2");
+        let (old_id, new_id) = (OrderId::new("oid-1"), OrderId::new("oid-2"));
+        let position_id = PositionId::new("strategy-chosen");
+        for rekeyed in [false, true] {
+            let mut state = instrument_state(OmsMode::Hedging);
+            rest_order_at_exchange(&mut state, &old_cid, &old_id, Some(&position_id));
+            let (cid, replaces) = if rekeyed {
+                (
+                    &new_cid,
+                    Replaces::new(old_id.clone()).with_cid(old_cid.clone()),
+                )
+            } else {
+                (&old_cid, Replaces::new(old_id.clone()))
+            };
+
+            let applied =
+                state.update_from_order_snapshot(Snapshot(&replacement(cid, &new_id, replaces)));
+
+            assert_eq!(applied.orders.replaced.len(), 1, "{rekeyed}");
+            assert_eq!(state.exchange_id_to_cid.get(&new_id), Some(cid));
+            assert_eq!(state.exchange_id_to_cid.get(&old_id), Some(cid));
+            assert_eq!(state.position_ids.get(cid), Some(&position_id));
+            assert_eq!(state.position_ids.contains_key(&old_cid), !rekeyed);
+
+            state.update_from_trade(&fill_reporting(new_id.clone(), Side::Buy, dec!(2), dec!(2)));
+            state.update_from_trade(&fill_reporting(old_id.clone(), Side::Buy, dec!(1), dec!(3)));
+            assert_eq!(tracked_filled(&state, cid), Some(dec!(3)), "{rekeyed}");
+            assert_eq!(open_position_ids(&state), vec![position_id.clone()]);
+
+            cancel_order(&mut state, cid, &new_id);
+            assert!(state.orders.0.is_empty(), "{rekeyed}");
+            state.update_from_trade(&fill(old_id.clone(), Side::Buy, dec!(1)));
+            state.update_from_trade(&fill(new_id.clone(), Side::Buy, dec!(1)));
+            assert_eq!(
+                open_position_ids(&state),
+                vec![position_id.clone()],
+                "{rekeyed}: a late fill on either id reaches the strategy's position"
+            );
+            assert_eq!(
+                state.tear_sheet.fills_routed_by_fallback + state.tear_sheet.fills_unmatched,
+                0,
+                "{rekeyed}"
+            );
+        }
+    }
+
+    /// A reduce-only order moved to a new client order id is still known as one.
+    #[test]
+    fn a_reduce_only_order_moved_to_a_new_client_order_id_stays_reduce_only() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let (old_cid, new_cid) = (ClientOrderId::new("cid-1"), ClientOrderId::new("cid-2"));
+        let old_id = OrderId::new("oid-1");
+        state.reduce_only.register(&old_cid, ReduceOnly::Position);
+        rest_order_at_exchange(&mut state, &old_cid, &old_id, None);
+
+        state.update_from_order_snapshot(Snapshot(&replacement(
+            &new_cid,
+            &OrderId::new("oid-2"),
+            Replaces::new(old_id).with_cid(old_cid.clone()),
+        )));
+
+        assert_eq!(state.reduce_only.sent_as(&old_cid), None);
+        assert_eq!(
+            state.reduce_only.sent_as(&new_cid),
+            Some(ReduceOnly::Position)
+        );
+    }
+
+    /// An amend answered under a new venue order id indexes it, so a fill on it still routes once
+    /// the amend has retired the order.
+    #[test]
+    fn an_amend_answered_under_a_new_id_keeps_the_new_ids_routing() {
+        let cid = ClientOrderId::new("cid-1");
+        let (old_id, new_id) = (OrderId::new("oid-1"), OrderId::new("oid-2"));
+        let position_id = PositionId::new("strategy-chosen");
+        // Cut to the 4 filled, the amend leaves nothing to fill; to 6, the order goes on working.
+        for (quantity, retired) in [(dec!(4), true), (dec!(6), false)] {
+            let mut state = instrument_state(OmsMode::Hedging);
+            rest_order_at_exchange(&mut state, &cid, &old_id, Some(&position_id));
+            state.update_from_trade(&fill_reporting(old_id.clone(), Side::Buy, dec!(4), dec!(4)));
+            let request = OrderRequestAmend {
+                key: order(
+                    cid.clone(),
+                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                )
+                .key,
+                state: RequestAmend::new(
+                    VenueOrderId::Assigned(old_id.clone()),
+                    AmendPatch::default().with_quantity(quantity),
+                    AmendTarget {
+                        side: Side::Buy,
+                        price: Some(dec!(100)),
+                        quantity: dec!(10),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        reduce_only: Some(ReduceOnly::No),
+                    },
+                    dec!(4),
+                ),
+            };
+            InFlightRequestRecorder::record_in_flight_amend(&mut state.orders, &request, TIME_SENT);
+
+            state.update_from_amend_response(&OrderResponseAmend {
+                key: request.key.clone(),
+                state: Ok(Amended::new(
+                    Open::new(VenueOrderId::Assigned(new_id.clone()), TIME, dec!(4)),
+                    Some(dec!(100)),
+                    quantity,
+                    OrderKind::Limit,
+                    Some(VenueOrderId::Assigned(old_id.clone())),
+                )),
+            });
+
+            assert_eq!(state.orders.get(&cid).is_none(), retired, "{quantity}");
+            assert_eq!(
+                state.exchange_id_to_cid.contains_key(&new_id),
+                !retired,
+                "{quantity}"
+            );
+            assert_eq!(
+                state.retired_routing.get(&new_id),
+                retired.then_some(&position_id),
+                "{quantity}"
+            );
+            state.update_from_trade(&fill(new_id.clone(), Side::Buy, dec!(1)));
+            assert_eq!(open_position_ids(&state), vec![position_id.clone()]);
+            assert_eq!(
+                state.tear_sheet.fills_routed_by_fallback + state.tear_sheet.fills_unmatched,
+                0,
+                "{quantity}"
+            );
+        }
+    }
+
+    /// An amend answer the order manager ignores, here one with no amend in flight, leaves its
+    /// new venue order id unindexed: the order still holds the id it had.
+    #[test]
+    fn an_amend_answer_not_applied_leaves_its_new_id_unindexed() {
+        let cid = ClientOrderId::new("cid-1");
+        let (old_id, new_id) = (OrderId::new("oid-1"), OrderId::new("oid-2"));
+        let mut state = instrument_state(OmsMode::Hedging);
+        rest_order_at_exchange(&mut state, &cid, &old_id, None);
+        let key = order(
+            cid.clone(),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
+        )
+        .key;
+
+        state.update_from_amend_response(&OrderResponseAmend {
+            key,
+            state: Ok(Amended::new(
+                Open::new(VenueOrderId::Assigned(new_id.clone()), TIME, dec!(0)),
+                Some(dec!(100)),
+                dec!(6),
+                OrderKind::Limit,
+                Some(VenueOrderId::Assigned(old_id.clone())),
+            )),
+        });
+
+        assert_eq!(
+            state
+                .orders
+                .get(&cid)
+                .and_then(|order| order.state.open_meta())
+                .map(|open| open.id.clone()),
+            Some(VenueOrderId::Assigned(old_id.clone()))
+        );
+        assert!(!state.exchange_id_to_cid.contains_key(&new_id));
+        assert_eq!(state.exchange_id_to_cid.get(&old_id), Some(&cid));
+    }
+
+    /// A fill parked while another order's open was in flight is replayed once a venue's report
+    /// adopts the order it names, rather than waiting on that other order.
+    #[test]
+    fn an_adopted_order_replays_the_fills_parked_for_its_id() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        state.update_from_state_only_snapshot(Snapshot(&order(
+            ClientOrderId::new("pending"),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
+        )));
+        let external_id = OrderId::new("ext-1");
+        state.update_from_trade(&fill(external_id.clone(), Side::Buy, dec!(2)));
+        assert_eq!(state.pending_fills.len(), 1, "precondition: parked");
+
+        let applied = state.update_from_state_only_snapshot(Snapshot(&order(
+            ClientOrderId::new("external"),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(external_id.clone()),
+                TIME,
+                Decimal::ZERO,
+            )),
+        )));
+
+        assert_eq!(applied.orders.adopted.len(), 1);
+        assert!(state.pending_fills.is_empty());
+        assert_eq!(
+            open_position_ids(&state),
+            vec![PositionId::new(external_id.0.clone())]
+        );
     }
 
     #[test]

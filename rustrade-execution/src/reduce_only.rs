@@ -227,6 +227,21 @@ impl ReduceOnlyBook {
         }
     }
 
+    /// Move the live order `from` to the client order id `to`, keeping what it was sent as and
+    /// the venue order id it was acknowledged with: for an order the venue replaced under a new
+    /// client order id, which goes on as the same order. It then counts as the latest
+    /// registered, and replaces anything the book held under `to`, live or retired. Does nothing
+    /// for an order the book does not hold live.
+    pub fn rekey(&mut self, from: &ClientOrderId, to: &ClientOrderId) {
+        let Some(order) = self.live.shift_remove(from) else {
+            return;
+        };
+        self.retired.shift_remove(to);
+        if let Some(earlier) = self.live.insert(to.clone(), order) {
+            self.live_reduce_only -= usize::from(earlier.reduce_only.is_reduce_only());
+        }
+    }
+
     /// Record that the order `cid` ended. Does nothing for an order the book does not hold.
     ///
     /// A reduce-only order moves to the retired orders, dropping the oldest of them when there
@@ -474,6 +489,41 @@ mod tests {
         let trade = fill(None, "v1");
         let found = book.lookup(&trade).unwrap();
         assert_eq!((found.cid, found.reduce_only), (&cid("new"), No));
+    }
+
+    /// A rekeyed order is found under its new client order id and its venue id, keeps what it
+    /// was sent as, and replaces what the new id held. An order not live moves nothing.
+    #[test]
+    fn a_rekeyed_order_keeps_what_it_was_sent_as_under_its_new_id() {
+        let mut book = ReduceOnlyBook::new();
+        book.register(&cid("taken"), Position);
+        book.retire(&cid("taken"));
+        book.register(&cid("old"), Position);
+        book.register(&cid("other"), No);
+        book.acknowledge(&cid("old"), &venue("v1"));
+
+        book.rekey(&cid("old"), &cid("taken"));
+
+        assert_eq!(flag(&book, &fill(Some("old"), "x")), None);
+        assert_eq!(flag(&book, &fill(Some("taken"), "x")), Some(Position));
+        let trade = fill(None, "v1");
+        let found = book.lookup(&trade).unwrap();
+        assert_eq!((found.cid, found.reduce_only), (&cid("taken"), Position));
+        assert!(book.retired.is_empty(), "{book:?}");
+        assert_eq!(book.live_len(), 2);
+        assert!(book.has_reduce_only());
+
+        // Onto a live reduce-only order: the count drops the one replaced.
+        book.register(&cid("ro"), Position);
+        book.rekey(&cid("taken"), &cid("ro"));
+        assert_eq!(book.live_reduce_only, 1);
+        book.retire(&cid("ro"));
+        assert_eq!(book.live_reduce_only, 0);
+
+        let before = book.clone();
+        book.rekey(&cid("absent"), &cid("other"));
+        book.rekey(&cid("ro"), &cid("other"));
+        assert_eq!(book, before, "a retired or unknown order moves nothing");
     }
 
     #[test]
