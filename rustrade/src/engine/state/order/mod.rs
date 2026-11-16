@@ -5555,7 +5555,8 @@ mod tests {
                 let tracked = orders.tracked(&old_cid()).expect("not moved");
                 assert!(tracked.superseded_ids().is_empty(), "{cid}");
                 // Under the same client order id the unlinked report is then applied as any
-                // other, whose state replaces the one held, id included, so only a move is checked.
+                // other: its state, being newer, replaces the one held, id included, so only a
+                // move is checked.
                 if cid == new_cid() {
                     assert_eq!(
                         tracked.order.state.open_meta().map(|open| &open.id),
