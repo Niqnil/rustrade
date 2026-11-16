@@ -3127,7 +3127,7 @@ fn test_an_order_replaced_at_the_venue_is_followed_observably() {
         panic!("expected one OrderReplaced then one OrderTermsChanged, got {replaced:?}");
     };
     assert_eq!(replaced.key.cid, replacement.key.cid);
-    assert_eq!(replaced.id, VenueOrderId::Assigned(OrderId::new("venue-2")));
+    assert_eq!(replaced.id, OrderId::new("venue-2"));
     assert_eq!(
         replaced.replaced,
         Replaces::new(OrderId::new("venue-1")).with_cid(resting.key.cid.clone())

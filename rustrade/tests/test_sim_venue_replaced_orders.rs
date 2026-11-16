@@ -258,12 +258,8 @@ fn an_order_changed_outside_the_engine_is_followed_to_its_new_id() {
             panic!("{amend:?}: expected one replace followed, got {replaced:?}");
         };
         assert_eq!(replaced.replaced, Replaces::new(old.clone()), "{amend:?}");
-        assert_ne!(
-            replaced.id,
-            VenueOrderId::Assigned(old.clone()),
-            "{amend:?}"
-        );
-        assert_eq!(engine_id(&engine), Some(replaced.id.clone()), "{amend:?}");
+        assert_ne!(replaced.id, old, "{amend:?}");
+        assert_eq!(held_id(&engine), replaced.id, "{amend:?}");
         let held = engine
             .instruments
             .instrument_index(&InstrumentIndex(0))

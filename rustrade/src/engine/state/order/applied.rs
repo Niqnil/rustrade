@@ -5,7 +5,7 @@
 use crate::engine::state::order::terms::{OrderTermsChanged, OrderTermsDiverged};
 use rustrade_execution::order::{
     Order, OrderKey,
-    id::VenueOrderId,
+    id::OrderId,
     report::{Replaces, ReportedTerms},
     state::ActiveOrderState,
 };
@@ -35,7 +35,7 @@ pub struct OrderReplaced<ExchangeKey, InstrumentKey> {
     /// strategy the order was tracked under.
     pub key: OrderKey<ExchangeKey, InstrumentKey>,
     /// The venue order id the report names, which the order is addressed by now.
-    pub id: VenueOrderId,
+    pub id: OrderId,
     /// What the order was addressed by before: its venue order id, and its client order id when
     /// that changed.
     pub replaced: Replaces,

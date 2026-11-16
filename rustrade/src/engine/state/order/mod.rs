@@ -147,6 +147,9 @@ impl<ExchangeKey, InstrumentKey> SnapshotApplied<ExchangeKey, InstrumentKey> {
 ///   are ignored: a working report, and an ended one, such as the cancel of the old order a venue
 ///   reports alongside its replacement. A fill naming such an id still counts towards the order
 ///   ([`Orders::update_from_fill`]).
+/// - **A link is ignored** on a report naming no venue order id, and on a report under a client
+///   order id already retired, which is a replay of a replace already followed: nothing moves
+///   back to an id the order has left.
 ///
 /// Each replace followed is returned as an [`OrderReplaced`]. An unlinked report naming a
 /// different venue order id from the one held is still refused, as one client order id covering
@@ -1025,7 +1028,12 @@ where
     {
         let replaces = report.replaces.as_ref()?;
         let key = &report.order.key;
-        if self.0.contains_key(&key.cid) || reported_id(&report.order.state).is_none() {
+        // A report under a client order id already retired is late: a replay of a replace already
+        // followed, perhaps one the order has since been moved on from, and moves nothing back.
+        if self.0.contains_key(&key.cid)
+            || self.1.contains(&key.cid)
+            || reported_assigned_id(&report.order.state).is_none()
+        {
             return None;
         }
         let names_replaced = |tracked: &TrackedOrder<ExchangeKey, InstrumentKey>| {
@@ -1061,17 +1069,13 @@ where
         let mut tracked = self.0.remove(&old)?;
         // A late report under the old id is ignored, as for any order retired.
         self.1.insert(old.clone());
-        let held = std::mem::replace(
-            &mut tracked.order.state,
-            ActiveOrderState::OpenInFlight(OpenInFlight::new(DateTime::<Utc>::MIN_UTC)),
-        );
         let dropped = matches!(
-            held,
+            tracked.order.state,
             ActiveOrderState::AmendInFlight(_) | ActiveOrderState::CancelInFlight(_)
         );
         // The venue answers a request in flight under the old id, which is no longer tracked, so
         // the order goes back to the state the request was sent from.
-        tracked.order.state = match held {
+        tracked.order.state = match tracked.order.state {
             ActiveOrderState::Open(open)
             | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. })
             | ActiveOrderState::CancelInFlight(CancelInFlight {
@@ -1122,15 +1126,17 @@ where
     ) -> Option<OrderReplaced<ExchangeKey, InstrumentKey>> {
         let replaces = report.replaces.as_ref()?;
         let tracked = self.0.get_mut(&report.order.key.cid)?;
-        let reported = reported_id(&report.order.state)?;
-        let late = tracked.names_superseded(&reported);
+        // A link on a report that names no venue order id is ignored: the order would be left
+        // addressed by none (see the producer obligations on `OrderReport`).
+        let reported = reported_assigned_id(&report.order.state)?;
+        let late = tracked.is_superseded(&reported);
         let held = tracked.current_id().cloned();
         let moved = !late
-            && reported.assigned() != Some(&replaces.id)
+            && reported != replaces.id
             && held.as_ref().is_none_or(|held| held == &replaces.id);
         if moved {
             if let Some(open) = tracked.order.state.open_meta_mut() {
-                open.id = reported.clone();
+                open.id = VenueOrderId::Assigned(reported.clone());
             }
             tracked.supersede(replaces.id.clone());
         }
@@ -1208,8 +1214,9 @@ where
             // An ended report of the order before a replace, such as the cancel of the old order
             // a venue reports alongside its replacement, says nothing of the order now
             (Entry::Occupied(entry), None)
-                if reported_id(&snapshot.state)
-                    .is_some_and(|id| entry.get().names_superseded(&id)) =>
+                if !entry.get().superseded_ids.is_empty()
+                    && reported_id(&snapshot.state)
+                        .is_some_and(|id| entry.get().names_superseded(&id)) =>
             {
                 debug!(
                     exchange = ?snapshot.key.exchange,
@@ -1623,6 +1630,16 @@ fn reported_id<AssetKey, InstrumentKey>(
             Some(VenueOrderId::Assigned(expired.id.clone()))
         }
         OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => None,
+    }
+}
+
+/// The venue order id `state` names, when the venue has assigned one (see [`reported_id`]).
+fn reported_assigned_id<AssetKey, InstrumentKey>(
+    state: &OrderState<AssetKey, InstrumentKey>,
+) -> Option<OrderId> {
+    match reported_id(state)? {
+        VenueOrderId::Assigned(id) => Some(id),
+        VenueOrderId::ClientAssigned => None,
     }
 }
 
@@ -5170,7 +5187,7 @@ mod tests {
                 applied.orders.replaced,
                 vec![OrderReplaced {
                     key: tracked.order.key.clone(),
-                    id: VenueOrderId::Assigned(id("2")),
+                    id: id("2"),
                     replaced: Replaces::new(id("1")),
                 }]
             );
@@ -5358,7 +5375,7 @@ mod tests {
                     applied.orders.replaced,
                     vec![OrderReplaced {
                         key: tracked.order.key.clone(),
-                        id: VenueOrderId::Assigned(id(venue_id)),
+                        id: id(venue_id),
                         replaced: Replaces::new(id("1")).with_cid(old_cid()),
                     }],
                     "{case}"
@@ -5474,6 +5491,76 @@ mod tests {
                 assert!(orders.get(&new_cid()).is_some(), "{replaces:?}");
                 assert!(applied.orders.replaced.is_empty(), "{replaces:?}");
                 assert_eq!(applied.orders.adopted.len(), 1, "{replaces:?}");
+            }
+        }
+
+        /// A replay of a replace already followed, under a client order id the order has since
+        /// moved on from, moves nothing back: that id is retired.
+        #[test]
+        fn a_replayed_replace_under_a_retired_cid_moves_nothing() {
+            let mut orders = tracked_as(
+                old_cid(),
+                ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+            );
+            // A new venue order id under the same client order id, then a new client order id.
+            let first = report(
+                old_cid(),
+                OrderState::active(working("2", 1, dec!(0.5))),
+                Some(Replaces::new(id("1"))),
+            );
+            apply(&mut orders, &first);
+            let second = report(
+                new_cid(),
+                OrderState::active(working("3", 2, dec!(0.5))),
+                Some(Replaces::new(id("2")).with_cid(old_cid())),
+            );
+            apply(&mut orders, &second);
+            assert_eq!(
+                orders.tracked(&new_cid()).unwrap().superseded_ids(),
+                [id("1"), id("2")]
+            );
+
+            let applied = apply(&mut orders, &first);
+
+            assert!(orders.get(&old_cid()).is_none());
+            assert_eq!(
+                state_of(&orders, &new_cid()),
+                ActiveOrderState::Open(working("3", 2, dec!(0.5)))
+            );
+            assert!(!orders.1.contains(&new_cid()));
+            assert!(applied.orders.is_empty(), "{applied:?}");
+        }
+
+        /// A link on a report naming no venue order id records no replace: under a new client
+        /// order id, the order is not moved from the id it had.
+        #[test]
+        fn a_link_on_a_report_naming_no_venue_order_id_is_ignored() {
+            let unnamed = Open {
+                id: VenueOrderId::ClientAssigned,
+                ..working("2", 1, dec!(0.5))
+            };
+            for cid in [old_cid(), new_cid()] {
+                let mut orders = tracked_as(
+                    old_cid(),
+                    ActiveOrderState::Open(working("1", 0, dec!(0.5))),
+                );
+                let linked = report(
+                    cid.clone(),
+                    OrderState::active(unnamed.clone()),
+                    Some(Replaces::new(id("1")).with_cid(old_cid())),
+                );
+
+                let applied = apply(&mut orders, &linked);
+
+                let tracked = orders.tracked(&old_cid()).expect("not moved");
+                assert!(tracked.superseded_ids().is_empty(), "{cid}");
+                if cid == new_cid() {
+                    assert_eq!(
+                        tracked.order.state.open_meta().map(|open| &open.id),
+                        Some(&VenueOrderId::Assigned(id("1")))
+                    );
+                }
+                assert!(applied.orders.replaced.is_empty(), "{cid}");
             }
         }
 

@@ -435,9 +435,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order id, or both. A report can now say so: `OrderReport` gains `replaces`, an optional
   `Replaces { id, cid }` naming the venue order id, and the client order id when it changed, of
   the order replaced (`OrderReport::with_replaces`, `Replaces::new`, `Replaces::with_cid`).
-  `OrderReport`'s rustdoc gives the producer's obligations: link only on the venue's own word,
-  report the replacement in totals (fills of the order replaced included), and send the old
-  order's end after the replacement. A report linked to an order the engine tracks keeps it one
+  `OrderReport`'s rustdoc gives the producer's obligations: link only on the venue's own word and
+  on a report naming the replacement's venue order id, report the replacement in totals (fills of
+  the order replaced included), and send the old order's end after the replacement. A report linked to an order the engine tracks keeps it one
   order:
   - **A new venue order id** under the same client order id is followed when the link names the
     id held.
@@ -455,8 +455,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     any other output of the event. The engine's own amend answered under a new venue order id
     records the old id in the same way, without that output.
 
-  An unlinked report naming a different venue order id is still refused. The live clients do not
-  link replaces yet.
+  A link is ignored on a report naming no venue order id, and on a report under a client order id
+  already retired, such as a replay of a replace already followed. An unlinked report naming a
+  different venue order id is still refused. The live clients do not link replaces yet.
 
 - **The simulated venue links a reassigned order to the id it replaces, and can restart it**
   (`rustrade-execution`). With `AmendConfig::reassign_id`, the account stream's report of the
@@ -670,7 +671,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader could not tell which.
   - **New `OrderReport { order, reported }`** in `order::report`: the order as before, and a
     `ReportedTerms` saying which of `quantity`, `price`, `kind` and `time_in_force` are the
-    venue's current values. `ReportedTerms` is `#[non_exhaustive]`: build one from
+    venue's current values. `OrderReport` is `#[non_exhaustive]`: build one with
+    `OrderReport::new` or `OrderReport::state_only`. `ReportedTerms` is `#[non_exhaustive]`: build one from
     `ReportedTerms::NONE` or `ReportedTerms::ALL` and the `with_*` setters.
     `OrderReport::new` never states a `TimeInForce::Unreported` or an
     `OrderKind::ConditionalUnresolved`; `OrderReport::state_only` states no term.

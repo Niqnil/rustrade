@@ -541,8 +541,10 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     }
 }
 
-/// Maximum number of retired orders for which [`InstrumentState::retired_routing`] keeps fill
-/// routing, per instrument.
+/// Maximum number of venue order ids of retired orders for which
+/// [`InstrumentState::retired_routing`] keeps fill routing, per instrument. A retired order takes
+/// one per venue order id it held: one, or, for an order replaced at the venue, one for its last
+/// id and one for each id it was replaced from.
 ///
 /// The map exists to cover the gap between a venue reporting an order finished and reporting its
 /// last fill, so the bound only has to span the orders that retire *within* that gap. Sixty-four
@@ -1287,8 +1289,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// written afterwards — so there is nothing here to demote, and those restored entries are
     /// what the *next* retirement's demotion finds.
     ///
-    /// The window is bounded at [`MAX_RETIRED_ROUTING`] retirements per instrument, oldest
-    /// evicted first. A fill for an order retired beyond that bound still opens a position under
+    /// The window is bounded at [`MAX_RETIRED_ROUTING`] venue order ids per instrument (one per id
+    /// a retired order held), oldest evicted first. A fill for an order retired beyond that bound still opens a position under
     /// the raw `OrderId`.
     ///
     /// Additional mitigation: `AlpacaClient`'s dedup LRU cache filters fills whose
@@ -1648,10 +1650,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         for replaced in &applied.orders.replaced {
             if let Some(old) = &replaced.replaced.cid {
                 self.rekey_order_routing(old, &replaced.key.cid);
+                // The position the order routed to under its old client order id: the report's
+                // own client order id was untracked, so it held none.
+                pre_update_pos_id = self.position_ids.get(&replaced.key.cid).cloned();
             }
-        }
-        if pre_update_pos_id.is_none() {
-            pre_update_pos_id = self.position_ids.get(&order.0.key.cid).cloned();
         }
         self.cleanup_routing_tables();
 

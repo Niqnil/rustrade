@@ -225,7 +225,11 @@ impl Replaces {
 /// A reader treats a [`TimeInForce::Unreported`] or an
 /// [`OrderKind::ConditionalUnresolved`] as not
 /// stated, whatever [`reported`](Self::reported) says. [`new`](Self::new) never states either, but
-/// the fields are public, and a report deserialized or built as a literal is taken as it is.
+/// a report deserialized, or with its public fields changed, is taken as it is.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Build one with
+/// [`new`](Self::new) or [`state_only`](Self::state_only), then
+/// [`with_replaces`](Self::with_replaces).
 ///
 /// # Producer obligations
 ///
@@ -247,6 +251,8 @@ impl Replaces {
 ///   stand-ins, not the venue's terms.
 /// - Set [`replaces`](Self::replaces) only on the venue's own word that this order replaces the
 ///   one named, such as a link field in its message, never on a guess from matching terms. Then:
+///   - Link a report that names the replacement's venue order id. A reader ignores the link on a
+///     report naming none, which leaves the order addressed by the id it had.
 ///   - Report the replacement's quantities as the order's totals, the fills of the order replaced
 ///     included. A venue that starts the replacement's quantity and filled quantity afresh has
 ///     them added back by the producer, or a reader reads the order as less filled than it is.
@@ -256,6 +262,7 @@ impl Replaces {
 ///     seen the replacement: before, that report ends the order.
 ///   - A producer may link every report of the replacement, not only the first: a reader ignores
 ///     the link on a report of an order already following it.
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(bound(
     serialize = "ExchangeKey: Serialize, AssetKey: Serialize, InstrumentKey: Serialize",
