@@ -1,9 +1,8 @@
 use crate::engine::state::order::{
+    applied::{OrderAdopted, OrderNotAdopted, OrderNotAdoptedReason, OrderReportsApplied},
     in_flight_recorder::InFlightRequestRecorder,
     manager::OrderManager,
-    terms::{
-        OrderTerms, OrderTermsApplied, OrderTermsChanged, OrderTermsDiverged, Reconciled, reconcile,
-    },
+    terms::{OrderTerms, OrderTermsChanged, OrderTermsDiverged, Reconciled, reconcile},
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
@@ -36,6 +35,7 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+pub mod applied;
 pub mod in_flight_recorder;
 pub mod manager;
 pub mod terms;
@@ -51,28 +51,29 @@ pub struct SnapshotApplied<ExchangeKey, InstrumentKey> {
     /// The snapshot ended the order, and it is no longer tracked: the caller owes the routing
     /// prune of any retirement.
     pub retired: bool,
-    /// The terms the snapshot changed, or stated and the engine did not adopt.
-    pub terms: OrderTermsApplied<ExchangeKey, InstrumentKey>,
+    /// What the snapshot did to the order: adopted it or refused it when it was untracked, or
+    /// changed its terms or left stated terms diverged.
+    pub orders: OrderReportsApplied<ExchangeKey, InstrumentKey>,
 }
 
 impl<ExchangeKey, InstrumentKey> Default for SnapshotApplied<ExchangeKey, InstrumentKey> {
     fn default() -> Self {
-        Self::working(OrderTermsApplied::default())
+        Self::working(OrderReportsApplied::default())
     }
 }
 
 impl<ExchangeKey, InstrumentKey> SnapshotApplied<ExchangeKey, InstrumentKey> {
-    fn working(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
+    fn working(orders: OrderReportsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
             retired: false,
-            terms,
+            orders,
         }
     }
 
-    fn retired(terms: OrderTermsApplied<ExchangeKey, InstrumentKey>) -> Self {
+    fn retired(orders: OrderReportsApplied<ExchangeKey, InstrumentKey>) -> Self {
         Self {
             retired: true,
-            terms,
+            orders,
         }
     }
 }
@@ -612,8 +613,12 @@ where
         ) {
             // Order untracked: track it, or ignore it
             (Entry::Vacant(entry), update) => {
-                update_untracked(entry, &mut self.1, report, update);
-                return SnapshotApplied::default();
+                return SnapshotApplied::working(update_untracked(
+                    entry,
+                    &mut self.1,
+                    report,
+                    update,
+                ));
             }
 
             // A refusal of a request under a client order id already in use says nothing about
@@ -645,7 +650,7 @@ where
                     "OrderManager received inactive order snapshot for tracked order - removing"
                 );
                 self.1.insert(entry.remove().order.key.cid);
-                return SnapshotApplied::retired(OrderTermsApplied::default());
+                return SnapshotApplied::retired(OrderReportsApplied::default());
             }
 
             // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
@@ -1311,12 +1316,12 @@ fn reconcile_terms<ExchangeKey, AssetKey, InstrumentKey>(
     report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
     open: &Open,
     amend: Option<&AmendPatch>,
-) -> OrderTermsApplied<ExchangeKey, InstrumentKey>
+) -> OrderReportsApplied<ExchangeKey, InstrumentKey>
 where
     ExchangeKey: Debug + Clone,
     InstrumentKey: Debug + Clone,
 {
-    let mut applied = OrderTermsApplied::default();
+    let mut applied = OrderReportsApplied::default();
     if report.reported.is_none() {
         return applied;
     }
@@ -1442,22 +1447,29 @@ fn is_duplicate_cid_refusal<AssetKey, InstrumentKey>(
 }
 
 /// Apply `snapshot` (`update` being its active state, if it has one) to an order `Orders` does
-/// not track: track it, unless it has ended or `retired` remembers it.
+/// not track: track it, unless it has ended, `retired` remembers it, or its quantity is not
+/// positive.
 ///
 /// `OpenInFlight` is only ever the engine's own record of an open request, never a venue's report,
 /// so a remembered id is forgotten and tracked again, as [`Orders`]'s `record_in_flight_open`
 /// does. Any other active state for a remembered id is a late report and is ignored. A snapshot
 /// saying the order has ended is remembered, so a late report of it cannot track it either.
+///
+/// Returns the order adopted, when a venue's report of a working order is tracked, or refused,
+/// when its quantity is zero or negative. The terms it states are not compared with anything:
+/// the order is tracked on them as they stand.
 fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
     entry: VacantEntry<'_, ClientOrderId, TrackedOrder<ExchangeKey, InstrumentKey>>,
     retired: &mut RecentlyRetired,
     report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
     update: Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
-) where
-    ExchangeKey: Debug,
+) -> OrderReportsApplied<ExchangeKey, InstrumentKey>
+where
+    ExchangeKey: Debug + Clone,
     AssetKey: Debug,
-    InstrumentKey: Debug,
+    InstrumentKey: Debug + Clone,
 {
+    let mut applied = OrderReportsApplied::default();
     let snapshot = &report.order;
     let cid = &snapshot.key.cid;
     match update {
@@ -1502,6 +1514,28 @@ fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
             );
         }
 
+        // No working order has nothing to fill in total: a placeholder, or a value the producer
+        // could not read. Tracked, it would read as finished while the order may be working, so
+        // it is refused, observably, and not remembered: a later report that can be tracked is.
+        Some(update)
+            if update.quantity <= Decimal::ZERO
+                && !matches!(update.state, ActiveOrderState::OpenInFlight(_)) =>
+        {
+            warn!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                %cid,
+                update = ?snapshot,
+                "OrderManager received a working order snapshot for an untracked order with no \
+                 positive quantity - not tracking it"
+            );
+            applied.not_adopted.push(OrderNotAdopted {
+                order: update,
+                reason: OrderNotAdoptedReason::QuantityNotPositive,
+            });
+        }
+
         // Input Snapshot is ActiveOrderState, so insert
         Some(update) => match &update.state {
             ActiveOrderState::Open(open)
@@ -1526,8 +1560,15 @@ fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
                     update = ?snapshot,
                     "OrderManager tracking new order"
                 );
-                if matches!(update.state, ActiveOrderState::OpenInFlight(_)) {
+                let in_flight = matches!(update.state, ActiveOrderState::OpenInFlight(_));
+                if in_flight {
                     retired.forget(cid);
+                } else {
+                    // A venue's report of an order this engine has no request for.
+                    applied.adopted.push(OrderAdopted {
+                        order: update.clone(),
+                        reported: report.reported,
+                    });
                 }
                 // A venue's report stating terms is the first word on them, at its own time.
                 let stated_at = update.state.open_meta().map(|open| open.time_exchange);
@@ -1539,6 +1580,7 @@ fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
             }
         },
     }
+    applied
 }
 
 impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
@@ -2149,7 +2191,9 @@ mod tests {
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                    OrderState::active(OpenInFlight {
+                        time_sent: TIME_SENT,
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
@@ -2203,7 +2247,9 @@ mod tests {
                 state: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                    OrderState::active(OpenInFlight {
+                        time_sent: TIME_SENT,
+                    }),
                 )),
                 expected: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
             },
@@ -2343,7 +2389,9 @@ mod tests {
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                    OrderState::active(OpenInFlight {
+                        time_sent: TIME_SENT,
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
@@ -3832,10 +3880,11 @@ mod tests {
         fn terms_of(
             changed: Option<OrderTermsChanged<ExchangeId, u64>>,
             diverged: Option<OrderTermsDiverged<ExchangeId, u64>>,
-        ) -> OrderTermsApplied<ExchangeId, u64> {
-            OrderTermsApplied {
+        ) -> OrderReportsApplied<ExchangeId, u64> {
+            OrderReportsApplied {
                 changed: changed.into_iter().collect(),
                 diverged: diverged.into_iter().collect(),
+                ..OrderReportsApplied::default()
             }
         }
 
@@ -4495,6 +4544,152 @@ mod tests {
             assert_eq!(applied, SnapshotApplied::default());
             assert!(orders.0.is_empty());
             assert!(orders.1.contains(&cid()));
+        }
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+    mod untracked {
+        use super::*;
+        use rustrade_execution::order::{report::ReportedTerms, state::OpenInFlight};
+
+        fn cid() -> ClientOrderId {
+            ClientOrderId::new("untracked")
+        }
+
+        /// A report of the untracked order in `state`, `quantity` in total, stating `stated`.
+        fn report(
+            state: OrderState<u64, u64>,
+            quantity: Decimal,
+            stated: ReportedTerms,
+        ) -> OrderReport<ExchangeId, u64, u64> {
+            OrderReport::new(
+                Order {
+                    quantity,
+                    ..order(cid(), state)
+                },
+                stated,
+            )
+        }
+
+        fn working(filled: Decimal) -> OrderState<u64, u64> {
+            OrderState::active(Open {
+                filled_quantity: filled,
+                ..open_assigned("venue", DateTime::<Utc>::MIN_UTC)
+            })
+        }
+
+        fn apply(
+            orders: &mut Orders<ExchangeId, u64>,
+            report: &OrderReport<ExchangeId, u64, u64>,
+        ) -> SnapshotApplied<ExchangeId, u64> {
+            orders.update_from_order_snapshot(Snapshot(report))
+        }
+
+        /// A venue's report of a working order the engine does not track is tracked on its terms
+        /// as they stand, and returned as adopted with the terms it stated.
+        #[test]
+        fn a_venues_report_of_an_untracked_working_order_is_adopted() {
+            for stated in [ReportedTerms::NONE, ReportedTerms::ALL] {
+                let mut orders = orders([]);
+                let report = report(working(dec!(0.5)), dec!(2), stated);
+
+                let applied = apply(&mut orders, &report);
+
+                let tracked = orders.get(&cid()).expect("tracked").clone();
+                assert_eq!(tracked.quantity, dec!(2));
+                assert_eq!(Some(tracked.clone()), report.order.to_active());
+                assert!(!applied.retired);
+                assert_eq!(
+                    applied.orders.adopted,
+                    vec![OrderAdopted {
+                        order: tracked,
+                        reported: stated,
+                    }],
+                    "stated {stated:?}"
+                );
+                assert!(applied.orders.not_adopted.is_empty());
+                assert!(applied.orders.changed.is_empty() && applied.orders.diverged.is_empty());
+            }
+        }
+
+        /// A report of an untracked working order with no positive quantity is refused, since
+        /// tracked it would read as finished, and not remembered: a later report of the same
+        /// order that can be tracked is adopted.
+        #[test]
+        fn an_untracked_working_order_with_no_positive_quantity_is_refused_until_reported_with_one()
+        {
+            // A filled part leaves the order nothing to fill of such a quantity too: it is still
+            // refused, not taken as finished.
+            for (quantity, filled) in [(dec!(0), dec!(0)), (dec!(-1), dec!(0)), (dec!(0), dec!(1))]
+            {
+                let mut orders = orders([]);
+                let refused = report(working(filled), quantity, ReportedTerms::NONE);
+
+                let applied = apply(&mut orders, &refused);
+
+                assert!(orders.get(&cid()).is_none(), "quantity {quantity}");
+                assert!(
+                    !orders.1.contains(&cid()),
+                    "remembered at quantity {quantity}"
+                );
+                assert!(!applied.retired);
+                assert!(applied.orders.adopted.is_empty());
+                assert_eq!(
+                    applied.orders.not_adopted,
+                    vec![OrderNotAdopted {
+                        order: refused.order.to_active().expect("working"),
+                        reason: OrderNotAdoptedReason::QuantityNotPositive,
+                    }]
+                );
+
+                let later = report(working(dec!(0)), dec!(1), ReportedTerms::NONE);
+                let applied = apply(&mut orders, &later);
+                assert_eq!(
+                    orders.get(&cid()).map(|order| order.quantity),
+                    Some(dec!(1))
+                );
+                assert_eq!(applied.orders.adopted.len(), 1);
+                assert!(applied.orders.not_adopted.is_empty());
+            }
+        }
+
+        /// The engine's own record of an open request is tracked, not adopted, whatever its
+        /// quantity: it is no venue's report, and the request answers for it.
+        #[test]
+        fn the_engines_own_open_in_flight_record_is_tracked_without_an_adoption() {
+            for quantity in [dec!(1), dec!(0)] {
+                let mut orders = orders([]);
+                let record = report(
+                    OrderState::active(OpenInFlight {
+                        time_sent: TIME_SENT,
+                    }),
+                    quantity,
+                    ReportedTerms::NONE,
+                );
+
+                let applied = apply(&mut orders, &record);
+
+                assert!(orders.get(&cid()).is_some(), "quantity {quantity}");
+                assert!(applied.orders.is_empty(), "{applied:?}");
+            }
+        }
+
+        /// Neither a late report of a retired order nor a report of an untracked order with
+        /// nothing left to fill adopts anything.
+        #[test]
+        fn a_retired_or_finished_untracked_order_is_not_adopted() {
+            let mut orders = orders([]);
+            let finished = report(working(dec!(1)), dec!(1), ReportedTerms::ALL);
+
+            let applied = apply(&mut orders, &finished);
+            assert!(orders.get(&cid()).is_none());
+            assert!(orders.1.contains(&cid()));
+            assert!(applied.orders.is_empty(), "{applied:?}");
+
+            let late = report(working(dec!(0)), dec!(1), ReportedTerms::ALL);
+            let applied = apply(&mut orders, &late);
+            assert!(orders.get(&cid()).is_none());
+            assert!(applied.orders.is_empty(), "{applied:?}");
         }
     }
 }

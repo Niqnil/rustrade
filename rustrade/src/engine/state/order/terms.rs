@@ -127,44 +127,6 @@ pub struct OrderTermsDiverged<ExchangeKey, InstrumentKey> {
     pub amend_in_flight: bool,
 }
 
-/// The terms order reports changed, and those they stated that the engine did not adopt: what
-/// applying one or more order reports did to the orders' terms.
-///
-/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Each field defaults
-/// when deserialised, through a path, so that the key types need no `Default`.
-#[non_exhaustive]
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct OrderTermsApplied<ExchangeKey, InstrumentKey> {
-    /// The terms adopted, one per order changed.
-    #[serde(default = "Vec::new")]
-    pub changed: Vec<OrderTermsChanged<ExchangeKey, InstrumentKey>>,
-    /// The terms not adopted, one per order whose report stated them.
-    #[serde(default = "Vec::new")]
-    pub diverged: Vec<OrderTermsDiverged<ExchangeKey, InstrumentKey>>,
-}
-
-impl<ExchangeKey, InstrumentKey> Default for OrderTermsApplied<ExchangeKey, InstrumentKey> {
-    fn default() -> Self {
-        Self {
-            changed: Vec::new(),
-            diverged: Vec::new(),
-        }
-    }
-}
-
-impl<ExchangeKey, InstrumentKey> OrderTermsApplied<ExchangeKey, InstrumentKey> {
-    /// Whether no order's terms were changed or left diverged.
-    pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.diverged.is_empty()
-    }
-
-    /// Append what `other` applied, after what this holds.
-    pub fn extend(&mut self, other: Self) {
-        self.changed.extend(other.changed);
-        self.diverged.extend(other.diverged);
-    }
-}
-
 /// What the engine takes from a report: the terms to track, and those left diverged.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct Reconciled {

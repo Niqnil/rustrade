@@ -397,8 +397,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `amend_in_flight`) for terms not adopted, including terms matching neither side of an amend in
     flight. Both are emitted for an order snapshot and for an account snapshot, ahead of that
     event's other outputs. A divergence that persists is reported again with each report stating
-    the term. Their types, `OrderTerms` and `OrderTermsApplied` (the changes and divergences of one
-    or more reports) are in `engine::state::order::terms`.
+    the term. Their types, `OrderTerms`, `OrderTermsChanged` and `OrderTermsDiverged`, are in
+    `engine::state::order::terms`. `OrderReportsApplied` (what one or more reports did: the
+    changes and divergences, and the untracked orders adopted or refused) is in
+    `engine::state::order::applied`.
   - **New `ReportedTerms::union` and `ReportedTerms::is_none`** (`rustrade-execution`).
   - **New `ReportedTerms::from_venue_read` and `ReportedTerms::from_read`**
     (`rustrade-execution`), the terms a report states when it read an order's terms from the
@@ -415,6 +417,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **New `AmendTarget::known_time_in_force`** (`rustrade-execution`), refusing with
     `AmendRefusal::TimeInForceUnknown` for an order whose time in force the venue never stated, for
     a client that must send the whole order again to amend it.
+
+- **The engine reports each order it begins tracking from a venue's report** (`rustrade`). An
+  order the venue reports working that the engine has no request for (placed by hand, by another
+  API client on the account, or by an earlier run and listed again after a restart or reconnect)
+  is tracked, as before, and now also reported as `EngineOutput::OrderAdopted`, carrying the
+  order as tracked and the terms its report stated (`reported`). Whether to cancel it, hand it to
+  a strategy or leave it is the consumer's decision. A report of such an order whose quantity is
+  zero or negative is not tracked, and is reported as `EngineOutput::OrderNotAdopted`, carrying
+  the order as reported and an `OrderNotAdoptedReason` (`QuantityNotPositive`). The refusal is not
+  remembered, so it is emitted again for every such report of the order. Both are emitted
+  for an order snapshot and for an account snapshot, after that event's `OrderTermsDiverged`
+  outputs. The types are in `engine::state::order::applied`.
 
 - **A test hook to change a resting order on the simulated venue from outside any client**
   (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
@@ -441,15 +455,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: the engine's order snapshot path takes the whole report and returns what it did**
   (`rustrade`).
   - `OrderManager::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` and returns a
-    `SnapshotApplied` (whether it retired the order, and the `OrderTermsApplied` it changed or
-    left diverged). `InstrumentState::update_from_order_snapshot` takes a `Snapshot<&OrderReport>`
-    too, and `InstrumentState::update_from_account_snapshot` returns the `OrderTermsApplied` of its
-    reports.
-  - `FillsApplied` gains a `terms` field (an `OrderTermsApplied`, defaulting when deserialised)
+    `SnapshotApplied` (whether it retired the order, and in `orders` the `OrderReportsApplied`
+    saying what it did to the order). `InstrumentState::update_from_order_snapshot` takes a
+    `Snapshot<&OrderReport>` too, and `InstrumentState::update_from_account_snapshot` returns the
+    `OrderReportsApplied` of its reports.
+  - `FillsApplied` gains an `orders` field (an `OrderReportsApplied`, defaulting when deserialised)
     and a third type parameter, `ExchangeKey`, defaulting to `ExchangeIndex`.
   - `UpdateFromAccountOutput::PositionDrift(drift)` is replaced by
-    `UpdateFromAccountOutput::AccountSnapshot { drift, terms }`, which carries the snapshot's
-    order terms alongside its position drift.
+    `UpdateFromAccountOutput::AccountSnapshot { drift, orders }`, which carries what the
+    snapshot's order reports did alongside its position drift.
   - **An order is retired against the quantity tracked, not the snapshot's.** A snapshot that
     does not state its quantity no longer retires an order on a quantity that may be an echo of
     the placement. Every arm now retires at or below zero remaining, so an order reported filled
@@ -682,6 +696,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     venue states").
 
 ### Fixed
+
+- **A venue's report of an untracked working order with no positive quantity no longer reads as
+  a finished order** (`rustrade`). Such a quantity is a placeholder or a value the producer could
+  not read. The engine used to take the order as having nothing left to fill, remember it as
+  retired, and so ignore every later report of it, while the order might still be working. It is
+  now refused, reported as `EngineOutput::OrderNotAdopted`, and not remembered, so a later report
+  with a positive quantity tracks it.
 
 - **A completed order keeps its fill routing when it had an amend or a cancel in flight**
   (`rustrade`). A snapshot completing an order restores its live routing for a fill reported

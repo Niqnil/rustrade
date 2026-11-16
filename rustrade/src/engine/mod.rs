@@ -23,9 +23,10 @@ use crate::{
             },
             order::{
                 Orders,
+                applied::{OrderAdopted, OrderNotAdopted, OrderReportsApplied},
                 in_flight_recorder::InFlightRequestRecorder,
                 manager::OrderManager,
-                terms::{OrderTermsApplied, OrderTermsChanged, OrderTermsDiverged},
+                terms::{OrderTermsChanged, OrderTermsDiverged},
             },
             position::{
                 EngineCheckpoint, Position, PositionDrift, PositionExited, PositionId,
@@ -572,7 +573,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 }
                 UpdateFromAccountOutput::AccountSnapshot {
                     drift,
-                    terms: applied.terms,
+                    orders: applied.orders,
                 }
             }
         }
@@ -2077,6 +2078,28 @@ pub enum EngineOutput<
     /// **Boxed**, as [`OrderTermsChanged`](Self::OrderTermsChanged).
     OrderTermsDiverged(Box<OrderTermsDiverged<ExchangeKey, InstrumentKey>>),
 
+    /// The engine began tracking an order from a venue's report of it, not from a request it
+    /// sent: an order placed outside the engine, or one an earlier run placed, listed again. See
+    /// [`OrderAdopted`].
+    ///
+    /// Emitted for the account event carrying the report, an order snapshot or an account
+    /// snapshot, after any [`OrderTermsDiverged`](Self::OrderTermsDiverged) of the same event.
+    /// What to do with the order (cancel it, hand it to a strategy, leave it) is the caller's.
+    ///
+    /// **Boxed**, because it carries a whole order.
+    OrderAdopted(Box<OrderAdopted<ExchangeKey, InstrumentKey>>),
+
+    /// A venue reported an untracked order working that the engine did not track, for the reason
+    /// [`OrderNotAdopted`] gives. The order may still be working at the venue.
+    ///
+    /// Emitted after any [`OrderAdopted`](Self::OrderAdopted) of the same event. The engine keeps
+    /// no record of a refusal, so it is emitted again for every report of the order that cannot
+    /// be tracked, an account snapshot listing it included. A consumer acting on it once
+    /// deduplicates on the order's key.
+    ///
+    /// **Boxed**, as [`OrderAdopted`](Self::OrderAdopted).
+    OrderNotAdopted(Box<OrderNotAdopted<ExchangeKey, InstrumentKey>>),
+
     /// A simulated venue's checkpoint reached the engine, and this is the engine's answer: the
     /// venue's state and the engine's positions on that venue, at the same point in the account
     /// stream. See [`EngineCheckpoint`] for how to restore both from it.
@@ -2334,11 +2357,13 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     OnDisconnect(OnDisconnect),
 
     /// The event's fills closed a position, the engine cut a reduce-only fill, it valued a
-    /// third-asset fee, or the event's order report changed an order's terms or left them
-    /// diverged. Never empty, and never for an account snapshot, which is
-    /// [`AccountSnapshot`](Self::AccountSnapshot). Each becomes an [`EngineOutput`]:
-    /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged) and
-    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged), then
+    /// third-asset fee, or the event's order report changed an order's terms, left them diverged,
+    /// or reported an untracked order the engine adopted or refused. Never empty, and never for
+    /// an account snapshot, which is [`AccountSnapshot`](Self::AccountSnapshot). Each becomes an
+    /// [`EngineOutput`]: [`OrderTermsChanged`](EngineOutput::OrderTermsChanged),
+    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged),
+    /// [`OrderAdopted`](EngineOutput::OrderAdopted) and
+    /// [`OrderNotAdopted`](EngineOutput::OrderNotAdopted), then
     /// [`FeeConversion`](EngineOutput::FeeConversion), then
     /// [`ReduceOnlyCapped`](EngineOutput::ReduceOnlyCapped) for each cut, then
     /// [`PositionExit`](EngineOutput::PositionExit).
@@ -2348,20 +2373,24 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     /// `on_disconnect` was **not** called. See [`UntrackedExchange`].
     UntrackedExchange(UntrackedExchange),
 
-    /// An account snapshot reported positions that differ from the engine's, or orders whose
-    /// terms the engine adopted or left diverged. Never both empty.
+    /// An account snapshot reported positions that differ from the engine's, orders whose terms
+    /// the engine adopted or left diverged, or untracked orders it adopted or refused. Never both
+    /// empty.
     ///
     /// A position a replayed fill closed while the snapshot was applied is not reported. Each
     /// becomes an [`EngineOutput`]:
-    /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged) and
-    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged) for each order, then
+    /// [`OrderTermsChanged`](EngineOutput::OrderTermsChanged),
+    /// [`OrderTermsDiverged`](EngineOutput::OrderTermsDiverged),
+    /// [`OrderAdopted`](EngineOutput::OrderAdopted) and
+    /// [`OrderNotAdopted`](EngineOutput::OrderNotAdopted) for each order, then
     /// [`PositionDrift`](EngineOutput::PositionDrift) for each instrument.
     AccountSnapshot {
         /// The positions that differ from the engine's, one per instrument. See
         /// [`EngineOutput::PositionDrift`].
         drift: Vec<PositionDrift<InstrumentKey>>,
-        /// The order terms the snapshot changed or left diverged.
-        terms: OrderTermsApplied<ExchangeIndex, InstrumentKey>,
+        /// What the snapshot's order reports did: the terms they changed or left diverged, and
+        /// the untracked orders adopted or refused.
+        orders: OrderReportsApplied<ExchangeIndex, InstrumentKey>,
     },
 
     /// A simulated venue's checkpoint, answered with the engine's positions. See

@@ -599,7 +599,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         .instrument_index_mut(&instrument.instrument);
 
                     applied
-                        .terms
+                        .orders
                         .extend(instrument_state.update_from_account_snapshot(instrument));
                     instrument_state.data.process(event);
                 }

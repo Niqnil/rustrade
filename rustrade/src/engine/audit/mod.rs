@@ -2,7 +2,7 @@ use crate::{
     engine::{
         Engine, EngineOutput, UpdateFromAccountOutput, UpdateFromMarketOutput,
         audit::context::EngineContext, clock::EngineClock, error::UnrecoverableEngineError,
-        state::order::terms::OrderTermsApplied,
+        state::order::applied::OrderReportsApplied,
     },
     strategy::{on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled},
 };
@@ -253,7 +253,7 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::OnDisconnect(disconnect) => {
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
-            UpdateFromAccountOutput::FillsApplied(applied) => term_outputs(applied.terms)
+            UpdateFromAccountOutput::FillsApplied(applied) => order_outputs(applied.orders)
                 .chain(applied.fee_conversion.map(EngineOutput::FeeConversion))
                 .chain(
                     applied
@@ -272,7 +272,7 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::UntrackedExchange(untracked) => {
                 Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
-            UpdateFromAccountOutput::AccountSnapshot { drift, terms } => term_outputs(terms)
+            UpdateFromAccountOutput::AccountSnapshot { drift, orders } => order_outputs(orders)
                 .chain(drift.into_iter().map(EngineOutput::PositionDrift))
                 .fold(Self::with_event(event), |audit, output| {
                     audit.add_output(output)
@@ -347,14 +347,19 @@ impl<Event, Output> ProcessAudit<Event, Output> {
     }
 }
 
-/// The outputs for `terms`: an [`EngineOutput::OrderTermsChanged`] per order changed, then an
-/// [`EngineOutput::OrderTermsDiverged`] per order diverged.
-fn term_outputs<OnTradingDisabled, OnDisconnect>(
-    terms: OrderTermsApplied<ExchangeIndex, InstrumentIndex>,
+/// The outputs for `orders`: an [`EngineOutput::OrderTermsChanged`] per order changed, an
+/// [`EngineOutput::OrderTermsDiverged`] per order diverged, an [`EngineOutput::OrderAdopted`] per
+/// order adopted, then an [`EngineOutput::OrderNotAdopted`] per report refused.
+fn order_outputs<OnTradingDisabled, OnDisconnect>(
+    orders: OrderReportsApplied<ExchangeIndex, InstrumentIndex>,
 ) -> impl Iterator<Item = EngineOutput<OnTradingDisabled, OnDisconnect>> {
-    let OrderTermsApplied {
-        changed, diverged, ..
-    } = terms;
+    let OrderReportsApplied {
+        changed,
+        diverged,
+        adopted,
+        not_adopted,
+        ..
+    } = orders;
     changed
         .into_iter()
         .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed)))
@@ -362,6 +367,16 @@ fn term_outputs<OnTradingDisabled, OnDisconnect>(
             diverged
                 .into_iter()
                 .map(|diverged| EngineOutput::OrderTermsDiverged(Box::new(diverged))),
+        )
+        .chain(
+            adopted
+                .into_iter()
+                .map(|adopted| EngineOutput::OrderAdopted(Box::new(adopted))),
+        )
+        .chain(
+            not_adopted
+                .into_iter()
+                .map(|refused| EngineOutput::OrderNotAdopted(Box::new(refused))),
         )
 }
 
