@@ -602,7 +602,11 @@ impl ExecutionClient for HyperliquidSpotClient {
                                 let pairs = orders_coins
                                     .covering(updates.data.iter().map(|update| update.order.coin.as_str()))
                                     .await;
+                                let replaced = super::common::replaced_orders(&updates.data);
                                 for update in updates.data {
+                                    if replaced.is_replaced_leg(&update) {
+                                        continue;
+                                    }
                                     // Filter: only spot coins
                                     let coin = update.order.coin.as_str();
                                     if CoinKind::of(coin) != CoinKind::Spot {
@@ -619,7 +623,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                                         }
                                         continue;
                                     };
-                                    if let Some(event) = order_update_to_account_event(&update, pair)
+                                    if let Some(event) = order_update_to_account_event(&update, &replaced, pair)
                                         && !send_observed(&orders_known, &orders_event_tx, event)
                                     {
                                         debug!("Spot orders event channel closed");
@@ -1341,10 +1345,12 @@ fn fill_to_account_event(
 /// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot.
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
+    replaced: &super::common::ReplacedOrders,
     pair: &SpotPair,
 ) -> Option<UnindexedAccountEvent> {
     super::common::order_update_to_account_event(
         update,
+        replaced,
         ExchangeId::HyperliquidSpot,
         spot_pair_to_instrument(pair),
     )
@@ -2372,7 +2378,12 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update, &pair("@107")).unwrap();
+        let event = order_update_to_account_event(
+            &update,
+            &super::super::common::ReplacedOrders::default(),
+            &pair("@107"),
+        )
+        .unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidSpot);
         match event.kind {

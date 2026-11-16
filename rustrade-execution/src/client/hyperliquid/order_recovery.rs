@@ -926,6 +926,7 @@ pub(super) mod tests {
         let ended = record("BTC", "canceled", "0.01");
         let event = super::super::common::order_update_to_account_event(
             &ended.update,
+            &super::super::common::ReplacedOrders::default(),
             ExchangeId::HyperliquidPerp,
             btc(),
         )
