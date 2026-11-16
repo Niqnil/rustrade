@@ -1213,7 +1213,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     );
                 } else if let Some(order) = self
                     .orders
-                    .0
                     .get(cid)
                     .filter(|order| matches!(order.state, ActiveOrderState::Open(_)))
                 {
@@ -1252,7 +1251,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn begin_account_resync(&mut self) {
         self.orders_open_at_resync = self
             .orders
-            .0
             .iter()
             .filter_map(|(cid, order)| match &order.state {
                 ActiveOrderState::Open(open) => Some((cid.clone(), open.id.clone())),
@@ -1434,7 +1432,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .client_order_id
             .as_ref()
             .or_else(|| self.tracked_order_cid(&trade.order_id))?;
-        self.orders.0.get(cid).map(|order| order.quantity)
+        self.orders.get(cid).map(|order| order.quantity)
     }
 
     /// The client order id of the tracked order the venue knows as `order_id`: O(1) through the
@@ -1444,7 +1442,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     fn tracked_order_cid(&self, order_id: &OrderId) -> Option<&ClientOrderId> {
         self.exchange_id_to_cid.get(order_id).or_else(|| {
             self.orders
-                .0
                 .iter()
                 .find_map(|(cid, order)| match &order.state {
                     ActiveOrderState::Open(open) if open.id.assigned() == Some(order_id) => {
@@ -1581,7 +1578,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
         let currently_open_in_flight = self
             .orders
-            .0
             .get(&order.0.key.cid)
             .map(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)))
             .unwrap_or(false);
@@ -1753,7 +1749,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         if !self.pending_fills.is_empty() {
             let still_has_in_flight = self
                 .orders
-                .0
                 .values()
                 .any(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)));
             if !still_has_in_flight {
@@ -2589,7 +2584,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     //   - Some(Some(pos_id)): match found with position_id
                     let matched =
                         self.orders
-                            .0
                             .iter()
                             .find_map(|(cid, order)| match &order.state {
                                 ActiveOrderState::Open(open)
@@ -2666,7 +2660,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                 // a liquidation, is not for an order of this engine's, so it is
                                 // never (a). Queued, it would wait for an ack that cannot come.
                                 let has_in_flight = trade.origin == TradeOrigin::Order
-                                    && self.orders.0.values().any(|order| {
+                                    && self.orders.values().any(|order| {
                                         matches!(order.state, ActiveOrderState::OpenInFlight(_))
                                     });
                                 if has_in_flight {
@@ -3205,7 +3199,7 @@ mod tests {
         state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
         cid: &ClientOrderId,
     ) -> Option<Decimal> {
-        match &state.orders.0.get(cid)?.state {
+        match &state.orders.get(cid)?.state {
             ActiveOrderState::Open(open) => Some(open.filled_quantity),
             _ => None,
         }
@@ -4337,7 +4331,7 @@ mod tests {
         ] {
             let mut state = instrument_state(OmsMode::Hedging);
             rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
-            state.orders.0.get_mut(&cid).expect("tracked").state = in_flight.clone();
+            state.orders.0.get_mut(&cid).expect("tracked").order.state = in_flight.clone();
 
             state.update_from_state_only_snapshot(Snapshot(&order(
                 cid.clone(),
@@ -4682,7 +4676,7 @@ mod tests {
         state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
 
         assert_eq!(
-            state.orders.0.get(&cid).map(|order| &order.state),
+            state.orders.get(&cid).map(|order| &order.state),
             Some(&ActiveOrderState::Open(Open::new(
                 VenueOrderId::Assigned(new_oid),
                 TIME,
@@ -4712,7 +4706,7 @@ mod tests {
         state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
 
         assert_eq!(
-            state.orders.0.get(&cid).map(|order| &order.state),
+            state.orders.get(&cid).map(|order| &order.state),
             Some(&resting)
         );
         assert!(state.orders_open_at_resync.is_empty());

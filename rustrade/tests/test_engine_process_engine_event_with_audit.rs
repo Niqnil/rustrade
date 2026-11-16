@@ -624,7 +624,6 @@ fn test_engine_process_engine_event_with_audit() {
             .instruments
             .instrument_index(&InstrumentIndex(1))
             .orders
-            .0
             .get(&gen_cid(1))
             .unwrap(),
         &Order {
@@ -2482,7 +2481,7 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
     let known_orders = &engine.state.instruments.instrument_index(&known).orders.0;
     assert_eq!(known_orders.len(), 1);
     assert!(matches!(
-        known_orders[&known_cancel.key.cid].state,
+        known_orders[&known_cancel.key.cid].order.state,
         ActiveOrderState::CancelInFlight(_)
     ));
 
@@ -2537,6 +2536,7 @@ fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
     };
     let tracked_quantity = |engine: &TestEngine| {
         engine.state.instruments.instrument_index(&known).orders.0[&ClientOrderId::new("dup")]
+            .order
             .quantity
     };
 
@@ -2727,7 +2727,9 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
     );
 
     let order = |engine: &TestEngine| {
-        engine.state.instruments.instrument_index(&known).orders.0[&cid].clone()
+        engine.state.instruments.instrument_index(&known).orders.0[&cid]
+            .order
+            .clone()
     };
     assert!(matches!(
         order(&engine).state,
@@ -2901,7 +2903,7 @@ fn test_an_order_changed_at_the_venue_is_adopted_and_reported() {
     assert_eq!(diverged.reported, terms(dec!(43_000), dec!(3), ioc));
     assert_eq!(diverged.terms, ReportedTerms::NONE.with_time_in_force(true));
     assert!(!diverged.amend_in_flight);
-    let tracked = &engine.state.instruments.instrument_index(&known).orders.0[&open.key.cid];
+    let tracked = &engine.state.instruments.instrument_index(&known).orders.0[&open.key.cid].order;
     assert_eq!(tracked.time_in_force, gtc);
     assert_eq!(tracked.state, ActiveOrderState::Open(working(4)));
 }
@@ -3073,12 +3075,12 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
 
     let orders = &engine.state.instruments.instrument_index(&known).orders.0;
     assert!(matches!(
-        orders[&ClientOrderId::new("stop")].state,
+        orders[&ClientOrderId::new("stop")].order.state,
         ActiveOrderState::CancelInFlight(_)
     ));
     for open in ["exit", "fresh"] {
         assert!(matches!(
-            orders[&ClientOrderId::new(open)].state,
+            orders[&ClientOrderId::new(open)].order.state,
             ActiveOrderState::OpenInFlight(_)
         ));
     }
@@ -8778,7 +8780,6 @@ fn test_in_flight_deadline_flags_each_request_once() {
         .instruments
         .instrument_index(&instrument)
         .orders
-        .0
         .get(&cid)
         .expect("the order is still tracked");
     assert!(
@@ -8989,7 +8990,6 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
             .instruments
             .instrument_index(&instrument)
             .orders
-            .0
             .get(&cid)
             .map(|order| order.state.clone())
     };
@@ -9728,7 +9728,6 @@ fn tracked_order_state(engine: &TestEngine, cid: &ClientOrderId) -> Option<Activ
         .instruments
         .instrument_index(&InstrumentIndex(0))
         .orders
-        .0
         .get(cid)
         .map(|order| order.state.clone())
 }

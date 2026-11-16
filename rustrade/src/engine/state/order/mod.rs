@@ -14,7 +14,7 @@ use rustrade_execution::{
         Order, OrderKey,
         amend::AmendPatch,
         id::{ClientOrderId, OrderId, VenueOrderId},
-        report::OrderReport,
+        report::{OrderReport, ReportedTerms},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, OrderResponseAmend,
             OrderResponseCancel,
@@ -135,9 +135,105 @@ impl<ExchangeKey, InstrumentKey> SnapshotApplied<ExchangeKey, InstrumentKey> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
-    pub FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+    pub FnvHashMap<ClientOrderId, TrackedOrder<ExchangeKey, InstrumentKey>>,
     #[serde(skip)] RecentlyRetired,
 );
+
+/// An order [`Orders`] tracks, with when the venue last stated each of its terms.
+///
+/// # Terms times
+///
+/// A report's terms are ordered by their own time, not by the order's state. The state an order
+/// holds may come from a report that states no terms, such as a listing or a placement answer
+/// stamped on another path. Ordered against that state, a report of a change made at the venue,
+/// stamped a little earlier, would be dropped, and the change missed until the venue reported it
+/// again. So [`terms_times`](Self::terms_times) records, term by term, when the venue last stated
+/// the value held, and a report's stated term is read only when the report is stamped no earlier
+/// than that, whether or not its state supersedes the one held. Term by term, because a report
+/// may state some terms and not others: a report stating only the price says nothing of when the
+/// quantity last changed.
+///
+/// Serialized as the order's own fields, with `terms_times` beside them once any is set: an order
+/// serialized without it reads back with none. That flattened layout needs a self-describing
+/// format, such as JSON, to read back, and it is why [`Order`] has no field named `terms_times`.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TrackedOrder<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// The order as tracked.
+    #[serde(flatten)]
+    pub order: Order<ExchangeKey, InstrumentKey, ActiveOrderState>,
+    #[serde(default, skip_serializing_if = "TermsTimes::is_none")]
+    terms_times: TermsTimes,
+}
+
+impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
+    /// Track `order` on the terms it holds, which no venue report has yet stated.
+    pub fn new(order: Order<ExchangeKey, InstrumentKey, ActiveOrderState>) -> Self {
+        Self {
+            order,
+            terms_times: TermsTimes::default(),
+        }
+    }
+
+    /// When the venue last stated each of this order's terms (see "Terms times").
+    pub fn terms_times(&self) -> TermsTimes {
+        self.terms_times
+    }
+}
+
+/// When the venue last stated each of an order's terms: the state timestamp of the latest report
+/// stating it, or of the venue's answer to an amend that set it. `None` for a term no report has
+/// stated, which the order holds as it was placed or first tracked.
+///
+/// A term's time records that the venue spoke to it, not that its value was taken: it advances
+/// even when the stated value is not adopted, such as a stand-in kind or time in force the
+/// report carries, or a price on a kind with no fixed limit. A report older than that still
+/// speaks for an earlier moment, so it is not read either.
+///
+/// `#[non_exhaustive]`, so a term can be added without breaking a caller.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct TermsTimes {
+    /// When the venue last stated the order's total quantity.
+    pub quantity: Option<DateTime<Utc>>,
+    /// When the venue last stated the order's limit price.
+    pub price: Option<DateTime<Utc>>,
+    /// When the venue last stated the order's kind.
+    pub kind: Option<DateTime<Utc>>,
+    /// When the venue last stated the order's time in force.
+    pub time_in_force: Option<DateTime<Utc>>,
+}
+
+impl TermsTimes {
+    /// Whether no term has been stated.
+    pub fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The terms of `stated` that a report stamped `time` speaks to: those last stated no later
+    /// than `time`.
+    fn in_sequence(&self, stated: ReportedTerms, time: DateTime<Utc>) -> ReportedTerms {
+        let current = |held: Option<DateTime<Utc>>| held.is_none_or(|held| time >= held);
+        ReportedTerms::NONE
+            .with_quantity(stated.quantity && current(self.quantity))
+            .with_price(stated.price && current(self.price))
+            .with_kind(stated.kind && current(self.kind))
+            .with_time_in_force(stated.time_in_force && current(self.time_in_force))
+    }
+
+    /// Record that the venue stated the terms of `stated` at `time`, never moving a time back.
+    fn stated_at(&mut self, stated: ReportedTerms, time: DateTime<Utc>) {
+        let advance = |held: &mut Option<DateTime<Utc>>, stated: bool| {
+            if stated {
+                *held = Some(held.map_or(time, |held| held.max(time)));
+            }
+        };
+        advance(&mut self.quantity, stated.quantity);
+        advance(&mut self.price, stated.price);
+        advance(&mut self.kind, stated.kind);
+        advance(&mut self.time_in_force, stated.time_in_force);
+    }
+}
 
 /// How many ended orders' [`ClientOrderId`]s an [`Orders`] remembers, so that a late active
 /// snapshot cannot track one again (see "Retired orders stay retired" on [`Orders`]).
@@ -196,11 +292,52 @@ where
 }
 
 impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
-    /// Track `orders`, remembering no retired ones.
+    /// Track `orders`, on the terms each holds, remembering no retired ones.
     pub fn new(
         orders: FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
     ) -> Self {
-        Self(orders, RecentlyRetired::default())
+        Self(
+            orders
+                .into_iter()
+                .map(|(cid, order)| (cid, TrackedOrder::new(order)))
+                .collect(),
+            RecentlyRetired::default(),
+        )
+    }
+
+    /// The order tracked under `cid`, with when the venue last stated its terms.
+    pub fn tracked(
+        &self,
+        cid: &ClientOrderId,
+    ) -> Option<&TrackedOrder<ExchangeKey, InstrumentKey>> {
+        self.0.get(cid)
+    }
+
+    /// The order tracked under `cid`.
+    pub fn get(
+        &self,
+        cid: &ClientOrderId,
+    ) -> Option<&Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
+        self.0.get(cid).map(|tracked| &tracked.order)
+    }
+
+    /// The tracked orders, by client order id, in no particular order.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &ClientOrderId,
+            &Order<ExchangeKey, InstrumentKey, ActiveOrderState>,
+        ),
+    > {
+        self.0.iter().map(|(cid, tracked)| (cid, &tracked.order))
+    }
+
+    /// The tracked orders, in no particular order.
+    pub fn values(
+        &self,
+    ) -> impl Iterator<Item = &Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
+        self.0.values().map(|tracked| &tracked.order)
     }
 
     /// Remove all tracked orders, discarding any pending state, and remember each as retired.
@@ -224,9 +361,9 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     /// exchange ([`ActiveOrderState::Open`]) is **not** in flight: nothing is owed in reply, and a
     /// limit order that never fills must not hold up a drain.
     pub fn has_request_in_flight(&self) -> bool {
-        self.0.values().any(|order| {
+        self.0.values().any(|tracked| {
             matches!(
-                order.state,
+                tracked.order.state,
                 ActiveOrderState::OpenInFlight(_)
                     | ActiveOrderState::CancelInFlight(_)
                     | ActiveOrderState::AmendInFlight(_)
@@ -250,7 +387,7 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         };
         self.0
             .get(&snapshot.key.cid)
-            .is_some_and(|order| match &order.state {
+            .is_some_and(|tracked| match &tracked.order.state {
                 ActiveOrderState::OpenInFlight(_) => false,
                 ActiveOrderState::Open(_) | ActiveOrderState::AmendInFlight(_) => true,
                 ActiveOrderState::CancelInFlight(cancel) => cancel.order.is_some(),
@@ -315,13 +452,13 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         cid: &ClientOrderId,
         id: &VenueOrderId,
     ) -> Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
-        match &self.0.get(cid)?.state {
+        match &self.0.get(cid)?.order.state {
             ActiveOrderState::Open(open)
             | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. })
                 if open.id.is_same_order_as(id) =>
             {
                 self.1.insert(cid.clone());
-                self.0.remove(cid)
+                self.0.remove(cid).map(|tracked| tracked.order)
             }
             _ => None,
         }
@@ -361,7 +498,7 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     where
         InstrumentKey: Debug,
     {
-        let Some(order) = self.0.get_mut(cid) else {
+        let Some(TrackedOrder { order, .. }) = self.0.get_mut(cid) else {
             return false;
         };
         // While an amend raising the quantity is in flight, the venue may already have made it and
@@ -449,7 +586,7 @@ where
         ExchangeKey: 'a,
         InstrumentKey: 'a,
     {
-        self.0.values()
+        self.0.values().map(|tracked| &tracked.order)
     }
 
     // One match over the tracked and the incoming state, an arm per pair. The lint counts each
@@ -475,7 +612,7 @@ where
         ) {
             // Order untracked: track it, or ignore it
             (Entry::Vacant(entry), update) => {
-                update_untracked(entry, &mut self.1, snapshot, update);
+                update_untracked(entry, &mut self.1, report, update);
                 return SnapshotApplied::default();
             }
 
@@ -484,7 +621,7 @@ where
             // that request's own, still in flight, which the refusal does end.
             (Entry::Occupied(entry), None)
                 if is_duplicate_cid_refusal(&snapshot.state)
-                    && !matches!(entry.get().state, ActiveOrderState::OpenInFlight(_)) =>
+                    && !matches!(entry.get().order.state, ActiveOrderState::OpenInFlight(_)) =>
             {
                 warn!(
                     exchange = ?snapshot.key.exchange,
@@ -507,7 +644,7 @@ where
                     update = ?snapshot,
                     "OrderManager received inactive order snapshot for tracked order - removing"
                 );
-                self.1.insert(entry.remove().key.cid);
+                self.1.insert(entry.remove().order.key.cid);
                 return SnapshotApplied::retired(OrderTermsApplied::default());
             }
 
@@ -515,7 +652,7 @@ where
             (Entry::Occupied(entry), Some(update)) => (entry, update),
         };
 
-        match (&current_entry.get().state, update.state) {
+        match (&current_entry.get().order.state, update.state) {
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
                 warn!(
                     exchange = ?snapshot.key.exchange,
@@ -538,12 +675,12 @@ where
                 );
                 // The venue's first report of the order: what it says of the terms is the first
                 // word the venue has given on them, so there is no earlier stamp to order against.
-                let terms = reconcile_terms(current_entry.get_mut(), report, None);
-                if nothing_left(&open, current_entry.get().quantity, &snapshot.key) {
-                    self.1.insert(current_entry.remove().key.cid);
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
+                if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
+                    self.1.insert(current_entry.remove().order.key.cid);
                     return SnapshotApplied::retired(terms);
                 }
-                current_entry.get_mut().state = ActiveOrderState::Open(open);
+                current_entry.get_mut().order.state = ActiveOrderState::Open(open);
                 SnapshotApplied::working(terms)
             }
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::CancelInFlight(update)) => {
@@ -555,7 +692,7 @@ where
                     update = ?snapshot,
                     "OrderManager transitioned an OpenInFlight order to CancelInFlight"
                 );
-                current_entry.get_mut().state = ActiveOrderState::CancelInFlight(update);
+                current_entry.get_mut().order.state = ActiveOrderState::CancelInFlight(update);
                 SnapshotApplied::default()
             }
             (ActiveOrderState::Open(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -592,15 +729,12 @@ where
                     return SnapshotApplied::default();
                 }
 
-                if current.is_superseded_by(&open) {
-                    // Terms are taken only from a report stamped no earlier than the state held: an
-                    // earlier one admitted for its higher fill may predate a change already applied.
-                    let terms = if open.time_exchange >= current.time_exchange {
-                        reconcile_terms(current_entry.get_mut(), report, None)
-                    } else {
-                        OrderTermsApplied::default()
-                    };
+                // Terms are ordered by their own time, whether or not the state supersedes the one
+                // held (see "Terms times" on `TrackedOrder`).
+                let superseded = current.is_superseded_by(&open);
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, None);
 
+                if superseded {
                     // A venue may report a completed fill as an Open snapshot with nothing left to
                     // fill, rather than as a distinct terminal state. That order is finished, so
                     // it stops being tracked -- exactly as the OpenInFlight -> Open arm above
@@ -612,7 +746,7 @@ where
                     // snapshot claiming a full fill does reach here: it reports a cumulative above
                     // a live order's, which is exactly the evidence the fill key tests for, and
                     // an order the venue has once reported complete cannot become live again.
-                    if nothing_left(&open, current_entry.get().quantity, &snapshot.key) {
+                    if nothing_left(&open, current_entry.get().order.quantity, &snapshot.key) {
                         debug!(
                             exchange = ?snapshot.key.exchange,
                             instrument = ?snapshot.key.instrument,
@@ -621,7 +755,7 @@ where
                             update = ?snapshot,
                             "OrderManager removing an Open order a more recent snapshot reports as fully filled"
                         );
-                        self.1.insert(current_entry.remove().key.cid);
+                        self.1.insert(current_entry.remove().order.key.cid);
                         return SnapshotApplied::retired(terms);
                     }
 
@@ -633,7 +767,7 @@ where
                         update = ?snapshot,
                         "OrderManager updating an Open order from a more recent snapshot"
                     );
-                    current_entry.get_mut().state = ActiveOrderState::Open(open);
+                    current_entry.get_mut().order.state = ActiveOrderState::Open(open);
                     SnapshotApplied::working(terms)
                 } else {
                     debug!(
@@ -642,9 +776,29 @@ where
                         strategy = %snapshot.key.strategy,
                         cid = %snapshot.key.cid,
                         update = ?snapshot,
-                        "OrderManager received an out of sequence Open order snapshot - ignoring"
+                        "OrderManager received an Open snapshot that does not supersede the state held - keeping the state, reading its terms"
                     );
-                    SnapshotApplied::default()
+                    // A quantity cut to what the state held has filled leaves nothing to fill.
+                    let tracked = &current_entry.get().order;
+                    let finished = !terms.changed.is_empty()
+                        && matches!(
+                            &tracked.state,
+                            ActiveOrderState::Open(held)
+                                if nothing_left(held, tracked.quantity, &snapshot.key)
+                        );
+                    if finished {
+                        debug!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            update = ?snapshot,
+                            "OrderManager removing an Open order whose adopted terms leave nothing to fill"
+                        );
+                        self.1.insert(current_entry.remove().order.key.cid);
+                        return SnapshotApplied::retired(terms);
+                    }
+                    SnapshotApplied::working(terms)
                 }
             }
             (ActiveOrderState::Open(current), ActiveOrderState::CancelInFlight(mut update)) => {
@@ -671,10 +825,11 @@ where
                     })
                     .unwrap_or_else(|| current.clone());
 
-                current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
-                    order: Some(latest_open),
-                    time_sent: update.time_sent,
-                });
+                current_entry.get_mut().order.state =
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: Some(latest_open),
+                        time_sent: update.time_sent,
+                    });
                 SnapshotApplied::default()
             }
             (ActiveOrderState::CancelInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -720,26 +875,18 @@ where
                     .order
                     .as_ref()
                     .is_none_or(|current| current.is_superseded_by(&update));
-                if !update_open_is_latest {
-                    return SnapshotApplied::default();
-                }
+                let time_sent = current.time_sent;
 
                 // Terms are adopted as for an `Open` order, but the order is not retired whatever
                 // they leave it: the cancel's answer ends it.
-                let in_sequence = current
-                    .order
-                    .as_ref()
-                    .is_none_or(|current| update.time_exchange >= current.time_exchange);
-                let time_sent = current.time_sent;
-                let terms = if in_sequence {
-                    reconcile_terms(current_entry.get_mut(), report, None)
-                } else {
-                    OrderTermsApplied::default()
-                };
-                current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
-                    order: Some(update),
-                    time_sent,
-                });
+                let terms = reconcile_terms(current_entry.get_mut(), report, &update, None);
+                if update_open_is_latest {
+                    current_entry.get_mut().order.state =
+                        ActiveOrderState::CancelInFlight(CancelInFlight {
+                            order: Some(update),
+                            time_sent,
+                        });
+                }
                 SnapshotApplied::working(terms)
             }
             (ActiveOrderState::CancelInFlight(_), ActiveOrderState::CancelInFlight(_)) => {
@@ -779,28 +926,25 @@ where
                     );
                     return SnapshotApplied::default();
                 }
-                if !current.order.is_superseded_by(&open) {
+                let superseded = current.order.is_superseded_by(&open);
+                // Nothing is adopted while the amend is in flight: its answer settles the terms. A
+                // report matching neither the order before the amend nor after it is reported.
+                let patch = current.patch;
+                let terms = reconcile_terms(current_entry.get_mut(), report, &open, Some(&patch));
+                if !superseded {
                     debug!(
                         exchange = ?snapshot.key.exchange,
                         instrument = ?snapshot.key.instrument,
                         strategy = %snapshot.key.strategy,
                         cid = %snapshot.key.cid,
                         update = ?snapshot,
-                        "OrderManager received an out of sequence Open order snapshot for an AmendInFlight - ignoring"
+                        "OrderManager received an Open snapshot that does not supersede the AmendInFlight state held - keeping the state, comparing its terms"
                     );
-                    return SnapshotApplied::default();
+                    return SnapshotApplied::working(terms);
                 }
-                // Nothing is adopted while the amend is in flight: its answer settles the terms. A
-                // report matching neither the order before the amend nor after it is reported.
-                let patch = current.patch;
-                let terms = if open.time_exchange >= current.order.time_exchange {
-                    reconcile_terms(current_entry.get_mut(), report, Some(&patch))
-                } else {
-                    OrderTermsApplied::default()
-                };
                 // The venue may already have made a raise and filled beyond the old total, as in
                 // `update_from_fill`.
-                let tracked = current_entry.get().quantity;
+                let tracked = current_entry.get().order.quantity;
                 let quantity = patch
                     .quantity
                     .map_or(tracked, |amended| amended.max(tracked));
@@ -813,10 +957,12 @@ where
                         update = ?snapshot,
                         "OrderManager removing an AmendInFlight order a more recent snapshot reports as fully filled"
                     );
-                    self.1.insert(current_entry.remove().key.cid);
+                    self.1.insert(current_entry.remove().order.key.cid);
                     return SnapshotApplied::retired(terms);
                 }
-                if let ActiveOrderState::AmendInFlight(amend) = &mut current_entry.get_mut().state {
+                if let ActiveOrderState::AmendInFlight(amend) =
+                    &mut current_entry.get_mut().order.state
+                {
                     amend.order = open;
                 }
                 SnapshotApplied::working(terms)
@@ -843,10 +989,11 @@ where
                     })
                     .unwrap_or_else(|| current.clone());
 
-                current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
-                    order: Some(latest_open),
-                    time_sent: update.time_sent,
-                });
+                current_entry.get_mut().order.state =
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: Some(latest_open),
+                        time_sent: update.time_sent,
+                    });
                 SnapshotApplied::default()
             }
             // An amend is recorded only by `record_in_flight_amend`, never by a snapshot.
@@ -882,7 +1029,7 @@ where
             return;
         };
 
-        match (&order.get().state, &response.state) {
+        match (&order.get().order.state, &response.state) {
             (
                 ActiveOrderState::OpenInFlight(_)
                 | ActiveOrderState::Open(_)
@@ -897,7 +1044,7 @@ where
                     update = ?response,
                     "OrderManager received Ok(Cancelled) for tracked order not CancelInFlight - removing"
                 );
-                self.1.insert(order.remove().key.cid);
+                self.1.insert(order.remove().order.key.cid);
             }
             (ActiveOrderState::CancelInFlight(_), Ok(_)) => {
                 debug!(
@@ -908,7 +1055,7 @@ where
                     update = ?response,
                     "OrderManager received Ok(Cancelled) for tracked order CancelInFlight - removing"
                 );
-                self.1.insert(order.remove().key.cid);
+                self.1.insert(order.remove().order.key.cid);
             }
             (
                 ActiveOrderState::OpenInFlight(_)
@@ -931,7 +1078,7 @@ where
                 if let Some(open) = &in_flight_cancel.order {
                     // Terms adopted behind the cancel may have left the order nothing to fill,
                     // which the cancel's answer was to settle. Refused, the order has ended.
-                    if nothing_left(open, order.get().quantity, &response.key) {
+                    if nothing_left(open, order.get().order.quantity, &response.key) {
                         debug!(
                             exchange = ?response.key.exchange,
                             instrument = ?response.key.instrument,
@@ -940,7 +1087,7 @@ where
                             ?error,
                             "OrderManager received Err(Cancelled) for an order with nothing left to fill - removing"
                         );
-                        self.1.insert(order.remove().key.cid);
+                        self.1.insert(order.remove().order.key.cid);
                         return;
                     }
                     debug!(
@@ -952,7 +1099,7 @@ where
                         ?error,
                         "OrderManager received Err(Cancelled) for previously Open order - setting Open"
                     );
-                    order.get_mut().state = ActiveOrderState::Open(open.clone())
+                    order.get_mut().order.state = ActiveOrderState::Open(open.clone())
                 } else {
                     debug!(
                         exchange = ?response.key.exchange,
@@ -1006,7 +1153,7 @@ where
                 return;
             }
             Err(error) => {
-                if let ActiveOrderState::AmendInFlight(amend) = &entry.get().state {
+                if let ActiveOrderState::AmendInFlight(amend) = &entry.get().order.state {
                     debug!(
                         exchange = ?response.key.exchange,
                         instrument = ?response.key.instrument,
@@ -1018,7 +1165,7 @@ where
                     let open = amend.order.clone();
                     // A fill can reach the old total while a raise is in flight: refused, the
                     // raise leaves the order with nothing to fill.
-                    if open.quantity_remaining(entry.get().quantity) <= Decimal::ZERO {
+                    if open.quantity_remaining(entry.get().order.quantity) <= Decimal::ZERO {
                         debug!(
                             exchange = ?response.key.exchange,
                             instrument = ?response.key.instrument,
@@ -1026,10 +1173,10 @@ where
                             cid = %response.key.cid,
                             "OrderManager removing an order filled while its refused amend was in flight"
                         );
-                        self.1.insert(entry.remove().key.cid);
+                        self.1.insert(entry.remove().order.key.cid);
                         return;
                     }
-                    entry.get_mut().state = ActiveOrderState::Open(open);
+                    entry.get_mut().order.state = ActiveOrderState::Open(open);
                 } else {
                     debug!(
                         exchange = ?response.key.exchange,
@@ -1037,7 +1184,7 @@ where
                         strategy = %response.key.strategy,
                         cid = %response.key.cid,
                         ?error,
-                        state = ?entry.get().state,
+                        state = ?entry.get().order.state,
                         "OrderManager received a refused amend for an order not AmendInFlight - ignoring"
                     );
                 }
@@ -1045,7 +1192,7 @@ where
             }
         };
 
-        let order = entry.get_mut();
+        let order = &mut entry.get_mut().order;
         let held = match &mut order.state {
             ActiveOrderState::OpenInFlight(_) => {
                 warn!(
@@ -1121,7 +1268,7 @@ where
                 update = ?response,
                 "OrderManager removing an order its amend left with nothing to fill"
             );
-            self.1.insert(entry.remove().key.cid);
+            self.1.insert(entry.remove().order.key.cid);
             return;
         }
 
@@ -1133,21 +1280,36 @@ where
             update = ?response,
             "OrderManager applied an amend"
         );
+        let time_exchange = open.time_exchange;
         match &mut order.state {
             ActiveOrderState::CancelInFlight(cancel) => cancel.order = Some(open),
             state => *state = ActiveOrderState::Open(open),
         }
+        // The venue's answer states the terms just applied, at the time of the state it gives:
+        // the whole order except its time in force, which an amend does not change.
+        entry
+            .get_mut()
+            .terms_times
+            .stated_at(ReportedTerms::ALL.with_time_in_force(false), time_exchange);
     }
 }
 
-/// Reconcile `order`'s terms with those `report` states (see [`terms`]), writing what is adopted
-/// onto `order`.
+/// Reconcile `tracked_order`'s terms with those `report` states (see [`terms`]), writing what is
+/// adopted onto its order. `open` is the report's state, which the caller has not yet applied.
+///
+/// A stated term is not read when the report is stamped earlier than the venue last stated that
+/// term (see "Terms times" on [`TrackedOrder`]). No term is read when the report reports less
+/// filled than the state held: fills only grow, so such a report predates that state whatever its
+/// stamp says. A term read with no amend in flight records the report's time, even when it
+/// changes nothing: it says the value held was still the venue's then.
 ///
 /// With `amend` set, an amend is in flight: nothing is adopted, and the report is compared with
-/// the order before and after the amend.
+/// the order before and after the amend. The terms times are left as they are, since the amend's
+/// answer settles the terms.
 fn reconcile_terms<ExchangeKey, AssetKey, InstrumentKey>(
-    order: &mut Order<ExchangeKey, InstrumentKey, ActiveOrderState>,
+    tracked_order: &mut TrackedOrder<ExchangeKey, InstrumentKey>,
     report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
+    open: &Open,
     amend: Option<&AmendPatch>,
 ) -> OrderTermsApplied<ExchangeKey, InstrumentKey>
 where
@@ -1158,24 +1320,58 @@ where
     if report.reported.is_none() {
         return applied;
     }
-    let tracked = OrderTerms::of(order);
+    let behind_held = tracked_order
+        .order
+        .state
+        .open_meta()
+        .is_some_and(|held| open.filled_quantity < held.filled_quantity);
+    let stated = if behind_held {
+        ReportedTerms::NONE
+    } else {
+        tracked_order
+            .terms_times
+            .in_sequence(report.reported, open.time_exchange)
+    };
+    if stated != report.reported {
+        let key = &tracked_order.order.key;
+        debug!(
+            exchange = ?key.exchange,
+            instrument = ?key.instrument,
+            strategy = %key.strategy,
+            cid = %key.cid,
+            reported = ?report.reported,
+            read = ?stated,
+            behind_held,
+            "OrderManager received terms older than those it holds for an order - not reading them"
+        );
+    }
+    if stated.is_none() {
+        return applied;
+    }
+    if amend.is_none() {
+        tracked_order
+            .terms_times
+            .stated_at(stated, open.time_exchange);
+    }
+    let order = &mut tracked_order.order;
+    let held_terms = OrderTerms::of(order);
     let reported = OrderTerms::of(&report.order);
-    let Reconciled { terms, diverged } = reconcile(&tracked, &reported, report.reported, amend);
+    let Reconciled { terms, diverged } = reconcile(&held_terms, &reported, stated, amend);
 
-    if terms != tracked {
+    if terms != held_terms {
         terms.apply_to(order);
         info!(
             exchange = ?order.key.exchange,
             instrument = ?order.key.instrument,
             strategy = %order.key.strategy,
             cid = %order.key.cid,
-            from = ?tracked,
+            from = ?held_terms,
             to = ?terms,
             "OrderManager adopted the terms a venue reported for an order it tracks"
         );
         applied.changed.push(OrderTermsChanged {
             key: order.key.clone(),
-            from: tracked,
+            from: held_terms,
             to: terms,
         });
     }
@@ -1253,15 +1449,16 @@ fn is_duplicate_cid_refusal<AssetKey, InstrumentKey>(
 /// does. Any other active state for a remembered id is a late report and is ignored. A snapshot
 /// saying the order has ended is remembered, so a late report of it cannot track it either.
 fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
-    entry: VacantEntry<'_, ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+    entry: VacantEntry<'_, ClientOrderId, TrackedOrder<ExchangeKey, InstrumentKey>>,
     retired: &mut RecentlyRetired,
-    snapshot: &Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
+    report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
     update: Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
 ) where
     ExchangeKey: Debug,
     AssetKey: Debug,
     InstrumentKey: Debug,
 {
+    let snapshot = &report.order;
     let cid = &snapshot.key.cid;
     match update {
         // Input Snapshot is InactiveOrderState (ie/ finished), so ignore
@@ -1332,7 +1529,13 @@ fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
                 if matches!(update.state, ActiveOrderState::OpenInFlight(_)) {
                     retired.forget(cid);
                 }
-                entry.insert(update);
+                // A venue's report stating terms is the first word on them, at its own time.
+                let stated_at = update.state.open_meta().map(|open| open.time_exchange);
+                let mut tracked = TrackedOrder::new(update);
+                if let Some(time) = stated_at {
+                    tracked.terms_times.stated_at(report.reported, time);
+                }
+                entry.insert(tracked);
             }
         },
     }
@@ -1349,7 +1552,7 @@ where
         request: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
         time_sent: DateTime<Utc>,
     ) {
-        let Some(order) = self.0.get_mut(&request.key.cid) else {
+        let Some(TrackedOrder { order, .. }) = self.0.get_mut(&request.key.cid) else {
             error!(
                 cid = %request.key.cid,
                 event = ?request,
@@ -1397,7 +1600,7 @@ where
                 // A new order by the engine's own hand, so its snapshots apply even under a
                 // client id that named a retired order.
                 self.1.forget(&request.key.cid);
-                entry.insert(Order::open_in_flight(request, time_sent));
+                entry.insert(TrackedOrder::new(Order::open_in_flight(request, time_sent)));
             }
         }
     }
@@ -1407,7 +1610,7 @@ where
         request: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
         time_sent: DateTime<Utc>,
     ) {
-        let Some(order) = self.0.get_mut(&request.key.cid) else {
+        let Some(TrackedOrder { order, .. }) = self.0.get_mut(&request.key.cid) else {
             error!(
                 cid = %request.key.cid,
                 event = ?request,
@@ -2817,7 +3020,7 @@ mod tests {
         state.update_from_state_only_snapshot(order_snapshot_outcome_unknown(cid.clone()).as_ref());
         assert!(
             matches!(
-                state.0.get(&cid).map(|order| &order.state),
+                state.get(&cid).map(|order| &order.state),
                 Some(ActiveOrderState::OpenInFlight(_))
             ),
             "an unknown outcome leaves the order in flight"
@@ -2826,7 +3029,7 @@ mod tests {
         state.update_from_state_only_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
         assert!(
             matches!(
-                state.0.get(&cid).map(|order| &order.state),
+                state.get(&cid).map(|order| &order.state),
                 Some(ActiveOrderState::Open(_))
             ),
             "the venue holds the order live, so the engine must track it"
@@ -2848,7 +3051,7 @@ mod tests {
             state.update_from_state_only_snapshot(
                 order_snapshot_outcome_unknown(cid.clone()).as_ref(),
             );
-            assert_eq!(state.0.get(&cid).map(|order| &order.state), Some(&tracked));
+            assert_eq!(state.get(&cid).map(|order| &order.state), Some(&tracked));
         }
 
         let cid = ClientOrderId::new("untracked");
@@ -2893,7 +3096,7 @@ mod tests {
                     order_snapshot_open_failed(cid.clone(), error.clone()).as_ref(),
                 );
                 assert_eq!(
-                    state.0.get(&cid).map(|order| &order.state),
+                    state.get(&cid).map(|order| &order.state),
                     Some(&tracked),
                     "{error:?} must not end {tracked:?}"
                 );
@@ -2946,10 +3149,10 @@ mod tests {
         let mut state = orders(cids.iter().map(open_order));
         state.0.insert(
             acked_filled.clone(),
-            order(
+            TrackedOrder::new(order(
                 acked_filled.clone(),
                 ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
-            ),
+            )),
         );
 
         // An `Open` with nothing left to fill, acknowledging an open request and updating an open
@@ -3015,7 +3218,7 @@ mod tests {
 
         assert!(
             matches!(
-                state.0.get(&cid).map(|order| &order.state),
+                state.get(&cid).map(|order| &order.state),
                 Some(ActiveOrderState::Open(_))
             ),
             "the tracked order is still the open one"
@@ -3050,7 +3253,7 @@ mod tests {
 
         assert!(
             matches!(
-                state.0.get(&working).map(|order| &order.state),
+                state.get(&working).map(|order| &order.state),
                 Some(ActiveOrderState::Open(_))
             ),
             "the order the venue holds keeps working"
@@ -3076,7 +3279,7 @@ mod tests {
         state.update_from_state_only_snapshot(order_snapshot_open(reused.clone(), time).as_ref());
         assert!(
             matches!(
-                state.0.get(&reused).map(|order| &order.state),
+                state.get(&reused).map(|order| &order.state),
                 Some(ActiveOrderState::Open(_))
             ),
             "a new open request under the id is a new order"
@@ -3108,7 +3311,7 @@ mod tests {
         state.update_from_state_only_snapshot(order_snapshot_cancelled(retired.clone()).as_ref());
 
         assert!(state.1.contains(&retired));
-        assert_eq!(state, orders(state.0.values().cloned()));
+        assert_eq!(state, orders(state.values().cloned()));
 
         let (Ok(json), Ok(map_json)) =
             (serde_json::to_value(&state), serde_json::to_value(&state.0))
@@ -3243,7 +3446,7 @@ mod tests {
         fn tracked_order(
             orders: &Orders<ExchangeId, u64>,
         ) -> &Order<ExchangeId, u64, ActiveOrderState> {
-            orders.0.get(&cid()).expect("tracked")
+            orders.get(&cid()).expect("tracked")
         }
 
         #[test]
@@ -3610,7 +3813,20 @@ mod tests {
         fn tracked_order(
             orders: &Orders<ExchangeId, u64>,
         ) -> &Order<ExchangeId, u64, ActiveOrderState> {
-            orders.0.get(&cid()).expect("tracked")
+            orders.get(&cid()).expect("tracked")
+        }
+
+        fn times(orders: &Orders<ExchangeId, u64>) -> TermsTimes {
+            orders.tracked(&cid()).expect("tracked").terms_times()
+        }
+
+        fn all_at(secs: i64) -> TermsTimes {
+            TermsTimes {
+                quantity: Some(t(secs)),
+                price: Some(t(secs)),
+                kind: Some(t(secs)),
+                time_in_force: Some(t(secs)),
+            }
         }
 
         fn terms_of(
@@ -3664,12 +3880,20 @@ mod tests {
             assert_eq!(order.state, ActiveOrderState::Open(open_at(1, dec!(1))));
         }
 
-        /// A report stamped earlier than the state held is admitted for its higher fill, but its
-        /// terms may predate a change already applied, so none is taken from it. One reporting
-        /// less filled is not admitted at all.
+        /// A report stamped earlier than the terms held is admitted for its higher fill, but its
+        /// terms may predate those, so none is taken from it. One reporting less filled than the
+        /// state held predates that state whatever its stamp, so its terms are not taken either.
         #[test]
         fn an_earlier_or_out_of_sequence_report_changes_no_terms() {
-            let mut orders = tracked(ActiveOrderState::Open(open_at(5, dec!(0))), dec!(1));
+            let mut orders = tracked(ActiveOrderState::Open(open_at(0, dec!(0))), dec!(1));
+            // The venue states the terms held, at 5.
+            let applied = apply(
+                &mut orders,
+                &report(open_at(5, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
+            );
+            assert_eq!(applied, SnapshotApplied::default());
+            assert_eq!(times(&orders), all_at(5));
+
             let applied = apply(
                 &mut orders,
                 &report(open_at(1, dec!(0.5)), dec!(2), dec!(3), ReportedTerms::ALL),
@@ -3678,6 +3902,7 @@ mod tests {
             let order = tracked_order(&orders);
             assert_eq!((order.price, order.quantity), (Some(dec!(1)), dec!(1)));
             assert_eq!(order.state, ActiveOrderState::Open(open_at(1, dec!(0.5))));
+            assert_eq!(times(&orders), all_at(5));
 
             let applied = apply(
                 &mut orders,
@@ -3685,6 +3910,343 @@ mod tests {
             );
             assert_eq!(applied, SnapshotApplied::default());
             assert_eq!(tracked_order(&orders).quantity, dec!(1));
+            assert_eq!(times(&orders), all_at(5));
+        }
+
+        /// A report stating no terms does not hide a change. A venue's report of new terms,
+        /// stamped earlier than a state-only report already applied (one from another path,
+        /// stamped later), still changes them, while the state held stays. An older report of the
+        /// old terms then does not undo the change.
+        #[test]
+        fn a_state_only_report_does_not_hide_an_earlier_stamped_change() {
+            let mut orders = tracked(ActiveOrderState::Open(open_at(0, dec!(0))), dec!(1));
+            apply(
+                &mut orders,
+                &report(open_at(5, dec!(0)), dec!(1), dec!(1), ReportedTerms::NONE),
+            );
+
+            let applied = apply(
+                &mut orders,
+                &report(open_at(3, dec!(0)), dec!(2), dec!(3), ReportedTerms::ALL),
+            );
+            assert_eq!(
+                applied,
+                SnapshotApplied::working(terms_of(
+                    changed(limit(dec!(1), dec!(1)), limit(dec!(2), dec!(3))),
+                    None
+                ))
+            );
+            let order = tracked_order(&orders);
+            assert_eq!((order.price, order.quantity), (Some(dec!(2)), dec!(3)));
+            assert_eq!(order.state, ActiveOrderState::Open(open_at(5, dec!(0))));
+            assert_eq!(times(&orders), all_at(3));
+
+            let applied = apply(
+                &mut orders,
+                &report(open_at(2, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
+            );
+            assert_eq!(applied, SnapshotApplied::default());
+            let order = tracked_order(&orders);
+            assert_eq!((order.price, order.quantity), (Some(dec!(2)), dec!(3)));
+        }
+
+        /// A change from a report whose state does not supersede the one held still retires the
+        /// order when it cuts the quantity to what the state held has filled.
+        #[test]
+        fn an_out_of_sequence_cut_to_what_filled_retires_the_order() {
+            let mut orders = tracked(ActiveOrderState::Open(open_at(5, dec!(0.5))), dec!(1));
+            let applied = apply(
+                &mut orders,
+                &report(
+                    open_at(3, dec!(0.5)),
+                    dec!(1),
+                    dec!(0.5),
+                    ReportedTerms::ALL,
+                ),
+            );
+            assert_eq!(
+                applied,
+                SnapshotApplied::retired(terms_of(
+                    changed(limit(dec!(1), dec!(1)), limit(dec!(1), dec!(0.5))),
+                    None
+                ))
+            );
+            assert!(orders.0.is_empty());
+
+            // One left something to fill keeps the order and the state held.
+            let mut orders = tracked(ActiveOrderState::Open(open_at(5, dec!(0.5))), dec!(1));
+            let applied = apply(
+                &mut orders,
+                &report(open_at(3, dec!(0.5)), dec!(1), dec!(2), ReportedTerms::ALL),
+            );
+            assert!(!applied.retired);
+            assert_eq!(
+                tracked_order(&orders).state,
+                ActiveOrderState::Open(open_at(5, dec!(0.5)))
+            );
+            assert_eq!(tracked_order(&orders).quantity, dec!(2));
+        }
+
+        /// A report stating no terms leaves the terms times as they are, and one stating a term
+        /// moves that term's time to its own, even when it changes nothing.
+        #[test]
+        fn only_a_report_stating_a_term_records_its_time() {
+            let mut orders = tracked(ActiveOrderState::Open(open_at(0, dec!(0))), dec!(1));
+            assert_eq!(times(&orders), TermsTimes::default());
+            apply(
+                &mut orders,
+                &report(open_at(1, dec!(0)), dec!(1), dec!(1), ReportedTerms::NONE),
+            );
+            assert_eq!(times(&orders), TermsTimes::default());
+            apply(
+                &mut orders,
+                &report(
+                    open_at(2, dec!(0)),
+                    dec!(1),
+                    dec!(1),
+                    ReportedTerms::NONE.with_price(true),
+                ),
+            );
+            assert_eq!(
+                times(&orders),
+                TermsTimes {
+                    price: Some(t(2)),
+                    ..TermsTimes::default()
+                }
+            );
+        }
+
+        /// An untracked order tracked from a report stating its terms holds them from that
+        /// report's time; one tracked from a report stating none holds no terms time.
+        #[test]
+        fn an_order_tracked_from_a_report_stating_terms_holds_their_time() {
+            let mut orders = Orders::<ExchangeId, u64>::default();
+            apply(
+                &mut orders,
+                &report(open_at(4, dec!(0)), dec!(2), dec!(3), ReportedTerms::ALL),
+            );
+            assert_eq!(times(&orders), all_at(4));
+            let applied = apply(
+                &mut orders,
+                &report(open_at(2, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
+            );
+            assert_eq!(applied, SnapshotApplied::default());
+            assert_eq!(tracked_order(&orders).quantity, dec!(3));
+
+            let mut orders = Orders::<ExchangeId, u64>::default();
+            apply(
+                &mut orders,
+                &report(open_at(4, dec!(0)), dec!(2), dec!(3), ReportedTerms::NONE),
+            );
+            assert_eq!(times(&orders), TermsTimes::default());
+        }
+
+        /// The venue's answer to an amend states the terms it commits, at the time of the state it
+        /// gives: a report stamped earlier, of the terms before the amend, does not undo them.
+        #[test]
+        fn an_amend_answer_records_the_time_of_its_terms() {
+            use rustrade_execution::order::{amend::Amended, request::OrderResponseAmend};
+
+            let mut orders = tracked(ActiveOrderState::Open(open_at(0, dec!(0))), dec!(1));
+            let patch = AmendPatch::default().with_price(dec!(2));
+            let current = order(cid(), ());
+            orders.record_in_flight_amend(
+                &OrderRequestAmend {
+                    key: current.key.clone(),
+                    state: RequestAmend::new(
+                        VenueOrderId::Assigned(OrderId::new("1")),
+                        patch,
+                        AmendTarget {
+                            side: current.side,
+                            price: current.price,
+                            quantity: current.quantity,
+                            kind: current.kind,
+                            time_in_force: current.time_in_force,
+                            reduce_only: Some(ReduceOnly::No),
+                        },
+                        Decimal::ZERO,
+                    ),
+                },
+                TIME_SENT,
+            );
+            // A report while the amend is in flight does not move the terms time.
+            apply(
+                &mut orders,
+                &report(open_at(3, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
+            );
+            assert_eq!(times(&orders), TermsTimes::default());
+
+            orders.update_from_amend_response(&OrderResponseAmend::<ExchangeId, u64, u64> {
+                key: current.key,
+                state: Ok(Amended::new(
+                    open_at(6, dec!(0)),
+                    Some(dec!(2)),
+                    dec!(1),
+                    OrderKind::Limit,
+                    None,
+                )),
+            });
+            assert_eq!(
+                times(&orders),
+                TermsTimes {
+                    time_in_force: None,
+                    ..all_at(6)
+                }
+            );
+
+            let applied = apply(
+                &mut orders,
+                &report(open_at(4, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
+            );
+            assert_eq!(applied, SnapshotApplied::default());
+            assert_eq!(tracked_order(&orders).price, Some(dec!(2)));
+        }
+
+        /// A tracked order serializes as the order's own fields, with its terms times beside them
+        /// only once one is set, so an order serialized before the field existed reads back with
+        /// none. An `Orders` holding one round-trips whole, as a restored engine reads it.
+        #[test]
+        fn a_tracked_order_serializes_as_its_order_with_its_terms_times_beside_it() {
+            let order = Order {
+                quantity: dec!(1),
+                ..order(cid(), ActiveOrderState::Open(open_at(0, dec!(0))))
+            };
+            let order_json = serde_json::to_value(&order).unwrap();
+            // The flattened layout relies on the order having no field of the same name.
+            assert!(order_json.get("terms_times").is_none(), "{order_json}");
+
+            let untimed = TrackedOrder::new(order.clone());
+            let json = serde_json::to_value(&untimed).unwrap();
+            assert_eq!(json, order_json);
+            assert_eq!(
+                serde_json::from_value::<TrackedOrder<ExchangeId, u64>>(json).unwrap(),
+                untimed
+            );
+
+            let mut timed = untimed;
+            timed
+                .terms_times
+                .stated_at(ReportedTerms::NONE.with_price(true), t(7));
+            let json = serde_json::to_value(&timed).unwrap();
+            assert_eq!(
+                json["terms_times"]["price"],
+                serde_json::to_value(t(7)).unwrap()
+            );
+            assert_eq!(
+                serde_json::from_value::<TrackedOrder<ExchangeId, u64>>(json).unwrap(),
+                timed
+            );
+
+            let mut orders = Orders::<ExchangeId, u64>::default();
+            orders.0.insert(cid(), timed.clone());
+            let restored: Orders<ExchangeId, u64> =
+                serde_json::from_str(&serde_json::to_string(&orders).unwrap()).unwrap();
+            assert_eq!(restored, orders);
+            assert_eq!(times(&restored), timed.terms_times());
+
+            // A time is never moved back.
+            timed
+                .terms_times
+                .stated_at(ReportedTerms::NONE.with_price(true), t(3));
+            assert_eq!(timed.terms_times().price, Some(t(7)));
+        }
+
+        /// A report stating only some terms says nothing of when the others last changed: a later
+        /// report stating only the price does not hide an earlier-stamped report of a new
+        /// quantity, while that report's older price is not read.
+        #[test]
+        fn a_report_stating_some_terms_does_not_hide_an_earlier_change_to_others() {
+            let mut orders = tracked(ActiveOrderState::Open(open_at(0, dec!(0))), dec!(1));
+            apply(
+                &mut orders,
+                &report(
+                    open_at(5, dec!(0)),
+                    dec!(1),
+                    dec!(1),
+                    ReportedTerms::NONE.with_price(true),
+                ),
+            );
+
+            let applied = apply(
+                &mut orders,
+                &report(open_at(3, dec!(0)), dec!(2), dec!(3), ReportedTerms::ALL),
+            );
+            assert_eq!(
+                applied,
+                SnapshotApplied::working(terms_of(
+                    changed(limit(dec!(1), dec!(1)), limit(dec!(1), dec!(3))),
+                    None
+                ))
+            );
+            let order = tracked_order(&orders);
+            assert_eq!((order.price, order.quantity), (Some(dec!(1)), dec!(3)));
+            assert_eq!(
+                times(&orders),
+                TermsTimes {
+                    price: Some(t(5)),
+                    ..all_at(3)
+                }
+            );
+        }
+
+        /// Behind a cancel in flight, a report whose state does not supersede the one the cancel
+        /// carries still changes the terms, and the state carried stays.
+        #[test]
+        fn an_out_of_sequence_report_behind_a_cancel_changes_the_terms_and_keeps_the_state() {
+            let held = ActiveOrderState::CancelInFlight(CancelInFlight::new(
+                Some(open_at(5, dec!(0))),
+                TIME_SENT,
+            ));
+            let mut orders = tracked(held.clone(), dec!(1));
+            let applied = apply(
+                &mut orders,
+                &report(open_at(3, dec!(0)), dec!(1), dec!(2), ReportedTerms::ALL),
+            );
+            assert_eq!(
+                applied,
+                SnapshotApplied::working(terms_of(
+                    changed(limit(dec!(1), dec!(1)), limit(dec!(1), dec!(2))),
+                    None
+                ))
+            );
+            let order = tracked_order(&orders);
+            assert_eq!(order.quantity, dec!(2));
+            assert_eq!(order.state, held);
+        }
+
+        /// While an amend is in flight, a report whose state does not supersede the one held is
+        /// still compared with the order before and after the amend: terms matching neither are
+        /// reported, nothing is adopted, and the state held stays.
+        #[test]
+        fn an_out_of_sequence_report_during_an_amend_is_compared_and_keeps_the_state() {
+            let patch = AmendPatch::default().with_quantity(dec!(3));
+            let held = ActiveOrderState::AmendInFlight(AmendInFlight {
+                order: open_at(5, dec!(0)),
+                patch,
+                time_sent: TIME_SENT,
+            });
+            let mut orders = tracked(held.clone(), dec!(1));
+            let applied = apply(
+                &mut orders,
+                &report(open_at(3, dec!(0)), dec!(1), dec!(4), ReportedTerms::ALL),
+            );
+            assert_eq!(
+                applied,
+                SnapshotApplied::working(terms_of(
+                    None,
+                    Some(OrderTermsDiverged {
+                        key: order(cid(), ()).key,
+                        tracked: limit(dec!(1), dec!(1)),
+                        reported: limit(dec!(1), dec!(4)),
+                        terms: ReportedTerms::NONE.with_quantity(true),
+                        amend_in_flight: true,
+                    })
+                ))
+            );
+            let order = tracked_order(&orders);
+            assert_eq!(order.quantity, dec!(1));
+            assert_eq!(order.state, held);
+            assert_eq!(times(&orders), TermsTimes::default());
         }
 
         /// A venue resizing an order to what filled completes it, and one reporting more filled
@@ -3773,13 +4335,18 @@ mod tests {
                 );
             }
 
-            // An earlier-stamped report behind a cancel: its fill is taken, its terms are not.
+            // A report stamped earlier than the terms held, behind a cancel: its fill is taken,
+            // its terms are not.
             let mut orders = tracked(
                 ActiveOrderState::CancelInFlight(CancelInFlight::new(
                     Some(open_at(5, dec!(0))),
                     TIME_SENT,
                 )),
                 dec!(1),
+            );
+            apply(
+                &mut orders,
+                &report(open_at(5, dec!(0)), dec!(1), dec!(1), ReportedTerms::ALL),
             );
             let applied = apply(
                 &mut orders,

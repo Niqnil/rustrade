@@ -69,8 +69,13 @@ where
     ///
     /// Terms are adopted:
     /// - from the venue's first report of an order whose open is in flight;
-    /// - from a snapshot superseding the `Open` state held, unless it is stamped earlier than that
-    ///   state: one admitted for a higher fill alone may predate a change already applied;
+    /// - from a later snapshot reporting no less filled than the state held, each stated term
+    ///   only when the snapshot is stamped no earlier than the venue last stated that term,
+    ///   whether or not its state supersedes the one held (see "Terms times" on
+    ///   [`TrackedOrder`](super::TrackedOrder)). A snapshot stating no terms, or only some,
+    ///   stamped later on another path, so cannot hide a change. A change from a snapshot
+    ///   whose state does not supersede the one held still retires an order it leaves nothing to
+    ///   fill;
     /// - likewise behind a cancel in flight, though the order is not retired there: the cancel's
     ///   answer ends it.
     ///

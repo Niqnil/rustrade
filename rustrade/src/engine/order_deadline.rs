@@ -83,7 +83,7 @@ where
             .state
             .instruments
             .get_index(&key.instrument)
-            .and_then(|instrument| instrument.orders.0.get(&key.cid))
+            .and_then(|instrument| instrument.orders.get(&key.cid))
             .map(|order| &order.state);
         match state {
             None => OrderDeadlineOutput::NotTracked(key.clone()),
@@ -114,7 +114,7 @@ where
                 .state
                 .instruments
                 .get_index(instrument)
-                .and_then(|state| state.orders.0.get(cid))
+                .and_then(|state| state.orders.get(cid))
                 .map(|order| &order.state);
             match state {
                 Some(ActiveOrderState::OpenInFlight(_)) => true,
@@ -144,7 +144,7 @@ where
             .state
             .instruments
             .get_index(&instrument)
-            .and_then(|state| state.orders.0.get(cid))
+            .and_then(|state| state.orders.get(cid))
             .and_then(|order| order.to_request_cancel());
         self.send_cancel_requests(request)
     }
