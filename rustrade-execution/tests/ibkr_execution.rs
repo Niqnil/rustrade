@@ -67,6 +67,7 @@
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
 //! | `test_gtd_expiry_reads_back_after_a_restart` | A GTD expiry parsed from IB's open and completed orders by clients that never saw the order |
+//! | `test_a_modify_made_away_is_reported_after_a_restart` | A modify made while disconnected is listed, and stated on the stream, after a restart |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
@@ -1824,6 +1825,173 @@ async fn test_gtd_expiry_reads_back_after_a_restart() {
     assert_eq!(
         ended.time_in_force, time_in_force,
         "read from IB's completed orders"
+    );
+}
+
+/// An order modified in place while no client of its API client id is connected, as by hand while
+/// the gateway is logged out, is reported with its new terms after a restart: by the open-order
+/// listing, and on the account stream, whose report of the status IB sends after its copy of the
+/// listed order states them.
+///
+/// The modify is made by a raw `ibapi` client under the same API client id, since IB lets no other
+/// API client modify the order. The first listing reads the order back and adopts it; the second
+/// is copied onto the stream with the order tracked, so the stream restates it. Outside regular
+/// trading hours too: the order rests far from the market.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_modify_made_away_is_reported_after_a_restart() {
+    use ibapi::orders::{Orders, PlaceOrder};
+    use rustrade_execution::order::report::ReportedTerms;
+    const OFFSET: i32 = 34;
+
+    init_logging();
+    let aapl = aapl_instrument();
+    let strategy = StrategyId::new("test-modify-read-back");
+    let client = connect_client(resolved_aapl_config(OFFSET))
+        .await
+        .expect("connection failed");
+    let cid = ClientOrderId::new(format!(
+        "modify-read-back-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl,
+        strategy: strategy.clone(),
+        cid: cid.clone(),
+    };
+    println!("Placing limit order: BUY 1 AAPL @ $1.00 GTC");
+    let placed = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        })
+        .await;
+    assert!(
+        matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{placed:?}"
+    );
+    client.disconnect();
+
+    // The modify, by a raw client under the same API client id once IB has released it.
+    let config = resolved_aapl_config(OFFSET);
+    let address = format!("{}:{}", config.host, config.port);
+    let order_ref = cid.0.to_string();
+    let modified = tokio::task::spawn_blocking(move || {
+        let raw = (0..15)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_secs(1));
+                ibapi::client::blocking::Client::connect(&address, config.client_id).ok()
+            })
+            .expect("raw connection failed");
+        let data = raw
+            .open_orders()
+            .expect("open_orders failed")
+            .timeout_iter_data(Duration::from_secs(10))
+            .find_map(|item| match item {
+                Ok(Orders::OrderData(data)) if data.order.order_ref == order_ref => Some(data),
+                _ => None,
+            })
+            .expect("the order is listed");
+        let mut order = data.order.clone();
+        order.limit_price = Some(1.01);
+        order.total_quantity = 2.0;
+        println!("Modifying IB order {} to BUY 2 @ $1.01", data.order_id);
+        raw.place_order(data.order_id, &data.contract, &order)
+            .expect("modify failed")
+            .timeout_iter_data(Duration::from_secs(10))
+            .any(|item| {
+                matches!(item, Ok(PlaceOrder::OpenOrder(data))
+                    if data.order.limit_price == Some(1.01) && data.order.total_quantity == 2.0)
+            })
+    })
+    .await
+    .unwrap();
+
+    let restarted = reconnect(OFFSET).await;
+    let mut stream = restarted
+        .account_stream(&[], &[])
+        .await
+        .expect("account_stream failed");
+    let open = restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open.iter().find(|order| order.key.cid == cid).cloned();
+    println!(
+        "Listed after the restart: {:?}",
+        listed
+            .as_ref()
+            .map(|order| (order.price, order.quantity, order.time_in_force))
+    );
+    // Now tracked: this listing's copy on the stream restates the order.
+    restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("second fetch_open_orders failed");
+    let stated = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind {
+                let report = snapshot.value();
+                if report.order.key.cid == cid && !report.reported.is_none() {
+                    return Some(report.clone());
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    println!(
+        "Stated on the stream: {:?}",
+        stated
+            .as_ref()
+            .map(|report| (report.reported, report.order.price, report.order.quantity))
+    );
+
+    // Orders an earlier, failed run left open.
+    for leftover in open
+        .iter()
+        .filter(|order| order.key.cid != cid && order.key.cid.0.starts_with("modify-read-back-"))
+    {
+        let _ = restarted
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    cid: leftover.key.cid.clone(),
+                    ..key.clone()
+                },
+                state: rustrade_execution::order::request::RequestCancel { id: None },
+            })
+            .await;
+    }
+    let cancelled = restarted
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+
+    // Asserted after the cancel, so a failure does not leave the order working.
+    assert!(modified, "IB answered the modify with the new terms");
+    let listed = listed.expect("the order is listed under its client order id");
+    assert_eq!(listed.price, Some(dec!(1.01)), "the listing's price");
+    assert_eq!(listed.quantity, dec!(2), "the listing's quantity");
+    let stated = stated.expect("the stream states the order's terms");
+    assert_eq!(stated.reported, ReportedTerms::ALL);
+    assert_eq!(stated.order.price, Some(dec!(1.01)));
+    assert_eq!(stated.order.quantity, dec!(2));
+    assert_eq!(
+        stated.order.time_in_force,
+        TimeInForce::GoodUntilCancelled { post_only: false }
     );
 }
 

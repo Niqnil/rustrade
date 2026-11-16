@@ -87,18 +87,22 @@ pub struct BracketOrderResult {
 ///
 /// # Invariant
 ///
-/// This data is immutable after order placement, because this client never modifies an order it
-/// placed: the [`ExecutionClient`](crate::client::ExecutionClient) trait has no modify operation,
-/// so a change is a cancel and a new order (new order ID, new entry). IB itself does allow an open
-/// order's price, size and time in force to be modified in place, under the same order ID.
+/// The terms start as the order was placed with, or as a listing showed an adopted order. IB
+/// allows an open order's price, size and time in force to be modified in place, under the same
+/// order ID, and re-sends the order's terms on the order-update stream when it is: the account
+/// stream then restates them here (see
+/// [`ExecutionClient::account_stream`](crate::client::ExecutionClient::account_stream)).
 ///
 /// # Known limitation
 ///
-/// An order modified outside this client, such as by hand in TWS, keeps its placement context
-/// here. Its statuses, and the open- and ended-order listings that find it tracked, then report the
-/// price, quantity and time in force it was placed with, not the modified ones. A cancellation is
-/// also told apart from an expiry by the placement time in force, and a filled order whose filled
-/// quantity cannot be read is taken as filled for the placement quantity.
+/// Terms are restated only while the account stream runs. An order modified when it does not,
+/// such as by hand while the gateway was logged out, keeps the terms held here until IB re-sends
+/// them: on the stream once it runs again, as when recovery lists the open orders after a
+/// reconnect. Until then, the statuses and the ended-order listing report the terms held here,
+/// a cancellation is told apart from an expiry by the time in force held here, and a filled order
+/// whose filled quantity cannot be read is taken as filled for the quantity held here. The
+/// open-order listings report the terms IB lists, but for a trailing stop-limit's stop, which
+/// stays the one held here: IB lists the stop as it trails.
 #[derive(Debug, Clone)]
 pub struct OrderContext {
     pub instrument: InstrumentNameExchange,
@@ -108,6 +112,63 @@ pub struct OrderContext {
     pub quantity: Decimal,
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
+}
+
+impl OrderContext {
+    /// This context with the price, quantity, kind and time in force IB states for the order in
+    /// `order`, as [`order_shape_from_ib`] reads them back, with a good-till-date that names no
+    /// zone read in `session_zone`. The instrument and side are kept: IB modifies neither.
+    ///
+    /// A time in force that reads back as [`TimeInForce::Unreported`] replaces the one held, rather
+    /// than keeping it: IB states that the order no longer has it. So a cancellation of the order is
+    /// then read as a cancellation, not an expiry.
+    ///
+    /// A trailing stop-limit keeps the `stop_price` held, the stop at submission, and takes its
+    /// trail and limit offset from IB. IB moves the stop it lists as the market moves, and sends the
+    /// order again each time it does, so the stop IB states is the order's state, not a term
+    /// changed. A stop changed by hand cannot be told apart from one IB trailed, and is not read.
+    ///
+    /// # Errors
+    /// A description of what does not read back: what [`order_shape_from_ib`] refuses, or a total
+    /// quantity that is not a positive number. IB sends the side apart from the quantity, so a
+    /// quantity of zero or less is no order's.
+    pub(crate) fn with_terms_of(
+        &self,
+        order: &Order,
+        session_zone: Option<chrono_tz::Tz>,
+    ) -> Result<Self, String> {
+        let shape = order_shape_from_ib(order, session_zone)?;
+        let quantity = Decimal::try_from(order.total_quantity)
+            .map_err(|e| format!("total_quantity {}: {e}", order.total_quantity))?;
+        if quantity <= Decimal::ZERO {
+            return Err(format!("total_quantity {quantity} is not positive"));
+        }
+        let kind = match (shape.kind, &self.kind) {
+            (
+                OrderKind::TrailingStopLimit {
+                    offset,
+                    offset_type,
+                    limit_offset,
+                    ..
+                },
+                OrderKind::TrailingStopLimit { stop_price, .. },
+            ) => OrderKind::TrailingStopLimit {
+                offset,
+                offset_type,
+                stop_price: *stop_price,
+                limit_offset,
+            },
+            (kind, _) => kind,
+        };
+        Ok(Self {
+            instrument: self.instrument.clone(),
+            side: self.side,
+            price: shape.price,
+            quantity,
+            kind,
+            time_in_force: shape.time_in_force,
+        })
+    }
 }
 
 /// Bidirectional mapping between rustrade ClientOrderId and IB order IDs.
@@ -329,6 +390,23 @@ impl OrderIdMap {
             .map(|(cid, ctx, _)| (cid.clone(), ctx.clone()))
     }
 
+    /// Replace the context of IB order `ib_id` with `context`, the terms IB now states for it, if
+    /// `ib_id` is tracked under `client_id`, and return the context it replaced. `None`, changing
+    /// nothing, when `ib_id` is not tracked, or is tracked under another id.
+    ///
+    /// The registration time is kept, so a restated order is reaped by
+    /// [`clear_stale`](Self::clear_stale) as it would have been.
+    pub(crate) fn restate(
+        &self,
+        ib_id: i32,
+        client_id: &ClientOrderId,
+        context: OrderContext,
+    ) -> Option<OrderContext> {
+        let mut inner = self.inner.write();
+        let (tracked_id, held, _) = inner.ib_to_entry.get_mut(&ib_id)?;
+        (tracked_id == client_id).then(|| std::mem::replace(held, context))
+    }
+
     /// Whether `client_id` now names a live order other than `ib_id`: the id was freed when `ib_id`
     /// ended and has since been registered again.
     pub fn names_other_order(&self, client_id: &ClientOrderId, ib_id: i32) -> bool {
@@ -521,7 +599,7 @@ pub(crate) struct OrderShape {
 /// Read back the shape of an order IB lists, the inverse of [`build_ib_order`].
 ///
 /// For an order this client did not place, or no longer tracks, such as one placed before a
-/// restart. A tracked order's shape is the one it was placed with.
+/// restart, and for the terms IB states for a tracked order ([`OrderContext::with_terms_of`]).
 ///
 /// A time in force this client never sends (IB's day-till-cancelled, auction or good-till-crossing),
 /// or a good-till-date whose time does not parse, reads as [`TimeInForce::Unreported`], with a
@@ -2827,5 +2905,159 @@ mod tests {
         for action in [Action::Sell, Action::SellShort, Action::SellLong] {
             assert_eq!(action_to_side(&action), Side::Sell, "{action:?}");
         }
+    }
+
+    fn limit_context(price: Decimal, quantity: Decimal) -> OrderContext {
+        OrderContext {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            side: Side::Buy,
+            price: Some(price),
+            quantity,
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        }
+    }
+
+    /// A context takes the terms IB states for the order, and keeps its instrument and side; terms
+    /// that do not read back, or a quantity that is not a positive number, are refused. A time in
+    /// force this client does not map replaces the one held.
+    #[test]
+    fn a_context_takes_the_terms_ib_states() {
+        let held = limit_context(Decimal::from(100), Decimal::from(10));
+        let modified = Order {
+            action: Action::Sell,
+            order_type: "LMT".to_owned(),
+            total_quantity: 12.5,
+            limit_price: Some(101.25),
+            tif: IbTimeInForce::Day,
+            ..Order::default()
+        };
+
+        let stated = held.with_terms_of(&modified, None).unwrap();
+        assert_eq!(stated.instrument, held.instrument);
+        assert_eq!(stated.side, Side::Buy, "IB does not modify the side");
+        assert_eq!(stated.price, Some(Decimal::new(10125, 2)));
+        assert_eq!(stated.quantity, Decimal::new(125, 1));
+        assert_eq!(stated.kind, OrderKind::Limit);
+        assert_eq!(stated.time_in_force, TimeInForce::GoodUntilEndOfDay);
+
+        let unreadable = Order {
+            order_type: "REL".to_owned(),
+            ..modified.clone()
+        };
+        assert!(held.with_terms_of(&unreadable, None).is_err());
+        for quantity in [f64::NAN, 0.0, -1.0] {
+            let no_quantity = Order {
+                total_quantity: quantity,
+                ..modified.clone()
+            };
+            assert!(
+                held.with_terms_of(&no_quantity, None).is_err(),
+                "{quantity}"
+            );
+        }
+
+        let held_gtd = OrderContext {
+            time_in_force: TimeInForce::GoodTillDate {
+                expiry: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            },
+            ..held.clone()
+        };
+        let day_till_cancelled = Order {
+            tif: IbTimeInForce::DayTillCanceled,
+            ..modified
+        };
+        assert_eq!(
+            held_gtd
+                .with_terms_of(&day_till_cancelled, None)
+                .unwrap()
+                .time_in_force,
+            TimeInForce::Unreported,
+            "IB states the held time in force no longer holds"
+        );
+    }
+
+    /// A trailing stop-limit keeps the stop it was placed with when IB states the stop it has
+    /// trailed to, and takes a trail or limit offset IB states.
+    #[test]
+    fn a_trailing_stop_limit_keeps_the_stop_it_was_placed_with() {
+        let trailing = |offset: i64, stop: i64, limit_offset: i64| OrderKind::TrailingStopLimit {
+            offset: Decimal::new(offset, 4),
+            offset_type: TrailingOffsetType::Absolute,
+            stop_price: Decimal::new(stop, 5),
+            limit_offset: Decimal::new(limit_offset, 4),
+        };
+        let held = OrderContext {
+            price: None,
+            kind: trailing(50, 50_000, 5),
+            ..limit_context(Decimal::from(100), Decimal::from(20_000))
+        };
+        let listed = |aux: f64, trail_stop: f64, limit_offset: f64| Order {
+            action: Action::Sell,
+            order_type: "TRAIL LIMIT".to_owned(),
+            total_quantity: 20_000.0,
+            aux_price: Some(aux),
+            trail_stop_price: Some(trail_stop),
+            limit_price: Some(trail_stop - limit_offset),
+            limit_price_offset: Some(limit_offset),
+            tif: IbTimeInForce::GoodTillCanceled,
+            ..Order::default()
+        };
+
+        let trailed = held.with_terms_of(&listed(0.005, 1.09753, 0.0005), None);
+        assert_eq!(trailed.unwrap().kind, held.kind, "the stop IB trailed");
+
+        let re_trailed = held.with_terms_of(&listed(0.008, 1.09753, 0.0007), None);
+        assert_eq!(
+            re_trailed.unwrap().kind,
+            trailing(80, 50_000, 7),
+            "the trail and limit offset IB states, with the stop held"
+        );
+
+        let was_limit = limit_context(Decimal::from(100), Decimal::from(20_000));
+        assert_eq!(
+            was_limit
+                .with_terms_of(&listed(0.005, 1.09753, 0.0005), None)
+                .unwrap()
+                .kind,
+            trailing(50, 109_753, 5),
+            "no stop held: the one IB states"
+        );
+    }
+
+    /// A restatement replaces the context of the order tracked under the id given, and returns
+    /// the one it replaced. It changes nothing for an id not tracked, or tracked under another
+    /// client order id.
+    #[test]
+    fn a_restatement_replaces_the_context_of_its_own_order() {
+        let order_ids = OrderIdMap::new();
+        let cid = ClientOrderId::new("cid-7");
+        order_ids
+            .register(
+                cid.clone(),
+                7,
+                limit_context(Decimal::from(100), Decimal::from(10)),
+            )
+            .unwrap();
+        let restated = limit_context(Decimal::from(101), Decimal::from(12));
+
+        assert!(order_ids.restate(8, &cid, restated.clone()).is_none());
+        assert!(
+            order_ids
+                .restate(7, &ClientOrderId::new("cid-8"), restated.clone())
+                .is_none()
+        );
+        let held = |order_ids: &OrderIdMap| order_ids.get_client_id_and_context(7).unwrap().1;
+        assert_eq!(held(&order_ids).price, Some(Decimal::from(100)));
+
+        let before = order_ids.restate(7, &cid, restated).unwrap();
+        assert_eq!(before.price, Some(Decimal::from(100)));
+        assert_eq!(held(&order_ids).price, Some(Decimal::from(101)));
+        assert_eq!(held(&order_ids).quantity, Decimal::from(12));
+        assert_eq!(
+            order_ids.get_ib_id(&cid),
+            Some(7),
+            "still tracked under its id"
+        );
     }
 }

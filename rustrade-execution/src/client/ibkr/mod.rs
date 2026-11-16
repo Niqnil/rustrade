@@ -102,8 +102,9 @@
 //! - **Client order ids** travel as each order's IB order reference, so they are at most 128
 //!   ASCII characters
 //! - **No order modification.** This client never modifies an open order, though IB allows it.
-//!   An order modified outside it, such as by hand in TWS, is still reported with the price,
-//!   quantity and time in force it was placed with (see [`OrderContext`]).
+//!   An order modified outside it, such as by hand in TWS, is reported with its new terms once
+//!   IB sends them on the account stream (see [Order terms](IbkrClient#order-terms) on
+//!   [`ExecutionClient::account_stream`], and [`OrderContext`]).
 //!
 //! # Reconnection & Recovery
 //!
@@ -191,6 +192,7 @@
 //! - `rustrade_data::exchange::ibkr` for market data
 
 pub mod account;
+mod clock;
 mod connect;
 pub mod contract;
 mod ended_orders;
@@ -219,7 +221,7 @@ use crate::{
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::OrderReport,
+        report::{OrderReport, ReportedTerms},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -230,6 +232,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
+use clock::OrderClock;
 pub use connect::{ConnectOutcome, ContractSkipReason, IbkrConnectError, SkippedContract};
 use contract::ResolveContractError;
 use execution::{
@@ -1031,171 +1034,298 @@ fn read_account_positions(
     Ok(false)
 }
 
-/// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
-/// until the subscription ends or the account stream does.
-///
-/// A closed stream is noticed on the next update, whether or not that update would be
-/// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
-/// TWS sends anything.
-///
-/// `ibapi` ends the subscription with [`ibapi::Error::Shutdown`] when the client shuts down for
-/// good, and the stream is terminated with [`recovery::CLIENT_SHUT_DOWN`].
-fn forward_order_updates(
-    updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
-    sink: &recovery::EventSink,
+/// What the account stream's reader holds to turn IB's order updates into account events.
+struct OrderUpdateReader {
     scope: ExecutionScope,
-    contracts: &ContractRegistry,
+    contracts: ContractRegistry,
+    /// The gateway's time zone, for a good-till-date that names none.
     session_zone: Option<chrono_tz::Tz>,
-    order_ids: &OrderIdMap,
-    pending_cancels: &PendingCancels,
-    exec_buffer: &ExecutionBuffer,
-) {
-    use ibapi::orders::{OrderStatusKind, OrderUpdate};
+    order_ids: OrderIdMap,
+    pending_cancels: PendingCancels,
+    exec_buffer: ExecutionBuffer,
+    clock: OrderClock,
+    /// The IB orders whose terms an `OpenOrder` has just restated, until the `OrderStatus` IB
+    /// sends after it, which carries the fill, reports them. IB sends the two back to back; an
+    /// `OpenOrder` that no status follows leaves its id here until the id's next `OpenOrder` or
+    /// status, or the stream's end, so the set holds at most the ids this stream has seen.
+    restated: fnv::FnvHashSet<i32>,
+}
 
-    for update in updates {
-        // Recovery ended the stream, or the consumer dropped it. Stop on this update rather than
-        // the next one that would be forwarded, which may never come.
-        if !sink.is_open() {
-            return;
-        }
-        let update = match update {
-            Ok(u) => u,
-            Err(ibapi::Error::Shutdown) => {
-                warn!("IBKR client shut down; terminating the account stream");
-                sink.terminate(StreamTerminationReason::Error(
-                    recovery::CLIENT_SHUT_DOWN.to_string(),
-                ));
+impl OrderUpdateReader {
+    /// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
+    /// until the subscription ends or the account stream does.
+    ///
+    /// A closed stream is noticed on the next update, whether or not that update would be
+    /// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
+    /// TWS sends anything.
+    ///
+    /// `ibapi` ends the subscription with [`ibapi::Error::Shutdown`] when the client shuts down for
+    /// good, and the stream is terminated with [`recovery::CLIENT_SHUT_DOWN`].
+    ///
+    /// # Terms
+    ///
+    /// IB sends an order's terms in an `OpenOrder`, when the order is placed or modified and when the
+    /// open orders are listed, each followed by the order's `OrderStatus`. An `OpenOrder` of an order
+    /// this client tracks [restates](OrderIdMap::restate) its terms, and the report of the status
+    /// after it states them, with the fill the status carries. Every other status report states
+    /// none. IB gives neither frame a time, so the report is stamped by [`OrderClock`] as it is
+    /// made, in the order this one thread receives the frames, which is the order IB sent them.
+    fn forward(
+        &mut self,
+        updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
+        sink: &recovery::EventSink,
+    ) {
+        use ibapi::orders::{OrderStatusKind, OrderUpdate};
+
+        for update in updates {
+            // Recovery ended the stream, or the consumer dropped it. Stop on this update rather than
+            // the next one that would be forwarded, which may never come.
+            if !sink.is_open() {
                 return;
             }
-            Err(e) => {
-                // ibapi's own reconnect does not surface here (see the
-                // recovery module), so an error on the subscription is terminal.
-                // Surface it in-band as StreamTerminated(Error) so the caller
-                // gets a programmatic signal rather than inferring EOF.
-                // (best-effort — a no-op if the consumer already dropped rx.)
-                error!(error = %e, "Order stream subscription error");
-                sink.terminate(StreamTerminationReason::Error(e.to_string()));
-                return;
-            }
-        };
-        let event = match update {
-            // IB numbers orders per API client. `ibapi` keeps other clients' order statuses off
-            // this stream, but only by reading the client id from the frame, so this check stays.
-            OrderUpdate::OrderStatus(status) if status.client_id != scope.api_client_id => {
-                trace!(
-                    ib_order_id = status.order_id,
-                    api_client_id = status.client_id,
-                    "OrderStatus for another API client's order, dropping"
-                );
-                None
-            }
-            OrderUpdate::OrderStatus(status) => {
-                let ib_id = status.order_id;
-                // Single-lock methods for the terminal statuses, to avoid read+write. Each ends
-                // the order, freeing its client id. Only `Cancelled`/`Inactive` remove its entry:
-                // a `Filled` order's is retained so late-arriving ExecutionData/CommissionReport
-                // events still resolve it (reaped later by `OrderIdMap::clear_stale`).
-                let lookup_result = match status.status {
-                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive => {
-                        order_ids.remove_and_get_context(ib_id)
-                    }
-                    OrderStatusKind::Filled => order_ids.release_client_id(ib_id),
-                    _ => order_ids.get_client_id_and_context(ib_id),
-                };
-
-                match lookup_result {
-                    // An order that already ended, whose id now names a later order: IB re-sent
-                    // a status for it. Forwarded under the id, it would be read as the later
-                    // order's, and a re-sent `Filled` would end that order.
-                    Some((client_id, _)) if order_ids.names_other_order(&client_id, ib_id) => {
-                        debug!(
-                            ib_order_id = ib_id,
-                            cid = %client_id,
-                            "OrderStatus for an ended order whose client order id names a later order, dropping"
-                        );
-                        None
-                    }
-                    Some((client_id, ctx)) => {
-                        let order =
-                            make_order_from_status(&status, client_id, &ctx, pending_cancels);
-                        Some(UnindexedAccountEvent {
-                            exchange: ExchangeId::Ibkr,
-                            kind: AccountEventKind::OrderSnapshot(Snapshot::new(
-                                OrderReport::state_only(order),
-                            )),
-                        })
-                    }
-                    None => {
-                        debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
-                        None
-                    }
-                }
-            }
-            OrderUpdate::ExecutionData(exec) => {
-                // ibapi copies an executions request's answers here too; they
-                // are not fills happening now, and recovery emits its own.
-                if recovery::is_replayed_execution(&exec) {
-                    trace!(
-                        exec_id = %exec.execution.execution_id,
-                        request_id = exec.request_id,
-                        "ExecutionData answering an executions request, skipping"
-                    );
-                    continue;
-                }
-                let time = execution::parse_ib_timestamp(&exec.execution.time, session_zone);
-                // IB stamped it, whoever the execution is for: it samples the stream's clock,
-                // which places fill recovery's span on IB's clock.
-                if let Some(time) = time {
-                    sink.observe_stamp(time);
-                }
-                let Some(resolved) = resolve_execution(&exec, scope, contracts, time) else {
-                    continue;
-                };
-                // Logged on arrival, so the correction is seen even if no commission report
-                // ever completes it.
-                if ExecutionRevision::parse(&exec.execution.execution_id)
-                    .is_some_and(|revision| revision.is_correction())
-                {
-                    warn!(
-                        exec_id = %exec.execution.execution_id,
-                        instrument = %resolved.instrument,
-                        price = exec.execution.price,
-                        shares = exec.execution.shares,
-                        "IBKR corrected an execution; it will be reported as TradeAmended if its \
-                         commission report arrives"
-                    );
-                }
-
-                exec_buffer.add_execution(exec, resolved);
-                None
-            }
-            OrderUpdate::CommissionReport(report) => {
-                if let Some(trade) = exec_buffer.complete_with_commission(&report)
-                    && !sink.send_execution(trade)
-                {
+            let update = match update {
+                Ok(u) => u,
+                Err(ibapi::Error::Shutdown) => {
+                    warn!("IBKR client shut down; terminating the account stream");
+                    sink.terminate(StreamTerminationReason::Error(
+                        recovery::CLIENT_SHUT_DOWN.to_string(),
+                    ));
                     return;
                 }
-                None
-            }
-            _ => None,
-        };
+                Err(e) => {
+                    // ibapi's own reconnect does not surface here (see the
+                    // recovery module), so an error on the subscription is terminal.
+                    // Surface it in-band as StreamTerminated(Error) so the caller
+                    // gets a programmatic signal rather than inferring EOF.
+                    // (best-effort — a no-op if the consumer already dropped rx.)
+                    error!(error = %e, "Order stream subscription error");
+                    sink.terminate(StreamTerminationReason::Error(e.to_string()));
+                    return;
+                }
+            };
+            let event = match update {
+                // IB numbers orders per API client. `ibapi` keeps other clients' order statuses off
+                // this stream, but only by reading the client id from the frame, so this check stays.
+                OrderUpdate::OrderStatus(status)
+                    if status.client_id != self.scope.api_client_id =>
+                {
+                    trace!(
+                        ib_order_id = status.order_id,
+                        api_client_id = status.client_id,
+                        "OrderStatus for another API client's order, dropping"
+                    );
+                    None
+                }
+                OrderUpdate::OrderStatus(status) => {
+                    let ib_id = status.order_id;
+                    let terms_restated = self.restated.remove(&ib_id);
+                    // Single-lock methods for the terminal statuses, to avoid read+write. Each ends
+                    // the order, freeing its client id. Only `Cancelled`/`Inactive` remove its entry:
+                    // a `Filled` order's is retained so late-arriving ExecutionData/CommissionReport
+                    // events still resolve it (reaped later by `OrderIdMap::clear_stale`).
+                    let lookup_result = match status.status {
+                        OrderStatusKind::Cancelled | OrderStatusKind::Inactive => {
+                            self.order_ids.remove_and_get_context(ib_id)
+                        }
+                        OrderStatusKind::Filled => self.order_ids.release_client_id(ib_id),
+                        _ => self.order_ids.get_client_id_and_context(ib_id),
+                    };
 
-        if let Some(e) = event
-            && !sink.send(e)
-        {
-            // The consumer dropped rx, or recovery ended the stream: either
-            // way nothing more may be sent.
-            return;
+                    match lookup_result {
+                        // An order that already ended, whose id now names a later order: IB re-sent
+                        // a status for it. Forwarded under the id, it would be read as the later
+                        // order's, and a re-sent `Filled` would end that order.
+                        Some((client_id, _))
+                            if self.order_ids.names_other_order(&client_id, ib_id) =>
+                        {
+                            debug!(
+                                ib_order_id = ib_id,
+                                cid = %client_id,
+                                "OrderStatus for an ended order whose client order id names a later order, dropping"
+                            );
+                            None
+                        }
+                        Some((client_id, ctx)) => {
+                            let order = make_order_from_status(
+                                &status,
+                                client_id,
+                                &ctx,
+                                &self.pending_cancels,
+                                self.clock.now(),
+                            );
+                            // `ctx` holds the terms the `OpenOrder` before this status restated.
+                            let report = if terms_restated {
+                                let reported = ReportedTerms::from_read(
+                                    &order.kind,
+                                    order.price,
+                                    order.quantity,
+                                );
+                                OrderReport::new(order, reported)
+                            } else {
+                                OrderReport::state_only(order)
+                            };
+                            Some(UnindexedAccountEvent {
+                                exchange: ExchangeId::Ibkr,
+                                kind: AccountEventKind::OrderSnapshot(Snapshot::new(report)),
+                            })
+                        }
+                        None => {
+                            debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                            None
+                        }
+                    }
+                }
+                OrderUpdate::OpenOrder(data)
+                    if data.order.client_id != self.scope.api_client_id =>
+                {
+                    trace!(
+                        ib_order_id = data.order_id,
+                        api_client_id = data.order.client_id,
+                        "OpenOrder for another API client's order, dropping"
+                    );
+                    None
+                }
+                OrderUpdate::OpenOrder(data) => {
+                    self.restate(&data);
+                    None
+                }
+                OrderUpdate::ExecutionData(exec) => {
+                    // ibapi copies an executions request's answers here too; they
+                    // are not fills happening now, and recovery emits its own.
+                    if recovery::is_replayed_execution(&exec) {
+                        trace!(
+                            exec_id = %exec.execution.execution_id,
+                            request_id = exec.request_id,
+                            "ExecutionData answering an executions request, skipping"
+                        );
+                        continue;
+                    }
+                    let time =
+                        execution::parse_ib_timestamp(&exec.execution.time, self.session_zone);
+                    // IB stamped it, whoever the execution is for: it samples the stream's clock,
+                    // which places fill recovery's span on IB's clock.
+                    if let Some(time) = time {
+                        sink.observe_stamp(time);
+                    }
+                    let Some(resolved) =
+                        resolve_execution(&exec, self.scope, &self.contracts, time)
+                    else {
+                        continue;
+                    };
+                    // Logged on arrival, so the correction is seen even if no commission report
+                    // ever completes it.
+                    if ExecutionRevision::parse(&exec.execution.execution_id)
+                        .is_some_and(|revision| revision.is_correction())
+                    {
+                        warn!(
+                            exec_id = %exec.execution.execution_id,
+                            instrument = %resolved.instrument,
+                            price = exec.execution.price,
+                            shares = exec.execution.shares,
+                            "IBKR corrected an execution; it will be reported as TradeAmended if its \
+                             commission report arrives"
+                        );
+                    }
+
+                    self.exec_buffer.add_execution(exec, resolved);
+                    None
+                }
+                OrderUpdate::CommissionReport(report) => {
+                    if let Some(trade) = self.exec_buffer.complete_with_commission(&report)
+                        && !sink.send_execution(trade)
+                    {
+                        return;
+                    }
+                    None
+                }
+                _ => None,
+            };
+
+            if let Some(e) = event
+                && !sink.send(e)
+            {
+                // The consumer dropped rx, or recovery ended the stream: either
+                // way nothing more may be sent.
+                return;
+            }
         }
+
+        // The subscription iterator ended without an error (e.g. clean
+        // disconnect/unsubscribe, or ibapi giving up reconnecting). Still a
+        // terminal stream death — surface it in-band so the consumer doesn't have
+        // to infer it from channel EOF.
+        sink.terminate(StreamTerminationReason::Error(
+            "IBKR order-update stream ended".to_string(),
+        ));
     }
 
-    // The subscription iterator ended without an error (e.g. clean
-    // disconnect/unsubscribe, or ibapi giving up reconnecting). Still a
-    // terminal stream death — surface it in-band so the consumer doesn't have
-    // to infer it from channel EOF.
-    sink.terminate(StreamTerminationReason::Error(
-        "IBKR order-update stream ended".to_string(),
-    ));
+    /// Restate the terms of the order IB sends in `data`, an `OpenOrder` of this API client's, if this
+    /// client tracks it, and mark them for the report of the status that follows.
+    ///
+    /// The order is the one tracked under its IB order id only when it is in the same instrument and
+    /// its order reference, if any, names the same client order id, as for a listing (IB numbers
+    /// orders per API client and reuses the numbers across sessions). An order this client does not
+    /// track is left to the listings, which adopt it. Terms that do not read back are not restated,
+    /// and the status after them states none. A time in force this client does not map reads back
+    /// as `Unreported` and is restated so (see [`OrderContext::with_terms_of`]).
+    fn restate(&mut self, data: &ibapi::orders::OrderData) {
+        let ib_id = data.order_id;
+        // A status after an earlier `OpenOrder` of this order, if IB sent none, reports nothing it
+        // did not restate.
+        self.restated.remove(&ib_id);
+        let Some((cid, held)) = self.order_ids.get_client_id_and_context(ib_id) else {
+            trace!(
+                ib_order_id = ib_id,
+                "OpenOrder for an order this client does not track"
+            );
+            return;
+        };
+        let same_order = self
+            .contracts
+            .get_name_by_con_id(data.contract.contract_id)
+            .as_ref()
+            == Some(&held.instrument)
+            && (data.order.order_ref.is_empty() || data.order.order_ref == cid.0.as_str());
+        if !same_order {
+            debug!(
+                ib_order_id = ib_id,
+                %cid,
+                order_ref = %data.order.order_ref,
+                "OpenOrder whose IB order id names another order this client tracks, not restating it"
+            );
+            return;
+        }
+        let stated = match held.with_terms_of(&data.order, self.session_zone) {
+            Ok(stated) => stated,
+            Err(reason) => {
+                warn!(
+                    ib_order_id = ib_id,
+                    %cid,
+                    %reason,
+                    "IBKR order's terms cannot be read back; its reports keep the terms held"
+                );
+                return;
+            }
+        };
+        let Some(before) = self.order_ids.restate(ib_id, &cid, stated.clone()) else {
+            // Ended, and its entry reaped, since it was looked up.
+            return;
+        };
+        if before.price != stated.price
+            || before.quantity != stated.quantity
+            || before.kind != stated.kind
+            || before.time_in_force != stated.time_in_force
+        {
+            debug!(
+                ib_order_id = ib_id,
+                %cid,
+                from = ?(before.price, before.quantity, before.kind, before.time_in_force),
+                to = ?(stated.price, stated.quantity, stated.kind, stated.time_in_force),
+                "IBKR restated an order's terms"
+            );
+        }
+        self.restated.insert(ib_id);
+    }
 }
 
 /// The message a worker thread panicked with.
@@ -1419,6 +1549,10 @@ pub struct IbkrClient {
     /// The gateway's time zone from the connection handshake: see
     /// [`session_zone`](Self::session_zone).
     session_zone: Option<chrono_tz::Tz>,
+    /// Stamps the order reports this client times itself: statuses, placement and cancel answers,
+    /// and open-order listings (see [`OrderClock`]). An ended order is reported on the time IB
+    /// gives for its completion, when it gives one.
+    clock: OrderClock,
 }
 
 impl std::fmt::Debug for IbkrClient {
@@ -1523,6 +1657,7 @@ impl IbkrClient {
             listings: ListingLock::default(),
             earlier_completions: ended_orders::EarlierCompletions::new(),
             session_zone,
+            clock: OrderClock::default(),
         };
         Ok(ConnectOutcome { client, skipped })
     }
@@ -2112,7 +2247,7 @@ impl IbkrClient {
         // Recorded only once sent, as for a single order.
         let result = match result {
             Ok(Ok((parent_filled, tp_filled, sl_filled))) => {
-                let now = Utc::now();
+                let now = self.clock.now();
                 let parent_filled_dec = parse_decimal_or_warn(parent_filled, "parent.filled");
                 let tp_filled_dec = parse_decimal_or_warn(tp_filled, "tp.filled");
                 let sl_filled_dec = parse_decimal_or_warn(sl_filled, "sl.filled");
@@ -2184,6 +2319,7 @@ impl IbkrClient {
                 [parent_ib_id, tp_ib_id, sl_ib_id],
                 failure,
                 &self.order_ids,
+                self.clock.now(),
             ),
             Err(join_err) => {
                 // The placement task panicked, and which legs it sent was lost
@@ -2279,12 +2415,13 @@ fn leg_send_error(
 /// mapping, as single-order placement does for an unknown outcome, so the
 /// account stream can still resolve it. Every other leg was never sent, was
 /// rejected, or had its cancel sent: it comes back `Inactive` with
-/// `failure.error`, and its mapping is removed.
+/// `failure.error`, and its mapping is removed. An `Open` leg is stamped `now`.
 fn failed_bracket(
     request: &BracketOrderRequest,
     [parent_ib_id, tp_ib_id, sl_ib_id]: [i32; 3],
     failure: BracketFailure,
     order_ids: &OrderIdMap,
+    now: DateTime<Utc>,
 ) -> BracketOrderResult {
     let BracketFailure { error, unresolved } = failure;
     if !unresolved.is_empty() {
@@ -2296,7 +2433,6 @@ fn failed_bracket(
     }
 
     let mut result = make_all_inactive_bracket(request, error);
-    let now = Utc::now();
     for (leg, ib_id) in [
         (&mut result.parent, parent_ib_id),
         (&mut result.take_profit, tp_ib_id),
@@ -2641,6 +2777,7 @@ impl ExecutionClient for IbkrClient {
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
         let listings = self.listings.clone();
+        let clock = self.clock.clone();
         let session_zone = self.session_zone;
         let orders_future = tokio::task::spawn_blocking(move || {
             let listing = listings.open_orders(&client)?;
@@ -2650,6 +2787,7 @@ impl ExecutionClient for IbkrClient {
                 &contracts,
                 &order_ids,
                 session_zone,
+                clock.now(),
             ))
         });
 
@@ -2834,6 +2972,30 @@ impl ExecutionClient for IbkrClient {
     /// older than a revision already delivered, so the trade reaches the stream
     /// only as the amendment.
     ///
+    /// # Order terms
+    ///
+    /// IB sends an order's terms (an `openOrder`) when the order is placed or modified in place,
+    /// and when the open orders are listed on this connection, such as by
+    /// [`ExecutionClient::fetch_open_orders`], [`ExecutionClient::account_snapshot`] or the gap
+    /// check above. Each is followed by the order's status. For an order this client tracks, the
+    /// `OrderSnapshot` of that status states the terms IB sent ([`OrderReport::reported`]), so a
+    /// change made outside this client, as by hand in TWS, reaches the engine. Every other
+    /// `OrderSnapshot` here states none. IB sends the pair more than once for one change, and
+    /// each states the same terms. IB also sends it each time a trailing stop-limit's stop trails;
+    /// the stop stated is the one held for the order: the one it was placed with, or for an order
+    /// adopted from a listing, the one listed then (see [`OrderKind::TrailingStopLimit`]'s
+    /// `stop_price`), so these state no change.
+    ///
+    /// IB gives an order's terms and status no time, so every order report built from them, here or
+    /// in a listing, is stamped with this host's time when it is made, held so that it never goes
+    /// back. The
+    /// reports stating terms all come from this stream, in the order IB sent them, so their
+    /// stamps order them. A change made while the gateway is logged out of IB, such as by hand in
+    /// another session that took over the login, is reported when IB next sends the order's
+    /// terms: IB sends them when the gateway logs back in, and the gap check lists the open
+    /// orders after that too. One made while no client is connected is reported once one
+    /// connects and lists the open orders.
+    ///
     /// # Filter Parameters
     ///
     /// The `assets` and `instruments` parameters are currently ignored. IB's
@@ -2868,11 +3030,16 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| read_error("order updates", e))?;
 
         let scope = self.execution_scope();
-        let session_zone = self.session_zone;
-        let contracts_clone = self.contracts.clone();
-        let order_ids_clone = self.order_ids.clone();
-        let pending_cancels_clone = self.pending_cancels.clone();
-        let exec_buffer_clone = self.execution_buffer.clone();
+        let mut reader = OrderUpdateReader {
+            scope,
+            contracts: self.contracts.clone(),
+            session_zone: self.session_zone,
+            order_ids: self.order_ids.clone(),
+            pending_cancels: self.pending_cancels.clone(),
+            exec_buffer: self.execution_buffer.clone(),
+            clock: self.clock.clone(),
+            restated: fnv::FnvHashSet::default(),
+        };
 
         let (tx, rx) = mpsc::unbounded_channel();
         let sink = recovery::EventSink::new(tx, new_dedup_cache(), self.known_live.clone());
@@ -2919,16 +3086,7 @@ impl ExecutionClient for IbkrClient {
                 // afterward, so the panic handler below emits a terminal StreamTerminated
                 // (a panic is a terminal stream death like any other).
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    forward_order_updates(
-                        order_sub.iter_data(),
-                        &sink,
-                        scope,
-                        &contracts_clone,
-                        session_zone,
-                        &order_ids_clone,
-                        &pending_cancels_clone,
-                        &exec_buffer_clone,
-                    );
+                    reader.forward(order_sub.iter_data(), &sink);
                 }));
 
                 if let Err(panic_info) = result {
@@ -3005,7 +3163,7 @@ impl ExecutionClient for IbkrClient {
                     key,
                     state: Ok(Cancelled::new(
                         OrderId::new(format_smolstr!("{}", ib_order_id)),
-                        Utc::now(),
+                        self.clock.now(),
                         None,
                     )),
                 }
@@ -3244,7 +3402,7 @@ impl ExecutionClient for IbkrClient {
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
                         VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", order_id))),
-                        Utc::now(),
+                        self.clock.now(),
                         filled,
                     )),
                 }
@@ -3266,7 +3424,7 @@ impl ExecutionClient for IbkrClient {
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
                         VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", ib_order_id))),
-                        Utc::now(),
+                        self.clock.now(),
                         Decimal::ZERO,
                     )),
                 }
@@ -3361,8 +3519,13 @@ impl ExecutionClient for IbkrClient {
     /// entered in TWS under API client id 0, so a client connected as 0 keeps them.
     ///
     /// Each order is returned under the client order id it was placed with: the one this client
-    /// tracks it under, with the kind, price and time in force it was placed with, or else the
-    /// one its IB order reference carries, with those read back from IB's listing. An order
+    /// tracks it under, or else the one its IB order reference carries. Its kind, price, quantity
+    /// and time in force are read back from IB's listing; a tracked order whose listed terms do
+    /// not read back keeps the terms held for it, and a tracked trailing stop-limit keeps the stop
+    /// held for it: the one it was placed with, or for an order adopted from a listing, the one
+    /// listed then (see [`OrderKind::TrailingStopLimit`]'s `stop_price`). The orders state none of
+    /// their terms (see [Order terms](IbkrClient#order-terms)): with the account stream running, IB
+    /// copies the listing onto it, and the stream states them. An order
     /// this client does not track but placed under a client order id, such as one placed before
     /// a restart, is tracked from then on, so its fills and status reach the account stream and
     /// it can be cancelled. Every listed order of this client's is adopted so, whatever
@@ -3389,6 +3552,7 @@ impl ExecutionClient for IbkrClient {
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
         let listings = self.listings.clone();
+        let clock = self.clock.clone();
         let session_zone = self.session_zone;
         let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
@@ -3404,6 +3568,7 @@ impl ExecutionClient for IbkrClient {
                 &contracts,
                 &order_ids,
                 session_zone,
+                clock.now(),
             );
             if let Some(filter) = &instruments_filter {
                 listed.retain(|listed| filter.contains(&listed.instrument));
@@ -3621,13 +3786,15 @@ impl ListedOpenOrder {
 
 /// This API client's open orders from what one open-orders request listed, by IB order id, each
 /// read back as [`open_order_from_listing`] does, with a good-till-date that names no zone read in
-/// `session_zone`. Orders in contracts not registered, and orders that have ended, are left out.
+/// `session_zone`, and stamped `now`. Orders in contracts not registered, and orders that have
+/// ended, are left out.
 fn open_orders_from_listing(
     listing: impl IntoIterator<Item = ibapi::orders::Orders>,
     api_client_id: i32,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
     session_zone: Option<chrono_tz::Tz>,
+    now: DateTime<Utc>,
 ) -> Vec<ListedOpenOrder> {
     use ibapi::orders::Orders;
 
@@ -3654,6 +3821,7 @@ fn open_orders_from_listing(
                 contracts,
                 order_ids,
                 session_zone,
+                now,
             )
         })
         .collect()
@@ -3663,9 +3831,14 @@ fn open_orders_from_listing(
 /// it is not in a registered contract or has ended.
 ///
 /// An order is named by the client order id it was placed with: the one this client tracks it
-/// under, or else its order reference, which carries the id ([`order::order_ref`]). Either way an
-/// order this client tracks keeps the shape it was placed with, and any other is read back by
-/// [`order::order_shape_from_ib`], with a good-till-date that names no zone read in `session_zone`.
+/// under, or else its order reference, which carries the id ([`order::order_ref`]). Its terms are
+/// read back by [`order::order_shape_from_ib`] as IB lists them, with a good-till-date that names
+/// no zone read in `session_zone`; an order this client tracks whose terms do not read back keeps
+/// the terms held for it. The order is stamped `now`.
+///
+/// The report states none of the terms (see [`OrderReport`]'s producer obligations): the listing
+/// is read on another thread than the account stream, so its stamp does not order it against the
+/// stream's reports. IB copies the listing onto the account stream, which states them.
 /// An order named by its reference that this client does not track,
 /// such as one placed before a restart, is adopted: tracked from then on under that id, so its
 /// fills and status reach the account stream and it can be cancelled.
@@ -3681,6 +3854,7 @@ fn open_order_from_listing(
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
     session_zone: Option<chrono_tz::Tz>,
+    now: DateTime<Utc>,
 ) -> Option<ListedOpenOrder> {
     let ib_id = data.order_id;
     let instrument = contracts.get_name_by_con_id(data.contract.contract_id)?;
@@ -3710,7 +3884,20 @@ fn open_order_from_listing(
             ctx.instrument == instrument && order_ref.as_ref().is_none_or(|r| r == cid)
         });
     let (cid, ctx, named_as_placed) = match tracked {
-        Some((cid, ctx)) => (cid, ctx, true),
+        Some((cid, held)) => {
+            let ctx = held
+                .with_terms_of(&data.order, session_zone)
+                .unwrap_or_else(|reason| {
+                    debug!(
+                        ib_order_id = ib_id,
+                        %cid,
+                        %reason,
+                        "Listed IBKR order's terms cannot be read back, reporting the terms held"
+                    );
+                    held
+                });
+            (cid, ctx, true)
+        }
         None => {
             let shape = match order::order_shape_from_ib(&data.order, session_zone) {
                 Ok(shape) => shape,
@@ -3762,7 +3949,7 @@ fn open_order_from_listing(
             time_in_force: ctx.time_in_force,
             state: Open::new(
                 VenueOrderId::Assigned(execution::ib_order_id(ib_id)),
-                Utc::now(),
+                now,
                 filled,
             ),
         }),
@@ -3956,13 +4143,14 @@ fn cancelled_at_expiry(user_cancel: bool, time_in_force: &TimeInForce, at: DateT
 ///
 /// # Time
 ///
-/// The state is stamped with this host's time when the status is converted: IB's `OrderStatus`
-/// carries no time of its own.
+/// The state is stamped `now`, this host's time when the status is converted (see
+/// [`OrderClock`]): IB's `OrderStatus` carries no time of its own.
 fn make_order_from_status(
     status: &ibapi::orders::OrderStatus,
     client_id: ClientOrderId,
     ctx: &OrderContext,
     pending_cancels: &PendingCancels,
+    now: DateTime<Utc>,
 ) -> Order<ExchangeId, InstrumentNameExchange, OrderState<AssetNameExchange, InstrumentNameExchange>>
 {
     use ibapi::orders::OrderStatusKind;
@@ -3989,7 +4177,6 @@ fn make_order_from_status(
             )))
         }
         OrderStatusKind::Cancelled => {
-            let now = Utc::now();
             if cancelled_at_expiry(pending_cancels.remove(ib_id), &ctx.time_in_force, now) {
                 OrderState::inactive(Expired::new(order_id, now, reported_fill))
             } else {
@@ -3999,7 +4186,7 @@ fn make_order_from_status(
         OrderStatusKind::Filled => {
             // A filled order filled its whole quantity, whether or not IB's figure parsed.
             let filled_qty = reported_fill.unwrap_or(ctx.quantity);
-            OrderState::fully_filled(Filled::new(order_id, Utc::now(), filled_qty, None))
+            OrderState::fully_filled(Filled::new(order_id, now, filled_qty, None))
         }
         // Working states (Submitted/PreSubmitted/PendingSubmit) and the
         // transitional ones (ApiPending/PendingCancel/ApiCancelled) are reported
@@ -4014,11 +4201,9 @@ fn make_order_from_status(
         | OrderStatusKind::PendingSubmit
         | OrderStatusKind::ApiPending
         | OrderStatusKind::PendingCancel
-        | OrderStatusKind::ApiCancelled => OrderState::active(Open::new(
-            VenueOrderId::Assigned(order_id),
-            Utc::now(),
-            filled_qty,
-        )),
+        | OrderStatusKind::ApiCancelled => {
+            OrderState::active(Open::new(VenueOrderId::Assigned(order_id), now, filled_qty))
+        }
         // A status string ibapi does not model. Upstream declines to classify
         // it — `is_active()` and `is_terminal()` are both false — and so do we:
         // report it active/Open so the order-id mapping is retained and the
@@ -4034,11 +4219,7 @@ fn make_order_from_status(
                 "unmodelled IBKR order status; treating as live, account \
                  stream is authoritative"
             );
-            OrderState::active(Open::new(
-                VenueOrderId::Assigned(order_id),
-                Utc::now(),
-                filled_qty,
-            ))
+            OrderState::active(Open::new(VenueOrderId::Assigned(order_id), now, filled_qty))
         }
     };
 
@@ -4692,6 +4873,7 @@ mod order_status_tests {
             ClientOrderId::new("cid-1"),
             &ctx(),
             &PendingCancels::new(),
+            Utc::now(),
         );
 
         assert!(
@@ -4717,6 +4899,7 @@ mod order_status_tests {
                 ClientOrderId::new("cid-1"),
                 &ctx(),
                 &PendingCancels::new(),
+                Utc::now(),
             )
             .state
         };
@@ -4761,6 +4944,7 @@ mod order_status_tests {
                 ClientOrderId::new("cid-1"),
                 &ctx,
                 &PendingCancels::new(),
+                Utc::now(),
             )
             .state
         };
@@ -4793,7 +4977,13 @@ mod order_status_tests {
             status: OrderStatusKind::Unknown("Reclassified".into()),
             ..OrderStatus::default()
         };
-        let _ = make_order_from_status(&raw, ClientOrderId::new("cid-1"), &ctx(), &pending);
+        let _ = make_order_from_status(
+            &raw,
+            ClientOrderId::new("cid-1"),
+            &ctx(),
+            &pending,
+            Utc::now(),
+        );
 
         assert!(
             pending.remove(42),
@@ -4895,6 +5085,7 @@ mod order_status_tests {
                 unresolved: vec![11],
             },
             &order_ids,
+            Utc::now(),
         );
 
         assert!(matches!(result.parent.state, OrderState::Inactive(_)));
@@ -4933,6 +5124,7 @@ mod order_status_tests {
                 unresolved: Vec::new(),
             },
             &order_ids,
+            Utc::now(),
         );
 
         for leg in [&result.parent, &result.take_profit, &result.stop_loss] {
@@ -4961,6 +5153,24 @@ mod order_reader_tests {
         }
     }
 
+    /// A reader for API client scope `scope`, over `contracts` and `order_ids`.
+    fn reader(
+        scope: ExecutionScope,
+        contracts: &ContractRegistry,
+        order_ids: &OrderIdMap,
+    ) -> OrderUpdateReader {
+        OrderUpdateReader {
+            scope,
+            contracts: contracts.clone(),
+            session_zone: None,
+            order_ids: order_ids.clone(),
+            pending_cancels: PendingCancels::new(),
+            exec_buffer: ExecutionBuffer::new(),
+            clock: OrderClock::default(),
+            restated: fnv::FnvHashSet::default(),
+        }
+    }
+
     /// Status updates for an order this client did not place, so none is forwarded.
     fn unforwarded(n: usize) -> Vec<Result<OrderUpdate, ibapi::Error>> {
         (0..n)
@@ -4976,17 +5186,11 @@ mod order_reader_tests {
     /// Run the reader over `updates` and return how many of them it pulled.
     fn run(sink: &recovery::EventSink, updates: Vec<Result<OrderUpdate, ibapi::Error>>) -> usize {
         let pulled = Cell::new(0);
-        forward_order_updates(
+        reader(scope(0), &ContractRegistry::new(), &OrderIdMap::new()).forward(
             updates
                 .into_iter()
                 .inspect(|_| pulled.set(pulled.get() + 1)),
             sink,
-            scope(0),
-            &ContractRegistry::new(),
-            None,
-            &OrderIdMap::new(),
-            &PendingCancels::new(),
-            &ExecutionBuffer::new(),
         );
         pulled.get()
     }
@@ -5053,19 +5257,13 @@ mod order_reader_tests {
                 )
                 .unwrap();
 
-            forward_order_updates(
+            reader(scope(0), &ContractRegistry::new(), &order_ids).forward(
                 [Ok(OrderUpdate::OrderStatus(OrderStatus {
                     order_id: 7,
                     status: kind.clone(),
                     ..OrderStatus::default()
                 }))],
                 &sink,
-                scope(0),
-                &ContractRegistry::new(),
-                None,
-                &order_ids,
-                &PendingCancels::new(),
-                &ExecutionBuffer::new(),
             );
 
             assert!(rx.try_recv().is_ok(), "{kind:?}: the status is forwarded");
@@ -5107,7 +5305,7 @@ mod order_reader_tests {
             )
             .unwrap();
 
-        forward_order_updates(
+        reader(scope(903), &ContractRegistry::new(), &order_ids).forward(
             [Ok(OrderUpdate::OrderStatus(OrderStatus {
                 order_id: 7,
                 client_id: 905,
@@ -5115,12 +5313,6 @@ mod order_reader_tests {
                 ..OrderStatus::default()
             }))],
             &sink,
-            scope(903),
-            &ContractRegistry::new(),
-            None,
-            &order_ids,
-            &PendingCancels::new(),
-            &ExecutionBuffer::new(),
         );
 
         assert!(
@@ -5174,16 +5366,7 @@ mod order_reader_tests {
                 status(1, OrderStatusKind::Filled)
             }))
             .chain([status(2, OrderStatusKind::Submitted)]);
-        forward_order_updates(
-            updates,
-            &sink,
-            scope(0),
-            &ContractRegistry::new(),
-            None,
-            &order_ids,
-            &PendingCancels::new(),
-            &ExecutionBuffer::new(),
-        );
+        reader(scope(0), &ContractRegistry::new(), &order_ids).forward(updates, &sink);
 
         let Ok(first) = rx.try_recv() else {
             panic!("the first order's fill is forwarded");
@@ -5281,7 +5464,7 @@ mod order_reader_tests {
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
         );
-        forward_order_updates(
+        reader(scope(0), &contracts, &order_ids).forward(
             [
                 execution("0000e0d5.5f8b1c2a.01.01", 100.0),
                 commission("0000e0d5.5f8b1c2a.01.01"),
@@ -5289,12 +5472,6 @@ mod order_reader_tests {
                 commission("0000e0d5.5f8b1c2a.01.02"),
             ],
             &sink,
-            scope(0),
-            &contracts,
-            None,
-            &order_ids,
-            &PendingCancels::new(),
-            &ExecutionBuffer::new(),
         );
 
         let AccountEventKind::Trade(original) = rx.try_recv().unwrap().kind else {
@@ -5712,9 +5889,9 @@ mod order_reader_tests {
             }
         }
 
-        /// This client's open orders, by IB order id: a tracked one as it was placed, under its
-        /// client order id; another read back from IB's listing, under its IB order id. Each with
-        /// the fill its status reports.
+        /// This client's open orders, by IB order id: a tracked one under its client order id,
+        /// another under its IB order id, each with the terms IB lists and the fill its status
+        /// reports.
         #[test]
         fn open_orders_are_this_api_clients_with_their_fills() {
             let order_ids = OrderIdMap::new();
@@ -5737,9 +5914,19 @@ mod order_reader_tests {
                 [
                     listed(API_CLIENT, 5, stop_order()),
                     status(API_CLIENT, 5, OrderStatusKind::PreSubmitted, 0.0),
-                    // IB lists the tracked order with whatever it holds; what it was placed with
-                    // stands.
-                    listed(API_CLIENT, 2, ibapi::orders::Order::default()),
+                    // Modified since it was placed: a limit of 12 at 151.
+                    listed(
+                        API_CLIENT,
+                        2,
+                        ibapi::orders::Order {
+                            action: ibapi::orders::Action::Buy,
+                            order_type: "LMT".to_owned(),
+                            total_quantity: 12.0,
+                            limit_price: Some(151.0),
+                            tif: ibapi::orders::TimeInForce::GoodTillCanceled,
+                            ..ibapi::orders::Order::default()
+                        },
+                    ),
                     status(API_CLIENT, 2, OrderStatusKind::Submitted, 4.0),
                     // Another API client's order under the tracked order's id.
                     listed(904, 2, stop_order()),
@@ -5749,6 +5936,7 @@ mod order_reader_tests {
                 &contracts(),
                 &order_ids,
                 None,
+                Utc::now(),
             );
 
             assert_eq!(listed_orders.len(), 2, "{listed_orders:?}");
@@ -5765,8 +5953,8 @@ mod order_reader_tests {
             let (tracked, untracked) = (&orders[0], &orders[1]);
             assert_eq!(tracked.key.cid, ClientOrderId::new("tracked"));
             assert_eq!(tracked.kind, OrderKind::Limit);
-            assert_eq!(tracked.price, Some(dec!(150)));
-            assert_eq!(tracked.quantity, dec!(10));
+            assert_eq!(tracked.price, Some(dec!(151)));
+            assert_eq!(tracked.quantity, dec!(12));
             assert_eq!(tracked.state.id, VenueOrderId::Assigned(OrderId::new("2")));
             assert_eq!(tracked.state.filled_quantity, dec!(4));
 
@@ -5789,6 +5977,44 @@ mod order_reader_tests {
                 VenueOrderId::Assigned(OrderId::new("5"))
             );
             assert_eq!(untracked.state.filled_quantity, Decimal::ZERO);
+        }
+
+        /// A tracked order whose listed terms do not read back is reported with the terms held,
+        /// and exactly: it is still named as placed.
+        #[test]
+        fn a_tracked_order_whose_listed_terms_do_not_read_back_keeps_those_held() {
+            let order_ids = OrderIdMap::new();
+            let held = OrderContext {
+                instrument: InstrumentNameExchange::new("AAPL"),
+                side: Side::Buy,
+                price: Some(dec!(150)),
+                quantity: dec!(10),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            };
+            order_ids
+                .register(ClientOrderId::new("tracked"), 2, held)
+                .unwrap();
+
+            let listed_orders = open_orders_from_listing(
+                [
+                    listed(API_CLIENT, 2, ibapi::orders::Order::default()),
+                    status(API_CLIENT, 2, OrderStatusKind::Submitted, 4.0),
+                ],
+                API_CLIENT,
+                &contracts(),
+                &order_ids,
+                None,
+                Utc::now(),
+            );
+
+            assert_eq!(listed_orders.len(), 1, "{listed_orders:?}");
+            assert!(listed_orders[0].is_exact());
+            let order = listed_orders[0].order.as_ref().unwrap();
+            assert_eq!(order.key.cid, ClientOrderId::new("tracked"));
+            assert_eq!(order.price, Some(dec!(150)));
+            assert_eq!(order.quantity, dec!(10));
+            assert_eq!(order.state.filled_quantity, dec!(4));
         }
 
         /// An order that has just ended, and one in a contract not registered, are not listed;
@@ -5823,6 +6049,7 @@ mod order_reader_tests {
                 &contracts(),
                 &OrderIdMap::new(),
                 None,
+                Utc::now(),
             );
             assert_eq!(orders.len(), 1, "{orders:?}");
             assert!(orders[0].order.is_none());
@@ -5856,6 +6083,7 @@ mod order_reader_tests {
                 &contracts(),
                 &OrderIdMap::new(),
                 Some(chrono_tz::Asia::Singapore),
+                Utc::now(),
             );
 
             let [listed] = orders.as_slice() else {
@@ -5883,6 +6111,7 @@ mod order_reader_tests {
                 &contracts(),
                 &order_ids,
                 None,
+                Utc::now(),
             );
 
             assert_eq!(listed.len(), 1, "{listed:?}");
@@ -5929,6 +6158,7 @@ mod order_reader_tests {
                 &contracts(),
                 &order_ids,
                 None,
+                Utc::now(),
             );
 
             let order = listed[0].order.as_ref().unwrap();
@@ -6022,6 +6252,7 @@ mod order_reader_tests {
                 &contracts,
                 &OrderIdMap::new(),
                 None,
+                Utc::now(),
             );
 
             let mut orders = SnapshotOrders::new(Some(listed_orders));
@@ -6180,6 +6411,290 @@ mod order_reader_tests {
                 untimed(Some(chrono_tz::Asia::Singapore)),
                 [("no-zone".to_string(), at("2026-10-07T10:00:00Z"))]
             );
+        }
+    }
+
+    /// Terms: an `OpenOrder` of an order this client tracks, and the status IB sends after it.
+    mod terms {
+        use super::*;
+        use crate::{order::report::ReportedTerms, order::state::ActiveOrderState};
+        use ibapi::{
+            contracts::Contract,
+            orders::{Order as IbOrder, OrderData, OrderStatusKind},
+        };
+        use rust_decimal_macros::dec;
+
+        const CLIENT: i32 = 903;
+        const CON_ID: i32 = 265598;
+        const IB_ID: i32 = 7;
+
+        fn contracts() -> ContractRegistry {
+            let contracts = ContractRegistry::new();
+            contracts
+                .register(
+                    InstrumentNameExchange::new("AAPL"),
+                    Contract {
+                        contract_id: CON_ID,
+                        ..Contract::default()
+                    },
+                )
+                .unwrap();
+            contracts
+        }
+
+        fn placed() -> OrderContext {
+            OrderContext {
+                instrument: InstrumentNameExchange::new("AAPL"),
+                side: Side::Buy,
+                price: Some(dec!(100)),
+                quantity: dec!(10),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            }
+        }
+
+        /// The order IB holds after a modify: a limit of `quantity` at `price`, good for the day.
+        fn modified(price: f64, quantity: f64) -> IbOrder {
+            IbOrder {
+                client_id: CLIENT,
+                order_id: IB_ID,
+                action: ibapi::orders::Action::Buy,
+                order_type: "LMT".to_owned(),
+                total_quantity: quantity,
+                limit_price: Some(price),
+                tif: ibapi::orders::TimeInForce::Day,
+                order_ref: "cid-7".to_owned(),
+                ..IbOrder::default()
+            }
+        }
+
+        fn open_order(order: IbOrder) -> Result<OrderUpdate, ibapi::Error> {
+            Ok(OrderUpdate::OpenOrder(OrderData {
+                order_id: order.order_id,
+                contract: Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+                order,
+                ..OrderData::default()
+            }))
+        }
+
+        fn status(filled: f64) -> Result<OrderUpdate, ibapi::Error> {
+            status_of(OrderStatusKind::Submitted, filled)
+        }
+
+        fn status_of(status: OrderStatusKind, filled: f64) -> Result<OrderUpdate, ibapi::Error> {
+            Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id: IB_ID,
+                client_id: CLIENT,
+                status,
+                filled,
+                ..OrderStatus::default()
+            }))
+        }
+
+        /// Run a reader for API client `CLIENT`, tracking `cid-7` as placed under `IB_ID`, over
+        /// `updates`, and return the order reports it forwarded, and the context it then holds.
+        fn read(
+            updates: Vec<Result<OrderUpdate, ibapi::Error>>,
+        ) -> (
+            Vec<crate::order::report::UnindexedOrderReport>,
+            OrderContext,
+        ) {
+            let (reports, order_ids) = read_reports(updates);
+            let (_, held) = order_ids.get_client_id_and_context(IB_ID).unwrap();
+            (reports, held)
+        }
+
+        /// As [`read`], returning the id map, for updates that may end the order.
+        fn read_reports(
+            updates: Vec<Result<OrderUpdate, ibapi::Error>>,
+        ) -> (Vec<crate::order::report::UnindexedOrderReport>, OrderIdMap) {
+            let order_ids = OrderIdMap::new();
+            order_ids
+                .register(ClientOrderId::new("cid-7"), IB_ID, placed())
+                .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let sink = recovery::EventSink::new(
+                tx,
+                new_dedup_cache(),
+                KnownLiveOrders::shared(ExchangeId::Ibkr),
+            );
+            reader(scope(CLIENT), &contracts(), &order_ids).forward(updates, &sink);
+            let mut reports = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let AccountEventKind::OrderSnapshot(snapshot) = event.kind {
+                    reports.push(snapshot.0);
+                }
+            }
+            (reports, order_ids)
+        }
+
+        fn filled(report: &crate::order::report::UnindexedOrderReport) -> Decimal {
+            let OrderState::Active(ActiveOrderState::Open(open)) = &report.order.state else {
+                panic!("expected an open order, got {:?}", report.order.state);
+            };
+            open.filled_quantity
+        }
+
+        /// The status after an `OpenOrder` states the terms it restated, with the status's fill;
+        /// IB sends the pair twice, and each states them. A status after none states nothing.
+        #[test]
+        fn the_status_after_an_open_order_states_its_terms() {
+            let (reports, held) = read(vec![
+                status(0.0),
+                open_order(modified(101.5, 12.0)),
+                status(3.0),
+                open_order(modified(101.5, 12.0)),
+                status(3.0),
+                status(4.0),
+            ]);
+
+            assert_eq!(reports.len(), 4, "{reports:?}");
+            assert_eq!(reports[0].reported, ReportedTerms::NONE);
+            assert_eq!(reports[0].order.price, Some(dec!(100)), "as placed");
+            for report in &reports[1..3] {
+                assert_eq!(report.reported, ReportedTerms::ALL);
+                assert_eq!(report.order.price, Some(dec!(101.5)));
+                assert_eq!(report.order.quantity, dec!(12));
+                assert_eq!(report.order.time_in_force, TimeInForce::GoodUntilEndOfDay);
+                assert_eq!(report.order.side, Side::Buy);
+                assert_eq!(filled(report), dec!(3), "the status's fill");
+            }
+            assert_eq!(reports[3].reported, ReportedTerms::NONE);
+            assert_eq!(
+                reports[3].order.price,
+                Some(dec!(101.5)),
+                "the restated terms are held"
+            );
+            assert_eq!(held.quantity, dec!(12));
+            assert!(reports.windows(2).all(|pair| {
+                pair[0].order.state.time_exchange() <= pair[1].order.state.time_exchange()
+            }));
+        }
+
+        /// An `OpenOrder` restates nothing, and the status after it states nothing, when it is
+        /// another API client's, names another order by its reference, is in another contract,
+        /// is of an order this client does not track, or does not read back.
+        #[test]
+        fn an_open_order_that_is_not_the_tracked_orders_restates_nothing() {
+            let other_client = IbOrder {
+                client_id: 904,
+                ..modified(101.5, 12.0)
+            };
+            let other_ref = IbOrder {
+                order_ref: "cid-8".to_owned(),
+                ..modified(101.5, 12.0)
+            };
+            let other_contract = Ok(OrderUpdate::OpenOrder(OrderData {
+                order_id: IB_ID,
+                contract: Contract {
+                    contract_id: 1,
+                    ..Contract::default()
+                },
+                order: modified(101.5, 12.0),
+                ..OrderData::default()
+            }));
+            let untracked = IbOrder {
+                order_id: 8,
+                ..modified(101.5, 12.0)
+            };
+            let unreadable = IbOrder {
+                order_type: "REL".to_owned(),
+                ..modified(101.5, 12.0)
+            };
+            let no_quantity = modified(101.5, 0.0);
+
+            for (case, open) in [
+                ("another client's", open_order(other_client)),
+                ("another reference", open_order(other_ref)),
+                ("another contract", other_contract),
+                ("untracked", open_order(untracked)),
+                ("unreadable", open_order(unreadable)),
+                ("zero quantity", open_order(no_quantity)),
+            ] {
+                let (reports, held) = read(vec![open, status(0.0)]);
+                assert_eq!(reports.len(), 1, "{case}: {reports:?}");
+                assert_eq!(reports[0].reported, ReportedTerms::NONE, "{case}");
+                assert_eq!(reports[0].order.price, Some(dec!(100)), "{case}");
+                assert_eq!(held.price, Some(dec!(100)), "{case}");
+            }
+        }
+
+        /// An `OpenOrder` that does not read back clears the mark an earlier one left, so the
+        /// status after it states nothing.
+        #[test]
+        fn an_unreadable_open_order_withdraws_an_earlier_restatement() {
+            let unreadable = IbOrder {
+                order_type: "REL".to_owned(),
+                ..modified(103.0, 12.0)
+            };
+            let (reports, held) = read(vec![
+                open_order(modified(101.5, 12.0)),
+                open_order(unreadable),
+                status(0.0),
+            ]);
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0].reported, ReportedTerms::NONE);
+            assert_eq!(held.price, Some(dec!(101.5)), "the first was restated");
+        }
+
+        /// The mark is the status's alone: a status of another order does not take it.
+        #[test]
+        fn a_restatement_is_reported_by_its_own_orders_status() {
+            let other = Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id: 8,
+                client_id: CLIENT,
+                status: OrderStatusKind::Submitted,
+                ..OrderStatus::default()
+            }));
+            let (reports, _) = read(vec![open_order(modified(101.5, 12.0)), other, status(0.0)]);
+            assert_eq!(
+                reports.len(),
+                1,
+                "the other order is untracked: {reports:?}"
+            );
+            assert_eq!(reports[0].reported, ReportedTerms::ALL);
+        }
+
+        /// Another API client's status of the same IB order id, between an `OpenOrder` and its
+        /// status, leaves the mark for the status of this client's order.
+        #[test]
+        fn another_clients_status_of_the_id_does_not_take_a_restatement() {
+            let other_client = Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id: IB_ID,
+                client_id: 904,
+                status: OrderStatusKind::Submitted,
+                ..OrderStatus::default()
+            }));
+            let (reports, _) = read(vec![
+                open_order(modified(101.5, 12.0)),
+                other_client,
+                status(0.0),
+            ]);
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0].reported, ReportedTerms::ALL);
+            assert_eq!(reports[0].order.price, Some(dec!(101.5)));
+        }
+
+        /// A status that ends the order states the terms the `OpenOrder` before it restated.
+        #[test]
+        fn a_status_ending_the_order_states_its_restated_terms() {
+            for (kind, filled) in [
+                (OrderStatusKind::Filled, 12.0),
+                (OrderStatusKind::Cancelled, 3.0),
+                (OrderStatusKind::Inactive, 0.0),
+            ] {
+                let (reports, _) = read_reports(vec![
+                    open_order(modified(101.5, 12.0)),
+                    status_of(kind.clone(), filled),
+                ]);
+                assert_eq!(reports.len(), 1, "{kind:?}: {reports:?}");
+                assert_eq!(reports[0].reported, ReportedTerms::ALL, "{kind:?}");
+                assert_eq!(reports[0].order.price, Some(dec!(101.5)), "{kind:?}");
+                assert_eq!(reports[0].order.quantity, dec!(12), "{kind:?}");
+            }
         }
     }
 }
