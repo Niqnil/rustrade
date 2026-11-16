@@ -184,6 +184,11 @@ impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
 /// stating it, or of the venue's answer to an amend that set it. `None` for a term no report has
 /// stated, which the order holds as it was placed or first tracked.
 ///
+/// A term's time records that the venue spoke to it, not that its value was taken: it advances
+/// even when the stated value is not adopted, such as a stand-in kind or time in force the
+/// report carries, or a price on a kind with no fixed limit. A report older than that still
+/// speaks for an earlier moment, so it is not read either.
+///
 /// `#[non_exhaustive]`, so a term can be added without breaking a caller.
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize)]
 #[serde(default)]
@@ -1280,7 +1285,8 @@ where
             ActiveOrderState::CancelInFlight(cancel) => cancel.order = Some(open),
             state => *state = ActiveOrderState::Open(open),
         }
-        // The venue's answer states the terms just applied, at the time of the state it gives.
+        // The venue's answer states the terms just applied, at the time of the state it gives:
+        // the whole order except its time in force, which an amend does not change.
         entry
             .get_mut()
             .terms_times
