@@ -657,7 +657,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     when it is placed, modified in place (as by hand in TWS) or listed on the connection, each
     followed by its status. For an order the client tracks, the account stream's `OrderSnapshot`
     of that status states every term IB sent, with the status's fill; an `openOrder` whose terms
-    don't read back, a zero quantity included, restates none.
+    don't read back, a zero quantity included, restates none. A trailing stop-limit's stop is
+    stated as placed: IB re-sends the order each time its stop trails, and lists the trailed
+    stop, which is the order's state rather than a term changed.
     Every other report states none: IB gives an order no time, so the stream, which carries
     IB's messages in order, is the only path whose host-time stamps order them. A change made
     while the gateway is logged out of IB, as by hand in another session that took over the
@@ -668,7 +670,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the terms it was placed with in all of these.
   - **IBKR's open-order listings report the terms IB lists for an order the client tracks**
     (`fetch_open_orders`, `account_snapshot`), where they reported the terms it was placed with.
-    They state none. A tracked order whose listed terms do not read back keeps the terms held.
+    They state none. A tracked order whose listed terms do not read back keeps the terms held,
+    and a tracked trailing stop-limit keeps the stop it was placed with.
   - **IBKR stamps the order reports it times itself with this host's clock held so that it never
     goes back** (statuses, placement and cancel answers, open-order listings), across the client's
     threads, so a wall-clock step back cannot stamp a later report earlier.

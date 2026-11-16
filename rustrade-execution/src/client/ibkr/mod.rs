@@ -2981,7 +2981,9 @@ impl ExecutionClient for IbkrClient {
     /// `OrderSnapshot` of that status states the terms IB sent ([`OrderReport::reported`]), so a
     /// change made outside this client, as by hand in TWS, reaches the engine. Every other
     /// `OrderSnapshot` here states none. IB sends the pair more than once for one change, and
-    /// each states the same terms.
+    /// each states the same terms. IB also sends it each time a trailing stop-limit's stop trails;
+    /// the stop stated is the one the order was placed with (see
+    /// [`OrderKind::TrailingStopLimit`]'s `stop_price`), so these state no change.
     ///
     /// IB gives an order's terms and status no time, so every order report built from them, here or
     /// in a listing, is stamped with this host's time when it is made, held so that it never goes
@@ -3518,7 +3520,8 @@ impl ExecutionClient for IbkrClient {
     /// Each order is returned under the client order id it was placed with: the one this client
     /// tracks it under, or else the one its IB order reference carries. Its kind, price, quantity
     /// and time in force are read back from IB's listing; a tracked order whose listed terms do
-    /// not read back keeps the terms held for it. The orders state none of their terms (see
+    /// not read back keeps the terms held for it, and a tracked trailing stop-limit keeps the stop
+    /// it was placed with (see [`OrderKind::TrailingStopLimit`]'s `stop_price`). The orders state none of their terms (see
     /// [Order terms](IbkrClient#order-terms)): with the account stream running, IB copies the
     /// listing onto it, and the stream states them. An order
     /// this client does not track but placed under a client order id, such as one placed before

@@ -335,8 +335,10 @@ pub enum OrderKind {
         /// The venue may trail it straight away. On IBKR paper, a stop within `offset` of the
         /// market was kept as placed, and one further away moved to `offset` from the market
         /// within seconds of IB accepting the order, for buys and sells, absolute and percentage
-        /// trails. So an order read back from a venue listing may report the stop after it has
-        /// trailed, not the one it was placed with.
+        /// trails, and IB then lists the stop as it trails. So an order read back from a venue
+        /// listing may report the stop after it has trailed, not the one it was placed with. The
+        /// IBKR client reports the stop it placed for an order it tracks, and the trailed one for
+        /// an order it does not.
         stop_price: Decimal,
         /// Offset from the triggered stop price to set the limit price.
         limit_offset: Decimal,

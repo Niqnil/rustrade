@@ -122,6 +122,11 @@ impl OrderContext {
     /// than keeping it: IB states that the order no longer has it. So a cancellation of the order is
     /// then read as a cancellation, not an expiry.
     ///
+    /// A trailing stop-limit keeps the `stop_price` held, the stop at submission, and takes its
+    /// trail and limit offset from IB. IB moves the stop it lists as the market moves, and sends the
+    /// order again each time it does, so the stop IB states is the order's state, not a term
+    /// changed. A stop changed by hand cannot be told apart from one IB trailed, and is not read.
+    ///
     /// # Errors
     /// A description of what does not read back: what [`order_shape_from_ib`] refuses, or a total
     /// quantity that is not a positive number. IB sends the side apart from the quantity, so a
@@ -137,12 +142,29 @@ impl OrderContext {
         if quantity <= Decimal::ZERO {
             return Err(format!("total_quantity {quantity} is not positive"));
         }
+        let kind = match (shape.kind, &self.kind) {
+            (
+                OrderKind::TrailingStopLimit {
+                    offset,
+                    offset_type,
+                    limit_offset,
+                    ..
+                },
+                OrderKind::TrailingStopLimit { stop_price, .. },
+            ) => OrderKind::TrailingStopLimit {
+                offset,
+                offset_type,
+                stop_price: *stop_price,
+                limit_offset,
+            },
+            (kind, _) => kind,
+        };
         Ok(Self {
             instrument: self.instrument.clone(),
             side: self.side,
             price: shape.price,
             quantity,
-            kind: shape.kind,
+            kind,
             time_in_force: shape.time_in_force,
         })
     }
@@ -2951,6 +2973,54 @@ mod tests {
                 .time_in_force,
             TimeInForce::Unreported,
             "IB states the held time in force no longer holds"
+        );
+    }
+
+    /// A trailing stop-limit keeps the stop it was placed with when IB states the stop it has
+    /// trailed to, and takes a trail or limit offset IB states.
+    #[test]
+    fn a_trailing_stop_limit_keeps_the_stop_it_was_placed_with() {
+        let trailing = |offset: i64, stop: i64, limit_offset: i64| OrderKind::TrailingStopLimit {
+            offset: Decimal::new(offset, 4),
+            offset_type: TrailingOffsetType::Absolute,
+            stop_price: Decimal::new(stop, 5),
+            limit_offset: Decimal::new(limit_offset, 4),
+        };
+        let held = OrderContext {
+            price: None,
+            kind: trailing(50, 50_000, 5),
+            ..limit_context(Decimal::from(100), Decimal::from(20_000))
+        };
+        let listed = |aux: f64, trail_stop: f64, limit_offset: f64| Order {
+            action: Action::Sell,
+            order_type: "TRAIL LIMIT".to_owned(),
+            total_quantity: 20_000.0,
+            aux_price: Some(aux),
+            trail_stop_price: Some(trail_stop),
+            limit_price: Some(trail_stop - limit_offset),
+            limit_price_offset: Some(limit_offset),
+            tif: IbTimeInForce::GoodTillCanceled,
+            ..Order::default()
+        };
+
+        let trailed = held.with_terms_of(&listed(0.005, 1.09753, 0.0005), None);
+        assert_eq!(trailed.unwrap().kind, held.kind, "the stop IB trailed");
+
+        let re_trailed = held.with_terms_of(&listed(0.008, 1.09753, 0.0007), None);
+        assert_eq!(
+            re_trailed.unwrap().kind,
+            trailing(80, 50_000, 7),
+            "the trail and limit offset IB states, with the stop held"
+        );
+
+        let was_limit = limit_context(Decimal::from(100), Decimal::from(20_000));
+        assert_eq!(
+            was_limit
+                .with_terms_of(&listed(0.005, 1.09753, 0.0005), None)
+                .unwrap()
+                .kind,
+            trailing(50, 109_753, 5),
+            "no stop held: the one IB states"
         );
     }
 
