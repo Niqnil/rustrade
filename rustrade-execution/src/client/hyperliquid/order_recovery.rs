@@ -684,6 +684,22 @@ pub(super) mod tests {
         assert_eq!(cancelled.filled_quantity, Some(dec!(0.006)));
     }
 
+    /// A lookup of an order that filled in part and had the rest cancelled finds it ended
+    /// cancelled with what filled, though `orderStatus` calls it `filled`.
+    #[test]
+    fn a_partly_filled_order_marked_filled_ends_cancelled_with_what_filled() {
+        let order = ended(lookup_from_record(
+            key(CID),
+            &record("BTC", "filled", "0.004"),
+            Some(btc()),
+        ));
+
+        let InactiveOrderState::Cancelled(cancelled) = order.state else {
+            panic!("expected cancelled, got {:?}", order.state);
+        };
+        assert_eq!(cancelled.filled_quantity, Some(dec!(0.006)));
+    }
+
     #[test]
     fn each_way_an_order_ends_is_read() {
         let state = |status: &str| {

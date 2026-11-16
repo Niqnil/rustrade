@@ -703,6 +703,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Only an order that filled whole is reported fully filled. An answer whose filled size does
     not parse leaves the order's outcome unknown, rather than read as a full fill.
 
+- **A Hyperliquid order that filled in part and had the rest cancelled is no longer reported
+  fully filled on the account stream or by an order lookup** (`rustrade-execution`, `hyperliquid`
+  feature, #962). Hyperliquid marks such an order `filled` too, as it does an `Ioc` limit order
+  that meets less than its size, with the cancelled remainder as its size. Both clients read every
+  `filled` record as a full fill of the order's whole quantity.
+  - A `filled` record with a remainder is now reported cancelled, with the part that filled.
+    Only one with nothing left is reported fully filled.
+  - A `filled` record whose remainder does not parse is dropped with a warning, rather than read
+    as a full fill.
+  - Unchanged, and now documented: an `open` record doesn't show a fill the order made when it was
+    placed, so it reports nothing filled. The fill itself arrives as a trade. The engine never
+    lets an open snapshot with a smaller fill replace the one it holds.
+
 - **Hyperliquid open-order listings and order lookups report each order's kind, trigger and time
   in force** (`rustrade-execution`, `hyperliquid` feature). They reported every order as a
   `Limit` order with `TimeInForce::Unreported`, a stop or take-profit order included.

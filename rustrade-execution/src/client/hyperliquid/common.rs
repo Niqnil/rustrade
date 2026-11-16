@@ -756,8 +756,21 @@ pub(super) fn order_update_to_account_event(
 /// The report states the quantity (`origSz`, the total), the price, and the kind and time in
 /// force where `terms` give them. It is stamped with the record's `statusTimestamp`.
 ///
+/// A record's `sz` is what was left to fill when its status was set, so `origSz - sz` filled:
+/// - **`filled`** is also how Hyperliquid marks an order that filled only in part and had the
+///   rest cancelled, such as an `Ioc` limit that met less than its size. Its `sz` is then the
+///   cancelled remainder, and it is read as [`Cancelled`] with `origSz - sz` filled. Only a
+///   `filled` record with `sz` zero is [`Filled`].
+/// - **`open`** is sent when the order is placed, before it matches, and no record follows a
+///   fill. So an order that matched part of its size on arrival reads as `Open` with nothing
+///   filled, and a later `open` record never shows a fill. The fill itself arrives on
+///   `userFills`, and `frontendOpenOrders` lists the remaining size. An `Open` snapshot with a
+///   smaller fill than the one held never supersedes it
+///   ([`Open::is_superseded_by`](crate::order::state::Open::is_superseded_by)).
+///
 /// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
-/// parse or the status is not one [`OrderStatus::classify`] recognises.
+/// parse or the status is not one [`OrderStatus::classify`] recognises. A `filled` record whose
+/// `sz` does not parse is `None` too, since it cannot tell a whole fill from a partial one.
 pub(super) fn order_update_to_order(
     update: &hyperliquid_rust_sdk::OrderUpdate,
     terms: &OrderTerms,
@@ -789,12 +802,20 @@ pub(super) fn order_update_to_order(
             time_exchange,
             filled_quantity: filled_quantity()?,
         }),
-        OrderStatus::Filled => OrderState::fully_filled(Filled::new(
-            order_id,
-            time_exchange,
-            orig_sz,
-            None, // The update does not carry the average price.
-        )),
+        OrderStatus::Filled => {
+            let filled = filled_quantity()?;
+            if filled < orig_sz {
+                // Filled in part, the rest cancelled.
+                OrderState::inactive(Cancelled::new(order_id, time_exchange, Some(filled)))
+            } else {
+                OrderState::fully_filled(Filled::new(
+                    order_id,
+                    time_exchange,
+                    orig_sz,
+                    None, // The update does not carry the average price.
+                ))
+            }
+        }
         // An unparseable remaining size leaves the fill unknown, not the cancel.
         OrderStatus::Cancelled => {
             OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
@@ -2232,6 +2253,55 @@ pub(super) mod info_tests {
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
+    }
+
+    /// Hyperliquid marks an order `filled` when part of it filled and the rest was cancelled, as
+    /// an `Ioc` that meets less than its size: `sz` is then the cancelled remainder. Seen on
+    /// testnet: `origSz` 0.00033, `sz` 0.00022, of which 0.00011 filled.
+    #[test]
+    fn a_filled_record_with_a_remainder_is_cancelled_with_what_filled() {
+        let update = order_update("filled", &format!(r#""{CLOID}""#), "0.005");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        assert_eq!(order.quantity, dec!(0.0075));
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.id, OrderId::new("7001"));
+                assert_eq!(cancelled.filled_quantity, Some(dec!(0.0025)));
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// A whole fill's `filled` record has nothing left.
+    #[test]
+    fn a_filled_record_with_nothing_left_is_fully_filled() {
+        for sz in ["0", "0.0"] {
+            let update = order_update("filled", &format!(r#""{CLOID}""#), sz);
+            let order = snapshot_of(
+                order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+            );
+            match order.state {
+                OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(
+                    filled,
+                )) => {
+                    assert_eq!(filled.id, OrderId::new("7001"), "{sz}");
+                    assert_eq!(filled.filled_quantity, dec!(0.0075), "{sz}");
+                }
+                other => panic!("{sz}: expected FullyFilled, got {other:?}"),
+            }
+        }
+    }
+
+    /// A `filled` record whose remainder does not parse cannot tell a whole fill from a partial
+    /// one, so it is dropped rather than guessed.
+    #[test]
+    fn a_filled_record_with_an_unparseable_size_is_dropped() {
+        let update = order_update("filled", &format!(r#""{CLOID}""#), "not a number");
+        assert!(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).is_none()
+        );
     }
 
     #[test]
