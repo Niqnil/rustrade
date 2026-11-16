@@ -407,6 +407,8 @@ fn an_external_modification_on_a_venue_that_reassigns_ids_reports_the_new_id() {
     assert_ne!(held.state.id, old);
     let reported = events.last().expect("the order is reported");
     assert_eq!(order_of(reported), &held.map_state(OrderState::active));
+    let old_id = old.assigned().cloned().expect("the venue named the order");
+    assert_eq!(report_of(reported).replaces, Some(Replaces::new(old_id)));
 }
 
 #[test]
@@ -1038,12 +1040,82 @@ fn a_venue_that_reassigns_ids_names_the_old_one_and_reports_its_own_fill_under_i
     assert_eq!(resting(&venue, "resting").state.id, answer.open.id);
     assert_eq!(venue.order_sequence(), sequence + 1);
     assert!(!venue.amend_support().keeps_id);
-    // The stream's report of the order, the last event the answer follows, names the new id.
+    // The stream's report of the order, the last event the answer follows, names the new id and
+    // links the old one. The order goes on under its new id, so nothing reports the old one ended.
     let reported = outcome.events.last().expect("the order is reported");
     assert_eq!(
         order_of(reported).state,
         OrderState::active(answer.open.clone())
     );
+    let old_id = old.assigned().cloned().expect("the venue named the order");
+    assert_eq!(report_of(reported).replaces, Some(Replaces::new(old_id)));
+}
+
+/// Restarted under its new id, the order under the old one is reported cancelled with what filled
+/// under it, after the report of the amended order, which counts that fill in its totals.
+#[test]
+fn a_venue_that_restarts_a_reassigned_order_reports_the_old_one_cancelled_after_it() {
+    let mut venue = resting_buy_amending(
+        AmendConfig::FULL
+            .with_reassign_id(true)
+            .with_filled_restarts(true),
+    );
+    offer_only(&mut venue, "0.4");
+    let old = resting(&venue, "resting");
+    let old_id = old
+        .state
+        .id
+        .assigned()
+        .cloned()
+        .expect("the venue named it");
+
+    let outcome = amend(&mut venue, "resting", price("49200"));
+
+    let answer = amended(&outcome);
+    assert_eq!(
+        answer.previous_id,
+        Some(VenueOrderId::Assigned(old_id.clone()))
+    );
+    assert_eq!(answer.open.filled_quantity, d("0.4"));
+    let [.., replacement, ended] = outcome.events.as_slice() else {
+        panic!("the amended order, then the old one: {outcome:?}");
+    };
+    let replacement = report_of(replacement);
+    assert_eq!(
+        replacement.order.state,
+        OrderState::active(answer.open.clone())
+    );
+    assert_eq!(replacement.replaces, Some(Replaces::new(old_id.clone())));
+    let ended = report_of(ended);
+    assert_eq!(ended.order.key, replacement.order.key);
+    assert_eq!(ended.replaces, None);
+    assert_eq!(ended.order.price, old.price);
+    assert_eq!(
+        ended.order.state,
+        OrderState::inactive(Cancelled {
+            id: old_id,
+            time_exchange: answer.open.time_exchange,
+            filled_quantity: Some(d("0.4")),
+        })
+    );
+    // The book holds the order under its new id, in totals.
+    assert_eq!(resting(&venue, "resting").state, answer.open);
+}
+
+/// Restarting is a reassigned id's: an amend keeping the order's id reports no order ended.
+#[test]
+fn restarting_does_nothing_on_a_venue_that_keeps_ids() {
+    let mut venue = resting_buy_amending(AmendConfig::FULL.with_filled_restarts(true));
+
+    let outcome = amend(&mut venue, "resting", price("47000"));
+
+    assert!(outcome.response.state.is_ok());
+    let reported = outcome.events.last().expect("the order is reported");
+    assert!(
+        matches!(order_of(reported).state, OrderState::Active(_)),
+        "{reported:?}"
+    );
+    assert_eq!(report_of(reported).replaces, None);
 }
 
 #[test]

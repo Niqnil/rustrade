@@ -1,5 +1,9 @@
 use crate::{
-    order::{Order, OrderKind, OrderSnapshot, TimeInForce, state::OrderState},
+    order::{
+        Order, OrderKind, OrderSnapshot, TimeInForce,
+        id::{ClientOrderId, OrderId},
+        state::OrderState,
+    },
     trade::TimeSource,
 };
 use rust_decimal::Decimal;
@@ -166,6 +170,44 @@ impl ReportedTerms {
     }
 }
 
+/// The order a reported order replaces at the venue: what the venue addressed it by before.
+///
+/// A venue may carry out a change to a working order by replacing it, under a new venue order id,
+/// a new client order id, or both, while the order goes on as one order: the same side and
+/// instrument, the fills made so far counted towards it. [`OrderReport::replaces`] links the
+/// replacement to the order it replaces, so a reader tracking the order by its ids follows it.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Build one with
+/// [`new`](Self::new) and [`with_cid`](Self::with_cid).
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct Replaces {
+    /// The venue order id of the order replaced. Equal to the replacement's own when the venue
+    /// kept it and changed only the client order id.
+    pub id: OrderId,
+    /// The client order id of the order replaced, when the replacement has a different one.
+    /// `None` when the client order id is unchanged, or when the venue's report does not name
+    /// the old one: a reader then finds the order replaced by [`id`](Self::id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<ClientOrderId>,
+}
+
+impl Replaces {
+    /// The order the venue addressed as `id`, under the replacement's client order id.
+    pub fn new(id: OrderId) -> Self {
+        Self { id, cid: None }
+    }
+
+    /// This link, naming `cid` as the client order id of the order replaced.
+    #[must_use]
+    pub fn with_cid(self, cid: ClientOrderId) -> Self {
+        Self {
+            cid: Some(cid),
+            ..self
+        }
+    }
+}
+
 /// An order as a venue reported it, and which of its terms the report states.
 ///
 /// The [`Order`] is always whole, so a reader that wants only the order's state reads
@@ -173,16 +215,21 @@ impl ReportedTerms {
 /// venue's current values rather than an echo of the placement, a value kept from an earlier
 /// report, or a stand-in.
 ///
-/// Serialized as the order's own fields, with `reported` beside them; a missing `reported` reads
-/// as [`ReportedTerms::NONE`]. That flattened layout needs a self-describing format, such as JSON,
-/// to read back, and it is why [`Order`] has no field named `reported`.
+/// Serialized as the order's own fields, with `reported` beside them, and `replaces` when it is
+/// set; a missing `reported` reads as [`ReportedTerms::NONE`], and a missing `replaces` as `None`.
+/// That flattened layout needs a self-describing format, such as JSON, to read back, and it is
+/// why [`Order`] has no field named `reported` or `replaces`.
 ///
 /// # Reading the flags
 ///
 /// A reader treats a [`TimeInForce::Unreported`] or an
 /// [`OrderKind::ConditionalUnresolved`] as not
 /// stated, whatever [`reported`](Self::reported) says. [`new`](Self::new) never states either, but
-/// the fields are public, and a report deserialized or built as a literal is taken as it is.
+/// a report deserialized, or with its public fields changed, is taken as it is.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Build one with
+/// [`new`](Self::new) or [`state_only`](Self::state_only), then
+/// [`with_replaces`](Self::with_replaces).
 ///
 /// # Producer obligations
 ///
@@ -202,6 +249,20 @@ impl ReportedTerms {
 ///   in force the order holds as [`TimeInForce::Unreported`], nor a kind it holds as
 ///   [`ConditionalUnresolved`](crate::order::OrderKind::ConditionalUnresolved): those are
 ///   stand-ins, not the venue's terms.
+/// - Set [`replaces`](Self::replaces) only on the venue's own word that this order replaces the
+///   one named, such as a link field in its message, never on a guess from matching terms. Then:
+///   - Link a report that names the replacement's venue order id. A reader ignores the link on a
+///     report naming none, which leaves the order addressed by the id it had.
+///   - Report the replacement's quantities as the order's totals, the fills of the order replaced
+///     included. A venue that starts the replacement's quantity and filled quantity afresh has
+///     them added back by the producer, or a reader reads the order as less filled than it is.
+///   - Send the report that the order replaced ended, if the venue sends one, after the
+///     replacement's report, holding it back until the replacement arrives. A reader ignores an
+///     ended report naming a venue order id the order was replaced from, but only once it has
+///     seen the replacement: before, that report ends the order.
+///   - A producer may link every report of the replacement, not only the first: a reader ignores
+///     the link on a report of an order already following it.
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(bound(
     serialize = "ExchangeKey: Serialize, AssetKey: Serialize, InstrumentKey: Serialize",
@@ -219,6 +280,11 @@ pub struct OrderReport<
     /// Which of [`order`](Self::order)'s terms are the venue's current values.
     #[serde(default)]
     pub reported: ReportedTerms,
+    /// The order this one replaces at the venue, when the venue says it does. `None` for a report
+    /// of an order that replaces none, or from a producer that cannot tell. See the producer
+    /// obligations above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Replaces>,
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> OrderReport<ExchangeKey, AssetKey, InstrumentKey> {
@@ -235,7 +301,11 @@ impl<ExchangeKey, AssetKey, InstrumentKey> OrderReport<ExchangeKey, AssetKey, In
             )
             .with_kind(reported.kind && !order.kind.is_conditional_unresolved());
 
-        Self { order, reported }
+        Self {
+            order,
+            reported,
+            replaces: None,
+        }
     }
 
     /// A report of `order`'s state alone: it states none of its terms.
@@ -248,6 +318,17 @@ impl<ExchangeKey, AssetKey, InstrumentKey> OrderReport<ExchangeKey, AssetKey, In
         Self {
             order,
             reported: ReportedTerms::NONE,
+            replaces: None,
+        }
+    }
+
+    /// This report, saying that its order replaces the one `replaces` names (see the producer
+    /// obligations).
+    #[must_use]
+    pub fn with_replaces(self, replaces: Replaces) -> Self {
+        Self {
+            replaces: Some(replaces),
+            ..self
         }
     }
 }
@@ -258,7 +339,7 @@ mod tests {
     use super::*;
     use crate::order::{
         ConditionalFamily, OrderKey, OrderKind,
-        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        id::{StrategyId, VenueOrderId},
         state::{ActiveOrderState, Open},
     };
     use chrono::{DateTime, Utc};
@@ -407,10 +488,27 @@ mod tests {
         let serde_json::Value::Object(mut fields) = json else {
             panic!("an order report serializes as an object");
         };
+        assert!(!fields.contains_key("replaces"), "{fields:?}");
         fields.remove("reported");
         let old: UnindexedOrderReport =
             serde_json::from_value(serde_json::Value::Object(fields)).unwrap();
-        assert_eq!(old, OrderReport::state_only(report.order));
+        assert_eq!(old, OrderReport::state_only(report.order.clone()));
+
+        // A link reads back, with a client order id and without one.
+        for (replaces, cid) in [
+            (Replaces::new(OrderId::new("old-venue-id")), None),
+            (
+                Replaces::new(OrderId::new("old-venue-id")).with_cid(ClientOrderId::new("old-cid")),
+                Some(serde_json::json!("old-cid")),
+            ),
+        ] {
+            let linked = report.clone().with_replaces(replaces.clone());
+            let json = serde_json::to_value(&linked).unwrap();
+            assert_eq!(json["replaces"]["id"], serde_json::json!("old-venue-id"));
+            assert_eq!(json["replaces"].get("cid"), cid.as_ref());
+            let back: UnindexedOrderReport = serde_json::from_value(json).unwrap();
+            assert_eq!(back.replaces, Some(replaces));
+        }
     }
 
     /// An account event and an account snapshot carrying reports read back from their JSON text:

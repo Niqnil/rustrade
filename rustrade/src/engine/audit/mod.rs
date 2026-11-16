@@ -347,22 +347,29 @@ impl<Event, Output> ProcessAudit<Event, Output> {
     }
 }
 
-/// The outputs for `orders`: an [`EngineOutput::OrderTermsChanged`] per order changed, an
+/// The outputs for `orders`: an [`EngineOutput::OrderReplaced`] per replace followed, an
+/// [`EngineOutput::OrderTermsChanged`] per order changed, an
 /// [`EngineOutput::OrderTermsDiverged`] per order diverged, an [`EngineOutput::OrderAdopted`] per
 /// order adopted, then an [`EngineOutput::OrderNotAdopted`] per report refused.
 fn order_outputs<OnTradingDisabled, OnDisconnect>(
     orders: OrderReportsApplied<ExchangeIndex, InstrumentIndex>,
 ) -> impl Iterator<Item = EngineOutput<OnTradingDisabled, OnDisconnect>> {
     let OrderReportsApplied {
+        replaced,
         changed,
         diverged,
         adopted,
         not_adopted,
         ..
     } = orders;
-    changed
+    replaced
         .into_iter()
-        .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed)))
+        .map(|replaced| EngineOutput::OrderReplaced(Box::new(replaced)))
+        .chain(
+            changed
+                .into_iter()
+                .map(|changed| EngineOutput::OrderTermsChanged(Box::new(changed))),
+        )
         .chain(
             diverged
                 .into_iter()

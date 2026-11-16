@@ -430,6 +430,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for an order snapshot and for an account snapshot, after that event's `OrderTermsDiverged`
   outputs. The types are in `engine::state::order::applied`.
 
+- **The engine follows an order a venue replaces** (`rustrade`, `rustrade-execution`). Some venues
+  carry out a change to a working order by replacing it, under a new venue order id, a new client
+  order id, or both. A report can now say so: `OrderReport` gains `replaces`, an optional
+  `Replaces { id, cid }` naming the venue order id, and the client order id when it changed, of
+  the order replaced (`OrderReport::with_replaces`, `Replaces::new`, `Replaces::with_cid`).
+  `OrderReport`'s rustdoc gives the producer's obligations: link only on the venue's own word and
+  on a report naming the replacement's venue order id, report the replacement in totals (fills of
+  the order replaced included), and send the old order's end after the replacement. A report linked to an order the engine tracks keeps it one
+  order:
+  - **A new venue order id** under the same client order id is followed when the link names the
+    id held.
+  - **A new client order id**: the order moves to it, found by the client order id the link names
+    or else by its venue order id, keeping its strategy, fills and terms, with no cancel reported.
+    A cancel or amend in flight under the old id is dropped, and its answer is ignored. The
+    order's position routing and reduce-only record move with it (`ReduceOnlyBook::rekey`).
+  - **Late reports of the order replaced**, naming a venue order id it was replaced from, are
+    ignored, working or ended, so the cancel of the old order a venue reports alongside its
+    replacement no longer ends the order. A late fill on such an id still counts towards the order
+    and routes to its position, also after the order retires. `TrackedOrder::superseded_ids` holds
+    the last `MAX_SUPERSEDED_IDS` (16) of them; serialised beside the order once any is set.
+  - Each replace followed is reported as `EngineOutput::OrderReplaced` (`OrderReplaced { key, id,
+    replaced }`, in `engine::state::order::applied`, and `OrderReportsApplied::replaced`), before
+    any other output of the event. The engine's own amend answered under a new venue order id
+    records the old id in the same way, without that output.
+
+  A link is ignored on a report naming no venue order id, and on a report under a client order id
+  already retired, such as a replay of a replace already followed. An unlinked report naming a
+  different venue order id is still refused. The live clients do not link replaces yet.
+
+- **The simulated venue links a reassigned order to the id it replaces, and can restart it**
+  (`rustrade-execution`). With `AmendConfig::reassign_id`, the account stream's report of the
+  amended order now carries `replaces`. The new `AmendConfig::filled_restarts` (with
+  `with_filled_restarts`; off in `FULL` and `NONE`) models a venue that replaces the order with a
+  new one: the order under the old id is then reported cancelled, with what filled under it, after
+  the report of the amended order, which stays in totals.
+
 - **A test hook to change a resting order on the simulated venue from outside any client**
   (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
   change made in the venue's own interface would, and reports it only on the account stream, for a
@@ -635,7 +671,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader could not tell which.
   - **New `OrderReport { order, reported }`** in `order::report`: the order as before, and a
     `ReportedTerms` saying which of `quantity`, `price`, `kind` and `time_in_force` are the
-    venue's current values. `ReportedTerms` is `#[non_exhaustive]`: build one from
+    venue's current values. `OrderReport` is `#[non_exhaustive]`: build one with
+    `OrderReport::new` or `OrderReport::state_only`. `ReportedTerms` is `#[non_exhaustive]`: build one from
     `ReportedTerms::NONE` or `ReportedTerms::ALL` and the `with_*` setters.
     `OrderReport::new` never states a `TimeInForce::Unreported` or an
     `OrderKind::ConditionalUnresolved`; `OrderReport::state_only` states no term.
@@ -703,6 +740,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retired, and so ignore every later report of it, while the order might still be working. It is
   now refused, reported as `EngineOutput::OrderNotAdopted`, and not remembered, so a later report
   with a positive quantity tracks it.
+
+- **An amend answered under a new venue order id keeps that id's fill routing** (`rustrade`). The
+  new id was never indexed, so a fill on it reached the order only by a scan of the working
+  orders, and once the amend had left the order nothing to fill, not at all: such a fill opened a
+  position under its raw order id. The new id is now indexed beside the old one, and kept for a
+  late fill when the order retires.
+
+- **An order adopted from a venue's report replays the fills parked for its id** (`rustrade`). A
+  fill that arrived while another order's open was in flight was parked, and stayed parked when a
+  report adopted the order it named, until a cancel's answer found no open in flight and dropped
+  it unapplied. It is now applied when a report adopts the order it names, as for an order whose
+  own open is answered.
 
 - **A completed order keeps its fill routing when it had an amend or a cancel in flight**
   (`rustrade`). A snapshot completing an order restores its live routing for a fill reported
