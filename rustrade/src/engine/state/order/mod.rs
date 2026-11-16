@@ -1016,9 +1016,9 @@ where
     ///
     /// The order replaced is the one under the client order id the link names, or, when it names
     /// none, the one addressed by its venue order id, now or before a replace. Nothing moves when
-    /// the report's own client order id is tracked, when the link names no order tracked, when
-    /// the order under the client order id named is addressed by another venue order id, or when
-    /// the report names no venue order.
+    /// the report's own client order id is tracked or retired, when the link names no order
+    /// tracked, when the order under the client order id named is addressed by another venue
+    /// order id, or when the report names no venue order id.
     fn rekey_replaced<AssetKey>(
         &mut self,
         report: &OrderReport<ExchangeKey, AssetKey, InstrumentKey>,
@@ -5554,6 +5554,8 @@ mod tests {
 
                 let tracked = orders.tracked(&old_cid()).expect("not moved");
                 assert!(tracked.superseded_ids().is_empty(), "{cid}");
+                // Under the same client order id the unlinked report is then applied as any
+                // other, whose state replaces the one held, id included, so only a move is checked.
                 if cid == new_cid() {
                     assert_eq!(
                         tracked.order.state.open_meta().map(|open| &open.id),
