@@ -769,8 +769,9 @@ pub(super) fn order_update_to_account_event(
 ///   ([`Open::is_superseded_by`](crate::order::state::Open::is_superseded_by)).
 ///
 /// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
-/// parse or the status is not one [`OrderStatus::classify`] recognises. A `filled` record whose
-/// `sz` does not parse is `None` too, since it cannot tell a whole fill from a partial one.
+/// parse or the status is not one [`OrderStatus::classify`] recognises. A `filled` or cancelled
+/// record whose `sz` does not parse still ends the order, as [`Cancelled`] with its fill unknown:
+/// a `filled` one cannot tell a whole fill from a partial one.
 pub(super) fn order_update_to_order(
     update: &hyperliquid_rust_sdk::OrderUpdate,
     terms: &OrderTerms,
@@ -802,20 +803,17 @@ pub(super) fn order_update_to_order(
             time_exchange,
             filled_quantity: filled_quantity()?,
         }),
-        OrderStatus::Filled => {
-            let filled = filled_quantity()?;
-            if filled < orig_sz {
-                // Filled in part, the rest cancelled.
-                OrderState::inactive(Cancelled::new(order_id, time_exchange, Some(filled)))
-            } else {
-                OrderState::fully_filled(Filled::new(
-                    order_id,
-                    time_exchange,
-                    orig_sz,
-                    None, // The update does not carry the average price.
-                ))
-            }
-        }
+        OrderStatus::Filled => match filled_quantity() {
+            Some(filled) if filled >= orig_sz => OrderState::fully_filled(Filled::new(
+                order_id,
+                time_exchange,
+                orig_sz,
+                None, // The update does not carry the average price.
+            )),
+            // Filled in part, the rest cancelled; or, with an unparseable remaining size, ended
+            // with its fill unknown, since a whole fill and a partial one read the same.
+            filled => OrderState::inactive(Cancelled::new(order_id, time_exchange, filled)),
+        },
         // An unparseable remaining size leaves the fill unknown, not the cancel.
         OrderStatus::Cancelled => {
             OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
@@ -2295,13 +2293,19 @@ pub(super) mod info_tests {
     }
 
     /// A `filled` record whose remainder does not parse cannot tell a whole fill from a partial
-    /// one, so it is dropped rather than guessed.
+    /// one, so it ends the order with its fill unknown rather than guessed.
     #[test]
-    fn a_filled_record_with_an_unparseable_size_is_dropped() {
+    fn a_filled_record_with_an_unparseable_size_ends_the_order_with_its_fill_unknown() {
         let update = order_update("filled", &format!(r#""{CLOID}""#), "not a number");
-        assert!(
-            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).is_none()
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
         );
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.filled_quantity, None);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 
     #[test]

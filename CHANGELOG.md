@@ -710,8 +710,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `filled` record as a full fill of the order's whole quantity.
   - A `filled` record with a remainder is now reported cancelled, with the part that filled.
     Only one with nothing left is reported fully filled.
-  - A `filled` record whose remainder does not parse is dropped with a warning, rather than read
-    as a full fill.
+  - A `filled` record whose remainder does not parse ends the order as cancelled with its fill
+    unknown, with a warning, rather than read as a full fill.
   - Unchanged, and now documented: an `open` record doesn't show a fill the order made when it was
     placed, so it reports nothing filled. The fill itself arrives as a trade. The engine never
     lets an open snapshot with a smaller fill replace the one it holds.

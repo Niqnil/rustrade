@@ -694,10 +694,29 @@ pub(super) mod tests {
             Some(btc()),
         ));
 
+        assert_eq!(order.key, key(CID));
+        assert_eq!(order.quantity, dec!(0.01));
         let InactiveOrderState::Cancelled(cancelled) = order.state else {
             panic!("expected cancelled, got {:?}", order.state);
         };
+        assert_eq!(cancelled.id, OrderId::new("42"));
         assert_eq!(cancelled.filled_quantity, Some(dec!(0.006)));
+    }
+
+    /// A lookup of a `filled` order whose remaining size does not parse finds it ended, with its
+    /// fill unknown, not still live.
+    #[test]
+    fn a_filled_order_with_an_unparseable_size_ends_with_its_fill_unknown() {
+        let order = ended(lookup_from_record(
+            key(CID),
+            &record("BTC", "filled", "not a number"),
+            Some(btc()),
+        ));
+
+        let InactiveOrderState::Cancelled(cancelled) = order.state else {
+            panic!("expected cancelled, got {:?}", order.state);
+        };
+        assert_eq!(cancelled.filled_quantity, None);
     }
 
     #[test]
