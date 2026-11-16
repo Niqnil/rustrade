@@ -2981,9 +2981,11 @@ impl ExecutionClient for IbkrClient {
     /// IB gives an order's terms and status no time, so every order report this client makes is
     /// stamped with this host's time when it is made, held so that it never goes back. The
     /// reports stating terms all come from this stream, in the order IB sent them, so their
-    /// stamps order them. A change made while the stream is not running, such as by hand while
-    /// the gateway was logged out, is reported when IB next sends the order's terms, as when the
-    /// gap check lists the open orders after a reconnect.
+    /// stamps order them. A change made while the gateway is logged out of IB, such as by hand in
+    /// another session that took over the login, is reported when IB next sends the order's
+    /// terms: IB sends them when the gateway logs back in, and the gap check lists the open
+    /// orders after that too. One made while no client is connected is reported once one
+    /// connects and lists the open orders.
     ///
     /// # Filter Parameters
     ///

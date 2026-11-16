@@ -659,8 +659,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of that status states every term IB sent, less a zero quantity, with the status's fill.
     Every other report states none: IB gives an order no time, so the stream, which carries
     IB's messages in order, is the only path whose host-time stamps order them. A change made
-    while the stream is not running reaches it the next time IB sends the order's terms, as
-    when the stream lists the open orders after a reconnect. The client's own record of the
+    while the gateway is logged out of IB, as by hand in another session that took over the
+    login, reaches the stream when IB sends the order's terms on the gateway's next login, and
+    again when the stream lists the open orders after the gap. The client's own record of the
     order takes the new terms too, so its later statuses, its ended-order lookups and its
     reading of a cancellation as an expiry use them; an order modified by hand used to keep
     the terms it was placed with in all of these.
