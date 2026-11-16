@@ -25,6 +25,14 @@ impl OrderClock {
         self.stamp(Utc::now())
     }
 
+    /// A clock that has already given `stamp`, so that none it gives is earlier.
+    #[cfg(test)]
+    pub(crate) fn stamped_at(stamp: DateTime<Utc>) -> Self {
+        Self {
+            last: Arc::new(Mutex::new(Some(stamp))),
+        }
+    }
+
     /// The stamp for a report made when the wall clock reads `wall`: `wall`, or the latest stamp
     /// given if that is later.
     fn stamp(&self, wall: DateTime<Utc>) -> DateTime<Utc> {
