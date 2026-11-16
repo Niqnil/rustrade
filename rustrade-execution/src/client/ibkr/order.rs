@@ -101,7 +101,8 @@ pub struct BracketOrderResult {
 /// reconnect. Until then, the statuses and the ended-order listing report the terms held here,
 /// a cancellation is told apart from an expiry by the time in force held here, and a filled order
 /// whose filled quantity cannot be read is taken as filled for the quantity held here. The
-/// open-order listings report the terms IB lists.
+/// open-order listings report the terms IB lists, but for a trailing stop-limit's stop, which
+/// stays the one held here: IB lists the stop as it trails.
 #[derive(Debug, Clone)]
 pub struct OrderContext {
     pub instrument: InstrumentNameExchange,

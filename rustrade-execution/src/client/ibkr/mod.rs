@@ -2982,8 +2982,9 @@ impl ExecutionClient for IbkrClient {
     /// change made outside this client, as by hand in TWS, reaches the engine. Every other
     /// `OrderSnapshot` here states none. IB sends the pair more than once for one change, and
     /// each states the same terms. IB also sends it each time a trailing stop-limit's stop trails;
-    /// the stop stated is the one the order was placed with (see
-    /// [`OrderKind::TrailingStopLimit`]'s `stop_price`), so these state no change.
+    /// the stop stated is the one held for the order: the one it was placed with, or for an order
+    /// adopted from a listing, the one listed then (see [`OrderKind::TrailingStopLimit`]'s
+    /// `stop_price`), so these state no change.
     ///
     /// IB gives an order's terms and status no time, so every order report built from them, here or
     /// in a listing, is stamped with this host's time when it is made, held so that it never goes
@@ -3521,9 +3522,10 @@ impl ExecutionClient for IbkrClient {
     /// tracks it under, or else the one its IB order reference carries. Its kind, price, quantity
     /// and time in force are read back from IB's listing; a tracked order whose listed terms do
     /// not read back keeps the terms held for it, and a tracked trailing stop-limit keeps the stop
-    /// it was placed with (see [`OrderKind::TrailingStopLimit`]'s `stop_price`). The orders state none of their terms (see
-    /// [Order terms](IbkrClient#order-terms)): with the account stream running, IB copies the
-    /// listing onto it, and the stream states them. An order
+    /// held for it: the one it was placed with, or for an order adopted from a listing, the one
+    /// listed then (see [`OrderKind::TrailingStopLimit`]'s `stop_price`). The orders state none of
+    /// their terms (see [Order terms](IbkrClient#order-terms)): with the account stream running, IB
+    /// copies the listing onto it, and the stream states them. An order
     /// this client does not track but placed under a client order id, such as one placed before
     /// a restart, is tracked from then on, so its fills and status reach the account stream and
     /// it can be cancelled. Every listed order of this client's is adopted so, whatever
