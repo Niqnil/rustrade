@@ -380,11 +380,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     activation price, is no change.
   - **What is not:** a change of kind or time in force, of a trailing order's offsets, or a limit
     price reported gone. The engine keeps its terms and reports the difference.
-  - **When:** from the venue's first report of an order whose open is in flight; from a report
-    superseding the working state held, unless stamped earlier than it; and behind a cancel in
-    flight, where the order is not retired, since the cancel's answer ends it (a refused cancel
-    retires an order the adopted terms left nothing to fill). Nothing is adopted while an amend is
-    in flight: the amend's answer settles the terms.
+  - **When:** from the venue's first report of an order whose open is in flight, and from any
+    later report stamped no earlier than the terms the engine last read for the order
+    (`TrackedOrder::terms_time`: the latest report stating terms, or the venue's answer to an
+    amend) that reports no less filled than the state held. Terms are ordered by their own time,
+    not by the order's state, so a report stating no terms (a listing or a placement answer on
+    another path, stamped a little later) cannot hide a change; a report whose state does not
+    supersede the one held changes only the terms, and retires the order if they leave nothing to
+    fill. Behind a cancel in flight the order is not retired, since the cancel's answer ends it (a
+    refused cancel retires an order the adopted terms left nothing to fill). Nothing is adopted
+    while an amend is in flight: the amend's answer settles the terms.
   - **New outputs:** `EngineOutput::OrderTermsChanged` (`key`, `from`, `to`) for terms adopted,
     and `EngineOutput::OrderTermsDiverged` (`key`, `tracked`, `reported`, `terms`,
     `amend_in_flight`) for terms not adopted, including terms matching neither side of an amend in
@@ -416,6 +421,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed
+- **Breaking: `Orders` tracks each order as a `TrackedOrder`** (`rustrade`). `Orders.0` maps a
+  `ClientOrderId` to a `TrackedOrder { order, terms_time }` rather than to the `Order` itself, so
+  that the time of an order's terms lives with it and survives a restored engine. Read the order
+  through `.order`, or through the new `Orders::get`, `Orders::iter` and `Orders::values`, which
+  yield the `Order`s; `OrderManager::orders` is unchanged. `Orders::new` still takes the orders
+  themselves. The serialized form is unchanged, with `terms_time` beside the order's fields once
+  set, so an `Orders` serialized before reads back.
 - **Breaking: the engine's order snapshot path takes the whole report and returns what it did**
   (`rustrade`).
   - `OrderManager::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` and returns a

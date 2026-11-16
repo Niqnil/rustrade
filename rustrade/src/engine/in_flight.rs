@@ -409,7 +409,7 @@ impl InFlightWatch {
 #[allow(clippy::expect_used)] // test code: panics acceptable
 mod tests {
     use super::*;
-    use crate::engine::state::EngineState;
+    use crate::engine::state::{EngineState, order::TrackedOrder};
     use chrono::TimeDelta;
     use rust_decimal_macros::dec;
     use rustrade_execution::order::{
@@ -522,7 +522,7 @@ mod tests {
             .1
             .orders
             .0
-            .insert(cid, order);
+            .insert(cid, TrackedOrder::new(order));
     }
 
     fn open_sent(secs: i64) -> ActiveOrderState {

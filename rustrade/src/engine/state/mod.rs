@@ -230,7 +230,6 @@ impl<GlobalData, InstrumentData> PreparesAmend<ExchangeIndex, InstrumentIndex>
             .ok_or(AmendRefusal::Untracked)?;
         let order = instrument
             .orders
-            .0
             .get(&amend.key.cid)
             .ok_or(AmendRefusal::Untracked)?;
         let ActiveOrderState::Open(open) = &order.state else {
