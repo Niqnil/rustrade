@@ -381,11 +381,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **What is not:** a change of kind or time in force, of a trailing order's offsets, or a limit
     price reported gone. The engine keeps its terms and reports the difference.
   - **When:** from the venue's first report of an order whose open is in flight, and from any
-    later report stamped no earlier than the terms the engine last read for the order
-    (`TrackedOrder::terms_time`: the latest report stating terms, or the venue's answer to an
-    amend) that reports no less filled than the state held. Terms are ordered by their own time,
-    not by the order's state, so a report stating no terms (a listing or a placement answer on
-    another path, stamped a little later) cannot hide a change; a report whose state does not
+    later report that reports no less filled than the state held, each stated term only when
+    the report is stamped no earlier than the venue last stated that term
+    (`TrackedOrder::terms_times`: per term, the latest report stating it, or the venue's answer to
+    an amend setting it). Terms are ordered by their own time, not by the order's state, so a
+    report stating no terms (a listing or a placement answer on another path, stamped a little
+    later) cannot hide a change, nor can one stating only some terms hide a change to the others;
+    a report whose state does not
     supersede the one held changes only the terms, and retires the order if they leave nothing to
     fill. Behind a cancel in flight the order is not retired, since the cancel's answer ends it (a
     refused cancel retires an order the adopted terms left nothing to fill). Nothing is adopted
@@ -422,12 +424,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Breaking: `Orders` tracks each order as a `TrackedOrder`** (`rustrade`). `Orders.0` maps a
-  `ClientOrderId` to a `TrackedOrder { order, terms_time }` rather than to the `Order` itself, so
-  that the time of an order's terms lives with it and survives a restored engine. Read the order
-  through `.order`, or through the new `Orders::get`, `Orders::iter` and `Orders::values`, which
-  yield the `Order`s; `OrderManager::orders` is unchanged. `Orders::new` still takes the orders
-  themselves. The serialized form is unchanged, with `terms_time` beside the order's fields once
-  set, so an `Orders` serialized before reads back.
+  `ClientOrderId` to a `TrackedOrder` (its `order`, and `terms_times()`: a `TermsTimes` saying
+  when the venue last stated each term) rather than to the `Order` itself, so that the times of
+  an order's terms live with it and survive a restored engine. Read the order through `.order`,
+  or through the new `Orders::get`, `Orders::iter` and `Orders::values`, which yield the `Order`s;
+  `Orders::tracked` yields the `TrackedOrder`. `OrderManager::orders` is unchanged, and
+  `Orders::new` still takes the orders themselves. In JSON and other self-describing formats the
+  serialized form is unchanged, with `terms_times` beside the order's fields once set, so an
+  `Orders` serialized before reads back. In a format that is not self-describing, such as
+  bincode, it changes and an old one does not read back.
 - **Breaking: the engine's order snapshot path takes the whole report and returns what it did**
   (`rustrade`).
   - `OrderManager::update_from_order_snapshot` takes a `Snapshot<&OrderReport>` and returns a
