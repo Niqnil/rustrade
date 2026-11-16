@@ -1045,7 +1045,9 @@ struct OrderUpdateReader {
     exec_buffer: ExecutionBuffer,
     clock: OrderClock,
     /// The IB orders whose terms an `OpenOrder` has just restated, until the `OrderStatus` IB
-    /// sends after it, which carries the fill, reports them.
+    /// sends after it, which carries the fill, reports them. IB sends the two back to back; an
+    /// `OpenOrder` that no status follows leaves its id here until the id's next `OpenOrder` or
+    /// status, or the stream's end, so the set holds at most the ids this stream has seen.
     restated: fnv::FnvHashSet<i32>,
 }
 
@@ -1264,7 +1266,8 @@ impl OrderUpdateReader {
     /// its order reference, if any, names the same client order id, as for a listing (IB numbers
     /// orders per API client and reuses the numbers across sessions). An order this client does not
     /// track is left to the listings, which adopt it. Terms that do not read back are not restated,
-    /// and the status after them states none.
+    /// and the status after them states none. A time in force this client does not map reads back
+    /// as `Unreported` and is restated so (see [`OrderContext::with_terms_of`]).
     fn restate(&mut self, data: &ibapi::orders::OrderData) {
         let ib_id = data.order_id;
         // A status after an earlier `OpenOrder` of this order, if IB sent none, reports nothing it
@@ -1546,7 +1549,9 @@ pub struct IbkrClient {
     /// The gateway's time zone from the connection handshake: see
     /// [`session_zone`](Self::session_zone).
     session_zone: Option<chrono_tz::Tz>,
-    /// Stamps every order report this client makes (see [`OrderClock`]).
+    /// Stamps the order reports this client times itself: statuses, placement and cancel answers,
+    /// and open-order listings (see [`OrderClock`]). An ended order is reported on the time IB
+    /// gives for its completion, when it gives one.
     clock: OrderClock,
 }
 
@@ -2978,8 +2983,9 @@ impl ExecutionClient for IbkrClient {
     /// `OrderSnapshot` here states none. IB sends the pair more than once for one change, and
     /// each states the same terms.
     ///
-    /// IB gives an order's terms and status no time, so every order report this client makes is
-    /// stamped with this host's time when it is made, held so that it never goes back. The
+    /// IB gives an order's terms and status no time, so every order report built from them, here or
+    /// in a listing, is stamped with this host's time when it is made, held so that it never goes
+    /// back. The
     /// reports stating terms all come from this stream, in the order IB sent them, so their
     /// stamps order them. A change made while the gateway is logged out of IB, such as by hand in
     /// another session that took over the login, is reported when IB next sends the order's
@@ -6470,10 +6476,14 @@ mod order_reader_tests {
         }
 
         fn status(filled: f64) -> Result<OrderUpdate, ibapi::Error> {
+            status_of(OrderStatusKind::Submitted, filled)
+        }
+
+        fn status_of(status: OrderStatusKind, filled: f64) -> Result<OrderUpdate, ibapi::Error> {
             Ok(OrderUpdate::OrderStatus(OrderStatus {
                 order_id: IB_ID,
                 client_id: CLIENT,
-                status: OrderStatusKind::Submitted,
+                status,
                 filled,
                 ..OrderStatus::default()
             }))
@@ -6487,6 +6497,15 @@ mod order_reader_tests {
             Vec<crate::order::report::UnindexedOrderReport>,
             OrderContext,
         ) {
+            let (reports, order_ids) = read_reports(updates);
+            let (_, held) = order_ids.get_client_id_and_context(IB_ID).unwrap();
+            (reports, held)
+        }
+
+        /// As [`read`], returning the id map, for updates that may end the order.
+        fn read_reports(
+            updates: Vec<Result<OrderUpdate, ibapi::Error>>,
+        ) -> (Vec<crate::order::report::UnindexedOrderReport>, OrderIdMap) {
             let order_ids = OrderIdMap::new();
             order_ids
                 .register(ClientOrderId::new("cid-7"), IB_ID, placed())
@@ -6504,8 +6523,7 @@ mod order_reader_tests {
                     reports.push(snapshot.0);
                 }
             }
-            let (_, held) = order_ids.get_client_id_and_context(IB_ID).unwrap();
-            (reports, held)
+            (reports, order_ids)
         }
 
         fn filled(report: &crate::order::report::UnindexedOrderReport) -> Decimal {
@@ -6581,6 +6599,7 @@ mod order_reader_tests {
                 order_type: "REL".to_owned(),
                 ..modified(101.5, 12.0)
             };
+            let no_quantity = modified(101.5, 0.0);
 
             for (case, open) in [
                 ("another client's", open_order(other_client)),
@@ -6588,6 +6607,7 @@ mod order_reader_tests {
                 ("another contract", other_contract),
                 ("untracked", open_order(untracked)),
                 ("unreadable", open_order(unreadable)),
+                ("zero quantity", open_order(no_quantity)),
             ] {
                 let (reports, held) = read(vec![open, status(0.0)]);
                 assert_eq!(reports.len(), 1, "{case}: {reports:?}");
@@ -6631,6 +6651,45 @@ mod order_reader_tests {
                 "the other order is untracked: {reports:?}"
             );
             assert_eq!(reports[0].reported, ReportedTerms::ALL);
+        }
+
+        /// Another API client's status of the same IB order id, between an `OpenOrder` and its
+        /// status, leaves the mark for the status of this client's order.
+        #[test]
+        fn another_clients_status_of_the_id_does_not_take_a_restatement() {
+            let other_client = Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id: IB_ID,
+                client_id: 904,
+                status: OrderStatusKind::Submitted,
+                ..OrderStatus::default()
+            }));
+            let (reports, _) = read(vec![
+                open_order(modified(101.5, 12.0)),
+                other_client,
+                status(0.0),
+            ]);
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0].reported, ReportedTerms::ALL);
+            assert_eq!(reports[0].order.price, Some(dec!(101.5)));
+        }
+
+        /// A status that ends the order states the terms the `OpenOrder` before it restated.
+        #[test]
+        fn a_status_ending_the_order_states_its_restated_terms() {
+            for (kind, filled) in [
+                (OrderStatusKind::Filled, 12.0),
+                (OrderStatusKind::Cancelled, 3.0),
+                (OrderStatusKind::Inactive, 0.0),
+            ] {
+                let (reports, _) = read_reports(vec![
+                    open_order(modified(101.5, 12.0)),
+                    status_of(kind.clone(), filled),
+                ]);
+                assert_eq!(reports.len(), 1, "{kind:?}: {reports:?}");
+                assert_eq!(reports[0].reported, ReportedTerms::ALL, "{kind:?}");
+                assert_eq!(reports[0].order.price, Some(dec!(101.5)), "{kind:?}");
+                assert_eq!(reports[0].order.quantity, dec!(12), "{kind:?}");
+            }
         }
     }
 }

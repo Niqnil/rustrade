@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 /// This host's clock, held so that no stamp it gives is earlier than one it gave before.
 ///
-/// IB gives an order's status and terms no time of their own, so every order report this client
-/// makes is stamped with this host's time when it is made, and a reader orders the reports of an
+/// IB gives an order's status and terms no time of their own, so every order report the client
+/// builds from them (a status, a placement or cancel answer, an open-order listing) is stamped
+/// with this host's time when it is made, and a reader orders the reports of an
 /// order by that stamp. The wall clock can step back (an NTP correction, say), which would stamp
 /// a later report earlier than the one before it. So each stamp is the later of the clock and the
 /// latest stamp given, by any thread of the client: a stamp taken after another is never earlier.

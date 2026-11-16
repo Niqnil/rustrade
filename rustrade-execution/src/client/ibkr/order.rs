@@ -118,9 +118,14 @@ impl OrderContext {
     /// `order`, as [`order_shape_from_ib`] reads them back, with a good-till-date that names no
     /// zone read in `session_zone`. The instrument and side are kept: IB modifies neither.
     ///
+    /// A time in force that reads back as [`TimeInForce::Unreported`] replaces the one held, rather
+    /// than keeping it: IB states that the order no longer has it. So a cancellation of the order is
+    /// then read as a cancellation, not an expiry.
+    ///
     /// # Errors
     /// A description of what does not read back: what [`order_shape_from_ib`] refuses, or a total
-    /// quantity that is not a number.
+    /// quantity that is not a positive number. IB sends the side apart from the quantity, so a
+    /// quantity of zero or less is no order's.
     pub(crate) fn with_terms_of(
         &self,
         order: &Order,
@@ -129,6 +134,9 @@ impl OrderContext {
         let shape = order_shape_from_ib(order, session_zone)?;
         let quantity = Decimal::try_from(order.total_quantity)
             .map_err(|e| format!("total_quantity {}: {e}", order.total_quantity))?;
+        if quantity <= Decimal::ZERO {
+            return Err(format!("total_quantity {quantity} is not positive"));
+        }
         Ok(Self {
             instrument: self.instrument.clone(),
             side: self.side,
@@ -2888,7 +2896,8 @@ mod tests {
     }
 
     /// A context takes the terms IB states for the order, and keeps its instrument and side; terms
-    /// that do not read back, or a quantity that is not a number, are refused.
+    /// that do not read back, or a quantity that is not a positive number, are refused. A time in
+    /// force this client does not map replaces the one held.
     #[test]
     fn a_context_takes_the_terms_ib_states() {
         let held = limit_context(Decimal::from(100), Decimal::from(10));
@@ -2914,11 +2923,35 @@ mod tests {
             ..modified.clone()
         };
         assert!(held.with_terms_of(&unreadable, None).is_err());
-        let no_quantity = Order {
-            total_quantity: f64::NAN,
+        for quantity in [f64::NAN, 0.0, -1.0] {
+            let no_quantity = Order {
+                total_quantity: quantity,
+                ..modified.clone()
+            };
+            assert!(
+                held.with_terms_of(&no_quantity, None).is_err(),
+                "{quantity}"
+            );
+        }
+
+        let held_gtd = OrderContext {
+            time_in_force: TimeInForce::GoodTillDate {
+                expiry: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            },
+            ..held.clone()
+        };
+        let day_till_cancelled = Order {
+            tif: IbTimeInForce::DayTillCanceled,
             ..modified
         };
-        assert!(held.with_terms_of(&no_quantity, None).is_err());
+        assert_eq!(
+            held_gtd
+                .with_terms_of(&day_till_cancelled, None)
+                .unwrap()
+                .time_in_force,
+            TimeInForce::Unreported,
+            "IB states the held time in force no longer holds"
+        );
     }
 
     /// A restatement replaces the context of the order tracked under the id given, and returns

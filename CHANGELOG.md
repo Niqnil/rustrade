@@ -656,7 +656,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **IBKR states the terms its account stream carries.** IB sends an order's terms (`openOrder`)
     when it is placed, modified in place (as by hand in TWS) or listed on the connection, each
     followed by its status. For an order the client tracks, the account stream's `OrderSnapshot`
-    of that status states every term IB sent, less a zero quantity, with the status's fill.
+    of that status states every term IB sent, with the status's fill; an `openOrder` whose terms
+    don't read back, a zero quantity included, restates none.
     Every other report states none: IB gives an order no time, so the stream, which carries
     IB's messages in order, is the only path whose host-time stamps order them. A change made
     while the gateway is logged out of IB, as by hand in another session that took over the
@@ -668,8 +669,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **IBKR's open-order listings report the terms IB lists for an order the client tracks**
     (`fetch_open_orders`, `account_snapshot`), where they reported the terms it was placed with.
     They state none. A tracked order whose listed terms do not read back keeps the terms held.
-  - **IBKR stamps every order report with this host's clock held so that it never goes back**,
-    across the client's threads, so a wall-clock step back cannot stamp a later report earlier.
+  - **IBKR stamps the order reports it times itself with this host's clock held so that it never
+    goes back** (statuses, placement and cancel answers, open-order listings), across the client's
+    threads, so a wall-clock step back cannot stamp a later report earlier.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
