@@ -117,9 +117,34 @@ impl ReportedTerms {
     }
 
     /// The terms a report states when it read the order's quantity, price, kind and time in force
-    /// from the venue: every one, when `time_source` says its state timestamp is the venue's, and
-    /// none when it is this host's, since a reader orders reports by that time (see
-    /// [`OrderReport`]'s producer obligations).
+    /// from the venue: those of [`from_read`](Self::from_read) when `time_source` says its state
+    /// timestamp is the venue's, and none when it is this host's, since a reader orders reports
+    /// by that time (see [`OrderReport`]'s producer obligations).
+    ///
+    /// `TimeSource::Venue` means the timestamp is the venue's time of these terms. A producer
+    /// whose timestamp is the venue's but not the time of the terms uses [`NONE`](Self::NONE)
+    /// instead. An order's creation time is such a timestamp on a venue that changes an order's
+    /// terms in place. It is the time of the terms only on a venue that never does, where a
+    /// change makes a new order.
+    ///
+    /// A producer stamping with this host's time may still state terms read from a single ordered
+    /// channel, under the conditions in [`OrderReport`]'s producer obligations; it uses
+    /// [`from_read`](Self::from_read) directly.
+    #[must_use]
+    pub fn from_venue_read(
+        time_source: TimeSource,
+        kind: &OrderKind,
+        price: Option<Decimal>,
+        quantity: Decimal,
+    ) -> Self {
+        match time_source {
+            TimeSource::Venue => Self::from_read(kind, price, quantity),
+            TimeSource::Host => Self::NONE,
+        }
+    }
+
+    /// The terms a report states when it read the order's quantity, price, kind and time in force
+    /// from the venue, and its timestamp orders them (see [`OrderReport`]'s producer obligations).
     ///
     /// - **Price.** A `kind` that carries no limit price ([`OrderKind::has_limit_price`]) states
     ///   that it has none. One that carries a limit states `price` only when it is non-zero: a
@@ -133,25 +158,11 @@ impl ReportedTerms {
     ///   [`OrderKind::ConditionalUnresolved`] kind and a [`TimeInForce::Unreported`] time in
     ///   force. A producer that filled a term in from elsewhere, such as the order it placed,
     ///   clears that flag itself.
-    ///
-    /// `TimeSource::Venue` means the timestamp is the venue's time of these terms. A producer
-    /// whose timestamp is the venue's but not the time of the terms uses [`NONE`](Self::NONE)
-    /// instead. An order's creation time is such a timestamp on a venue that changes an order's
-    /// terms in place. It is the time of the terms only on a venue that never does, where a
-    /// change makes a new order.
     #[must_use]
-    pub fn from_venue_read(
-        time_source: TimeSource,
-        kind: &OrderKind,
-        price: Option<Decimal>,
-        quantity: Decimal,
-    ) -> Self {
-        match time_source {
-            TimeSource::Venue => Self::ALL
-                .with_price(!kind.has_limit_price() || price.is_some_and(|price| !price.is_zero()))
-                .with_quantity(!quantity.is_zero()),
-            TimeSource::Host => Self::NONE,
-        }
+    pub fn from_read(kind: &OrderKind, price: Option<Decimal>, quantity: Decimal) -> Self {
+        Self::ALL
+            .with_price(!kind.has_limit_price() || price.is_some_and(|price| !price.is_zero()))
+            .with_quantity(!quantity.is_zero())
     }
 }
 
@@ -177,9 +188,16 @@ impl ReportedTerms {
 ///
 /// - Set a flag only for a term read from the venue on this report's path, never from a cache of
 ///   what the order was placed with.
-/// - Set no flag when the report's state timestamp is not the venue's time for these terms: a
-///   reader orders reports by that time, so terms stamped with another time could undo a newer
-///   change.
+/// - Stamp a report that states terms so that its state timestamp orders it against every other
+///   report of the order stating the same terms: a reader keeps, term by term, the value of the
+///   latest stamped, so a report stamped out of order could undo a newer change. Either:
+///   - the timestamp is the venue's time for these terms; or
+///   - every report of the order that states terms comes off one channel that delivers them in
+///     the venue's order, and is stamped on receipt, in delivery order, with a time that never
+///     goes back (this host's clock, held at the latest stamp it gave when the clock steps back).
+///
+///   Otherwise set no flag. A report stamped with this host's time on another path, such as a
+///   listing read on another thread, states none.
 /// - Build with [`new`](Self::new) or [`state_only`](Self::state_only), which never state a time
 ///   in force the order holds as [`TimeInForce::Unreported`], nor a kind it holds as
 ///   [`ConditionalUnresolved`](crate::order::OrderKind::ConditionalUnresolved): those are

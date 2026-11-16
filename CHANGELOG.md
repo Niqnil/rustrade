@@ -400,10 +400,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the term. Their types, `OrderTerms` and `OrderTermsApplied` (the changes and divergences of one
     or more reports) are in `engine::state::order::terms`.
   - **New `ReportedTerms::union` and `ReportedTerms::is_none`** (`rustrade-execution`).
-  - **New `ReportedTerms::from_venue_read`** (`rustrade-execution`), the terms a report states
-    when it read an order's terms from the venue: every one on the venue's time, none on this
-    host's, less a zero or missing limit price on a kind that has one and a zero quantity. A
-    producer, a client written outside this crate included, builds its flags with it.
+  - **New `ReportedTerms::from_venue_read` and `ReportedTerms::from_read`**
+    (`rustrade-execution`), the terms a report states when it read an order's terms from the
+    venue: every one, less a zero or missing limit price on a kind that has one and a zero
+    quantity. `from_venue_read` states them on the venue's time and none on this host's;
+    `from_read` states them whatever the time, for a producer that meets the ordering obligation
+    below. A producer, a client written outside this crate included, builds its flags with them.
+    `OrderReport`'s producer obligations say when a report may state terms: when its timestamp
+    is the venue's time for them, or when every report of the order stating terms comes off one
+    channel in the venue's order, stamped on receipt with a time that never goes back.
   - **New `OrderKind::has_limit_price`** (`rustrade-execution`): whether orders of the kind carry
     a limit price in `Order::price`. A `TrailingStopLimit` carries none, since its limit follows
     from its stop.
@@ -648,6 +653,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     states none. A listed order without `updated_at` states its terms on `created_at`: Alpaca
     never changes an order's terms in place, as a replace is a new order. An order of a kind
     without a limit price holds none, whatever Alpaca's `limit_price` says.
+  - **IBKR states the terms its account stream carries.** IB sends an order's terms (`openOrder`)
+    when it is placed, modified in place (as by hand in TWS) or listed on the connection, each
+    followed by its status. For an order the client tracks, the account stream's `OrderSnapshot`
+    of that status states every term IB sent, less a zero quantity, with the status's fill.
+    Every other report states none: IB gives an order no time, so the stream, which carries
+    IB's messages in order, is the only path whose host-time stamps order them. A change made
+    while the stream is not running reaches it the next time IB sends the order's terms, as
+    when the stream lists the open orders after a reconnect. The client's own record of the
+    order takes the new terms too, so its later statuses, its ended-order lookups and its
+    reading of a cancellation as an expiry use them; an order modified by hand used to keep
+    the terms it was placed with in all of these.
+  - **IBKR's open-order listings report the terms IB lists for an order the client tracks**
+    (`fetch_open_orders`, `account_snapshot`), where they reported the terms it was placed with.
+    They state none. A tracked order whose listed terms do not read back keeps the terms held.
+  - **IBKR stamps every order report with this host's clock held so that it never goes back**,
+    across the client's threads, so a wall-clock step back cannot stamp a later report earlier.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
