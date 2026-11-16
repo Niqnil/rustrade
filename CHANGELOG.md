@@ -425,7 +425,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order as tracked and the terms its report stated (`reported`). Whether to cancel it, hand it to
   a strategy or leave it is the consumer's decision. A report of such an order whose quantity is
   zero or negative is not tracked, and is reported as `EngineOutput::OrderNotAdopted`, carrying
-  the order as reported and an `OrderNotAdoptedReason` (`QuantityNotPositive`). Both are emitted
+  the order as reported and an `OrderNotAdoptedReason` (`QuantityNotPositive`). The refusal is not
+  remembered, so it is emitted again for every such report of the order. Both are emitted
   for an order snapshot and for an account snapshot, after that event's `OrderTermsDiverged`
   outputs. The types are in `engine::state::order::applied`.
 

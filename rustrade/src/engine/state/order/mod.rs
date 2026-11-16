@@ -4618,9 +4618,12 @@ mod tests {
         #[test]
         fn an_untracked_working_order_with_no_positive_quantity_is_refused_until_reported_with_one()
         {
-            for quantity in [dec!(0), dec!(-1)] {
+            // A filled part leaves the order nothing to fill of such a quantity too: it is still
+            // refused, not taken as finished.
+            for (quantity, filled) in [(dec!(0), dec!(0)), (dec!(-1), dec!(0)), (dec!(0), dec!(1))]
+            {
                 let mut orders = orders([]);
-                let refused = report(working(dec!(0)), quantity, ReportedTerms::NONE);
+                let refused = report(working(filled), quantity, ReportedTerms::NONE);
 
                 let applied = apply(&mut orders, &refused);
 

@@ -2092,7 +2092,10 @@ pub enum EngineOutput<
     /// A venue reported an untracked order working that the engine did not track, for the reason
     /// [`OrderNotAdopted`] gives. The order may still be working at the venue.
     ///
-    /// Emitted after any [`OrderAdopted`](Self::OrderAdopted) of the same event.
+    /// Emitted after any [`OrderAdopted`](Self::OrderAdopted) of the same event. The engine keeps
+    /// no record of a refusal, so it is emitted again for every report of the order that cannot
+    /// be tracked, an account snapshot listing it included. A consumer acting on it once
+    /// deduplicates on the order's key.
     ///
     /// **Boxed**, as [`OrderAdopted`](Self::OrderAdopted).
     OrderNotAdopted(Box<OrderNotAdopted<ExchangeKey, InstrumentKey>>),
