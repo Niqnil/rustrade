@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hyperliquid clients follow an order the venue replaces.** A modify gives an order a new venue
+  id and restarts its size and fill. The account stream now reports the new order linked to the
+  one it replaced (`OrderReport::replaces`), with the fill of the old order added back to its
+  size and fill, and leaves out the old order's `canceled` record, so the engine keeps one order
+  instead of ending it. The two records are paired within one `orderUpdates` message by coin,
+  cloid and status time; records that cannot be paired unambiguously are read as before. Every
+  later report of the new order, from the stream, `fetch_order_status`, `fetch_open_orders` or
+  the account snapshot, has the earlier fills added back too, across repeated modifies. The
+  client learns them from the account stream and holds them in memory, so a modify it did not
+  see on its stream is reported without them.
 - **Option pricing: American and European prices, implied volatility and Greeks, with discrete
   cash dividends** (new crate `rustrade-pricing`). Pure computation, with no I/O, clock or market
   data access, so a backtest and a live system that feed it the same quotes get the same

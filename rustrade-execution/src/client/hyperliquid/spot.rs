@@ -84,6 +84,7 @@
 //! [`ClientOrderId::uuid()`](crate::order::id::ClientOrderId::uuid) form. See the
 //! [`super`] module documentation for why.
 
+use super::carried::{CarriedFills, carry_into_open};
 use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, HYPERLIQUID_TIME_IN_FORCE, InstrumentFilter, OpenOrder,
     OpenOrderListing, UserFill, cancel_outcome, cid_to_cloid, classify_order, cloid_to_cid,
@@ -159,6 +160,9 @@ pub struct HyperliquidSpotClient {
     /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     /// clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    /// What each order a modify replaced had filled, carried into the order replacing it. Shared
+    /// by every clone, every account stream, which learns it, and every lookup, which adds it.
+    carried: CarriedFills,
 }
 
 impl HyperliquidSpotClient {
@@ -213,6 +217,7 @@ impl HyperliquidSpotClient {
             exchange_client: Arc::new(exchange_client),
             spot_coins,
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+            carried: CarriedFills::default(),
         })
     }
 
@@ -337,6 +342,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             exchange_client: Arc::new(exchange_client),
             spot_coins,
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+            carried: CarriedFills::default(),
         }
     }
 
@@ -373,6 +379,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             &open_orders,
             ExchangeId::HyperliquidSpot,
             instruments,
+            &self.carried,
             |coin| pairs.get(coin).map(spot_pair_to_instrument),
         )
         .into_snapshots()
@@ -465,7 +472,18 @@ impl ExecutionClient for HyperliquidSpotClient {
             move |instruments| {
                 spot_listed_cids(list_client.clone(), list_coins.clone(), user, instruments)
             },
-            move |key| spot_order_lookup(lookup_client.clone(), lookup_coins.clone(), user, key),
+            {
+                let carried = self.carried.clone();
+                move |key| {
+                    spot_order_lookup(
+                        lookup_client.clone(),
+                        lookup_coins.clone(),
+                        carried.clone(),
+                        user,
+                        key,
+                    )
+                }
+            },
         );
 
         // Spawn task to process fills (filtered to spot only)
@@ -565,6 +583,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let orders_terminated = terminated;
         let orders_coins = self.spot_coins.clone();
         let orders_known = self.known_live.clone();
+        let orders_carried = self.carried.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
             // Spot coins already logged as missing from spotMeta, so each is logged once.
@@ -602,29 +621,34 @@ impl ExecutionClient for HyperliquidSpotClient {
                                 let pairs = orders_coins
                                     .covering(updates.data.iter().map(|update| update.order.coin.as_str()))
                                     .await;
-                                for update in updates.data {
-                                    // Filter: only spot coins
-                                    let coin = update.order.coin.as_str();
-                                    if CoinKind::of(coin) != CoinKind::Spot {
-                                        continue;
-                                    }
-                                    let Some(pair) = pairs.get(coin) else {
-                                        if missing_coins.insert(coin.to_owned()) {
-                                            warn!(
-                                                %coin,
-                                                oid = update.order.oid,
-                                                "Hyperliquid spot order updates on a coin not in \
-                                                 spotMeta are left out; logged once per stream"
-                                            );
+                                let sent = super::common::order_updates_to_account_events(
+                                    &updates.data,
+                                    ExchangeId::HyperliquidSpot,
+                                    &orders_carried,
+                                    |update| {
+                                        // Filter: only spot coins
+                                        let coin = update.order.coin.as_str();
+                                        if CoinKind::of(coin) != CoinKind::Spot {
+                                            return None;
                                         }
-                                        continue;
-                                    };
-                                    if let Some(event) = order_update_to_account_event(&update, pair)
-                                        && !send_observed(&orders_known, &orders_event_tx, event)
-                                    {
-                                        debug!("Spot orders event channel closed");
-                                        return;
-                                    }
+                                        let Some(pair) = pairs.get(coin) else {
+                                            if missing_coins.insert(coin.to_owned()) {
+                                                warn!(
+                                                    %coin,
+                                                    oid = update.order.oid,
+                                                    "Hyperliquid spot order updates on a coin not in \
+                                                     spotMeta are left out; logged once per stream"
+                                                );
+                                            }
+                                            return None;
+                                        };
+                                        Some(spot_pair_to_instrument(pair))
+                                    },
+                                    |event| send_observed(&orders_known, &orders_event_tx, event),
+                                );
+                                if !sent {
+                                    debug!("Spot orders event channel closed");
+                                    return;
                                 }
                             }
                             Message::NoData => {
@@ -1016,7 +1040,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             .covering(open_orders.iter().map(|order| order.coin.as_str()))
             .await;
 
-        let orders = spot_open_orders(&open_orders, &pairs, instruments)?;
+        let orders = spot_open_orders(&open_orders, &pairs, instruments, &self.carried)?;
         remember_open(&self.known_live, &orders);
         Ok(orders)
     }
@@ -1066,6 +1090,7 @@ impl OrderStatusClient for HyperliquidSpotClient {
             spot_order_lookup(
                 self.info_client.clone(),
                 self.spot_coins.clone(),
+                self.carried.clone(),
                 address,
                 key,
             )
@@ -1087,6 +1112,7 @@ impl OrderStatusClient for HyperliquidSpotClient {
         spot_order_status(
             self.info_client.clone(),
             self.spot_coins.clone(),
+            self.carried.clone(),
             self.wallet_h160(),
             key.clone(),
         )
@@ -1103,11 +1129,12 @@ impl OrderStatusClient for HyperliquidSpotClient {
 async fn spot_order_lookup(
     info_client: Arc<InfoClient>,
     spot_coins: SpotCoins,
+    carried: CarriedFills,
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
     Ok(lookup_of(
-        spot_order_status(info_client, spot_coins, address, key).await?,
+        spot_order_status(info_client, spot_coins, carried, address, key).await?,
     ))
 }
 
@@ -1120,6 +1147,7 @@ async fn spot_order_lookup(
 async fn spot_order_status(
     info_client: Arc<InfoClient>,
     spot_coins: SpotCoins,
+    carried: CarriedFills,
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<Option<VenueOrderStatus>, UnindexedClientError> {
@@ -1129,7 +1157,7 @@ async fn spot_order_status(
     let coin = record.update.order.coin.as_str();
     let pairs = spot_coins.covering([coin]).await;
     let instrument = spot_pair(&pairs, coin)?.map(spot_pair_to_instrument);
-    Ok(status_from_record(key, &record, instrument))
+    Ok(status_from_record(key, &record, instrument, &carried))
 }
 
 /// The client order ids `frontendOpenOrders` (weight 20) lists on the spot `instruments`, for a
@@ -1164,6 +1192,7 @@ fn spot_open_orders(
     rows: &[OpenOrder],
     pairs: &SpotPairs,
     instruments: &[InstrumentNameExchange],
+    carried: &CarriedFills,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
     let instrument_filter = InstrumentFilter::new(instruments);
 
@@ -1176,11 +1205,12 @@ fn spot_open_orders(
         if !instrument_filter.matches(&instrument) {
             continue;
         }
-        orders.extend(open_order_to_order(
-            order,
-            ExchangeId::HyperliquidSpot,
-            instrument,
-        ));
+        orders.extend(
+            open_order_to_order(order, ExchangeId::HyperliquidSpot, instrument).map(|mut open| {
+                carry_into_open(&mut open, carried.get(order.oid));
+                open
+            }),
+        );
     }
     Ok(orders)
 }
@@ -1338,7 +1368,9 @@ fn fill_to_account_event(
     ))
 }
 
-/// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot.
+/// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot. For tests: the
+/// stream converts whole messages.
+#[cfg(test)]
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
     pair: &SpotPair,
@@ -1410,9 +1442,15 @@ mod tests {
         async fn a_spot_lookup_names_the_pair_from_spot_meta() {
             let (_server, client, coins) = serve(order_status("@107")).await;
 
-            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key())
-                .await
-                .unwrap();
+            let lookup = spot_order_lookup(
+                client,
+                coins,
+                CarriedFills::default(),
+                ethers::types::H160::zero(),
+                key(),
+            )
+            .await
+            .unwrap();
 
             let OrderLookup::Ended(order) = lookup else {
                 panic!("expected an ended order, got {lookup:?}");
@@ -1443,6 +1481,7 @@ mod tests {
                             .await,
                     ),
                     known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+                    carried: CarriedFills::default(),
                 };
 
                 let found = client.fetch_order_status(&key()).await;
@@ -1469,13 +1508,80 @@ mod tests {
             }
         }
 
+        /// A spot client against `server`, whose records `carried` adds to.
+        async fn spot_client(
+            server: &MockServer,
+            info_client: Arc<InfoClient>,
+            spot_coins: SpotCoins,
+            carried: CarriedFills,
+        ) -> HyperliquidSpotClient {
+            use super::super::super::common::info_tests::{exchange_client_against, test_wallet};
+            use super::super::super::config::Network;
+            HyperliquidSpotClient {
+                config: HyperliquidConfig::new(test_wallet(), Network::Testnet),
+                spot_coins,
+                info_client,
+                exchange_client: Arc::new(
+                    exchange_client_against(server.uri(), std::collections::HashMap::new()).await,
+                ),
+                known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+                carried,
+            }
+        }
+
+        /// Ended orders are read with `orderStatus`, with what a replacement carries added.
+        #[tokio::test]
+        async fn spot_ended_orders_are_looked_up_with_their_carried_fill() {
+            let (server, info_client, spot_coins) = serve(order_status("@107")).await;
+            let carried = CarriedFills::default();
+            carried.carry(42, dec!(0.5));
+            let client = spot_client(&server, info_client, spot_coins, carried).await;
+
+            let ended = client.fetch_ended_orders(&[key()]).await.unwrap();
+
+            let [order] = ended.as_slice() else {
+                panic!("expected one ended order, got {ended:?}");
+            };
+            assert_eq!(order.key, key());
+            assert_eq!(order.quantity, dec!(0.51));
+        }
+
+        /// Open orders are listed with `frontendOpenOrders`, with what a replacement carries
+        /// added.
+        #[tokio::test]
+        async fn spot_open_orders_are_listed_with_their_carried_fill() {
+            let (server, info_client, spot_coins) = serve(serde_json::json!([
+                {"coin": "@107", "side": "B", "limitPx": "25.5", "sz": "2", "oid": 2,
+                 "timestamp": 1714100000000u64}
+            ]))
+            .await;
+            let carried = CarriedFills::default();
+            carried.carry(2, dec!(0.5));
+            let client = spot_client(&server, info_client, spot_coins, carried).await;
+
+            let orders = client.fetch_open_orders(&[]).await.unwrap();
+
+            let [order] = orders.as_slice() else {
+                panic!("expected one open order, got {orders:?}");
+            };
+            assert_eq!(order.key.instrument.as_ref(), "HYPE-USDC-SPOT");
+            assert_eq!(order.quantity, dec!(2.5));
+            assert_eq!(order.state.filled_quantity, dec!(0.5));
+        }
+
         #[tokio::test]
         async fn a_spot_lookup_of_a_perp_order_is_unknown() {
             let (_server, client, coins) = serve(order_status("BTC")).await;
 
-            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key())
-                .await
-                .unwrap();
+            let lookup = spot_order_lookup(
+                client,
+                coins,
+                CarriedFills::default(),
+                ethers::types::H160::zero(),
+                key(),
+            )
+            .await
+            .unwrap();
 
             assert!(matches!(lookup, OrderLookup::Unknown));
         }
@@ -1484,7 +1590,14 @@ mod tests {
         async fn a_spot_lookup_fails_on_a_coin_missing_from_spot_meta() {
             let (_server, client, coins) = serve(order_status("@999")).await;
 
-            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key()).await;
+            let lookup = spot_order_lookup(
+                client,
+                coins,
+                CarriedFills::default(),
+                ethers::types::H160::zero(),
+                key(),
+            )
+            .await;
 
             assert!(lookup.is_err());
         }
@@ -1592,6 +1705,7 @@ mod tests {
                     .await,
                 ),
                 known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+                carried: CarriedFills::default(),
             };
             (server, client)
         }
@@ -2154,6 +2268,7 @@ mod tests {
                     .await,
                 ),
                 known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+                carried: CarriedFills::default(),
             };
             let instrument = InstrumentNameExchange::new("HYPE-USDC-SPOT");
             let key = OrderKey {
@@ -2448,20 +2563,56 @@ mod tests {
 
     #[test]
     fn open_orders_on_indexed_coins_are_listed_and_other_markets_left_out() {
-        let orders = spot_open_orders(&open_order_rows("@107"), &test_spot_pairs(), &[]).unwrap();
+        let orders = spot_open_orders(
+            &open_order_rows("@107"),
+            &test_spot_pairs(),
+            &[],
+            &CarriedFills::default(),
+        )
+        .unwrap();
 
         let instruments: Vec<_> = orders.iter().map(|o| o.key.instrument.as_ref()).collect();
         assert_eq!(instruments, ["HYPE-USDC-SPOT", "PURR-USDC-SPOT"]);
 
         let hype_only = [InstrumentNameExchange::from("HYPE-USDC-SPOT")];
-        let orders =
-            spot_open_orders(&open_order_rows("@107"), &test_spot_pairs(), &hype_only).unwrap();
+        let orders = spot_open_orders(
+            &open_order_rows("@107"),
+            &test_spot_pairs(),
+            &hype_only,
+            &CarriedFills::default(),
+        )
+        .unwrap();
         assert_eq!(orders.len(), 1);
     }
 
     #[test]
+    fn a_listed_order_that_replaced_another_carries_its_fill() {
+        let carried = CarriedFills::default();
+        carried.carry(2, dec!(0.5));
+        let orders =
+            spot_open_orders(&open_order_rows("@107"), &test_spot_pairs(), &[], &carried).unwrap();
+
+        let hype = orders
+            .iter()
+            .find(|o| o.key.instrument.as_ref() == "HYPE-USDC-SPOT")
+            .unwrap();
+        assert_eq!(hype.quantity, dec!(2.5));
+        assert_eq!(hype.state.filled_quantity, dec!(0.5));
+        let purr = orders
+            .iter()
+            .find(|o| o.key.instrument.as_ref() == "PURR-USDC-SPOT")
+            .unwrap();
+        assert_eq!(purr.quantity, dec!(100));
+    }
+
+    #[test]
     fn an_open_order_on_a_spot_coin_missing_from_spot_meta_fails_the_list() {
-        let result = spot_open_orders(&open_order_rows("@999"), &test_spot_pairs(), &[]);
+        let result = spot_open_orders(
+            &open_order_rows("@999"),
+            &test_spot_pairs(),
+            &[],
+            &CarriedFills::default(),
+        );
         assert!(
             matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("@999")),
             "a list missing an order must not read as complete: {result:?}"
