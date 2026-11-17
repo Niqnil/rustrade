@@ -5163,23 +5163,50 @@ mod tests {
     }
 
     /// An amend whose order status (`X`) is neither live nor an end, or missing, could leave the
-    /// order live or end it, so it is reported as neither; so is one under a new client order id
-    /// that ended it, which the engine holds under its old id.
+    /// order live or end it, so it is reported as neither; so is one under a new client order id,
+    /// which the engine holds under its old id. Each is logged, and a renamed one that ended the
+    /// order says that it ended.
     #[test]
     fn an_amend_with_an_unknown_status_or_a_new_id_produces_nothing() {
+        let logged = |report: ExecutionReport| {
+            let (events, logs) = rustrade_instrument::test_utils::logs::capture(|| convert(report));
+            assert!(events.is_empty(), "{events:?}");
+            logs.iter()
+                .flat_map(|event| &event.fields)
+                .filter(|(name, _)| *name == "message")
+                .map(|(_, message)| message.clone())
+                .collect::<Vec<_>>()
+        };
         for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
-            let amend = ExecutionReport {
+            let messages = logged(ExecutionReport {
                 order_status: status.map(str::to_string),
                 ..resting_report("REPLACED", "0.002")
-            };
-            assert!(convert(amend).is_empty(), "X = {status:?}");
+            });
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("neither live nor an end")),
+                "X = {status:?}: {messages:?}"
+            );
         }
-        let renamed_and_ended = ExecutionReport {
-            order_status: Some("EXPIRED".to_string()),
-            orig_client_order_id: Some("client-0".to_string()),
-            ..resting_report("REPLACED", "0.002")
-        };
-        assert!(convert(renamed_and_ended).is_empty());
+        for (status, ended) in [("EXPIRED", true), ("NEW", false)] {
+            let messages = logged(ExecutionReport {
+                order_status: Some(status.to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            });
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("amended under a new client order id")),
+                "X = {status}: {messages:?}"
+            );
+            assert_eq!(
+                messages.iter().any(|m| m.contains("order id ended")),
+                ended,
+                "X = {status}: {messages:?}"
+            );
+        }
     }
 
     /// A report states its terms only when its time is the venue's, an amend's included. A limit
