@@ -748,6 +748,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An unparseable Alpaca account stream message no longer panics the connection task when it is
+  logged** (`rustrade-execution`, `alpaca`). The log line quoted the message's first 200 bytes by
+  slicing at byte 200, which panics when that byte falls inside a multi-byte character. A
+  `trade_updates` payload that failed to deserialize hit this whenever `warn` was enabled, as
+  production log filters usually are; a non-JSON frame hit it at `trace`. The line now quotes the
+  first 200 characters, as the Binance clients' log lines do.
+
 - **A venue's report of an untracked working order with no positive quantity no longer reads as
   a finished order** (`rustrade`). Such a quantity is a placeholder or a value the producer could
   not read. The engine used to take the order as having nothing left to fill, remember it as

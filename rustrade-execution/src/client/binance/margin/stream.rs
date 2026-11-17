@@ -21,10 +21,11 @@ use crate::client::binance::shared::{
     CONNECT_TIMEOUT_SECS, Disconnect, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker,
     RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills, account_position_time,
     classify_rest_query_error, convert_execution_report, dedup_key_from_event, disconnect_error,
-    disconnect_lookback, event_time_from_ms, frame_excerpt, is_duplicate, lenient_millis,
-    log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind, response_decode_error,
-    rest_call_with_retry, retry_or_end,
+    disconnect_lookback, event_time_from_ms, is_duplicate, lenient_millis, log_unhandled_event,
+    log_unrecognised_frame, resolve_snapshot_kind, response_decode_error, rest_call_with_retry,
+    retry_or_end,
 };
+use crate::client::log_excerpt::frame_excerpt;
 use crate::client::venue_clock::HostMoment;
 use crate::{
     AccountEventKind, InstrumentBalanceUpdate, UnindexedAccountEvent,
