@@ -2123,7 +2123,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =78.0.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =78.1.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -2341,7 +2341,7 @@ async fn connection_manager(
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
         // unsubscribe() aborts the callback task without waiting for it (verified against
-        // binance-sdk =78.0.0): a callback already running finishes, and none starts once the
+        // binance-sdk =78.1.0): a callback already running finishes, and none starts once the
         // task sees the abort. That is benign: the callback holds its own clone of the
         // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
         // reaches the consumer through the dedup cache like any other from this connection.

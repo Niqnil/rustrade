@@ -1149,7 +1149,7 @@ binance-sdk=78.1.0  # 2026-11-17 | Exchange SDK, signing/IO. PINNED: the clients
 #   (1. `send_message` unchanged; no caller.) The `http_request` re-send HAZARD recorded at 78.0.0 is unchanged.
 # Still pinned by `a_disconnected_connection_leaves_no_task_behind` and the SDK-made errors in
 # client/binance/sdk_errors.rs.
-# What changed in the compiled modules (all generated, all additive, ~620 added lines across the crate):
+# What changed in the compiled modules (all generated, all additive; 584 added lines in `src/`):
 #   - Spot "Quote Notional Limit": an optional `quote_notional_limit` (`quoteNotionalLimit`, BUY only, the
 #     most quote asset the order may spend) on the new-order, order-test and cancel-replace params, REST and
 #     WS API, and `above_`/`below_`/working/pending variants on the order-list params; each is sent only
