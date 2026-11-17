@@ -55,13 +55,14 @@ use super::shared::{
     binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
-    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
+    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, gap_failed, gap_time,
+    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
+    trailing_params, unix_ms, unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
+use crate::client::log_excerpt::frame_excerpt;
 use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{

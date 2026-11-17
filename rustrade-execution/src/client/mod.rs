@@ -110,6 +110,10 @@ pub(crate) mod reconnect_budget;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod listed_order;
 
+// Excerpts of venue text for log lines. Gated on the clients that use it.
+#[cfg(any(feature = "alpaca", feature = "binance"))]
+pub(crate) mod log_excerpt;
+
 // A REST stub on the test's own runtime, for the reconnect tests on a paused clock.
 #[cfg(all(test, any(feature = "alpaca", feature = "binance")))]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable

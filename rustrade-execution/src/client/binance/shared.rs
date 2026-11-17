@@ -19,6 +19,7 @@
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
 use super::server_time::{ServerTime, SigningClock};
+use crate::client::log_excerpt::{excerpt, frame_excerpt};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     client::listed_order::ListedOrder,
@@ -828,14 +829,6 @@ pub(crate) fn log_unhandled_event(
             count, event_type, "Binance WS: unhandled user-data event, ignoring it"
         );
     }
-}
-
-/// The first 200 characters of a frame, for a log line about it.
-pub(crate) fn frame_excerpt(frame: &str) -> &str {
-    frame
-        .char_indices()
-        .nth(200)
-        .map_or(frame, |(end, _)| &frame[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -4241,10 +4234,7 @@ fn classify_forbidden(msg: String) -> RequestFailure {
         // `RateLimited` carries no message, so log the body it replaces. A CDN's 403 body is a
         // full HTML page: log only its start. A 403 carries no wait.
         const LOG_EXCERPT_CHARS: usize = 256;
-        let excerpt = msg
-            .char_indices()
-            .nth(LOG_EXCERPT_CHARS)
-            .map_or(msg.as_str(), |(end, _)| &msg[..end]);
+        let excerpt = excerpt(&msg, LOG_EXCERPT_CHARS);
         warn!(body = %excerpt, "Binance answered 403 (WAF limit); reporting RateLimit");
         RequestFailure::RateLimited(None)
     } else {
@@ -6005,15 +5995,6 @@ mod tests {
                 "{frame}"
             );
         }
-    }
-
-    #[test]
-    fn frame_excerpt_cuts_at_200_characters_on_a_char_boundary() {
-        assert_eq!(frame_excerpt("short"), "short");
-        let exact = "a".repeat(200);
-        assert_eq!(frame_excerpt(&exact), exact);
-        let long = "é".repeat(300);
-        assert_eq!(frame_excerpt(&long).chars().count(), 200);
     }
 
     /// A `myTrades` execution reduced to the fields recovery's order totals read.
