@@ -478,6 +478,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed
+- **`binance-sdk` 78.0.0 → 78.1.0** (`rustrade-execution`, `binance` feature, #968). The SDK adds
+  Binance spot's optional quote notional limit to its order parameters, and an optional event
+  filter to the user-data stream subscription. The clients set neither, so the requests they send
+  are unchanged, and the SDK internals the clients rely on are unchanged.
 - **Breaking: `Orders` tracks each order as a `TrackedOrder`** (`rustrade`). `Orders.0` maps a
   `ClientOrderId` to a `TrackedOrder` (its `order`, and `terms_times()`: a `TermsTimes` saying
   when the venue last stated each term) rather than to the `Order` itself, so that the times of
