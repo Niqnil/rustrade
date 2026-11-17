@@ -7,8 +7,9 @@
 //! [`StreamAccount`]) and drops the rest at `debug`.
 //!
 //! Frames are bare events, `{ "e": <type>, "E": <time>, .. }`. Fills, orders and balances keep the
-//! payloads of the earlier margin streams. What the account owes arrives as `liabilityChange`, and
-//! its margin level as `marginLevelChange`.
+//! payloads of the earlier margin streams. What the cross account owes arrives as
+//! `liabilityChange`, and its margin level as `marginLevelChange`. Binance sends neither for an
+//! isolated pair: an isolated pair's debt and margin level come from the account snapshot.
 
 use super::{
     open_reconnect_recovery, read_margin_restatement, recover_margin_ended_orders,
@@ -237,7 +238,8 @@ struct FrameHeader<'a> {
     /// `true` for an isolated pair's frame, `false` for cross.
     #[serde(rename = "is", default)]
     is_isolated: Option<bool>,
-    /// The isolated pair, on every event type but `marginLevelChange`, where it is the status.
+    /// The isolated pair, on the event types that carry one. On `marginLevelChange` it is the
+    /// status, and `liabilityChange` has none.
     #[serde(borrow, default)]
     s: Option<Cow<'a, str>>,
     /// When Binance sent the event, in epoch milliseconds; `None` when it is not an integer.
@@ -255,12 +257,14 @@ struct FrameHeader<'a> {
 ///   `warn`, as a balance applied to the wrong account would be wrong until the next snapshot.
 /// - `balanceUpdate` (a transfer, deposit or withdrawal) is not forwarded: the next
 ///   `outboundAccountPosition` carries the balance it left.
-/// - `liabilityChange`: one [`MarginDebtUpdate`] per asset it lists, naming the pair on isolated.
-///   One that does not say whose it is is dropped with a `warn`, since without its pair it would
-///   read as the cross account's debt.
-/// - `marginLevelChange`: a [`AccountNotice`]. Its `s` is the status, so it never names a pair: an
-///   isolated one is delivered naming no instrument, with a `warn`, as is one with no `is`, since
-///   losing a margin call costs more than losing its attribution.
+/// - `liabilityChange`: one [`MarginDebtUpdate`] per asset it lists. Binance sends it for the
+///   cross account only. An isolated one, should Binance start sending them, is kept only if it
+///   names its pair. One that does not say whose it is is dropped with a `warn`, since without its
+///   pair it would read as the cross account's debt.
+/// - `marginLevelChange`: a [`AccountNotice`]. Binance sends it for the cross account only, and its
+///   `s` is the status, so it never names a pair: an isolated one, should Binance start sending
+///   them, is delivered naming no instrument, with a `warn`, as is one with no `is`, since losing a
+///   margin call costs more than losing its attribution.
 /// - `listenKeyExpired` ends the session, for a new key.
 ///
 /// Event types with no arm are logged by [`log_unhandled_event`], so a renamed event is seen.

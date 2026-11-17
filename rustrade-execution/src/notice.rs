@@ -26,8 +26,9 @@ use std::fmt::{Display, Formatter};
 /// # Producers
 ///
 /// Known producers, as of writing:
-/// - Binance margin (`BinanceMargin`): `marginLevelChange`. See the client's rustdoc for how
-///   its status maps to a [`NoticeKind`], and which instrument an isolated pair's notice names.
+/// - Binance margin (`BinanceMargin`): `marginLevelChange`, for the cross account only, naming
+///   no instrument. Binance sends no margin notices for an isolated pair. See the client's rustdoc
+///   for how its status maps to a [`NoticeKind`], and how an isolated client watches its margin.
 /// - The simulated venue
 ///   ([`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)), when its spot margin account is
 ///   configured with a [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): a
@@ -37,7 +38,7 @@ use std::fmt::{Display, Formatter};
 pub struct AccountNotice<InstrumentKey> {
     /// What the notice says, independent of venue.
     pub kind: NoticeKind,
-    /// The instrument the notice is about, when the venue scopes it to one, as it does an isolated
+    /// The instrument the notice is about, when the venue scopes it to one, such as an isolated
     /// margin pair. `None` for a notice about the account as a whole, and for one the producer
     /// could not attribute; each producer says which it sends.
     pub instrument: Option<InstrumentKey>,
