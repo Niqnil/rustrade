@@ -892,23 +892,19 @@ impl ExecutionClient for HyperliquidClient {
                         };
                         match msg {
                             Message::OrderUpdates(updates) => {
-                                let replaced = common::replaced_orders(&updates.data);
-                                for update in updates.data {
-                                    unknown_coins.warn_once(&update.order.coin);
-                                    unconfigured.warn_once(&orders_dexes, &update.order.coin);
-                                    if replaced.is_replaced_leg(&update) {
-                                        continue;
-                                    }
-                                    if let Some(event) = order_update_to_account_event(
-                                        &update,
-                                        &replaced,
-                                        &orders_dexes,
-                                    )
-                                        && !send_observed(&orders_known, &orders_event_tx, event)
-                                    {
-                                        debug!("Orders event channel closed");
-                                        return;
-                                    }
+                                let sent = common::order_updates_to_account_events(
+                                    &updates.data,
+                                    ExchangeId::HyperliquidPerp,
+                                    |update| {
+                                        unknown_coins.warn_once(&update.order.coin);
+                                        unconfigured.warn_once(&orders_dexes, &update.order.coin);
+                                        orders_dexes.instrument(&update.order.coin)
+                                    },
+                                    |event| send_observed(&orders_known, &orders_event_tx, event),
+                                );
+                                if !sent {
+                                    debug!("Orders event channel closed");
+                                    return;
                                 }
                             }
                             Message::NoData => {
@@ -1529,15 +1525,14 @@ fn fill_to_account_event(
 }
 
 /// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot, `None` if its coin names no
-/// perpetual this client trades.
+/// perpetual this client trades. For tests: the stream converts whole messages.
+#[cfg(test)]
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
-    replaced: &common::ReplacedOrders,
     dexes: &PerpDexes,
 ) -> Option<UnindexedAccountEvent> {
     common::order_update_to_account_event(
         update,
-        replaced,
         ExchangeId::HyperliquidPerp,
         dexes.instrument(&update.order.coin)?,
     )
@@ -2891,12 +2886,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(
-            &update,
-            &common::ReplacedOrders::default(),
-            &default_dex(),
-        )
-        .unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
         match event.kind {
@@ -2932,12 +2922,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(
-            &update,
-            &common::ReplacedOrders::default(),
-            &default_dex(),
-        )
-        .unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
@@ -2971,12 +2956,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(
-            &update,
-            &common::ReplacedOrders::default(),
-            &default_dex(),
-        )
-        .unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
@@ -3010,11 +2990,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(
-            &update,
-            &common::ReplacedOrders::default(),
-            &default_dex(),
-        );
+        let event = order_update_to_account_event(&update, &default_dex());
         assert!(event.is_none());
     }
 }

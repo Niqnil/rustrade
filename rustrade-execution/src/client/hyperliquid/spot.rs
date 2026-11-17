@@ -602,33 +602,33 @@ impl ExecutionClient for HyperliquidSpotClient {
                                 let pairs = orders_coins
                                     .covering(updates.data.iter().map(|update| update.order.coin.as_str()))
                                     .await;
-                                let replaced = super::common::replaced_orders(&updates.data);
-                                for update in updates.data {
-                                    if replaced.is_replaced_leg(&update) {
-                                        continue;
-                                    }
-                                    // Filter: only spot coins
-                                    let coin = update.order.coin.as_str();
-                                    if CoinKind::of(coin) != CoinKind::Spot {
-                                        continue;
-                                    }
-                                    let Some(pair) = pairs.get(coin) else {
-                                        if missing_coins.insert(coin.to_owned()) {
-                                            warn!(
-                                                %coin,
-                                                oid = update.order.oid,
-                                                "Hyperliquid spot order updates on a coin not in \
-                                                 spotMeta are left out; logged once per stream"
-                                            );
+                                let sent = super::common::order_updates_to_account_events(
+                                    &updates.data,
+                                    ExchangeId::HyperliquidSpot,
+                                    |update| {
+                                        // Filter: only spot coins
+                                        let coin = update.order.coin.as_str();
+                                        if CoinKind::of(coin) != CoinKind::Spot {
+                                            return None;
                                         }
-                                        continue;
-                                    };
-                                    if let Some(event) = order_update_to_account_event(&update, &replaced, pair)
-                                        && !send_observed(&orders_known, &orders_event_tx, event)
-                                    {
-                                        debug!("Spot orders event channel closed");
-                                        return;
-                                    }
+                                        let Some(pair) = pairs.get(coin) else {
+                                            if missing_coins.insert(coin.to_owned()) {
+                                                warn!(
+                                                    %coin,
+                                                    oid = update.order.oid,
+                                                    "Hyperliquid spot order updates on a coin not in \
+                                                     spotMeta are left out; logged once per stream"
+                                                );
+                                            }
+                                            return None;
+                                        };
+                                        Some(spot_pair_to_instrument(pair))
+                                    },
+                                    |event| send_observed(&orders_known, &orders_event_tx, event),
+                                );
+                                if !sent {
+                                    debug!("Spot orders event channel closed");
+                                    return;
                                 }
                             }
                             Message::NoData => {
@@ -1342,15 +1342,15 @@ fn fill_to_account_event(
     ))
 }
 
-/// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot.
+/// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot. For tests: the
+/// stream converts whole messages.
+#[cfg(test)]
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
-    replaced: &super::common::ReplacedOrders,
     pair: &SpotPair,
 ) -> Option<UnindexedAccountEvent> {
     super::common::order_update_to_account_event(
         update,
-        replaced,
         ExchangeId::HyperliquidSpot,
         spot_pair_to_instrument(pair),
     )
@@ -2378,12 +2378,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(
-            &update,
-            &super::super::common::ReplacedOrders::default(),
-            &pair("@107"),
-        )
-        .unwrap();
+        let event = order_update_to_account_event(&update, &pair("@107")).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidSpot);
         match event.kind {

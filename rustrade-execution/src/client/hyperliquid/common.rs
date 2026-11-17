@@ -10,7 +10,10 @@ use crate::error::{OrderError, UnindexedClientError, UnindexedOrderError};
 use crate::order::{
     Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-    state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+    state::{
+        ActiveOrderState, Cancelled, Filled, InactiveOrderState, Open, OrderState,
+        UnindexedOrderState,
+    },
 };
 use crate::{
     InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -728,118 +731,146 @@ impl OrderStatus {
     }
 }
 
-/// The orders one `orderUpdates` message shows modified, found by [`replaced_orders`].
+/// Convert one `orderUpdates` message's records into order snapshot events, handing each to
+/// `emit` in the message's order. Stops, returning `false`, at the first event `emit` refuses.
 ///
-/// A modify keeps the order's cloid and gives it a new `oid`, which the stream shows as two
-/// records in one message: `open` on the new `oid` and `canceled` on the old, with the same coin,
-/// cloid and `statusTimestamp` (the modify's time) and no field naming the other `oid`.
-#[derive(Debug, Default)]
-pub(super) struct ReplacedOrders {
-    /// Each replacement's `oid`, with what it replaced.
-    replacements: HashMap<u64, Replaced>,
-    /// The `oid`s of the orders replaced, whose `canceled` records are the modify, not a cancel.
-    old_legs: HashSet<u64>,
-}
-
-/// An order a modify replaced, as its `canceled` record last showed it.
-#[derive(Debug, Clone, Copy)]
-struct Replaced {
-    oid: u64,
-    /// What had filled of it: the replacement's size restarts, so this is added back.
-    filled: Decimal,
-}
-
-impl ReplacedOrders {
-    /// Whether `update` is the `canceled` record of an order replaced in this message. It is left
-    /// out: the replacement's report is its successor, and carries the totals.
-    pub(super) fn is_replaced_leg(&self, update: &hyperliquid_rust_sdk::OrderUpdate) -> bool {
-        self.old_legs.contains(&update.order.oid)
+/// `instrument` names the instrument a record is reported on, or `None` to leave the record out.
+///
+/// # Modifies
+///
+/// A modify keeps an order's cloid but gives it a new `oid`, and restarts its size and fill. The
+/// stream sends it as two records in one message, with the same coin, cloid and
+/// `statusTimestamp` (the modify's time) and no field naming the other `oid`: `open` on the new
+/// `oid` and `canceled` on the old. Such a pair is read as one order replaced: the `open` is
+/// reported linked to the old `oid` ([`Replaces`]), with the old order's fill added to its size
+/// and fill so that both are totals, and the old `canceled` is left out.
+///
+/// The records are paired only when nothing else in the message shares their coin, cloid and
+/// `statusTimestamp`, they are of one side, and both convert with the old one's fill known.
+/// Otherwise each is reported as it stands, the `canceled` ending the order, as are records of
+/// one modify that arrive in separate messages.
+pub(super) fn order_updates_to_account_events(
+    updates: &[hyperliquid_rust_sdk::OrderUpdate],
+    exchange: ExchangeId,
+    mut instrument: impl FnMut(&hyperliquid_rust_sdk::OrderUpdate) -> Option<InstrumentNameExchange>,
+    mut emit: impl FnMut(UnindexedAccountEvent) -> bool,
+) -> bool {
+    // The stream's records carry no type, trigger or time in force, so a report states only the
+    // quantity and price.
+    let mut convert = |update: &hyperliquid_rust_sdk::OrderUpdate| {
+        order_update_to_order(
+            update,
+            &OrderTerms::UNREPORTED,
+            exchange,
+            instrument(update)?,
+        )
+    };
+    // Most messages hold one record, which pairs with nothing.
+    if let [update] = updates {
+        return convert(update).is_none_or(|report| emit(order_snapshot_event(exchange, report)));
     }
+    let mut reports: Vec<_> = updates.iter().map(&mut convert).collect();
+    for (new, old) in modify_pairs(updates) {
+        link_replacement(&mut reports, new, old);
+    }
+    reports
+        .into_iter()
+        .flatten()
+        .all(|report| emit(order_snapshot_event(exchange, report)))
 }
 
-/// Find the orders `updates` show modified.
+/// The key a modify's two records share.
+fn modify_key(update: &hyperliquid_rust_sdk::OrderUpdate) -> Option<(&str, &str, u64)> {
+    Some((
+        &update.order.coin,
+        update.order.cloid.as_deref()?,
+        update.status_timestamp,
+    ))
+}
+
+/// The positions in `updates` of each modify's records, as `(new, old)`: a `canceled` and an
+/// `open` record of one side and different `oid`s that alone share a [`modify_key`].
 ///
-/// The venue sends no link between the two `oid`s, so the pair is read from the records
-/// themselves: within one message, a `canceled` and an `open` record of the same coin, cloid
-/// and `statusTimestamp`, and nothing else sharing them. Two of either, a record without a cloid,
-/// or an unreadable size, leave the records unpaired, and each is read as it stands.
-pub(super) fn replaced_orders(updates: &[hyperliquid_rust_sdk::OrderUpdate]) -> ReplacedOrders {
-    let mut groups: HashMap<(&str, &str, u64), Vec<&hyperliquid_rust_sdk::OrderUpdate>> =
-        HashMap::new();
-    for update in updates {
-        if let Some(cloid) = update.order.cloid.as_deref() {
-            groups
-                .entry((&update.order.coin, cloid, update.status_timestamp))
-                .or_default()
-                .push(update);
+/// A message holds few records, so this compares them pairwise rather than allocate an index.
+fn modify_pairs(
+    updates: &[hyperliquid_rust_sdk::OrderUpdate],
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    updates.iter().enumerate().filter_map(|(old, cancelled)| {
+        // Only the statuses a modify was seen to send: another cancel, such as a self-trade
+        // cancel, is the venue ending the order.
+        if cancelled.status != "canceled" {
+            return None;
         }
-    }
-    let mut found = ReplacedOrders::default();
-    for group in groups.values() {
-        let [a, b] = group.as_slice() else { continue };
-        let (new, old) = match (
-            OrderStatus::classify(&a.status),
-            OrderStatus::classify(&b.status),
-        ) {
-            (Some(OrderStatus::Open), Some(OrderStatus::Cancelled)) => (a, b),
-            (Some(OrderStatus::Cancelled), Some(OrderStatus::Open)) => (b, a),
-            _ => continue,
-        };
-        if new.order.oid == old.order.oid || new.order.side != old.order.side {
-            continue;
-        }
-        let (Some(orig_sz), Some(sz)) = (
-            parse_decimal(&old.order.orig_sz, "order.origSz"),
-            parse_decimal(&old.order.sz, "order.sz"),
-        ) else {
-            continue;
-        };
-        found.replacements.insert(
-            new.order.oid,
-            Replaced {
-                oid: old.order.oid,
-                filled: (orig_sz - sz).max(Decimal::ZERO),
-            },
-        );
-        found.old_legs.insert(old.order.oid);
-    }
-    found
+        let key = modify_key(cancelled)?;
+        let mut sharing = updates
+            .iter()
+            .enumerate()
+            .filter(|(index, update)| *index != old && modify_key(update) == Some(key));
+        let (new, opened) = sharing.next()?;
+        (sharing.next().is_none()
+            && opened.status == "open"
+            && opened.order.oid != cancelled.order.oid
+            && opened.order.side == cancelled.order.side)
+            .then_some((new, old))
+    })
 }
 
-/// Convert an `orderUpdates` message into an order snapshot event on `instrument`, keyed as
-/// [`record_cid`] says.
-///
-/// A record `replaced` shows to be a modify's replacement is linked to the order it replaced,
-/// with that order's fill added to its size and fill (the venue restarts both), and the replaced
-/// order's own `canceled` record is for the caller to leave out
-/// ([`ReplacedOrders::is_replaced_leg`]).
-///
-/// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
-/// parse or the status is not one [`OrderStatus::classify`] recognises.
+/// Report `reports[new]` as the order that replaced `reports[old]`, and leave `reports[old]` out,
+/// when both converted and the old one's fill is known.
+fn link_replacement(reports: &mut [Option<UnindexedOrderReport>], new: usize, old: usize) {
+    let (Some(Some(old_report)), Some(Some(_))) = (reports.get(old), reports.get(new)) else {
+        return;
+    };
+    let OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled {
+        id: old_id,
+        filled_quantity: Some(filled),
+        ..
+    })) = &old_report.order.state
+    else {
+        return;
+    };
+    let (old_id, filled) = (old_id.clone(), *filled);
+    reports[old] = None;
+    if let Some(slot) = reports.get_mut(new)
+        && let Some(report) = slot.take()
+    {
+        let mut report = report.with_replaces(Replaces::new(old_id));
+        report.order.quantity += filled;
+        if let OrderState::Active(ActiveOrderState::Open(open)) = &mut report.order.state {
+            open.filled_quantity += filled;
+        }
+        *slot = Some(report);
+    }
+}
+
+/// The event of one record, alone in a message, on `instrument`.
+#[cfg(test)]
 pub(super) fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
-    replaced: &ReplacedOrders,
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
 ) -> Option<UnindexedAccountEvent> {
-    // The stream's records carry no type, trigger or time in force, so the report states only
-    // the quantity and price.
-    let mut report = order_update_to_order(update, &OrderTerms::UNREPORTED, exchange, instrument)?;
-    if let Some(old) = replaced.replacements.get(&update.order.oid) {
-        report.order.quantity += old.filled;
-        if let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
-            &mut report.order.state
-        {
-            open.filled_quantity += old.filled;
-        }
-        report = report.with_replaces(Replaces::new(OrderId(format_smolstr!("{}", old.oid))));
-    }
-    Some(crate::AccountEvent::new(
+    let mut event = None;
+    order_updates_to_account_events(
+        std::slice::from_ref(update),
+        exchange,
+        |_| Some(instrument.clone()),
+        |sent| event.replace(sent).is_none(),
+    );
+    event
+}
+
+/// An order snapshot event of `report`.
+fn order_snapshot_event(
+    exchange: ExchangeId,
+    report: UnindexedOrderReport,
+) -> UnindexedAccountEvent {
+    crate::AccountEvent::new(
         exchange,
         crate::AccountEventKind::OrderSnapshot(
             rustrade_integration::collection::snapshot::Snapshot(report),
         ),
-    ))
+    )
 }
 
 /// Convert an order record, as `orderUpdates` sends it and `orderStatus` answers with it, into the
@@ -1828,7 +1859,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 pub(super) mod info_tests {
     use super::*;
-    use crate::{error::ApiError, order::UnindexedOrderSnapshot};
+    use crate::error::ApiError;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2258,10 +2289,6 @@ pub(super) mod info_tests {
         .unwrap()
     }
 
-    fn snapshot_of(event: UnindexedAccountEvent) -> UnindexedOrderSnapshot {
-        report_of(event).order
-    }
-
     fn report_of(event: UnindexedAccountEvent) -> UnindexedOrderReport {
         match event.kind {
             crate::AccountEventKind::OrderSnapshot(snapshot) => snapshot.0,
@@ -2289,34 +2316,57 @@ pub(super) mod info_tests {
         .unwrap()
     }
 
-    fn convert(
-        update: &hyperliquid_rust_sdk::OrderUpdate,
-        replaced: &ReplacedOrders,
-    ) -> UnindexedOrderReport {
-        report_of(
-            order_update_to_account_event(update, replaced, ExchangeId::HyperliquidPerp, eth())
-                .unwrap(),
-        )
+    /// The reports `updates` convert to, as one message, every record on ETH.
+    fn convert_message(updates: &[hyperliquid_rust_sdk::OrderUpdate]) -> Vec<UnindexedOrderReport> {
+        let mut reports = Vec::new();
+        assert!(order_updates_to_account_events(
+            updates,
+            ExchangeId::HyperliquidPerp,
+            |_| Some(eth()),
+            |event| {
+                reports.push(report_of(event));
+                true
+            },
+        ));
+        reports
+    }
+
+    /// The report of the one record `update` is, alone in a message.
+    fn convert_one(update: &hyperliquid_rust_sdk::OrderUpdate) -> Option<UnindexedOrderReport> {
+        let mut reports = convert_message(std::slice::from_ref(update));
+        assert!(reports.len() <= 1);
+        reports.pop()
+    }
+
+    fn oid_of(report: &UnindexedOrderReport) -> String {
+        match &report.order.state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                open.id.assigned().unwrap().0.to_string()
+            }
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
+                cancelled.id.0.to_string()
+            }
+            other => panic!("unexpected state {other:?}"),
+        }
     }
 
     #[test]
     fn a_modifys_records_link_the_new_order_to_the_old_and_drop_the_old_cancel() {
         // Seen on testnet: `open` on the new oid, then `canceled` on the old, one instant.
-        let updates = [
+        let reports = convert_message(&[
             leg("open", 8002, "0.0191", "0.0191", 1714100001000),
             leg("canceled", 8001, "0.0127", "0.0064", 1714100000000),
-        ];
-        let replaced = replaced_orders(&updates);
+        ]);
 
-        assert!(!replaced.is_replaced_leg(&updates[0]));
-        assert!(replaced.is_replaced_leg(&updates[1]));
-        let report = convert(&updates[0], &replaced);
+        let [report] = reports.as_slice() else {
+            panic!("expected only the replacement, got {reports:?}");
+        };
         assert_eq!(report.replaces, Some(Replaces::new(OrderId::new("8001"))));
         assert_eq!(report.order.key.cid, ClientOrderId::new(CID));
         // The 0.0063 filled before the modify is added back: the venue restarts both figures.
         assert_eq!(report.order.quantity, dec!(0.0254));
-        match report.order.state {
-            OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
+        match &report.order.state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
                 assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("8002")));
                 assert_eq!(open.filled_quantity, dec!(0.0063));
             }
@@ -2326,15 +2376,16 @@ pub(super) mod info_tests {
 
     #[test]
     fn the_pairing_does_not_depend_on_the_records_order() {
-        let updates = [
+        let reports = convert_message(&[
             leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
             leg("open", 8002, "0.0191", "0.0191", 1714100001000),
-        ];
-        let replaced = replaced_orders(&updates);
+        ]);
 
-        assert!(replaced.is_replaced_leg(&updates[0]));
-        let report = convert(&updates[1], &replaced);
+        let [report] = reports.as_slice() else {
+            panic!("expected only the replacement, got {reports:?}");
+        };
         assert_eq!(report.replaces, Some(Replaces::new(OrderId::new("8001"))));
+        // Nothing had filled, so the size is the new one.
         assert_eq!(report.order.quantity, dec!(0.0191));
     }
 
@@ -2344,75 +2395,148 @@ pub(super) mod info_tests {
             leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
             leg("open", 8002, "0.0191", "0.0191", 1714100001000),
         ] {
-            let replaced = replaced_orders(std::slice::from_ref(&update));
-            assert!(!replaced.is_replaced_leg(&update));
-            assert_eq!(convert(&update, &replaced).replaces, None);
+            let report = convert_one(&update).unwrap();
+            assert_eq!(report.replaces, None);
+            assert_eq!(report.order.quantity.to_string(), update.order.orig_sz);
+            assert_eq!(oid_of(&report), update.order.oid.to_string());
         }
+    }
+
+    /// Records that do not pair are all reported, unlinked, in the message's order.
+    fn assert_unpaired(updates: &[hyperliquid_rust_sdk::OrderUpdate]) {
+        let reports = convert_message(updates);
+        assert_eq!(
+            reports.iter().map(oid_of).collect::<Vec<_>>(),
+            updates
+                .iter()
+                .map(|update| update.order.oid.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(reports.iter().all(|report| report.replaces.is_none()));
     }
 
     #[test]
     fn records_that_could_be_two_modifies_are_not_paired() {
         // Two opens against one cancel: nothing says which replaced it.
-        let updates = [
+        assert_unpaired(&[
             leg("open", 8002, "0.0191", "0.0191", 1714100001000),
             leg("open", 8003, "0.0191", "0.0191", 1714100001000),
             leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
-        ];
-        let replaced = replaced_orders(&updates);
+        ]);
+    }
 
-        assert!(
-            updates
-                .iter()
-                .all(|update| !replaced.is_replaced_leg(update))
-        );
-        assert_eq!(convert(&updates[0], &replaced).replaces, None);
+    #[test]
+    fn records_of_another_instant_or_without_a_cloid_are_not_paired() {
+        let mut later = leg("open", 8002, "0.0191", "0.0191", 1714100001000);
+        later.status_timestamp += 1;
+        let cancel = leg("canceled", 8001, "0.0127", "0.0127", 1714100000000);
+        assert_unpaired(&[later, cancel.clone()]);
+
+        let mut no_cloid = [leg("open", 8002, "0.0191", "0.0191", 1714100001000), cancel];
+        for update in &mut no_cloid {
+            update.order.cloid = None;
+        }
+        assert_unpaired(&no_cloid);
     }
 
     #[test]
     fn records_of_one_oid_or_of_opposite_sides_are_not_paired() {
-        let same_oid = [
+        assert_unpaired(&[
             leg("open", 8001, "0.0191", "0.0191", 1714100001000),
             leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
-        ];
+        ]);
         let mut sell = leg("open", 8002, "0.0191", "0.0191", 1714100001000);
         sell.order.side = "A".to_owned();
-        let opposite = [
+        assert_unpaired(&[
             sell,
             leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
-        ];
-        for updates in [same_oid, opposite] {
-            let replaced = replaced_orders(&updates);
-            assert!(!replaced.is_replaced_leg(&updates[1]));
-            assert_eq!(convert(&updates[0], &replaced).replaces, None);
-        }
+        ]);
     }
 
     #[test]
-    fn records_of_another_instant_or_order_are_not_paired() {
-        let mut later = leg("open", 8002, "0.0191", "0.0191", 1714100001000);
-        later.status_timestamp += 1;
-        let no_cloid = order_update("open", "null", "0.0075");
-        let cancel = leg("canceled", 8001, "0.0127", "0.0127", 1714100000000);
-        for open in [later, no_cloid] {
-            let updates = [open, cancel.clone()];
-            let replaced = replaced_orders(&updates);
-            assert!(!replaced.is_replaced_leg(&updates[1]));
-            assert_eq!(convert(&updates[0], &replaced).replaces, None);
-        }
+    fn only_the_statuses_a_modify_sends_are_paired() {
+        // A venue cancel, such as a self-trade cancel, ends the order even beside an `open`.
+        assert_unpaired(&[
+            leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("selfTradeCanceled", 8001, "0.0127", "0.0127", 1714100000000),
+        ]);
+        assert_unpaired(&[
+            leg("triggered", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("canceled", 8001, "0.0127", "0.0127", 1714100000000),
+        ]);
+    }
+
+    #[test]
+    fn an_old_cancel_is_kept_when_its_replacement_does_not_convert() {
+        let mut bad = leg("open", 8002, "0.0191", "0.0191", 1714100001000);
+        bad.order.limit_px = "not a price".to_owned();
+        let reports = convert_message(&[
+            bad,
+            leg("canceled", 8001, "0.0127", "0.0064", 1714100000000),
+        ]);
+
+        let [report] = reports.as_slice() else {
+            panic!("expected only the cancel, got {reports:?}");
+        };
+        assert_eq!(oid_of(report), "8001");
+        assert_eq!(report.replaces, None);
+    }
+
+    #[test]
+    fn records_with_an_unknown_old_fill_or_no_instrument_are_not_paired() {
+        // The old fill cannot be added back when it is unknown.
+        assert_unpaired(&[
+            leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("canceled", 8001, "0.0127", "?", 1714100000000),
+        ]);
+
+        // A record left out by its instrument leaves the other as it stands.
+        let updates = [
+            leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("canceled", 8001, "0.0127", "0.0064", 1714100000000),
+        ];
+        let mut oids = Vec::new();
+        assert!(order_updates_to_account_events(
+            &updates,
+            ExchangeId::HyperliquidPerp,
+            |update| (update.order.oid == 8001).then(eth),
+            |event| {
+                oids.push(oid_of(&report_of(event)));
+                true
+            },
+        ));
+        assert_eq!(oids, ["8001"]);
+    }
+
+    #[test]
+    fn emitting_stops_at_the_first_event_refused() {
+        let updates = [
+            leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("open", 8003, "0.0191", "0.0191", 1714100002000),
+        ];
+        let mut sent = 0;
+        assert!(!order_updates_to_account_events(
+            &updates,
+            ExchangeId::HyperliquidPerp,
+            |_| Some(eth()),
+            |_| {
+                sent += 1;
+                false
+            },
+        ));
+        assert_eq!(sent, 1);
+        assert!(!order_updates_to_account_events(
+            &updates[..1],
+            ExchangeId::HyperliquidPerp,
+            |_| Some(eth()),
+            |_| false,
+        ));
     }
 
     #[test]
     fn an_order_update_names_the_order_by_the_id_it_was_placed_under() {
         let update = order_update("open", &format!(r#""{CLOID}""#), "0.005");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
 
         assert_eq!(order.key.cid, ClientOrderId::new(CID));
         assert_eq!(order.quantity, dec!(0.0075));
@@ -2420,15 +2544,7 @@ pub(super) mod info_tests {
         assert_eq!(order.time_in_force, TimeInForce::Unreported);
         // Nor a type, so neither its `Limit` nor its `limitPx`, which could as well be a market
         // trigger's worst fill price, is stated: only its quantity is.
-        let report = report_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let report = convert_one(&update).unwrap();
         assert_eq!(report.reported, ReportedTerms::NONE.with_quantity(true));
         match order.state {
             OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
@@ -2442,44 +2558,20 @@ pub(super) mod info_tests {
     #[test]
     fn an_order_update_without_a_cloid_is_named_by_its_oid() {
         let update = order_update("open", "null", "0.0075");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         assert_eq!(order.key.cid, ClientOrderId::new("7001"));
     }
 
     #[test]
     fn an_order_update_with_a_malformed_cloid_is_dropped() {
         let update = order_update("open", r#""0x1234""#, "0.0075");
-        assert!(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth()
-            )
-            .is_none()
-        );
+        assert!(convert_one(&update).is_none());
     }
 
     #[test]
     fn a_cancellation_for_any_reason_ends_the_order() {
         let update = order_update("selfTradeCanceled", &format!(r#""{CLOID}""#), "0.005");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
                 assert_eq!(cancelled.filled_quantity, Some(dec!(0.0025)));
@@ -2493,15 +2585,7 @@ pub(super) mod info_tests {
     #[test]
     fn a_cancellation_with_an_unparseable_size_ends_the_order_with_its_fill_unknown() {
         let update = order_update("canceled", &format!(r#""{CLOID}""#), "not a number");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
                 assert_eq!(cancelled.filled_quantity, None);
@@ -2516,15 +2600,7 @@ pub(super) mod info_tests {
     #[test]
     fn a_filled_record_with_a_remainder_is_cancelled_with_what_filled() {
         let update = order_update("filled", &format!(r#""{CLOID}""#), "0.005");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         assert_eq!(order.quantity, dec!(0.0075));
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
@@ -2540,15 +2616,7 @@ pub(super) mod info_tests {
     fn a_filled_record_with_nothing_left_is_fully_filled() {
         for sz in ["0", "0.0"] {
             let update = order_update("filled", &format!(r#""{CLOID}""#), sz);
-            let order = snapshot_of(
-                order_update_to_account_event(
-                    &update,
-                    &ReplacedOrders::default(),
-                    ExchangeId::HyperliquidPerp,
-                    eth(),
-                )
-                .unwrap(),
-            );
+            let order = convert_one(&update).unwrap().order;
             match order.state {
                 OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(
                     filled,
@@ -2566,15 +2634,7 @@ pub(super) mod info_tests {
     #[test]
     fn a_filled_record_with_an_unparseable_size_ends_the_order_with_its_fill_unknown() {
         let update = order_update("filled", &format!(r#""{CLOID}""#), "not a number");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
                 assert_eq!(cancelled.filled_quantity, None);
@@ -2587,15 +2647,7 @@ pub(super) mod info_tests {
     fn a_status_saying_funds_ran_short_ends_the_order_as_balance_insufficient() {
         for status in ["perpMarginRejected", "insufficientSpotBalanceRejected"] {
             let update = order_update(status, &format!(r#""{CLOID}""#), "0.0075");
-            let order = snapshot_of(
-                order_update_to_account_event(
-                    &update,
-                    &ReplacedOrders::default(),
-                    ExchangeId::HyperliquidPerp,
-                    eth(),
-                )
-                .unwrap(),
-            );
+            let order = convert_one(&update).unwrap().order;
             match order.state {
                 OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
                     OrderError::Rejected(ApiError::BalanceInsufficient(None, reason)),
@@ -2608,15 +2660,7 @@ pub(super) mod info_tests {
     #[test]
     fn a_rejection_ends_the_order_and_names_the_reason() {
         let update = order_update("badAloPxRejected", &format!(r#""{CLOID}""#), "0.0075");
-        let order = snapshot_of(
-            order_update_to_account_event(
-                &update,
-                &ReplacedOrders::default(),
-                ExchangeId::HyperliquidPerp,
-                eth(),
-            )
-            .unwrap(),
-        );
+        let order = convert_one(&update).unwrap().order;
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
                 OrderError::Rejected(ApiError::OrderRejected(reason)),
