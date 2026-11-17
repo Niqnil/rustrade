@@ -8413,7 +8413,14 @@ mod tests {
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
         tracing::subscriber::with_default(subscriber, || {
             for frame in [&not_json, &bad_payload] {
-                process_ws_text(frame, &tx, &dedup, &known, &mut VenueClock::new());
+                process_ws_text(
+                    frame,
+                    &tx,
+                    &dedup,
+                    &known,
+                    &mut VenueClock::new(),
+                    &mut ReplaceTracker::default(),
+                );
             }
         });
         assert!(rx.try_recv().is_err(), "neither message reports an event");
