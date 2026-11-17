@@ -469,8 +469,8 @@ impl BinanceMarginConfig {
 /// debt live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a
 /// cross account only: Binance sends that event for cross margin alone, as it has confirmed
 /// ([forum thread](https://dev.binance.vision/t/39387)). An isolated pair's debt comes from
-/// `account_snapshot`; Binance suggests taking the pair's balance events as the cue to read it
-/// again. A debt change sent while the stream is down is not recovered, so call `account_snapshot`
+/// `account_snapshot`; Binance suggests taking the pair's order and balance events as the cue to
+/// read it again. A debt change sent while the stream is down is not recovered, so call `account_snapshot`
 /// at startup and after a reconnect (see [`account_stream`](Self::account_stream)'s cold-start
 /// note).
 ///
@@ -1802,13 +1802,15 @@ impl ExecutionClient for BinanceMargin {
     /// [`margin_level`](crate::AccountNotice::margin_level).
     ///
     /// Binance sends `marginLevelChange` for the cross account only, as it has confirmed
-    /// ([forum thread](https://dev.binance.vision/t/39387)), and the event's `s` is its status, so it names no pair. A cross
-    /// client's notices are about the account as a whole and name no instrument. **An isolated
-    /// client receives no margin notices from the stream.** It watches its pairs' margin through
-    /// [`ExecutionClient::account_snapshot`], whose
+    /// ([forum thread](https://dev.binance.vision/t/39387)), and the event's `s` is its status, so
+    /// it names no pair. A cross client's notices are about the account as a whole and name no
+    /// instrument. **An isolated client receives no margin notices from the stream.** It watches
+    /// its pairs' margin through [`ExecutionClient::account_snapshot`], whose
     /// [`InstrumentAccountSnapshot::isolated`](crate::InstrumentAccountSnapshot::isolated) carries
-    /// each pair's margin level and liquidation price; Binance suggests taking the pair's balance
-    /// events as the cue to read it again.
+    /// each pair's margin level and liquidation price; Binance suggests taking the pair's order and
+    /// balance events as the cue to read it again. Each read is a REST request, and nothing is
+    /// pushed when a pair's margin level falls, so how often the caller reads bounds how late it
+    /// sees a pair near liquidation.
     ///
     /// Should Binance start sending the event for an isolated pair, it would be delivered to an
     /// isolated client naming no instrument, with a `warn`, since losing a margin call costs more
@@ -1829,11 +1831,11 @@ impl ExecutionClient for BinanceMargin {
     /// [`venue_kind`](crate::MarginDebtUpdate::venue_kind).
     /// - **Cross** updates name no instrument: they are the account's debt in that asset.
     /// - **Isolated** debt is not streamed. Binance sends `liabilityChange` for the cross account
-    ///   only, as it has confirmed ([forum thread](https://dev.binance.vision/t/39387)): a borrow, a repay or an interest
-    ///   charge on an isolated pair comes with balance updates alone. An isolated client reads its
-    ///   pairs' debt from [`ExecutionClient::account_snapshot`]; Binance suggests taking those
-    ///   balance updates as the cue to read it again. Should Binance start sending the event for
-    ///   an isolated pair, it would be kept only if it named its pair.
+    ///   only, as it has confirmed (see "Margin notices" above): a borrow, a repay or an interest
+    ///   charge on an isolated pair comes with order and balance updates alone. An isolated client
+    ///   reads its pairs' debt from [`ExecutionClient::account_snapshot`]; Binance suggests taking
+    ///   those updates as the cue to read it again. Should Binance start sending the event for an
+    ///   isolated pair, it would be kept only if it named its pair.
     ///
     /// Binance posts an interest charge some time after the period it is for; when is not
     /// documented. An asset with no name, or whose `p` or `i` cannot be read, is dropped with a
