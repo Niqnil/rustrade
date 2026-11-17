@@ -2672,6 +2672,33 @@ pub(super) mod info_tests {
     }
 
     #[test]
+    fn a_pair_whose_old_record_does_not_convert_keeps_what_the_new_one_carries() {
+        let carried = CarriedFills::default();
+        carried.carry(8002, dec!(0.5));
+        let updates = [
+            leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+            leg("canceled", 8001, "0.0127", "0.0064", 1714100000000),
+        ];
+        let mut reports = Vec::new();
+        assert!(order_updates_to_account_events(
+            &updates,
+            ExchangeId::HyperliquidPerp,
+            &carried,
+            |update| (update.order.oid == 8002).then(eth),
+            |event| {
+                reports.push(report_of(event));
+                true
+            },
+        ));
+
+        let [new] = reports.as_slice() else {
+            panic!("expected the new record only, got {reports:?}");
+        };
+        assert_eq!(new.replaces, None);
+        assert_eq!(new.order.quantity, dec!(0.5191));
+    }
+
+    #[test]
     fn a_listing_adds_what_a_replacement_carries() {
         let carried = CarriedFills::default();
         let rows = rows();
