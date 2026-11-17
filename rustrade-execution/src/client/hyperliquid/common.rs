@@ -789,8 +789,14 @@ pub(super) fn order_updates_to_account_events(
         }
     }
     for (new, old) in pairs {
-        if let Some(update) = updates.get(new) {
-            link_replacement(&mut reports, new, old, update.order.oid, carried);
+        let Some(update) = updates.get(new) else {
+            continue;
+        };
+        if !link_replacement(&mut reports, new, old, update.order.oid, carried)
+            && let Some(Some(report)) = reports.get_mut(new)
+        {
+            // Not linked: read as it stands, with whatever its `oid` already carries.
+            carry_into_report(report, carried.get(update.order.oid));
         }
     }
     reports
@@ -838,15 +844,16 @@ fn modify_pairs(
 /// Report `reports[new]`, of `new_oid`, as the order that replaced `reports[old]`, and leave
 /// `reports[old]` out, when both converted and the old one's fill is known. That fill, a total
 /// with what the old order carried, is carried into the new one and recorded in `carried`.
+/// Whether it linked them.
 fn link_replacement(
     reports: &mut [Option<UnindexedOrderReport>],
     new: usize,
     old: usize,
     new_oid: u64,
     carried: &CarriedFills,
-) {
+) -> bool {
     let Some(Some(old_report)) = reports.get(old) else {
-        return;
+        return false;
     };
     let OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled {
         id: old_id,
@@ -854,17 +861,18 @@ fn link_replacement(
         ..
     })) = &old_report.order.state
     else {
-        return;
+        return false;
     };
     let (old_id, filled) = (old_id.clone(), *filled);
     let Some(report) = reports.get_mut(new).and_then(Option::take) else {
-        return;
+        return false;
     };
     let mut report = report.with_replaces(Replaces::new(old_id));
     carry_into_report(&mut report, filled);
     carried.carry(new_oid, filled);
     reports[new] = Some(report);
     reports[old] = None;
+    true
 }
 
 /// The event of one record, alone in a message, on `instrument`.
@@ -2640,6 +2648,27 @@ pub(super) mod info_tests {
 
         assert_eq!(first, second);
         assert_eq!(second[0].order.quantity, dec!(0.0254));
+    }
+
+    #[test]
+    fn a_pair_left_unlinked_keeps_what_its_records_carry() {
+        let carried = CarriedFills::default();
+        carried.carry(8002, dec!(0.5));
+        // The old fill is unknown, so the records are not linked and each stands as it is.
+        let reports = convert_with(
+            &[
+                leg("open", 8002, "0.0191", "0.0191", 1714100001000),
+                leg("canceled", 8001, "0.0127", "?", 1714100000000),
+            ],
+            &carried,
+        );
+
+        let [new, old] = reports.as_slice() else {
+            panic!("expected both records, got {reports:?}");
+        };
+        assert_eq!(new.replaces, None);
+        assert_eq!(new.order.quantity, dec!(0.5191));
+        assert_eq!(old.order.quantity, dec!(0.0127));
     }
 
     #[test]

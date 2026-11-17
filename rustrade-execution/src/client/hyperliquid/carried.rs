@@ -15,10 +15,15 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use std::{num::NonZeroUsize, sync::Arc};
+use tracing::warn;
 
-/// How many replacing orders [`CarriedFills`] remembers before it forgets the least recently
-/// used. Far above the open orders an account holds, so that an order forgotten has long ended.
-const CARRIED_ORDERS: NonZeroUsize = match NonZeroUsize::new(4_096) {
+/// How many replacing orders [`CarriedFills`] remembers before it forgets the least recently used.
+///
+/// The bound is on modifies, not on open orders: each modify takes an entry, and only a report of
+/// the order refreshes it. An order modified once and not read since is forgotten after this many
+/// later modifies, live or not, which is logged. An entry is an `oid` and a decimal, so the bound
+/// holds the memory to about 4 MiB.
+const CARRIED_ORDERS: NonZeroUsize = match NonZeroUsize::new(65_536) {
     Some(capacity) => capacity,
     None => panic!("a non-zero literal"),
 };
@@ -29,17 +34,30 @@ const CARRIED_ORDERS: NonZeroUsize = match NonZeroUsize::new(4_096) {
 /// Learned only from the account stream, and held in memory: an order modified while no stream
 /// of this client was reading, or before the process started, has its earlier fill left out of
 /// every report of it. An entry outlives the order's end, so a late lookup of it still adds the
-/// fill back, until [`CARRIED_ORDERS`] later replacements push it out.
+/// fill back, until it is the least recently used of more than [`CARRIED_ORDERS`] (logged at
+/// `warn`, as the order's reports then leave its earlier fill out).
 #[derive(Debug, Clone)]
 pub(super) struct CarriedFills(Arc<Mutex<LruCache<u64, Decimal>>>);
 
 impl Default for CarriedFills {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(LruCache::new(CARRIED_ORDERS))))
+        Self::with_capacity(CARRIED_ORDERS)
     }
 }
 
 impl CarriedFills {
+    fn with_capacity(capacity: NonZeroUsize) -> Self {
+        Self(Arc::new(Mutex::new(LruCache::new(capacity))))
+    }
+
+    /// Record `filled` under `oid`, and give the entry of another order forgotten to make room.
+    fn put(&self, oid: u64, filled: Decimal) -> Option<(u64, Decimal)> {
+        self.0
+            .lock()
+            .push(oid, filled)
+            .filter(|(forgotten, _)| *forgotten != oid)
+    }
+
     /// What filled before the modify that gave the order its `oid`: zero for an order no modify
     /// seen replaced.
     pub(super) fn get(&self, oid: u64) -> Decimal {
@@ -48,7 +66,14 @@ impl CarriedFills {
 
     /// Record that `filled` filled before the modify that gave the order its `oid`.
     pub(super) fn carry(&self, oid: u64, filled: Decimal) {
-        self.0.lock().put(oid, filled);
+        if let Some((forgotten, forgotten_filled)) = self.put(oid, filled) {
+            warn!(
+                oid = forgotten,
+                filled = %forgotten_filled,
+                "Hyperliquid order a modify replaced is forgotten: its reports now leave out what \
+                 filled before the modify"
+            );
+        }
     }
 }
 
@@ -199,6 +224,25 @@ mod tests {
         carry_into_open(&mut order, dec!(1));
         assert_eq!(order.quantity, dec!(3));
         assert_eq!(order.state.filled_quantity, dec!(1.5));
+    }
+
+    #[test]
+    fn the_least_recently_read_order_is_forgotten_past_the_bound() {
+        let carried = CarriedFills::with_capacity(NonZeroUsize::new(2).unwrap());
+        assert_eq!(carried.put(1, dec!(0.1)), None);
+        assert_eq!(carried.put(2, dec!(0.2)), None);
+        // A report of 1 refreshes it, so 2 is the one forgotten.
+        assert_eq!(carried.get(1), dec!(0.1));
+        assert_eq!(carried.put(3, dec!(0.3)), Some((2, dec!(0.2))));
+
+        assert_eq!(carried.get(1), dec!(0.1));
+        assert_eq!(carried.get(2), Decimal::ZERO);
+        assert_eq!(carried.get(3), dec!(0.3));
+        // Recording an order again replaces its entry and forgets none.
+        assert_eq!(carried.put(3, dec!(0.4)), None);
+        carried.carry(1, dec!(0.5));
+        assert_eq!(carried.get(1), dec!(0.5));
+        assert_eq!(carried.get(3), dec!(0.4));
     }
 
     #[test]
