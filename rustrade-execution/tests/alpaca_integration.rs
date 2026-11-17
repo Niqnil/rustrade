@@ -895,6 +895,8 @@ async fn test_a_replaced_crypto_order_is_followed() {
     let (new_id, new_cid) = match replace.await {
         Ok(ids) => ids,
         Err(error) => {
+            // Printed first, so a cleanup that panics too does not hide it.
+            eprintln!("{error}");
             cancel_open_orders(&client, &instrument).await;
             panic!("{error}");
         }
@@ -942,6 +944,7 @@ async fn test_a_replaced_crypto_order_is_followed() {
         })
         .await;
     if cancelled.state.is_err() {
+        eprintln!("Cancel rejected: {:?}", cancelled.state);
         cancel_open_orders(&client, &instrument).await;
         panic!("Cancel rejected: {:?}", cancelled.state);
     }

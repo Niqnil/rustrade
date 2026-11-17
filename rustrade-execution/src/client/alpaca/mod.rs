@@ -13460,9 +13460,11 @@ mod tests {
                 .await
                 .expect("the held end is sent")
                 .expect("the stream is open");
+            // The upper bound allows for the paused clock advancing to the server's next ping
+            // before the client reads the frame, which starts the hold later.
             let waited = tokio::time::Instant::now() - sent;
             assert!(
-                waited >= REPLACED_HOLD && waited < REPLACED_HOLD + Duration::from_millis(100),
+                waited >= REPLACED_HOLD && waited < REPLACED_HOLD + Duration::from_millis(1_500),
                 "sent {waited:?} after the `replaced`"
             );
             assert_eq!(
