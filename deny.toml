@@ -40,7 +40,9 @@ ignore = [
     # zip 0.6.6 archive-extraction advisories of 2026-10-09/10 (SUID/SGID bits kept, symlink
     # targets and permissions not confined to the destination), and RUSTSEC-2026-0429 of
     # 2026-10-22 (`ZipArchive::extract` aborts the process on a symlink entry with a large declared
-    # size). Same class as rkyv above: an
+    # size), and RUSTSEC-2026-0548 of 2026-10-17 (`ZipStreamReader` extracting under local-header
+    # names) and RUSTSEC-2026-0545 of 2026-10-22 (AES entries returned without checking their
+    # authentication code). Same class as rkyv above: an
     # *unenabled optional* dependency, two levels deep. The lockfile path is ethers 2.0.14 ->
     # ethers-solc (optional, behind ethers' `solc` feature) -> svm-rs 0.3.5 (optional, behind
     # ethers-solc's `svm-solc` feature) -> zip. Neither feature is enabled by us or by
@@ -53,6 +55,8 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0369", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0429", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0545", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0548", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
 
     # zstd-safe legacy-frame decompression advisory of 2026-10-16. Two copies are in Cargo.lock. The
     # compiled one (8.x, via zstd 0.14 <- async-compression, databento, parquet) is bumped past the
@@ -79,12 +83,21 @@ ignore = [
     { id = "RUSTSEC-2026-0404", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0406", reason = "unsound warning on zstd-safe 5.0.2, an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace" },
 
+    # chrono and chrono-tz unmaintained (informational, dated 2026-09-14; no vulnerability). Both
+    # are direct dependencies, and chrono's `DateTime<Utc>` is in every crate's public API, so
+    # replacing them is a breaking change of its own, tracked in #975. Ignored by id, so a real
+    # vulnerability advisory against either crate still fails CI. Drop these entries when #975
+    # lands.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; direct dependency in the public API; migration tracked in #975" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; direct dependency; migration tracked in #975" },
+
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2025-0009", reason = "ring AES panic; transitive via hyperliquid_rust_sdk; overflow checks disabled in release" },
     { id = "RUSTSEC-2025-0010", reason = "ring < 0.17 unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive via hyperliquid_rust_sdk" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; transitive via hyperliquid_rust_sdk -> env_logger 0.10" },
     { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; transitive via hyperliquid_rust_sdk; CRLs not used" },
