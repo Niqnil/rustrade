@@ -11,6 +11,7 @@
 //! `frontendOpenOrders`, and asks `orderStatus` about each order held as live that the listing no
 //! longer shows.
 
+use super::carried::{CarriedFills, carry_into_report};
 use super::common::{OpenOrder, OrderTerms, cid_to_cloid, info, order_update_to_order, record_cid};
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -193,17 +194,26 @@ pub(super) fn lookup_of(status: Option<VenueOrderStatus>) -> OrderLookup {
 ///
 /// `instrument` is the instrument the record's coin names, `None` for a market this client does not
 /// trade. An order on another instrument than the key's is [`VenueOrderStatus::Unknown`]. A found
-/// order carries `key`, so a strategy the venue does not record survives. `None` for a record that
-/// does not convert (logged at `warn`).
+/// order carries `key`, so a strategy the venue does not record survives. What the order carried
+/// from one a modify replaced ([`CarriedFills`]) is added to its quantity and fill. `None` for a
+/// record that does not convert (logged at `warn`).
 pub(super) fn status_from_record(
     key: UnindexedOrderKey,
     record: &OrderRecord,
     instrument: Option<InstrumentNameExchange>,
+    carried: &CarriedFills,
 ) -> Option<VenueOrderStatus> {
     if instrument.as_ref() != Some(&key.instrument) {
         debug!(cid = %key.cid, asked = %key.instrument, coin = %record.update.order.coin, "Hyperliquid order is on another instrument than asked");
         return Some(VenueOrderStatus::Unknown);
     }
+    let mut report = order_update_to_order(
+        &record.update,
+        &record.terms,
+        key.exchange,
+        key.instrument.clone(),
+    )?;
+    carry_into_report(&mut report, carried.get(record.update.order.oid));
     let OrderReport {
         order:
             Order {
@@ -216,12 +226,7 @@ pub(super) fn status_from_record(
                 ..
             },
         ..
-    } = order_update_to_order(
-        &record.update,
-        &record.terms,
-        key.exchange,
-        key.instrument.clone(),
-    )?;
+    } = report;
     match state {
         OrderState::Active(ActiveOrderState::Open(state)) => {
             Some(VenueOrderStatus::Live(Box::new(Order {
@@ -657,7 +662,12 @@ pub(super) mod tests {
         record: &OrderRecord,
         instrument: Option<InstrumentNameExchange>,
     ) -> OrderLookup {
-        lookup_of(status_from_record(key, record, instrument))
+        lookup_of(status_from_record(
+            key,
+            record,
+            instrument,
+            &CarriedFills::default(),
+        ))
     }
 
     fn ended(lookup: OrderLookup) -> crate::order::UnindexedInactiveOrder {
@@ -762,13 +772,33 @@ pub(super) mod tests {
         }
     }
 
+    /// A record of an order that replaced another carries what filled before the modify.
+    #[test]
+    fn a_looked_up_replacement_carries_its_fill() {
+        let carried = CarriedFills::default();
+        carried.carry(42, dec!(0.002));
+        let Some(VenueOrderStatus::Live(order)) = status_from_record(
+            key(CID),
+            &record("BTC", "open", "0.004"),
+            Some(btc()),
+            &carried,
+        ) else {
+            panic!("expected a live order");
+        };
+        assert_eq!(order.quantity, dec!(0.012));
+        assert_eq!(order.state.filled_quantity, dec!(0.008));
+    }
+
     /// A live order is reported in its state, under the key asked; a record that does not
     /// convert answers nothing.
     #[test]
     fn a_live_order_is_reported_live_in_its_state() {
-        let Some(VenueOrderStatus::Live(order)) =
-            status_from_record(key(CID), &record("BTC", "open", "0.004"), Some(btc()))
-        else {
+        let Some(VenueOrderStatus::Live(order)) = status_from_record(
+            key(CID),
+            &record("BTC", "open", "0.004"),
+            Some(btc()),
+            &CarriedFills::default(),
+        ) else {
             panic!("expected a live order");
         };
         assert_eq!(order.key, key(CID));
@@ -780,7 +810,8 @@ pub(super) mod tests {
             status_from_record(
                 key(CID),
                 &record("BTC", "aStatusAddedLater", "0"),
-                Some(btc())
+                Some(btc()),
+                &CarriedFills::default(),
             )
             .is_none()
         );
@@ -798,7 +829,7 @@ pub(super) mod tests {
 
         let live = |record: serde_json::Value| {
             let record: OrderRecord = serde_json::from_value(record).unwrap();
-            match status_from_record(key(CID), &record, Some(btc())) {
+            match status_from_record(key(CID), &record, Some(btc()), &CarriedFills::default()) {
                 Some(VenueOrderStatus::Live(order)) => order,
                 other => panic!("expected a live order, got {other:?}"),
             }

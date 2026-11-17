@@ -163,6 +163,13 @@
 //! `canceled`. Records that arrive in separate messages are not paired, and a `canceled` read
 //! alone ends the order.
 //!
+//! Every later record of the new `oid`, on the stream or from `orderStatus` and the open-order
+//! listing, counts only what filled since the modify. The client remembers what filled before,
+//! learned from the pair, and adds it to each report of the new order, through any number of
+//! modifies, so its quantity and fill are totals. That memory is the client's, shared by its
+//! clones, and starts empty: an order modified while none of its account streams was reading,
+//! or before the process started, is reported without the fills before the modify.
+//!
 //! # Time in force
 //!
 //! Hyperliquid has three: `Gtc`, `Alo` (add liquidity only, a post-only order) and `Ioc`. It has
@@ -234,6 +241,7 @@
 //!   since that would place an order other than the one requested. Read the rules with
 //!   [`HyperliquidClient::order_precision`] and round first. See [`precision`].
 
+mod carried;
 pub mod common;
 pub mod config;
 pub mod error;
@@ -268,6 +276,7 @@ use crate::{
     position::{Position, PositionReport},
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin, TradesRead},
 };
+use carried::{CarriedFills, carry_into_open};
 use chrono::{DateTime, Utc};
 use common::{
     CLOID_REQUIRED, CancelOnDropStream, HYPERLIQUID_TIME_IN_FORCE, InstrumentFilter,
@@ -321,6 +330,9 @@ pub struct HyperliquidClient {
     /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     /// clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    /// What each order a modify replaced had filled, carried into the order replacing it. Shared
+    /// by every clone, every account stream, which learns it, and every lookup, which adds it.
+    carried: CarriedFills,
 }
 
 impl HyperliquidClient {
@@ -387,6 +399,7 @@ impl HyperliquidClient {
             exchange_client: Arc::new(exchange_client),
             dexes: Arc::new(dexes),
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
+            carried: CarriedFills::default(),
         })
     }
 
@@ -536,6 +549,7 @@ impl ExecutionClient for HyperliquidClient {
             &open_orders,
             ExchangeId::HyperliquidPerp,
             instruments,
+            &self.carried,
             |coin| dexes.instrument(coin),
         );
 
@@ -722,7 +736,18 @@ impl ExecutionClient for HyperliquidClient {
             move |instruments| {
                 perp_listed_cids(list_client.clone(), list_dexes.clone(), user, instruments)
             },
-            move |key| perp_order_lookup(lookup_client.clone(), lookup_dexes.clone(), user, key),
+            {
+                let carried = self.carried.clone();
+                move |key| {
+                    perp_order_lookup(
+                        lookup_client.clone(),
+                        lookup_dexes.clone(),
+                        carried.clone(),
+                        user,
+                        key,
+                    )
+                }
+            },
         );
 
         // Spawn task to process fills
@@ -857,6 +882,7 @@ impl ExecutionClient for HyperliquidClient {
         let orders_cancel = cancel_token.clone();
         let orders_terminated = terminated;
         let orders_known = self.known_live.clone();
+        let orders_carried = self.carried.clone();
         let orders_dexes = self.dexes.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
@@ -895,6 +921,7 @@ impl ExecutionClient for HyperliquidClient {
                                 let sent = common::order_updates_to_account_events(
                                     &updates.data,
                                     ExchangeId::HyperliquidPerp,
+                                    &orders_carried,
                                     |update| {
                                         unknown_coins.warn_once(&update.order.coin);
                                         unconfigured.warn_once(&orders_dexes, &update.order.coin);
@@ -1255,7 +1282,9 @@ impl ExecutionClient for HyperliquidClient {
                 if !instrument_filter.matches(&instrument) {
                     return None;
                 }
-                open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)
+                let mut open = open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)?;
+                carry_into_open(&mut open, self.carried.get(order.oid));
+                Some(open)
             })
             .collect();
         remember_open(&self.known_live, &orders);
@@ -1366,7 +1395,13 @@ impl OrderStatusClient for HyperliquidClient {
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         let address = self.wallet_h160();
         fetch_ended_by_key(orders, |key| {
-            perp_order_lookup(self.info_client.clone(), self.dexes.clone(), address, key)
+            perp_order_lookup(
+                self.info_client.clone(),
+                self.dexes.clone(),
+                self.carried.clone(),
+                address,
+                key,
+            )
         })
         .await
     }
@@ -1384,6 +1419,7 @@ impl OrderStatusClient for HyperliquidClient {
         perp_order_status(
             self.info_client.clone(),
             self.dexes.clone(),
+            self.carried.clone(),
             self.wallet_h160(),
             key.clone(),
         )
@@ -1396,11 +1432,12 @@ impl OrderStatusClient for HyperliquidClient {
 async fn perp_order_lookup(
     info_client: Arc<InfoClient>,
     dexes: Arc<PerpDexes>,
+    carried: CarriedFills,
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
     Ok(lookup_of(
-        perp_order_status(info_client, dexes, address, key).await?,
+        perp_order_status(info_client, dexes, carried, address, key).await?,
     ))
 }
 
@@ -1409,6 +1446,7 @@ async fn perp_order_lookup(
 async fn perp_order_status(
     info_client: Arc<InfoClient>,
     dexes: Arc<PerpDexes>,
+    carried: CarriedFills,
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<Option<VenueOrderStatus>, UnindexedClientError> {
@@ -1416,7 +1454,7 @@ async fn perp_order_status(
         return Ok(Some(VenueOrderStatus::Unknown));
     };
     let instrument = dexes.instrument(&record.update.order.coin);
-    Ok(status_from_record(key, &record, instrument))
+    Ok(status_from_record(key, &record, instrument, &carried))
 }
 
 /// The client order ids `frontendOpenOrders` (weight 20 per DEX traded) lists on the perpetuals
@@ -1659,16 +1697,42 @@ mod tests {
         async fn a_perp_lookup_reads_how_the_order_ended() {
             let (_server, client) = serve(order_status("BTC")).await;
 
-            let lookup =
-                perp_order_lookup(client, Arc::default(), ethers::types::H160::zero(), key())
-                    .await
-                    .unwrap();
+            let lookup = perp_order_lookup(
+                client,
+                Arc::default(),
+                CarriedFills::default(),
+                ethers::types::H160::zero(),
+                key(),
+            )
+            .await
+            .unwrap();
 
             let OrderLookup::Ended(order) = lookup else {
                 panic!("expected an ended order, got {lookup:?}");
             };
             assert_eq!(order.key, key());
             assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+        }
+
+        /// Ended orders are read with `orderStatus`, with what a replacement carries added.
+        #[tokio::test]
+        async fn perp_ended_orders_are_looked_up_with_their_carried_fill() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(order_status("BTC")))
+                .mount(&server)
+                .await;
+            let client = client_against(&server, HashMap::new()).await;
+            client.carried.carry(42, dec!(0.5));
+
+            let ended = client.fetch_ended_orders(&[key()]).await.unwrap();
+
+            let [order] = ended.as_slice() else {
+                panic!("expected one ended order, got {ended:?}");
+            };
+            assert_eq!(order.key, key());
+            assert_eq!(order.quantity, dec!(0.51));
         }
 
         /// One `orderStatus` answers a lookup, live, ended or unknown, without listing the open
@@ -1713,10 +1777,15 @@ mod tests {
         async fn a_perp_lookup_of_a_spot_order_is_unknown() {
             let (_server, client) = serve(order_status("@107")).await;
 
-            let lookup =
-                perp_order_lookup(client, Arc::default(), ethers::types::H160::zero(), key())
-                    .await
-                    .unwrap();
+            let lookup = perp_order_lookup(
+                client,
+                Arc::default(),
+                CarriedFills::default(),
+                ethers::types::H160::zero(),
+                key(),
+            )
+            .await
+            .unwrap();
 
             assert!(matches!(lookup, OrderLookup::Unknown));
         }
@@ -1767,6 +1836,7 @@ mod tests {
             exchange_client: Arc::new(exchange_client_against(server.uri(), coin_to_asset).await),
             dexes: Arc::new(dexes),
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
+            carried: CarriedFills::default(),
         }
     }
 
