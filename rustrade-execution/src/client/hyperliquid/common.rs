@@ -818,7 +818,7 @@ fn modify_pairs(
 /// Report `reports[new]` as the order that replaced `reports[old]`, and leave `reports[old]` out,
 /// when both converted and the old one's fill is known.
 fn link_replacement(reports: &mut [Option<UnindexedOrderReport>], new: usize, old: usize) {
-    let (Some(Some(old_report)), Some(Some(_))) = (reports.get(old), reports.get(new)) else {
+    let Some(Some(old_report)) = reports.get(old) else {
         return;
     };
     let OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled {
@@ -830,17 +830,16 @@ fn link_replacement(reports: &mut [Option<UnindexedOrderReport>], new: usize, ol
         return;
     };
     let (old_id, filled) = (old_id.clone(), *filled);
-    reports[old] = None;
-    if let Some(slot) = reports.get_mut(new)
-        && let Some(report) = slot.take()
-    {
-        let mut report = report.with_replaces(Replaces::new(old_id));
-        report.order.quantity += filled;
-        if let OrderState::Active(ActiveOrderState::Open(open)) = &mut report.order.state {
-            open.filled_quantity += filled;
-        }
-        *slot = Some(report);
+    let Some(report) = reports.get_mut(new).and_then(Option::take) else {
+        return;
+    };
+    let mut report = report.with_replaces(Replaces::new(old_id));
+    report.order.quantity += filled;
+    if let OrderState::Active(ActiveOrderState::Open(open)) = &mut report.order.state {
+        open.filled_quantity += filled;
     }
+    reports[new] = Some(report);
+    reports[old] = None;
 }
 
 /// The event of one record, alone in a message, on `instrument`.
