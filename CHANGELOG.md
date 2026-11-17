@@ -748,6 +748,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Binance margin docs now say that margin debt and margin notices are streamed for cross
+  margin only** (`rustrade-execution`, `binance`). They said only that Binance had not been seen to
+  send `liabilityChange` for an isolated pair, and described how an isolated pair's
+  `marginLevelChange` was delivered. Binance has confirmed
+  ([forum thread](https://dev.binance.vision/t/39387)) that both events are sent for the cross
+  account alone and name no pair. An isolated client receives no `MarginDebt` or `Notice` events
+  from the stream: it reads its pairs' debt, margin level and liquidation price from
+  `account_snapshot`, which Binance suggests reading again after a pair's order and balance
+  events. `IsolatedMarginRisk`'s freshness note no longer points to a margin-level notice for an
+  isolated pair either. The client still handles either event for an isolated pair, should Binance
+  start sending them.
+
 - **An unparseable Alpaca account stream message no longer panics the connection task when it is
   logged** (`rustrade-execution`, `alpaca`). The log line quoted the message's first 200 bytes by
   slicing at byte 200, which panics when that byte falls inside a multi-byte character. A

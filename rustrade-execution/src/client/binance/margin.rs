@@ -11,11 +11,11 @@
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over Binance's margin
 //! user-data stream (a listen key from `POST /sapi/v2/margin/listen-key`), which carries fills,
-//! orders, balances, margin debt and margin notices, and after a reconnect recovers missed fills
-//! and reports how orders ended meanwhile. It also
-//! implements [`OrderStatusClient`], looking orders up by client order id, and reports a pair's
-//! borrow terms ([`ShortabilityClient`]) and how much this account can borrow for it
-//! ([`BorrowCapacityClient`]). Two reads beyond the traits cover what the account stream does not
+//! orders, balances and, on cross, margin debt and margin notices, and after a reconnect recovers
+//! missed fills and reports how orders ended meanwhile. It also implements [`OrderStatusClient`],
+//! looking orders up by client order id, and reports a pair's borrow terms
+//! ([`ShortabilityClient`]) and how much this account can borrow for it ([`BorrowCapacityClient`]).
+//! Two reads beyond the traits cover what the account stream does not
 //! carry: the interest charged ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
 //! ([`BinanceMargin::fetch_forced_liquidations`]). [`BinanceMargin::fetch_collateral_ratios`]
 //! reads cross margin's per-asset collateral ratios, for liquidation, borrowing and transfers
@@ -456,8 +456,9 @@ impl BinanceMarginConfig {
 /// minutes after. Since 2026-10-14
 /// Binance refuses the earlier margin streams' credentials (`POST /sapi/v1/userListenToken` and
 /// `POST /sapi/v1/margin/listen-key`) with `-3086` for new accounts and for accounts it has
-/// migrated, and the v2 key is open to every account. One stream carries fills, orders, balances,
-/// margin debt and margin notices, for the cross account and every isolated pair alike.
+/// migrated, and the v2 key is open to every account. One stream carries fills, orders and
+/// balances for the cross account and every isolated pair alike, and margin debt and margin notices
+/// for the cross account only.
 ///
 /// # Margin balances & debt-freshness
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
@@ -466,9 +467,12 @@ impl BinanceMarginConfig {
 /// from the REST [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream
 /// keeps `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps
 /// debt live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a
-/// cross account: Binance has not been seen to send that event for an isolated pair. A debt change
-/// sent while the stream is down is not recovered, so call `account_snapshot` at startup and after
-/// a reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
+/// cross account only: Binance sends that event for cross margin alone, as it has confirmed
+/// ([forum thread](https://dev.binance.vision/t/39387)). An isolated pair's debt comes from
+/// `account_snapshot`; Binance suggests taking the pair's order and balance events as the cue to
+/// read it again. A debt change sent while the stream is down is not recovered, so call `account_snapshot`
+/// at startup and after a reconnect (see [`account_stream`](Self::account_stream)'s cold-start
+/// note).
 ///
 /// As Binance documents it, margin interest is charged hourly on what is borrowed and accrues as
 /// the asset's unpaid `interest`, which comes out of `total` only when it is repaid. `net_asset`
@@ -1744,8 +1748,8 @@ impl ExecutionClient for BinanceMargin {
         Ok(TradesRead::complete(all_trades))
     }
 
-    /// Live stream of account events (fills, order updates, balances, margin debt and notices)
-    /// over Binance's margin user-data stream.
+    /// Live stream of account events (fills, order updates, balances and, on cross, margin debt
+    /// and notices) over Binance's margin user-data stream.
     ///
     /// Gets a listen key (`POST /sapi/v2/margin/listen-key`, weight 1), connects to
     /// `wss://fstream.binance.com/private/ws` and subscribes the key, then keeps the stream live
@@ -1797,12 +1801,22 @@ impl ExecutionClient for BinanceMargin {
     /// [`AccountNotice::status`](crate::AccountNotice::status) and its margin level (`l`) in
     /// [`margin_level`](crate::AccountNotice::margin_level).
     ///
-    /// The event's `s` is its status, so it names no pair. A cross account's notice names no
-    /// instrument. An isolated pair's is delivered to an isolated client naming no instrument,
-    /// with a `warn`, whichever pair it is about, since losing a margin call costs more than losing
-    /// its attribution; a cross client does not receive it. So an isolated client's notice can be
-    /// about any isolated pair of the account, one it is not configured for included, and two
-    /// isolated clients on one account each receive it.
+    /// Binance sends `marginLevelChange` for the cross account only, as it has confirmed
+    /// ([forum thread](https://dev.binance.vision/t/39387)), and the event's `s` is its status, so
+    /// it names no pair. A cross client's notices are about the account as a whole and name no
+    /// instrument. **An isolated client receives no margin notices from the stream.** It watches
+    /// its pairs' margin through [`ExecutionClient::account_snapshot`], whose
+    /// [`InstrumentAccountSnapshot::isolated`](crate::InstrumentAccountSnapshot::isolated) carries
+    /// each pair's margin level and liquidation price; Binance suggests taking the pair's order and
+    /// balance events as the cue to read it again. Each read is a REST request, and nothing is
+    /// pushed when a pair's margin level falls, so how often the caller reads bounds how late it
+    /// sees a pair near liquidation.
+    ///
+    /// Should Binance start sending the event for an isolated pair, it would be delivered to an
+    /// isolated client naming no instrument, with a `warn`, since losing a margin call costs more
+    /// than losing its attribution; a cross client would not receive it. Such a notice could be
+    /// about any isolated pair of the account, one the client is not configured for included, and
+    /// two isolated clients on one account would each receive it.
     ///
     /// A notice with no time is stamped on arrival. Each arrival is logged at `info`, before
     /// dedup. A notice sent while the stream is disconnected is not recovered.
@@ -1816,10 +1830,12 @@ impl ExecutionClient for BinanceMargin {
     /// `DEBT_CHANGE`, → `Other`, with Binance's type verbatim in
     /// [`venue_kind`](crate::MarginDebtUpdate::venue_kind).
     /// - **Cross** updates name no instrument: they are the account's debt in that asset.
-    /// - **Isolated** debt is not known to be streamed. Binance has not been seen to send
-    ///   `liabilityChange` for an isolated pair: a borrow and a repay there came with balance
-    ///   updates alone. One that did arrive would name its pair, from the frame. An isolated
-    ///   client reads its pairs' debt from [`ExecutionClient::account_snapshot`].
+    /// - **Isolated** debt is not streamed. Binance sends `liabilityChange` for the cross account
+    ///   only, as it has confirmed (see "Margin notices" above): a borrow, a repay or an interest
+    ///   charge on an isolated pair comes with order and balance updates alone. An isolated client
+    ///   reads its pairs' debt from [`ExecutionClient::account_snapshot`]; Binance suggests taking
+    ///   those updates as the cue to read it again. Should Binance start sending the event for an
+    ///   isolated pair, it would be kept only if it named its pair.
     ///
     /// Binance posts an interest charge some time after the period it is for; when is not
     /// documented. An asset with no name, or whose `p` or `i` cannot be read, is dropped with a
@@ -1886,8 +1902,8 @@ impl ExecutionClient for BinanceMargin {
     /// reported. A pair whose base and quote could not be read at the start has its balance frames
     /// dropped with a `warn`; its fills and orders are unaffected.
     ///
-    /// Debt totals (`borrowed`/`interest`) are not known to be streamed for an isolated pair (see
-    /// "Margin debt" above), so they come from
+    /// Debt totals (`borrowed`/`interest`) are not streamed for an isolated pair (see "Margin debt"
+    /// above), so they come from
     /// [`account_snapshot`](ExecutionClient::account_snapshot), and from the
     /// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot)s the stream
     /// restates after each reconnect (see the
