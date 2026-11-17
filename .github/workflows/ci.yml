@@ -130,7 +130,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -209,7 +209,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
           shared-key: "rustrade-ci-test"
 
@@ -265,7 +265,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -290,7 +290,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -468,7 +468,7 @@ jobs:
       # rebuilds those: 84 crates for `rustrade-execution` and 95 for `rustrade`, measured locally.
       # `--test-workspace` would hit the cache in full, but then every mutant rebuilds and tests
       # every crate that depends on its own.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
           shared-key: "rustrade-ci-test"
           save-if: false
