@@ -1775,20 +1775,27 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// Alpaca carries out a replace (`PATCH /v2/orders/{id}`), whoever asked for it, as a new order
     /// under a new order id and a new client order id, and names the order it replaces on every
-    /// read of it. Observed, its stream sends `pending_replace` on the order replaced, then the
-    /// replacement's first event (`accepted`), then `replaced` on the order replaced. The stream
-    /// reports the replace as one order going on under new ids:
+    /// read of it. Observed for a crypto order, its stream sends `pending_replace` on the order
+    /// replaced, then the replacement's first event (`accepted`), then `replaced` on the order
+    /// replaced. Observed for an equity order, in regular hours, it sends only the `replaced`, and
+    /// nothing for the replacement until its next change; the stream then reads the replacement
+    /// with `GET /v2/orders/{id}` and reports what it reads as the replacement's first event. The
+    /// stream reports the replace as one order going on under new ids:
     ///
     /// - **The replacement.** Each [`AccountEventKind::OrderSnapshot`] of it that reports it live
     ///   is linked to the order replaced ([`OrderReport::replaces`]): by its order id, and by its
-    ///   client order id when the stream saw the `pending_replace`. So is each open order
-    ///   [`account_snapshot`](ExecutionClient::account_snapshot) lists, by order id.
-    ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders) returns orders without a link.
+    ///   client order id when the stream saw the `pending_replace` or the `replaced` first. So is
+    ///   each open order [`account_snapshot`](ExecutionClient::account_snapshot) lists, by order
+    ///   id. [`fetch_open_orders`](ExecutionClient::fetch_open_orders) returns orders without a
+    ///   link. A replacement the stream reads over REST is reported only while it is live; one
+    ///   that has ended already is reported by its own stream events.
     /// - **The order replaced** ends as an [`AccountEventKind::OrderSnapshot`] of a cancelled
     ///   order, with what it filled, not as an [`AccountEventKind::OrderCancelled`]. It is sent
-    ///   after the replacement's first event: one arriving first is held for that event, for at
-    ///   most 5 s, then sent with a warning. One held when the stream disconnects is reported by the
-    ///   reconnect's check (see "Orders that ended while disconnected").
+    ///   after the replacement's first event, from the stream or the read: one arriving first is
+    ///   held for that event, for at most 5 s, then sent with a warning (a read that fails, finds
+    ///   no order or is slower than that). A read that returns after the hold ran out still
+    ///   reports the replacement, after the end. One held when the stream disconnects is reported
+    ///   by the reconnect's check (see "Orders that ended while disconnected").
     /// - **Fills.** A replacement's quantity and filled quantity are reported as Alpaca states
     ///   them, as totals that count what the order replaced filled. That Alpaca counts those fills
     ///   in the replacement was not observed for a partly filled order. A replacement first
@@ -1798,6 +1805,10 @@ impl ExecutionClient for AlpacaClient {
     ///   the order replaced. Every `rejected` event naming an order it replaces is read this way,
     ///   whatever Alpaca's reason. A rejection that left the order replaced working was not
     ///   observed; one would be reported as the order ending while it still rests.
+    ///
+    /// A replacement replaced again before its read returns, which takes two replaces within one
+    /// REST round trip, is not reported: its read finds it ended, and its successor is linked to
+    /// an order the stream never reported.
     ///
     /// A replace whose events arrive while the stream is disconnected is covered only as above.
     /// So is a replace around a reconnect: the order check after a reconnect is not held back, so
@@ -3130,6 +3141,9 @@ async fn connection_manager(
         // Reset to the earliest held after each message; its arm is off while none is held.
         let replace_hold = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(replace_hold);
+        // REST reads of replacements the tracker asked for, run beside the stream so it keeps
+        // reading. Those in flight when the stream drops are dropped with the ends held for them.
+        let mut replacement_reads = futures::stream::FuturesUnordered::new();
         // A connection still receiving a heartbeat window after the stream loop starts is proven
         // stable: the failures before it are cleared, so only consecutive ones exhaust the budget.
         let stable_from = tokio::time::Instant::now() + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
@@ -3167,6 +3181,19 @@ async fn connection_manager(
                 }
             };
         }
+        // Starts the REST reads of replacements the tracker asked for since the last call.
+        macro_rules! start_replacement_reads {
+            () => {
+                for id in replaces.take_reads() {
+                    replacement_reads.push(read_replacement(
+                        http.clone(),
+                        rate_limiter.clone(),
+                        config.clone(),
+                        id,
+                    ));
+                }
+            };
+        }
         // Distinguishes why the inner stream loop exited so the terminal emit below can report a
         // meaningful `last_error`. The consumer-drop arm uses `break 'outer` and never yields one.
         enum DisconnectReason {
@@ -3193,6 +3220,7 @@ async fn connection_manager(
                                 &mut clock,
                                 &mut replaces,
                             );
+                            start_replacement_reads!();
                             reset_replace_hold!();
                             reset_heartbeat!();
                         }
@@ -3208,6 +3236,7 @@ async fn connection_manager(
                                         &mut clock,
                                         &mut replaces,
                                     );
+                                    start_replacement_reads!();
                                     reset_replace_hold!();
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
@@ -3233,6 +3262,13 @@ async fn connection_manager(
                     }
                 }
                 () = &mut order_checks => {}
+                Some((id, read)) = replacement_reads.next(), if !replacement_reads.is_empty() => {
+                    let now = tokio::time::Instant::now();
+                    for event in replacement_read_events(&id, read, &mut replaces, now) {
+                        send_ws_event(event, &tx, &dedup, &known);
+                    }
+                    reset_replace_hold!();
+                }
                 () = &mut replace_hold, if replaces.next_deadline().is_some() => {
                     for event in replaces.expire(tokio::time::Instant::now()) {
                         send_ws_event(event, &tx, &dedup, &known);
@@ -3683,6 +3719,81 @@ fn replace_facts(update: &AlpacaTradeUpdate<'_>) -> Option<ReplaceFacts> {
             .filled_qty
             .and_then(|filled| Decimal::from_str(filled).ok()),
     })
+}
+
+/// Read the replacement `id` with `GET /v2/orders/{id}`, for [`ReplaceTracker::take_reads`],
+/// returning `id` with the order read, or `None` for a 404.
+async fn read_replacement(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    id: SmolStr,
+) -> (
+    SmolStr,
+    Result<Option<AlpacaOrderResponse>, UnindexedClientError>,
+) {
+    let url = format!("{}/v2/orders/{id}", config.rest_base_url());
+    let read = rest_lookup_with_retry(&rate_limiter, || http.get(&url)).await;
+    (id, read)
+}
+
+/// The events to report now for `read`, the REST read of the replacement `id`, as
+/// [`ReplaceTracker::process_read`] gives them, at `now`.
+///
+/// Only a live replacement is reported. One that has ended already sends its own stream events
+/// (its fill, or its cancel), which name the order it replaces, so they release the end held. A
+/// read that failed, or found no order, is logged at `warn`; the end held for it is then reported
+/// when its hold runs out, without it.
+fn replacement_read_events(
+    id: &SmolStr,
+    read: Result<Option<AlpacaOrderResponse>, UnindexedClientError>,
+    replaces: &mut ReplaceTracker,
+    now: tokio::time::Instant,
+) -> Vec<UnindexedAccountEvent> {
+    let order = match read {
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            warn!(
+                replacement_id = %id,
+                "Alpaca WS: Alpaca does not know the order replacing a replaced order - the replaced order's end is reported once its hold runs out"
+            );
+            return Vec::new();
+        }
+        Err(error) => {
+            warn!(
+                replacement_id = %id,
+                %error,
+                "Alpaca WS: could not read the order replacing a replaced order - the replaced order's end is reported once its hold runs out"
+            );
+            return Vec::new();
+        }
+    };
+    if !order.status.as_deref().is_some_and(order_status_is_live) {
+        debug!(
+            replacement_id = %id,
+            status = ?order.status,
+            "Alpaca WS: the order replacing a replaced order is not live - its own stream events report it"
+        );
+        return Vec::new();
+    }
+    let Some(listed) = convert_open_order(&order) else {
+        return Vec::new();
+    };
+    let facts = ReplaceFacts {
+        event: ReplaceEvent::Other,
+        id: SmolStr::new(&order.id),
+        cid: listed.order.key.cid.clone(),
+        replaces: order.replaces.as_deref().map(SmolStr::new),
+        replaced_by: None,
+        filled: Decimal::from_str(&order.filled_qty).ok(),
+    };
+    let event = UnindexedAccountEvent::new(
+        ExchangeId::AlpacaBroker,
+        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot(
+            listed.into_report(),
+        )),
+    );
+    replaces.process_read(facts, vec![event], now)
 }
 
 /// The cumulative dedup key for a fill that took order `order_id` to `cumulative` filled: what
@@ -13423,16 +13534,14 @@ mod tests {
             );
         }
 
-        /// The stream task sends an end held for a replacement whose event never comes once the
-        /// hold runs out, on its own timer, and not before.
-        #[tokio::test(start_paused = true)]
-        async fn the_stream_sends_a_held_end_when_its_hold_runs_out() {
-            use super::replace::REPLACED_HOLD;
+        /// A WS server that authorises and acknowledges the listen, sends a `replaced` whose
+        /// replacement it never reports, then only pings, every second, so the heartbeat holds.
+        /// Returns its URL, and when it sent the `replaced`.
+        async fn serve_a_replaced_alone()
+        -> (String, tokio::sync::oneshot::Receiver<tokio::time::Instant>) {
             use futures::{SinkExt as _, StreamExt as _};
             use tokio_tungstenite::tungstenite::Message;
 
-            // A WS server that authorises and acknowledges the listen, sends a `replaced` whose
-            // replacement it never reports, then only pings, every second, so the heartbeat holds.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let ws_url = format!("ws://{}", listener.local_addr().unwrap());
             let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
@@ -13477,10 +13586,17 @@ mod tests {
                     }
                 }
             });
-            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            (ws_url, sent_rx)
+        }
+
+        /// The stream task on `ws_url`, reading orders from `rest_url`, and its events.
+        fn spawn_stream(
+            ws_url: String,
+            rest_url: String,
+        ) -> mpsc::UnboundedReceiver<UnindexedAccountEvent> {
             let mut config = AlpacaConfig::with_base_url("key".into(), "secret".into(), rest_url);
             config.ws_url_override = Some(ws_url);
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(connection_manager(
                 tx,
                 new_dedup_cache(),
@@ -13491,6 +13607,19 @@ mod tests {
                 Vec::new(),
                 None,
             ));
+            rx
+        }
+
+        /// The stream task sends an end held for a replacement whose event never comes once the
+        /// hold runs out, on its own timer, and not before. Here the read of the replacement
+        /// finds no order.
+        #[tokio::test(start_paused = true)]
+        async fn the_stream_sends_a_held_end_when_its_hold_runs_out() {
+            use super::replace::REPLACED_HOLD;
+
+            let (ws_url, sent_rx) = serve_a_replaced_alone().await;
+            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            let mut rx = spawn_stream(ws_url, rest_url);
 
             let sent = sent_rx.await.expect("the server sent the `replaced`");
             let event = tokio::time::timeout(2 * REPLACED_HOLD, rx.recv())
@@ -13506,6 +13635,50 @@ mod tests {
             );
             assert_eq!(
                 ended(&event),
+                ("c-old".to_string(), OLD.to_string(), Some(Decimal::ZERO))
+            );
+        }
+
+        /// A `replaced` alone, as Alpaca sends an equity's replace: the stream task reads the
+        /// replacement, reports it linked to the old order by its id and client order id, then
+        /// the old order's end, without waiting out the hold.
+        #[tokio::test(start_paused = true)]
+        async fn a_replaced_alone_is_followed_by_its_replacement_read_over_rest() {
+            use super::replace::REPLACED_HOLD;
+
+            let (ws_url, sent_rx) = serve_a_replaced_alone().await;
+            let rest_url = crate::client::test_http::serve(|method, path| {
+                if method == "GET" && path == "/v2/orders/id-new" {
+                    let order = r#"{"id":"id-new","client_order_id":"c-new","symbol":"BTC/USD","qty":"2","filled_qty":"0","status":"new","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"1001","stop_price":null,"trail_percent":null,"trail_price":null,"created_at":"2026-11-17T01:43:00Z","updated_at":"2026-11-17T01:43:00Z","replaces":"id-old"}"#;
+                    (200, order.to_string())
+                } else {
+                    (404, String::new())
+                }
+            })
+            .await;
+            let mut rx = spawn_stream(ws_url, rest_url);
+
+            let sent = sent_rx.await.expect("the server sent the `replaced`");
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                events.push(
+                    tokio::time::timeout(REPLACED_HOLD, rx.recv())
+                        .await
+                        .expect("sent before the hold runs out")
+                        .expect("the stream is open"),
+                );
+            }
+            assert!(tokio::time::Instant::now() - sent < REPLACED_HOLD);
+            assert_eq!(
+                report(&events[0]).order.key.cid,
+                ClientOrderId::new("c-new")
+            );
+            assert_eq!(
+                linked_to_old(&events[0]),
+                Some(Replaces::new(OrderId::new(OLD)).with_cid(ClientOrderId::new("c-old")))
+            );
+            assert_eq!(
+                ended(&events[1]),
                 ("c-old".to_string(), OLD.to_string(), Some(Decimal::ZERO))
             );
         }

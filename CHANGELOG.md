@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order under a new order id and client order id. Every live report of the replacement, on the
   account stream and in `account_snapshot`'s open orders, is now linked to the order it replaces
   (`OrderReport::replaces`), by order id and, on the stream, by client order id once it has seen
-  the `pending_replace`, so the engine keeps one order with its strategy and fills. The stream
-  sends the old order's end after the replacement's first event, holding it for up to 5 s if it
-  arrives first. Quantities are reported as Alpaca states them, which are taken to count the old
+  the `pending_replace` or the `replaced`, so the engine keeps one order with its strategy and
+  fills. The stream sends the old order's end after the replacement's first event, holding it for
+  up to 5 s if it arrives first. For an equity order, Alpaca's stream sends only the old order's
+  `replaced` and nothing for the replacement until it next changes, so the stream reads the
+  replacement over REST (`GET /v2/orders/{id}`) and reports it from that read. Quantities are reported as Alpaca states them, which are taken to count the old
   order's fills; that was not observed for a partly filled order, and a replacement reporting less
   filled than the old order is logged at `warn`. `fetch_open_orders` returns orders without the
   link, and an order replaced while the stream was disconnected is still recovered as cancelled.

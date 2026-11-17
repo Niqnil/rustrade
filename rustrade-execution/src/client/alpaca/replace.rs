@@ -2,17 +2,25 @@
 //! replace as one order going on under new ids.
 //!
 //! Alpaca carries out a replace (`PATCH /v2/orders/{id}`) as a new order, with a new order id and
-//! a new client order id, and observed sends three `trade_updates` events for it, in this order:
+//! a new client order id. How its `trade_updates` events report it depends on the asset class.
+//! Observed for a crypto order, three events, in this order:
 //!
 //! 1. `pending_replace` on the order replaced, naming its replacement (`replaced_by`);
 //! 2. the replacement's first event (`accepted`), naming the order it replaces (`replaces`);
 //! 3. `replaced` on the order replaced, ending it.
 //!
+//! Observed for an equity order, in regular hours, only the third: `replaced` on the order
+//! replaced. The replacement sends nothing until its own next change, such as a fill or a cancel.
+//!
 //! The stream links each report of a live replacement to the order it replaces
 //! ([`OrderReport::replaces`](crate::order::report::OrderReport::replaces)), naming its order id,
-//! and its client order id when a `pending_replace` gave it. [`ReplaceTracker`] supplies that
-//! client order id, and makes sure the end of the order replaced is not reported before its
-//! replacement, as the report's producer obligations require, whatever order Alpaca sends them in.
+//! and its client order id when a `pending_replace` or a `replaced` gave it. [`ReplaceTracker`]
+//! supplies that client order id, and makes sure the end of the order replaced is not reported
+//! before its replacement, as the report's producer obligations require, whatever order Alpaca
+//! sends them in. When a `replaced` arrives before any event of its replacement, the tracker asks
+//! its owner to read the replacement over REST ([`ReplaceTracker::take_reads`]), and reports what
+//! that read finds as the replacement's first report
+//! ([`ReplaceTracker::process_read`]).
 
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
@@ -26,14 +34,16 @@ use rust_decimal::Decimal;
 use smol_str::SmolStr;
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
-/// How long the end of an order replaced is held for its replacement's first event, before it is
-/// reported anyway.
+/// How long the end of an order replaced is held for its replacement's first report, before it
+/// is reported anyway.
 ///
-/// Observed, the replacement's event arrives first, about a millisecond before, so nothing is
-/// held. The bound is for an order of events not yet seen; once it passes, the end is reported
-/// with a warning, as the order replaced has ended whether or not its replacement was seen.
+/// Observed for crypto, the replacement's event arrives first, about a millisecond before, so
+/// nothing is held. For an equity, the end is held while the replacement is read over REST. Once
+/// the bound passes, because that read failed or was slow, or no read was asked for, the end is
+/// reported with a warning, as the order replaced has ended whether or not its replacement was
+/// seen.
 pub(super) const REPLACED_HOLD: Duration = Duration::from_secs(5);
 
 /// How many replaces [`ReplaceTracker`] remembers each of its facts for, before it forgets the
@@ -74,7 +84,8 @@ pub(super) enum ReplaceEvent {
     Other,
 }
 
-/// What [`ReplaceTracker`] learned from a `pending_replace`, by the replacement's order id.
+/// What [`ReplaceTracker`] learned from a `pending_replace`, or from a `replaced` that came before
+/// any event of its replacement, by the replacement's order id.
 #[derive(Debug)]
 struct Pending {
     /// The order id of the order replaced.
@@ -103,16 +114,25 @@ struct Held {
 /// What one Alpaca account stream remembers of the replaces it has seen, so that it reports
 /// them as the module docs describe. Owned by the stream's task, and told the time by its caller.
 ///
-/// - **Old client order id.** A `pending_replace` names the replacement's order id. A live report
-///   of that replacement is linked to the order replaced by its client order id too, which spares
-///   a reader the search by order id, and finds an order whose order id it has not learned yet.
+/// - **Old client order id.** A `pending_replace` names the replacement's order id, and so does a
+///   `replaced`. A live report of that replacement is linked to the order replaced by its client
+///   order id too, which spares a reader the search by order id, and finds an order whose order id
+///   it has not learned yet.
+/// - **Reads.** A `replaced` that arrives before any report of its replacement, as Alpaca sends
+///   an equity's replace, asks for the replacement to be read over REST: its owner takes the order
+///   ids to read ([`take_reads`](Self::take_reads)), and hands each read back
+///   ([`process_read`](Self::process_read)). A live replacement read is reported as its first
+///   report, which releases the end held for it. A read that arrives after a report of the
+///   replacement from the stream is dropped, as it may be older. A replacement replaced again
+///   before its read returns is never reported: the read finds it ended.
 /// - **Fills.** The replacement is reported with the fill Alpaca states for it. Alpaca is taken to
 ///   count the fills of the order replaced in it, which was not observed for a partly filled
 ///   order: a replacement first reported with less filled than its `pending_replace` stated for
 ///   the order replaced is logged at `warn`, naming both.
-/// - **The end of the order replaced** is reported once the replacement's first event, of any
-///   kind, has been. Until then it is held, for at most [`REPLACED_HOLD`]. An end held when the
-///   stream disconnects is dropped ([`drop_held`](Self::drop_held)): the order is then still held
+/// - **The end of the order replaced** is reported once the replacement's first report, of any
+///   kind, from the stream or a read, has been. Until then it is held, for at most
+///   [`REPLACED_HOLD`]. An end held when the stream disconnects is dropped, and so are the reads
+///   not yet taken ([`drop_held`](Self::drop_held)): the order is then still held
 ///   as live, so the reconnect's check of the orders that ended while disconnected reports it.
 ///   The hold orders the stream's own events only: that check runs beside the stream, so it can
 ///   report an order whose end is held as ended before its replacement's first event.
@@ -133,6 +153,8 @@ pub(super) struct ReplaceTracker {
     reported: LruCache<SmolStr, ()>,
     /// Ends held, oldest first, which is also their deadlines' order.
     held: VecDeque<Held>,
+    /// The order ids of replacements to read over REST, not yet taken by the owner.
+    reads: Vec<SmolStr>,
 }
 
 impl Default for ReplaceTracker {
@@ -141,6 +163,7 @@ impl Default for ReplaceTracker {
             pending: LruCache::new(TRACKED_REPLACES),
             reported: LruCache::new(TRACKED_REPLACES),
             held: VecDeque::new(),
+            reads: Vec::new(),
         }
     }
 }
@@ -186,6 +209,20 @@ impl ReplaceTracker {
             (ReplaceEvent::Replaced, Some(replaced_by))
                 if !events.is_empty() && !self.reported.contains(&replaced_by) =>
             {
+                // No `pending_replace` came first, as for an equity: the `replaced` gives the old
+                // client order id instead.
+                if !self.pending.contains(&replaced_by) {
+                    self.pending.put(
+                        replaced_by.clone(),
+                        Pending {
+                            id: id.clone(),
+                            cid,
+                            filled,
+                            checked: false,
+                        },
+                    );
+                }
+                self.reads.push(replaced_by.clone());
                 self.hold(id.clone(), replaced_by, events, now)
             }
             _ => events,
@@ -195,6 +232,36 @@ impl ReplaceTracker {
             self.release(&id, &mut out);
         }
         out
+    }
+
+    /// The events to report now for a REST read of a replacement asked for by
+    /// [`take_reads`](Self::take_reads), which `facts` describes and converted to `events`: as
+    /// [`process`](Self::process) reports them, or nothing when the stream has reported the
+    /// replacement already, as the read may be older than that report.
+    ///
+    /// A read that arrives after the end it was asked for was reported without it, because its
+    /// hold ran out, is still reported, so the replacement is not lost.
+    pub(super) fn process_read(
+        &mut self,
+        facts: ReplaceFacts,
+        events: Vec<UnindexedAccountEvent>,
+        now: Instant,
+    ) -> Vec<UnindexedAccountEvent> {
+        if self.reported.contains(&facts.id) {
+            debug!(
+                id = %facts.id,
+                "Alpaca WS: the stream reported a replacement before its REST read returned - dropping the read"
+            );
+            return Vec::new();
+        }
+        self.process(facts, events, now)
+    }
+
+    /// The order ids of the replacements to read over REST, each once, and each to be handed back
+    /// to [`process_read`](Self::process_read). Asked for by a `replaced` that arrived before any
+    /// report of its replacement.
+    pub(super) fn take_reads(&mut self) -> Vec<SmolStr> {
+        std::mem::take(&mut self.reads)
     }
 
     /// Ends held whose deadline is at or before `now`, oldest first, logged at `warn` as reported
@@ -220,10 +287,12 @@ impl ReplaceTracker {
         self.held.front().map(|held| held.deadline)
     }
 
-    /// Drop every end held, for a stream that disconnected, returning how many were.
+    /// Drop every end held, and every read not yet taken, for a stream that disconnected,
+    /// returning how many ends were held.
     pub(super) fn drop_held(&mut self) -> usize {
         let dropped = self.held.len();
         self.held.clear();
+        self.reads.clear();
         dropped
     }
 
@@ -494,6 +563,7 @@ mod tests {
         let out = tracker.process(replaced(), vec![ended("c-old", "old")], now);
         assert_eq!(out, vec![ended("c-old", "old")]);
         assert_eq!(tracker.next_deadline(), None);
+        assert!(tracker.take_reads().is_empty(), "nothing to read");
     }
 
     /// An end arriving before its replacement's first event is held, and goes out right after
@@ -642,6 +712,10 @@ mod tests {
         assert_eq!(tracker.next_deadline(), None);
         assert!(tracker.expire(now + REPLACED_HOLD).is_empty());
         assert_eq!(tracker.drop_held(), 0);
+        assert!(
+            tracker.take_reads().is_empty(),
+            "the read asked for is dropped too"
+        );
     }
 
     /// An end whose replacement was already reported, or that names none, goes out at once.
@@ -693,5 +767,110 @@ mod tests {
             vec![ended("c-old-0", "old-0")]
         );
         assert_eq!(tracker.drop_held(), TRACKED_REPLACES.get());
+    }
+
+    /// A `replaced` before any event of its replacement, as Alpaca sends an equity's replace,
+    /// asks once for the replacement to be read. The read is reported linked by the old order's id
+    /// and the client order id the `replaced` gave, then the end held for it.
+    #[test]
+    fn a_replaced_before_its_replacement_asks_for_a_read_reported_before_the_end() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+
+        assert!(
+            tracker
+                .process(replaced(), vec![ended("c-old", "old")], now)
+                .is_empty()
+        );
+        assert_eq!(tracker.take_reads(), vec![SmolStr::new("new")]);
+        assert!(
+            tracker.take_reads().is_empty(),
+            "each read is asked for once"
+        );
+
+        let out = tracker.process_read(
+            replacement(Decimal::ZERO),
+            vec![open("c-new", "new", Decimal::ZERO, Some("old"))],
+            now,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            link_of(&out[0]),
+            Some(Replaces::new(OrderId::new("old")).with_cid(ClientOrderId::new("c-old")))
+        );
+        assert_eq!(out[1], ended("c-old", "old"));
+        assert_eq!(tracker.next_deadline(), None);
+    }
+
+    /// A read returning after the stream reported the replacement is dropped, as it may be older.
+    #[test]
+    fn a_read_after_the_stream_reported_the_replacement_is_dropped() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(replaced(), vec![ended("c-old", "old")], now);
+        let out = tracker.process(
+            replacement(Decimal::ZERO),
+            vec![open("c-new", "new", Decimal::ZERO, Some("old"))],
+            now,
+        );
+        assert_eq!(out.len(), 2, "the replacement, then the end released");
+
+        assert!(
+            tracker
+                .process_read(
+                    replacement(Decimal::ZERO),
+                    vec![open("c-new", "new", Decimal::ZERO, Some("old"))],
+                    now,
+                )
+                .is_empty()
+        );
+    }
+
+    /// A read returning after its end was reported without it, its hold run out, still reports
+    /// the replacement, linked, and nothing else.
+    #[test]
+    fn a_read_after_the_hold_ran_out_still_reports_the_replacement() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(replaced(), vec![ended("c-old", "old")], now);
+        assert_eq!(
+            tracker.expire(now + REPLACED_HOLD),
+            vec![ended("c-old", "old")]
+        );
+
+        let out = tracker.process_read(
+            replacement(Decimal::ZERO),
+            vec![open("c-new", "new", Decimal::ZERO, Some("old"))],
+            now + REPLACED_HOLD,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            link_of(&out[0]),
+            Some(Replaces::new(OrderId::new("old")).with_cid(ClientOrderId::new("c-old")))
+        );
+    }
+
+    /// A `pending_replace` seen first keeps its client order id and fill: the `replaced` after it
+    /// does not overwrite them, though it still asks for a read.
+    #[test]
+    fn a_replaced_after_a_pending_replace_keeps_what_the_pending_replace_gave() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(pending_replace(dec!(1)), Vec::new(), now);
+        let mut end = replaced();
+        end.cid = ClientOrderId::new("c-other");
+        end.filled = Some(Decimal::ZERO);
+        tracker.process(end, vec![ended("c-old", "old")], now);
+        assert_eq!(tracker.take_reads(), vec![SmolStr::new("new")]);
+
+        let out = tracker.process_read(
+            replacement(dec!(1)),
+            vec![open("c-new", "new", dec!(1), Some("old"))],
+            now,
+        );
+        assert_eq!(
+            link_of(&out[0]),
+            Some(Replaces::new(OrderId::new("old")).with_cid(ClientOrderId::new("c-old")))
+        );
     }
 }
