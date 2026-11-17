@@ -864,6 +864,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the CI audit job, because any warning made that job report a check run, which
   intermittently failed. `cargo audit` now reports no vulnerabilities and no warnings.
 
+- **The audit ignore lists cover the new `chrono`, `chrono-tz` and `humantime` unmaintained
+  notices, and two new `zip` 0.6.6 advisories.** RustSec now lists `chrono` (RUSTSEC-2026-0543)
+  and `chrono-tz` (RUSTSEC-2026-0555) as unmaintained, and `humantime` (RUSTSEC-2026-0542) with
+  them. These are informational notices, not vulnerabilities. `chrono` and `chrono-tz` are direct
+  dependencies, and `chrono`'s `DateTime<Utc>` is in every crate's public API, so moving off them
+  is a breaking change of its own, tracked in #975. `humantime` arrives only through
+  `hyperliquid_rust_sdk`. The `zip` advisories (RUSTSEC-2026-0545, -0548) concern the same copy
+  as the `zip` entries already ignored, which is never compiled. `cargo deny` and `cargo audit`
+  pass again.
+
 - **`IbkrHistoricalData`'s requests no longer wait forever** (`rustrade-data`, `ibkr` feature,
   #883). Its requests had no deadline: one IB never answered never returned, and a candle or
   calculator request caught by a dropped connection waited through every reconnect attempt,
