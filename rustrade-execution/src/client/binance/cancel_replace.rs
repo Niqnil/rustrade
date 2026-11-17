@@ -852,6 +852,7 @@ mod tests {
             time_in_force,
             quantity,
             quote_order_qty,
+            quote_notional_limit,
             price,
             cancel_new_client_order_id,
             cancel_orig_client_order_id,
@@ -887,6 +888,7 @@ mod tests {
         assert_eq!(new_client_order_id.as_deref(), Some("exit"));
         assert_eq!(wire(&new_order_resp_type), json!("RESULT"));
         assert!(quote_order_qty.is_none() && stop_price.is_none() && iceberg_qty.is_none());
+        assert!(quote_notional_limit.is_none());
         assert!(cancel_new_client_order_id.is_none() && cancel_orig_client_order_id.is_none());
         assert!(strategy_id.is_none() && strategy_type.is_none() && trailing_delta.is_none());
         assert!(self_trade_prevention_mode.is_none() && cancel_restrictions.is_none());

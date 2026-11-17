@@ -587,7 +587,7 @@ ibapi=5.7.0  # 2026-11-08 | Financial protocol, community-maintained, no officia
 #     TickType::ComboImpliedBid/Ask (TickType is not #[non_exhaustive]; our matches have wildcards),
 #     blocking `is_terminated()` on subscriptions, `HistoricalScheduleBuilder::trading_hours`.
 #   rustrade compiles unchanged: `cargo check --locked --workspace --all-targets --all-features` is warning-free.
-binance-sdk=78.0.0  # 2026-11-12 | Exchange SDK, signing/IO. PINNED: the clients couple to `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify each still in use before merge:
+binance-sdk=78.1.0  # 2026-11-17 | Exchange SDK, signing/IO. PINNED: the clients couple to `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify each still in use before merge:
 #   1. common::websocket::WebsocketApi::send_message      — RETIRED: no production caller since #761 moved the margin account stream to the v2 listen key (typed REST + our own WS connection). Re-verify only if a caller returns.
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path: the spot account stream's `subscribe_on_ws_events` (spot.rs), whose callback relies on sequential delivery
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (the margin new-order and cancel requests, decoded into our own answer types; the collateral-ratio read)
@@ -1135,6 +1135,41 @@ binance-sdk=78.0.0  # 2026-11-12 | Exchange SDK, signing/IO. PINNED: the clients
 # CONSUMER-SIDE API CHURN: patterns on the error variants need `..`, and `classify_connector_error` a wildcard
 # arm (a future variant is read as outcome-unknown) plus `ConflictError` with the refusals; ~75 test
 # constructions moved to SDK-made errors.
+#
+# Re-verified against the =78.1.0 crates.io source on 2026-11-17 (78.0.0 -> 78.1.0). .crate sha256
+# 066311c575748d6f07c8aa1ea15e46bdfd74fa9ebe5b540a93571af99966adaf matches the index and our Cargo.lock;
+# publisher unchanged (solutionsGH, 2026-11-12); published from git c23dd2da4d8c475f177612150171359393fa2719,
+# one commit ("Release v78.1.0") after 78.0.0's 6ffea724. No CHANGELOG ships in the crate.
+# `src/common/` is BYTE-IDENTICAL to 78.0.0 (utils.rs md5 789335de5bdf445e6d598411b730680b, websocket.rs
+# b66fb659138af42f6bbb37663189dc3c), so every internal in use, the REST error mapping and the
+# disconnected-connection property hold unchanged:
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:138, sequential `rx.recv()` loop at :151);
+#      `subscribe_on_ws_events` (spot/websocket_api/mod.rs:96) still calls it.
+#   3. `send_request` (utils.rs:1014), same 7 args, signing and `X-MBX-APIKEY` unchanged.
+#   (1. `send_message` unchanged; no caller.) The `http_request` re-send HAZARD recorded at 78.0.0 is unchanged.
+# Still pinned by `a_disconnected_connection_leaves_no_task_behind` and the SDK-made errors in
+# client/binance/sdk_errors.rs.
+# What changed in the compiled modules (all generated, all additive; 584 added lines in `src/`):
+#   - Spot "Quote Notional Limit": an optional `quote_notional_limit` (`quoteNotionalLimit`, BUY only, the
+#     most quote asset the order may spend) on the new-order, order-test and cancel-replace params, REST and
+#     WS API, and `above_`/`below_`/working/pending variants on the order-list params; each is sent only
+#     when set. Exchange info symbols gain `market_`/`limit_quote_notional_limit_allowed`; execution
+#     reports gain `Qq` (the limit) and `eV` (the effective self-trade-prevention mode).
+#   - Spot WS API `userDataStream.subscribe` params gain an optional `filter`, sent only when set.
+#   - `src/margin_trading/`: raw-string test noise only (`r#""#` -> `r""`).
+# Outside the compiled modules: alpha and derivatives WS stream `id` clone removals, new USD-M algo-order
+# fields, stocks price-stream fields, doc lines; none compiled under `spot` + `margin_trading`.
+# Security: PASS. `src/common/` and build.rs identical; the set of URL literals is identical to 78.0.0; no
+# new `unsafe`, env, filesystem, process, signing or encoded-blob sites in the diff. Both standing caveats
+# carry forward unchanged. No OSV/RUSTSEC advisory (CI `cargo audit` and `cargo deny` pass).
+# Dependency surface: Cargo.toml differs only in `version` (32 direct deps, `[features]` identical). Our
+# Cargo.lock delta is binance-sdk's version + checksum, plus a Windows-only re-resolution that drops the
+# duplicate windows-sys 0.60 / windows-targets 0.53 (quinn-udp now on the windows-sys 0.61 already in the tree).
+# CONSUMER-SIDE API CHURN: one test, `the_params_carry_both_legs_and_the_policys_mode`
+# (client/binance/cancel_replace.rs), names every `OrderCancelReplaceParams` field and now names
+# `quote_notional_limit`, asserted unset. The clients build params through the builder, so the field
+# defaults to None and the wire request is unchanged. Our own `ExecutionReport` reads only the keys it uses,
+# so the new `Qq`/`eV` keys pass through.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
