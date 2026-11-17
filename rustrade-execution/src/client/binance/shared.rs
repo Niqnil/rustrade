@@ -2911,6 +2911,13 @@ fn trade_order_is_live(status: &str) -> bool {
     matches!(status, "PARTIALLY_FILLED" | "FILLED")
 }
 
+/// Whether an `executionReport`'s order status (`X`) says the order has nothing left to fill, on a
+/// report whose execution type does not end the order itself: self-trade prevention, or an amend
+/// down to the filled quantity.
+fn report_left_nothing_to_fill(status: &str) -> bool {
+    matches!(status, "EXPIRED_IN_MATCH" | "EXPIRED" | "FILLED")
+}
+
 /// When an `executionReport`'s execution happened, and whose clock says so: its transaction time
 /// `T`, else its event time `E`, else this host's clock, as [`TimeSource::Host`].
 ///
@@ -3112,8 +3119,7 @@ pub(crate) fn convert_execution_report(
             // the expire modes the order leaves the book (`EXPIRED_IN_MATCH`); in `DECREMENT` it
             // may stay live with less left to fill, which an order snapshot cannot express.
             match report.order_status.as_deref() {
-                // The statuses Binance gives an order once prevention leaves it nothing to fill.
-                Some("EXPIRED_IN_MATCH" | "EXPIRED" | "FILLED") => buf.push(cancelled_event(
+                Some(status) if report_left_nothing_to_fill(status) => buf.push(cancelled_event(
                     report,
                     exchange,
                     symbol,
@@ -3169,7 +3175,8 @@ pub(crate) fn convert_execution_report(
             //
             // An amend down to the filled quantity or below ends the order: Binance sends this one
             // report with `X = EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report after
-            // it, so this report has to end the order, as the `EXPIRED` arm does.
+            // it, so this report has to end the order, as the `EXPIRED` arm does. Any status that
+            // leaves the order nothing to fill is read so, as self-trade prevention's are.
             let renamed_from = report
                 .orig_client_order_id
                 .as_deref()
@@ -3186,20 +3193,31 @@ pub(crate) fn convert_execution_report(
                         (time_exchange, time_source),
                     ));
                 }
-                (None, Some("EXPIRED")) => buf.push(cancelled_event(
-                    report,
-                    exchange,
-                    symbol,
-                    cid,
-                    order_id,
-                    time_exchange,
-                )),
-                // An unknown status could be a live order or an ended one, so it is taken as
-                // neither.
+                (None, Some(status)) if report_left_nothing_to_fill(status) => {
+                    buf.push(cancelled_event(
+                        report,
+                        exchange,
+                        symbol,
+                        cid,
+                        order_id,
+                        time_exchange,
+                    ));
+                }
+                // Any other status, or none, could describe a live order or an ended one, so it
+                // is taken as neither. Not sampled, here or below: each one leaves the engine
+                // holding the order as it was before the amend.
                 (None, status) => warn!(
                     %exchange, %symbol, %order_id, status = status.unwrap_or("<missing>"),
-                    "Binance REPLACED report with an unrecognised order status (X), dropping - \
-                     the engine still holds the order's earlier quantity"
+                    "Binance REPLACED report with an order status (X) that is neither live nor an \
+                     end, dropping - the engine still holds the order's earlier quantity"
+                ),
+                (Some(previous), Some(status)) if report_left_nothing_to_fill(status) => warn!(
+                    %exchange, %symbol, %order_id,
+                    client_order_id = %cid,
+                    previous_client_order_id = previous,
+                    status,
+                    "Binance order amended under a new client order id ended - the engine still \
+                     holds it as live, under its old id"
                 ),
                 (Some(previous), status) => warn!(
                     %exchange, %symbol, %order_id,
@@ -3207,7 +3225,7 @@ pub(crate) fn convert_execution_report(
                     previous_client_order_id = previous,
                     status = status.unwrap_or("<missing>"),
                     "Binance order amended under a new client order id - the engine still holds \
-                     it under its old id and quantity, and as live whatever its status (X)"
+                     it under its old id and quantity"
                 ),
             }
         }

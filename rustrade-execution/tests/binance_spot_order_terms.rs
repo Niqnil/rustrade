@@ -323,18 +323,31 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
         )
         .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let mut partly_filled = false;
-        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, stream.next()).await {
-            if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind
-                && snapshot.0.order.key.cid == buy
-                && let OrderState::Active(ActiveOrderState::Open(open)) = &snapshot.0.order.state
-                && open.filled_quantity == unit
-            {
-                partly_filled = true;
-                break;
+        // What the stream said of the buy, and how the wait ended, for a failure's message.
+        let mut seen = Vec::new();
+        let ended = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(event)) => {
+                    if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind
+                        && snapshot.0.order.key.cid == buy
+                    {
+                        seen.push(format!("{:?}", snapshot.0.order.state));
+                        if let OrderState::Active(ActiveOrderState::Open(open)) =
+                            &snapshot.0.order.state
+                            && open.filled_quantity == unit
+                        {
+                            break "the fill";
+                        }
+                    }
+                }
+                Ok(None) => break "the stream ending",
+                Err(_) => break "ten seconds",
             }
-        }
-        assert!(partly_filled, "the stream reports the buy filled in part");
+        };
+        assert_eq!(
+            ended, "the fill",
+            "the stream reports the buy filled in part; saw {seen:?}"
+        );
 
         outside_client()
             .order_amend_keep_priority(
@@ -370,6 +383,8 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
     let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(60), body))
         .catch_unwind()
         .await;
+    // Both orders have usually ended by now (the sell filled, the buy amended to its fill), so
+    // these cancels are expected to fail; they matter only when the test stopped early.
     for cid in [&buy, &sell] {
         let _ = client
             .cancel_order(OrderEvent {

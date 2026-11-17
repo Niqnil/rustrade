@@ -5134,12 +5134,40 @@ mod tests {
         assert_eq!(open.filled_quantity, Decimal::new(15, 4));
     }
 
-    /// An amend whose order status (`X`) is unknown or missing could leave the order live or end
-    /// it, so it is reported as neither; so is one under a new client order id that ended it,
-    /// which the engine holds under its old id.
+    /// Any order status that leaves the order nothing to fill ends it on an amend report, as on a
+    /// self-trade prevention one, with what filled.
+    #[test]
+    fn an_amend_with_any_status_that_leaves_nothing_to_fill_ends_the_order() {
+        for status in ["EXPIRED", "EXPIRED_IN_MATCH", "FILLED"] {
+            let amend = ExecutionReport {
+                order_status: Some(status.to_string()),
+                cumulative_filled_quantity: Some("0.002".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let event = sole_event(convert(amend)).expect("an amend that ends the order");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!(
+                    "X = {status}: expected OrderCancelled, got {:?}",
+                    event.kind
+                );
+            };
+            let Ok(cancelled) = response.state else {
+                panic!("X = {status}: expected Ok, got {:?}", response.state);
+            };
+            assert_eq!(
+                cancelled.filled_quantity,
+                Some(Decimal::new(2, 3)),
+                "X = {status}"
+            );
+        }
+    }
+
+    /// An amend whose order status (`X`) is neither live nor an end, or missing, could leave the
+    /// order live or end it, so it is reported as neither; so is one under a new client order id
+    /// that ended it, which the engine holds under its old id.
     #[test]
     fn an_amend_with_an_unknown_status_or_a_new_id_produces_nothing() {
-        for status in [Some("SOME_FUTURE_STATUS"), Some("FILLED"), None] {
+        for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
             let amend = ExecutionReport {
                 order_status: status.map(str::to_string),
                 ..resting_report("REPLACED", "0.002")
