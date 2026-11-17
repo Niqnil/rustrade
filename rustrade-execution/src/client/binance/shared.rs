@@ -4234,8 +4234,8 @@ fn classify_forbidden(msg: String) -> RequestFailure {
         // `RateLimited` carries no message, so log the body it replaces. A CDN's 403 body is a
         // full HTML page: log only its start. A 403 carries no wait.
         const LOG_EXCERPT_CHARS: usize = 256;
-        let excerpt = excerpt(&msg, LOG_EXCERPT_CHARS);
-        warn!(body = %excerpt, "Binance answered 403 (WAF limit); reporting RateLimit");
+        let body = excerpt(&msg, LOG_EXCERPT_CHARS);
+        warn!(%body, "Binance answered 403 (WAF limit); reporting RateLimit");
         RequestFailure::RateLimited(None)
     } else {
         RequestFailure::Unauthenticated(msg)
