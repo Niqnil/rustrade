@@ -1795,9 +1795,14 @@ impl ExecutionClient for AlpacaClient {
     ///   reported with less filled than its `pending_replace` stated is logged at `warn`.
     /// - **A replacement Alpaca rejects**, as it does when the order replaced fills first, ends as
     ///   a cancelled snapshot, not as a rejection: the order was working, and its fills arrive on
-    ///   the order replaced.
+    ///   the order replaced. Every `rejected` event naming an order it replaces is read this way,
+    ///   whatever Alpaca's reason. A rejection that left the order replaced working was not
+    ///   observed; one would be reported as the order ending while it still rests.
     ///
     /// A replace whose events arrive while the stream is disconnected is covered only as above.
+    /// So is a replace around a reconnect: the order check after a reconnect is not held back, so
+    /// if it asks about an order replaced while that order's end is held, it reports the order
+    /// ended before its replacement's first event, as for a replace while disconnected.
     ///
     /// # Rejected orders
     ///
@@ -5210,7 +5215,8 @@ fn convert_trade_update_at(
             // A replacement Alpaca rejected, as it does when the order replaced filled first, ends
             // a working order rather than failing to open one: reported as ended like the order it
             // replaced, so a reader following the replace stops tracking it, and an order that was
-            // working is not counted as a rejected open.
+            // working is not counted as a rejected open. Taken so whatever the rejection's reason
+            // (see `account_stream`'s "Orders Alpaca replaces").
             if order.replaces.is_some()
                 && let Some(ended) = ws_ended_snapshot(
                     order,
@@ -13377,6 +13383,91 @@ mod tests {
                     (NEW.to_string(), Some(Replaces::new(OrderId::new(OLD)))),
                     ("id-plain".to_string(), None),
                 ]
+            );
+        }
+
+        /// The stream task sends an end held for a replacement whose event never comes once the
+        /// hold runs out, on its own timer, and not before.
+        #[tokio::test(start_paused = true)]
+        async fn the_stream_sends_a_held_end_when_its_hold_runs_out() {
+            use super::replace::REPLACED_HOLD;
+            use futures::{SinkExt as _, StreamExt as _};
+            use tokio_tungstenite::tungstenite::Message;
+
+            // A WS server that authorises and acknowledges the listen, sends a `replaced` whose
+            // replacement it never reports, then only pings, every second, so the heartbeat holds.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+            let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Without it, a frame can wait in the kernel for the client's delayed ACK,
+                // which is real time the paused clock does not wait for.
+                stream.set_nodelay(true).unwrap();
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                for answer in [
+                    r#"{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}"#,
+                    r#"{"stream":"listening","data":{"streams":["trade_updates"]}}"#,
+                ] {
+                    let Some(Ok(_)) = ws.next().await else {
+                        return;
+                    };
+                    if ws.send(Message::text(answer)).await.is_err() {
+                        return;
+                    }
+                }
+                if ws.send(Message::text(replaced())).await.is_err() {
+                    return;
+                }
+                let _ = sent_tx.send(tokio::time::Instant::now());
+                let mut pings = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = pings.tick() => {
+                            if ws.send(Message::Ping(Default::default())).await.is_err() {
+                                return;
+                            }
+                        }
+                        message = ws.next() => {
+                            if !matches!(message, Some(Ok(_))) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            let mut config = AlpacaConfig::with_base_url("key".into(), "secret".into(), rest_url);
+            config.ws_url_override = Some(ws_url);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            tokio::spawn(connection_manager(
+                tx,
+                new_dedup_cache(),
+                Arc::new(config),
+                reqwest::Client::new(),
+                Arc::new(RateLimitTracker::new()),
+                KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+                Vec::new(),
+                None,
+            ));
+
+            let sent = sent_rx.await.expect("the server sent the `replaced`");
+            let event = tokio::time::timeout(2 * REPLACED_HOLD, rx.recv())
+                .await
+                .expect("the held end is sent")
+                .expect("the stream is open");
+            let waited = tokio::time::Instant::now() - sent;
+            assert!(
+                waited >= REPLACED_HOLD && waited < REPLACED_HOLD + Duration::from_millis(100),
+                "sent {waited:?} after the `replaced`"
+            );
+            assert_eq!(
+                ended(&event),
+                ("c-old".to_string(), OLD.to_string(), Some(Decimal::ZERO))
             );
         }
     }

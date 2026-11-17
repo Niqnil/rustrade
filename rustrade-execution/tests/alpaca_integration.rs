@@ -136,6 +136,32 @@ async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentName
     }
 }
 
+/// Cancel every open order on `instrument`, as best it can, then wait until none is listed: the
+/// cleanup of a test that failed before its own cancel, so the shared paper account is left flat.
+async fn cancel_open_orders(client: &AlpacaClient, instrument: &InstrumentNameExchange) {
+    for order in client
+        .fetch_open_orders(std::slice::from_ref(instrument))
+        .await
+        .unwrap_or_default()
+    {
+        let cancelled = client
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::AlpacaBroker,
+                    instrument,
+                    strategy: order.key.strategy.clone(),
+                    cid: order.key.cid.clone(),
+                },
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(order.state.id.clone()),
+                },
+            })
+            .await;
+        println!("cleanup cancel of {}: {:?}", order.key.cid, cancelled.state);
+    }
+    await_no_open_orders(client, instrument).await;
+}
+
 // ============================================================================
 // Connection Tests
 // ============================================================================
@@ -800,6 +826,9 @@ async fn test_a_resting_equity_order_states_its_terms() {
 async fn test_a_replaced_crypto_order_is_followed() {
     init_logging();
     let config = test_config();
+    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
+    let secret_key =
+        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
     let client = AlpacaClient::new(config.clone());
     let instrument = btc_instrument();
     let instruments = [instrument.clone()];
@@ -837,28 +866,39 @@ async fn test_a_replaced_crypto_order_is_followed() {
         panic!("Alpaca names the order it placed: {open:?}");
     };
 
-    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
-    let secret_key =
-        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
-    let replaced: serde_json::Value = reqwest::Client::new()
-        .patch(format!("{}/v2/orders/{old_id}", config.rest_base_url()))
-        .header("APCA-API-KEY-ID", api_key)
-        .header("APCA-API-SECRET-KEY", secret_key)
-        .json(&serde_json::json!({ "limit_price": "1001" }))
-        .send()
-        .await
-        .expect("the replace request was sent")
-        .error_for_status()
-        .expect("Alpaca accepted the replace")
-        .json()
-        .await
-        .expect("the replace answer is JSON");
-    let new_id = OrderId::new(replaced["id"].as_str().expect("the replacement's id"));
-    let new_cid = ClientOrderId::new(
-        replaced["client_order_id"]
-            .as_str()
-            .expect("the replacement's client order id"),
-    );
+    // From here until the order is cancelled, a failure cancels what rests before panicking.
+    let replace = async {
+        let replaced: serde_json::Value = reqwest::Client::new()
+            .patch(format!("{}/v2/orders/{old_id}", config.rest_base_url()))
+            .header("APCA-API-KEY-ID", api_key)
+            .header("APCA-API-SECRET-KEY", secret_key)
+            .json(&serde_json::json!({ "limit_price": "1001" }))
+            .send()
+            .await
+            .map_err(|error| format!("the replace request was not sent: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("Alpaca refused the replace: {error}"))?
+            .json()
+            .await
+            .map_err(|error| format!("the replace answer is not JSON: {error}"))?;
+        let field = |name: &str| {
+            replaced[name]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("the replace answer has no `{name}`: {replaced}"))
+        };
+        Ok::<_, String>((
+            OrderId::new(field("id")?),
+            ClientOrderId::new(field("client_order_id")?),
+        ))
+    };
+    let (new_id, new_cid) = match replace.await {
+        Ok(ids) => ids,
+        Err(error) => {
+            cancel_open_orders(&client, &instrument).await;
+            panic!("{error}");
+        }
+    };
 
     // The stream's reports of either order until the old one has ended, within ten seconds.
     let streamed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -885,11 +925,13 @@ async fn test_a_replaced_crypto_order_is_followed() {
     let listed = client
         .account_snapshot(&[], &instruments)
         .await
-        .expect("account_snapshot failed")
-        .instruments
-        .into_iter()
-        .flat_map(|snapshot| snapshot.orders)
-        .find(|order| order.order.key.cid == new_cid);
+        .map(|snapshot| {
+            snapshot
+                .instruments
+                .into_iter()
+                .flat_map(|snapshot| snapshot.orders)
+                .find(|order| order.order.key.cid == new_cid)
+        });
 
     let cancelled = client
         .cancel_order(rustrade_execution::order::OrderEvent {
@@ -899,11 +941,10 @@ async fn test_a_replaced_crypto_order_is_followed() {
             },
         })
         .await;
-    assert!(
-        cancelled.state.is_ok(),
-        "Cancel rejected: {:?}",
-        cancelled.state
-    );
+    if cancelled.state.is_err() {
+        cancel_open_orders(&client, &instrument).await;
+        panic!("Cancel rejected: {:?}", cancelled.state);
+    }
     await_no_open_orders(&client, &instrument).await;
 
     let linked = streamed
@@ -924,7 +965,9 @@ async fn test_a_replaced_crypto_order_is_followed() {
         })
         .unwrap_or_else(|| panic!("the old order is reported ended: {streamed:#?}"));
     assert!(linked < ended, "the replacement comes first: {streamed:#?}");
-    let listed = listed.expect("the account snapshot lists the replacement");
+    let listed = listed
+        .expect("account_snapshot failed")
+        .expect("the account snapshot lists the replacement");
     assert_eq!(listed.replaces, Some(Replaces::new(old_id.clone())));
 }
 

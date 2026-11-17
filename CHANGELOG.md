@@ -501,10 +501,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
   rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as
   an `OrderSnapshot` of a cancelled order with what it filled, instead of `OrderCancelled`, so a
-  reader that followed the replace ignores the end of the order it left. A `rejected` event for a replacement, which Alpaca sends when the
-  old order filled first, is reported the same way instead of `OrderCancelled` with a rejection
-  error, since the order was working. A `rejected` event for any other order is unchanged. A
-  `replaced` payload whose side or type cannot be read is still reported as `OrderCancelled`.
+  reader that followed the replace ignores the end of the order it left. A `rejected` event for
+  a replacement, which Alpaca sends when the old order filled first, is reported the same way
+  instead of `OrderCancelled` with a rejection error, since the order was working; every
+  `rejected` event naming an order it replaces is read so, whatever its reason. A `rejected`
+  event for any other order is unchanged. A `replaced` payload whose side or type cannot be read
+  is still reported as `OrderCancelled`.
 - **`binance-sdk` 78.0.0 → 78.1.0** (`rustrade-execution`, `binance` feature, #968). The SDK adds
   Binance spot's optional quote notional limit to its order parameters, and an optional event
   filter to the user-data stream subscription. The clients set neither, so the requests they send

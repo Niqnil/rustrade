@@ -114,9 +114,17 @@ struct Held {
 ///   kind, has been. Until then it is held, for at most [`REPLACED_HOLD`]. An end held when the
 ///   stream disconnects is dropped ([`drop_held`](Self::drop_held)): the order is then still held
 ///   as live, so the reconnect's check of the orders that ended while disconnected reports it.
+///   The hold orders the stream's own events only: that check runs beside the stream, so it can
+///   report an order whose end is held as ended before its replacement's first event.
 ///
 /// Each fact is remembered for the last [`TRACKED_REPLACES`] replaces, and as many ends are held
 /// at once; past that, the end held longest is reported at once, with a warning.
+///
+/// # Caller obligations
+///
+/// The `now` passed to [`process`](Self::process) and [`expire`](Self::expire) must not go
+/// backwards: pass a monotonic clock's reading. Ends are held in deadline order, and only
+/// the earliest is checked, so an earlier `now` would hold an end behind a later deadline.
 #[derive(Debug)]
 pub(super) struct ReplaceTracker {
     /// What each `pending_replace` said, by the replacement's order id.
@@ -285,6 +293,13 @@ impl ReplaceTracker {
         events: Vec<UnindexedAccountEvent>,
         now: Instant,
     ) -> Vec<UnindexedAccountEvent> {
+        let deadline = now + REPLACED_HOLD;
+        debug_assert!(
+            self.held
+                .back()
+                .is_none_or(|last| last.deadline <= deadline),
+            "the time told a ReplaceTracker went backwards"
+        );
         let out = if self.held.len() >= TRACKED_REPLACES.get()
             && let Some(oldest) = self.held.pop_front()
         {
@@ -302,7 +317,7 @@ impl ReplaceTracker {
             id,
             replaced_by,
             events,
-            deadline: now + REPLACED_HOLD,
+            deadline,
         });
         out
     }
