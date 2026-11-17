@@ -5172,9 +5172,7 @@ mod tests {
             let (events, logs) = rustrade_instrument::test_utils::logs::capture(|| convert(report));
             assert!(events.is_empty(), "{events:?}");
             logs.iter()
-                .flat_map(|event| &event.fields)
-                .filter(|(name, _)| *name == "message")
-                .map(|(_, message)| message.clone())
+                .map(|event| event.message().to_string())
                 .collect::<Vec<_>>()
         };
         for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
@@ -5202,7 +5200,9 @@ mod tests {
                 "X = {status}: {messages:?}"
             );
             assert_eq!(
-                messages.iter().any(|m| m.contains("order id ended")),
+                messages
+                    .iter()
+                    .any(|m| m.contains("ended - the engine still holds it as live")),
                 ended,
                 "X = {status}: {messages:?}"
             );
