@@ -159,6 +159,53 @@ jobs:
             echo "::endgroup::"
           done
 
+  # `rust-version` in Cargo.toml promises users the workspace builds on that compiler, while every
+  # other job builds with the newer release `rust-toolchain.toml` pins. A newly stabilised API or
+  # language feature, or a dependency update that raises its own MSRV, would pass those jobs and
+  # break users on the MSRV. A change that needs a newer compiler raises `rust-version` instead.
+  # `check` is enough: the question is whether the code compiles; the test job runs the tests.
+  msrv:
+    name: cargo check (MSRV)
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Build scripts and proc macros are linked, with `.cargo/config.toml`'s mold flag.
+      - name: Install mold linker
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      # The version is read from Cargo.toml, so the job cannot drift from what the crates declare.
+      # `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml` for every later step, the cache's key
+      # included.
+      - name: Install the MSRV toolchain
+        run: |
+          msrv=$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          # A PR controls Cargo.toml: refuse anything but a version before it reaches GITHUB_ENV.
+          [[ $msrv =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "unexpected rust-version: $msrv"; exit 1; }
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+
+      - name: Show the toolchain
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
+        with:
+          shared-key: "rustrade-ci-msrv"
+
+      - name: Run cargo check
+        run: cargo check --locked --workspace --all-targets --all-features
+
   test:
     name: cargo test
     needs: [fmt, check]
@@ -584,7 +631,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Synced with deny.toml [advisories.ignore] - see that file for full justifications
-          ignore: RUSTSEC-2026-0235,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0429,RUSTSEC-2026-0403,RUSTSEC-2026-0395,RUSTSEC-2026-0397,RUSTSEC-2026-0399,RUSTSEC-2026-0400,RUSTSEC-2026-0401,RUSTSEC-2026-0402,RUSTSEC-2026-0404,RUSTSEC-2026-0406,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258,RUSTSEC-2026-0346,RUSTSEC-2026-0349,RUSTSEC-2026-0381,RUSTSEC-2026-0382,RUSTSEC-2026-0387
+          ignore: RUSTSEC-2026-0235,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0429,RUSTSEC-2026-0403,RUSTSEC-2026-0395,RUSTSEC-2026-0397,RUSTSEC-2026-0399,RUSTSEC-2026-0400,RUSTSEC-2026-0401,RUSTSEC-2026-0402,RUSTSEC-2026-0404,RUSTSEC-2026-0406,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258,RUSTSEC-2026-0346,RUSTSEC-2026-0349,RUSTSEC-2026-0381,RUSTSEC-2026-0382,RUSTSEC-2026-0387,RUSTSEC-2026-0545,RUSTSEC-2026-0548,RUSTSEC-2026-0542,RUSTSEC-2026-0543,RUSTSEC-2026-0555
 
   deny:
     name: cargo deny

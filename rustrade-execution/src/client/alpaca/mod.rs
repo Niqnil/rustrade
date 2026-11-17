@@ -50,7 +50,6 @@ use crate::{
     InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead},
-    client::listed_order::ListedOrder,
     client::{
         BracketOrderClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
@@ -60,6 +59,7 @@ use crate::{
         reconnect_budget::{BackoffLimits, ReconnectBudget},
         venue_clock::{HostMoment, VenueClock},
     },
+    client::{listed_order::ListedOrder, log_excerpt::frame_excerpt},
     emit_stream_terminated,
     error::{
         ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError,
@@ -3560,7 +3560,7 @@ fn process_ws_text(
         Err(e) => {
             trace!(
                 %e,
-                raw = ?&text[..text.len().min(200)],
+                raw = ?frame_excerpt(text),
                 "Alpaca WS: skipped non-JSON message"
             );
             return;
@@ -3578,7 +3578,7 @@ fn process_ws_text(
                     // event (e.g. a rejected order). Visible at production log levels.
                     warn!(
                         %e,
-                        raw = ?&msg.data.get()[..msg.data.get().len().min(200)],
+                        raw = ?frame_excerpt(msg.data.get()),
                         "Alpaca WS trade_updates: failed to deserialize event — event dropped"
                     );
                     return;
@@ -8387,6 +8387,36 @@ mod tests {
             timestamp: None,
         };
         assert_eq!(early_dedup_key(&update3).as_str(), "ord-x:1");
+    }
+
+    /// An unparseable message is logged as an excerpt cut on a character, and skipped without a
+    /// panic: both the non-JSON frame (`trace!`) and the `trade_updates` payload that fails to
+    /// deserialize (`warn!`). Each is longer than the excerpt, with a two-byte character across
+    /// byte 200, where a byte cut would panic. The subscriber enables both levels, because tracing
+    /// does not evaluate a disabled event's fields.
+    #[test]
+    fn process_ws_text_logs_an_unparseable_message_cut_inside_a_character() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+
+        let not_json = format!("{}{}", "x".repeat(199), "é".repeat(10));
+        let data_prefix = r#"{"pad":""#;
+        let pad = "a".repeat(199 - data_prefix.len());
+        let accents = "é".repeat(10);
+        let bad_payload =
+            format!(r#"{{"stream":"trade_updates","data":{data_prefix}{pad}{accents}"}}}}"#);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        tracing::subscriber::with_default(subscriber, || {
+            for frame in [&not_json, &bad_payload] {
+                process_ws_text(frame, &tx, &dedup, &known, &mut VenueClock::new());
+            }
+        });
+        assert!(rx.try_recv().is_err(), "neither message reports an event");
     }
 
     /// Regression guard for HIGH-2: a `rejected` event without `filled_qty` in the JSON

@@ -796,15 +796,16 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
         "the cancel did not repay the loan: {left:?}"
     );
 
-    // Binance sends `liabilityChange` for the cross account. For an isolated pair it has not
-    // been seen to, so there its absence is reported rather than failed.
+    // Binance sends `liabilityChange` for the cross account only, as it has confirmed, so an
+    // isolated borrow brings no MarginDebt. One that does is reported rather than failed: it
+    // would mean Binance has started sending the event for isolated pairs.
     match account {
         Account::Cross => assert!(
             borrow_streamed,
             "the stream did not deliver the borrow as MarginDebt"
         ),
-        Account::Isolated if !borrow_streamed => {
-            println!("NOTE: no MarginDebt for the isolated borrow");
+        Account::Isolated if borrow_streamed => {
+            println!("NOTE: MarginDebt arrived for the isolated borrow; Binance now streams it");
         }
         Account::Isolated => {}
     }
