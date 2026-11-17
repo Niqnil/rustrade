@@ -25,7 +25,8 @@
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     order::{
-        id::ClientOrderId,
+        id::{ClientOrderId, OrderId},
+        report::{Replaces, UnindexedOrderReport},
         state::{ActiveOrderState, OrderState},
     },
 };
@@ -124,7 +125,7 @@ struct Held {
 ///   ([`process_read`](Self::process_read)). A live replacement read is reported as its first
 ///   report, which releases the end held for it. A read that arrives after a report of the
 ///   replacement from the stream is dropped, as it may be older. A replacement replaced again
-///   before its read returns is never reported: the read finds it ended.
+///   before its read returns may not be reported: a read that finds it ended reports nothing.
 /// - **Fills.** The replacement is reported with the fill Alpaca states for it. Alpaca is taken to
 ///   count the fills of the order replaced in it, which was not observed for a partly filled
 ///   order: a replacement first reported with less filled than its `pending_replace` stated for
@@ -222,7 +223,10 @@ impl ReplaceTracker {
                         },
                     );
                 }
-                self.reads.push(replaced_by.clone());
+                // A second `replaced` for an end already held has its read asked for already.
+                if !self.held.iter().any(|held| held.replaced_by == replaced_by) {
+                    self.reads.push(replaced_by.clone());
+                }
                 self.hold(id.clone(), replaced_by, events, now)
             }
             _ => events,
@@ -241,10 +245,13 @@ impl ReplaceTracker {
     ///
     /// A read that arrives after the end it was asked for was reported without it, because its
     /// hold ran out, is still reported, so the replacement is not lost.
+    ///
+    /// A read that does not name the order it replaces is linked to the order whose `replaced`
+    /// asked for it, which the tracker remembers, so its end is released all the same.
     pub(super) fn process_read(
         &mut self,
-        facts: ReplaceFacts,
-        events: Vec<UnindexedAccountEvent>,
+        mut facts: ReplaceFacts,
+        mut events: Vec<UnindexedAccountEvent>,
         now: Instant,
     ) -> Vec<UnindexedAccountEvent> {
         if self.reported.contains(&facts.id) {
@@ -254,11 +261,27 @@ impl ReplaceTracker {
             );
             return Vec::new();
         }
+        if facts.replaces.is_none()
+            && let Some(pending) = self.pending.peek(&facts.id)
+        {
+            let replaced = pending.id.clone();
+            debug!(
+                id = %facts.id,
+                replaced_id = %replaced,
+                "Alpaca WS: a replacement's REST read names no order it replaces - linking it to the one whose replace asked for the read"
+            );
+            for report in live_reports(&mut events) {
+                report
+                    .replaces
+                    .get_or_insert_with(|| Replaces::new(OrderId(replaced.clone())));
+            }
+            facts.replaces = Some(replaced);
+        }
         self.process(facts, events, now)
     }
 
-    /// The order ids of the replacements to read over REST, each once, and each to be handed back
-    /// to [`process_read`](Self::process_read). Asked for by a `replaced` that arrived before any
+    /// The order ids of the replacements to read over REST, each once per end held for it, and
+    /// each to be handed back to [`process_read`](Self::process_read). Asked for by a `replaced` that arrived before any
     /// report of its replacement.
     pub(super) fn take_reads(&mut self) -> Vec<SmolStr> {
         std::mem::take(&mut self.reads)
@@ -315,17 +338,7 @@ impl ReplaceTracker {
             return false;
         }
         let mut linked = false;
-        for event in events.iter_mut() {
-            let AccountEventKind::OrderSnapshot(snapshot) = &mut event.kind else {
-                continue;
-            };
-            let report = &mut snapshot.0;
-            if !matches!(
-                report.order.state,
-                OrderState::Active(ActiveOrderState::Open(_))
-            ) {
-                continue;
-            }
+        for report in live_reports(events) {
             let Some(link) = report.replaces.take() else {
                 continue;
             };
@@ -402,6 +415,23 @@ impl ReplaceTracker {
         self.held = kept;
         out.extend(due.into_iter().flat_map(|held| held.events));
     }
+}
+
+/// The reports among `events` that report an order live: the ones a replacement's link goes on.
+fn live_reports(
+    events: &mut [UnindexedAccountEvent],
+) -> impl Iterator<Item = &mut UnindexedOrderReport> {
+    events.iter_mut().filter_map(|event| match &mut event.kind {
+        AccountEventKind::OrderSnapshot(snapshot)
+            if matches!(
+                snapshot.0.order.state,
+                OrderState::Active(ActiveOrderState::Open(_))
+            ) =>
+        {
+            Some(&mut snapshot.0)
+        }
+        _ => None,
+    })
 }
 
 /// Whether a replacement reporting `after` filled counts less than the order it replaces had,
@@ -872,5 +902,56 @@ mod tests {
             link_of(&out[0]),
             Some(Replaces::new(OrderId::new("old")).with_cid(ClientOrderId::new("c-old")))
         );
+    }
+
+    /// A read that names no order it replaces is linked to the order whose `replaced` asked for
+    /// it, by its id and client order id, and releases that order's end.
+    #[test]
+    fn a_read_naming_no_replaced_order_is_linked_to_the_one_that_asked() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(replaced(), vec![ended("c-old", "old")], now);
+        let mut facts = replacement(Decimal::ZERO);
+        facts.replaces = None;
+
+        let out = tracker.process_read(facts, vec![open("c-new", "new", Decimal::ZERO, None)], now);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            link_of(&out[0]),
+            Some(Replaces::new(OrderId::new("old")).with_cid(ClientOrderId::new("c-old")))
+        );
+        assert_eq!(out[1], ended("c-old", "old"));
+    }
+
+    /// A second `replaced` for an end already held asks for no second read.
+    #[test]
+    fn a_repeated_replaced_asks_for_one_read() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(replaced(), vec![ended("c-old", "old")], now);
+        tracker.process(replaced(), vec![ended("c-old", "old")], now);
+
+        assert_eq!(tracker.take_reads(), vec![SmolStr::new("new")]);
+    }
+
+    /// The old client order id goes on live reports of a replacement only: an ended one keeps the
+    /// link it came with.
+    #[test]
+    fn an_ended_report_of_a_replacement_gets_no_client_order_id() {
+        let mut tracker = ReplaceTracker::default();
+        let now = Instant::now();
+        tracker.process(pending_replace(Decimal::ZERO), Vec::new(), now);
+        let state = OrderState::inactive(Cancelled::new(
+            OrderId::new("new"),
+            chrono::DateTime::UNIX_EPOCH,
+            Some(Decimal::ZERO),
+        ));
+
+        let out = tracker.process(
+            replacement(Decimal::ZERO),
+            vec![order_event("c-new", state, Some("old"))],
+            now,
+        );
+        assert_eq!(link_of(&out[0]), Some(Replaces::new(OrderId::new("old"))));
     }
 }
