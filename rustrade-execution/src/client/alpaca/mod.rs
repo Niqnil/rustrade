@@ -3433,6 +3433,15 @@ fn check_listen_ack(text: &str) -> bool {
 // Process incoming WS messages
 // ---------------------------------------------------------------------------
 
+/// The most of a WS message a log line quotes, in bytes.
+const LOGGED_SNIPPET_BYTES: usize = 200;
+
+/// The start of `text` that a log line quotes: at most [`LOGGED_SNIPPET_BYTES`], cut back to a
+/// char boundary. A cut inside a multi-byte character would panic the connection task.
+fn logged_snippet(text: &str) -> &str {
+    &text[..text.floor_char_boundary(LOGGED_SNIPPET_BYTES)]
+}
+
 /// Parse a raw WS text message and forward relevant account events to `tx`.
 ///
 /// Each event is applied to `known` before it is sent, under the lock, so an order this reports
@@ -3454,7 +3463,7 @@ fn process_ws_text(
         Err(e) => {
             trace!(
                 %e,
-                raw = ?&text[..text.len().min(200)],
+                raw = ?logged_snippet(text),
                 "Alpaca WS: skipped non-JSON message"
             );
             return;
@@ -3472,7 +3481,7 @@ fn process_ws_text(
                     // event (e.g. a rejected order). Visible at production log levels.
                     warn!(
                         %e,
-                        raw = ?&msg.data.get()[..msg.data.get().len().min(200)],
+                        raw = ?logged_snippet(msg.data.get()),
                         "Alpaca WS trade_updates: failed to deserialize event — event dropped"
                     );
                     return;
@@ -8098,6 +8107,52 @@ mod tests {
             timestamp: None,
         };
         assert_eq!(early_dedup_key(&update3).as_str(), "ord-x:1");
+    }
+
+    /// A log snippet is at most `LOGGED_SNIPPET_BYTES`, cut back to the char boundary at or
+    /// below it, so a multi-byte character across the cap is dropped whole.
+    #[test]
+    fn logged_snippet_cuts_at_a_char_boundary() {
+        let short = "a".repeat(LOGGED_SNIPPET_BYTES);
+        assert_eq!(logged_snippet(&short), short);
+
+        let long = "a".repeat(LOGGED_SNIPPET_BYTES + 1);
+        assert_eq!(logged_snippet(&long), &long[..LOGGED_SNIPPET_BYTES]);
+
+        // "é" is two bytes, here the cap's last byte and the one after it.
+        let straddling = format!("{}é", "a".repeat(LOGGED_SNIPPET_BYTES - 1));
+        assert_eq!(
+            logged_snippet(&straddling),
+            &straddling[..LOGGED_SNIPPET_BYTES - 1]
+        );
+    }
+
+    /// A message logged as unparseable, whose snippet cap falls inside a multi-byte character,
+    /// is skipped without a panic: both the non-JSON frame (`trace!`) and the `trade_updates`
+    /// payload that fails to deserialize (`warn!`). The subscriber enables both levels, because
+    /// tracing does not evaluate a disabled event's fields.
+    #[test]
+    fn process_ws_text_logs_an_unparseable_message_cut_inside_a_character() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+
+        // "é" starts at the cap's last byte, so a byte cut at the cap lands inside it.
+        let not_json = format!("{}é", "x".repeat(LOGGED_SNIPPET_BYTES - 1));
+        let data_prefix = r#"{"pad":""#;
+        let pad = "a".repeat(LOGGED_SNIPPET_BYTES - 1 - data_prefix.len());
+        let bad_payload = format!(r#"{{"stream":"trade_updates","data":{data_prefix}{pad}é"}}}}"#);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        tracing::subscriber::with_default(subscriber, || {
+            for frame in [&not_json, &bad_payload] {
+                process_ws_text(frame, &tx, &dedup, &known, &mut VenueClock::new());
+            }
+        });
+        assert!(rx.try_recv().is_err(), "neither message reports an event");
     }
 
     /// Regression guard for HIGH-2: a `rejected` event without `filled_qty` in the JSON
