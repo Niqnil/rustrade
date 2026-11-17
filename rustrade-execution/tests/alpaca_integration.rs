@@ -53,8 +53,8 @@ use rustrade_execution::{
     },
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
-        id::{ClientOrderId, StrategyId},
-        report::{ReportedTerms, UnindexedOrderReport},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::{Replaces, ReportedTerms, UnindexedOrderReport},
         request::RequestOpen,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
@@ -787,6 +787,145 @@ async fn test_a_resting_equity_order_states_its_terms() {
     let listed = listed.expect("the account snapshot lists the order");
     assert_eq!(listed.reported, ReportedTerms::ALL, "{listed:?}");
     assert_eq!(terms(&listed), expected);
+}
+
+/// An order replaced at Alpaca, here by a `PATCH` this client does not send itself, goes on as
+/// its replacement: the account stream reports the replacement linked to the order it replaces,
+/// by its order id and client order id, then the old order ended as cancelled, and an account
+/// snapshot lists the replacement linked by order id. Crypto, so it runs at any hour: an equity
+/// order placed outside market hours waits `accepted`, which Alpaca refuses to replace.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_replaced_crypto_order_is_followed() {
+    init_logging();
+    let config = test_config();
+    let client = AlpacaClient::new(config.clone());
+    let instrument = btc_instrument();
+    let instruments = [instrument.clone()];
+    let mut stream = client
+        .account_stream(&[], &instruments)
+        .await
+        .expect("account_stream failed");
+    let old_cid = ClientOrderId::new(format!(
+        "test-replace-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = |cid: &ClientOrderId| OrderKey {
+        exchange: ExchangeId::AlpacaBroker,
+        instrument: &instrument,
+        strategy: StrategyId::new("test-strategy"),
+        cid: cid.clone(),
+    };
+
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key(&old_cid),
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1000.00)),
+                dec!(0.01),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        })
+        .await;
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!("BTC/USD limit order did not rest: {:?}", response.state);
+    };
+    let VenueOrderId::Assigned(old_id) = &open.id else {
+        panic!("Alpaca names the order it placed: {open:?}");
+    };
+
+    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
+    let secret_key =
+        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
+    let replaced: serde_json::Value = reqwest::Client::new()
+        .patch(format!("{}/v2/orders/{old_id}", config.rest_base_url()))
+        .header("APCA-API-KEY-ID", api_key)
+        .header("APCA-API-SECRET-KEY", secret_key)
+        .json(&serde_json::json!({ "limit_price": "1001" }))
+        .send()
+        .await
+        .expect("the replace request was sent")
+        .error_for_status()
+        .expect("Alpaca accepted the replace")
+        .json()
+        .await
+        .expect("the replace answer is JSON");
+    let new_id = OrderId::new(replaced["id"].as_str().expect("the replacement's id"));
+    let new_cid = ClientOrderId::new(
+        replaced["client_order_id"]
+            .as_str()
+            .expect("the replacement's client order id"),
+    );
+
+    // The stream's reports of either order until the old one has ended, within ten seconds.
+    let streamed = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut reports = Vec::new();
+        while let Some(event) = stream.next().await {
+            let AccountEventKind::OrderSnapshot(snapshot) = event.kind else {
+                continue;
+            };
+            let report = snapshot.0;
+            if report.order.key.cid != old_cid && report.order.key.cid != new_cid {
+                continue;
+            }
+            let ended = report.order.key.cid == old_cid
+                && matches!(report.order.state, OrderState::Inactive(_));
+            reports.push(report);
+            if ended {
+                break;
+            }
+        }
+        reports
+    })
+    .await
+    .unwrap_or_default();
+    let listed = client
+        .account_snapshot(&[], &instruments)
+        .await
+        .expect("account_snapshot failed")
+        .instruments
+        .into_iter()
+        .flat_map(|snapshot| snapshot.orders)
+        .find(|order| order.order.key.cid == new_cid);
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: key(&new_cid),
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(VenueOrderId::Assigned(new_id.clone())),
+            },
+        })
+        .await;
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+    await_no_open_orders(&client, &instrument).await;
+
+    let linked = streamed
+        .iter()
+        .position(|report| {
+            report.order.key.cid == new_cid
+                && report.replaces == Some(Replaces::new(old_id.clone()).with_cid(old_cid.clone()))
+        })
+        .unwrap_or_else(|| panic!("the replacement is reported linked: {streamed:#?}"));
+    let ended = streamed
+        .iter()
+        .position(|report| {
+            report.order.key.cid == old_cid
+                && matches!(
+                    report.order.state,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(_))
+                )
+        })
+        .unwrap_or_else(|| panic!("the old order is reported ended: {streamed:#?}"));
+    assert!(linked < ended, "the replacement comes first: {streamed:#?}");
+    let listed = listed.expect("the account snapshot lists the replacement");
+    assert_eq!(listed.replaces, Some(Replaces::new(old_id.clone())));
 }
 
 #[tokio::test]

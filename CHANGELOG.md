@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Alpaca client follows an order Alpaca replaces.** Alpaca carries out a replace as a new
+  order under a new order id and client order id. Every live report of the replacement, on the
+  account stream and in `account_snapshot`'s open orders, is now linked to the order it replaces
+  (`OrderReport::replaces`), by order id and, on the stream, by client order id once it has seen
+  the `pending_replace`, so the engine keeps one order with its strategy and fills. The stream
+  sends the old order's end after the replacement's first event, holding it for up to 5 s if it
+  arrives first. Quantities are reported as Alpaca states them, which are taken to count the old
+  order's fills; that was not observed for a partly filled order, and a replacement reporting less
+  filled than the old order is logged at `warn`. `fetch_open_orders` returns orders without the
+  link, and an order replaced while the stream was disconnected is still recovered as cancelled.
 - **Hyperliquid clients follow an order the venue replaces.** A modify gives an order a new venue
   id and restarts its size and fill. The account stream now reports the new order linked to the
   one it replaced (`OrderReport::replaces`), with the fill of the old order added back to its
@@ -488,6 +498,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
 
 ### Changed
+- **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
+  rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as
+  an `OrderSnapshot` of a cancelled order with what it filled, instead of `OrderCancelled`, so a
+  reader that followed the replace ignores the end of the order it left. A `rejected` event for a replacement, which Alpaca sends when the
+  old order filled first, is reported the same way instead of `OrderCancelled` with a rejection
+  error, since the order was working. A `rejected` event for any other order is unchanged. A
+  `replaced` payload whose side or type cannot be read is still reported as `OrderCancelled`.
 - **`binance-sdk` 78.0.0 → 78.1.0** (`rustrade-execution`, `binance` feature, #968). The SDK adds
   Binance spot's optional quote notional limit to its order parameters, and an optional event
   filter to the user-data stream subscription. The clients set neither, so the requests they send

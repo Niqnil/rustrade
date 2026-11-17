@@ -532,6 +532,9 @@ pub struct AmendConfig {
     /// The account stream's snapshot of the amended order names the new id, links the old one
     /// in [`OrderReport::replaces`](crate::order::report::OrderReport::replaces), and arrives
     /// before the answer that says which id it replaced, as a live venue's stream can.
+    ///
+    /// The order keeps its client order id. A venue that replaces an order under a new client
+    /// order id too, as Alpaca does, cannot be simulated yet.
     pub reassign_id: bool,
     /// With [`reassign_id`](Self::reassign_id): whether the order under its new id starts
     /// afresh, as a venue that carries out an amend by cancelling the order and placing a new
