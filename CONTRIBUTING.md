@@ -10,7 +10,8 @@ install` there. You then build and lint with the same compiler as CI, so a new R
 fail CI with lints you never saw. Dependabot proposes each new release as a PR, which fixes any
 lints it adds. The MSRV, the oldest compiler users may build with, is `1.95` (`rust-version` in
 `Cargo.toml`). CI checks that the workspace still builds with it. A change that needs a newer
-compiler raises `rust-version` in the same PR and says so in the CHANGELOG.
+compiler raises `rust-version` in the same PR, updates the version named here and in the README,
+and says so in the CHANGELOG.
 
 **Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
 `.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
