@@ -50,6 +50,8 @@ jobs:
         with:
           shared-key: "rustrade-ci-test"
 
+      # Includes the `market_hours` tests, which `alpaca-integration.yml` skips: the schedule above
+      # falls in the US regular session on a trading day.
       - name: Execution tests
         id: exec-tests
         continue-on-error: true

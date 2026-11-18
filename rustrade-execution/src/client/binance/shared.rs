@@ -1938,7 +1938,11 @@ fn convert_listed_order<T: BinanceOrderFields>(
             row.filled_qty.unwrap_or(Decimal::ZERO),
         )
     });
-    Some(ListedOrder { order, reported })
+    Some(ListedOrder {
+        order,
+        reported,
+        replaces: None,
+    })
 }
 
 /// The order a REST order row such as `GET /api/v3/order`'s describes, live or ended, as a report
