@@ -746,10 +746,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       so the engine moves the order to the new id, keeping its strategy and fills. Binance links
       the two ids only in the amend's own report, and no longer finds the order by the old id.
       The client's record of live orders follows the rename, so a reconnect asks about the order
-      by the id Binance knows it by. Known limitation: a rename made while the account stream was
-      disconnected is not learned. A reconnect then finds no order under the old id and stops
-      holding it, and the open-order listing shows the order under its new id as one the engine
-      did not place.
+      by the id Binance knows it by.
+    - **A rename made while the account stream was disconnected** is followed by the reconnect's
+      check of the orders held as live: an order listed open under a new client order id with the
+      venue order id held for it is reported under its new id, linked to the order held, with no
+      further request; one not listed, which Binance no longer knows by the old client order id
+      (`-2013`), is looked up by the venue order id held and reported, live or ended, likewise.
+      An order held without its venue order id cannot be followed, and is still dropped as
+      unknown. `fetch_ended_orders` looks such an order up by its venue order id too, and leaves
+      it out when it is found renamed, since every order it returns carries the key asked for.
+    - **A client order id a rename left is not mistaken for the order held.** Binance accepts a
+      new order under it, and a lookup by it then finds that order. A lookup, on reconnect or in
+      `fetch_ended_orders`, that finds an order under another venue order id than the one held
+      looks the order held up by its venue order id instead, and the reconnect's listing does not
+      count an order listed under the held client order id but another venue order id as the
+      order held.
     - **An amend down to the filled quantity or below ends the order**: Binance sends that one
       report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report
       after it, so it is reported as an order snapshot ended as `Expired`, with what filled, on

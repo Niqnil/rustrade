@@ -461,7 +461,8 @@ pub(super) fn spawn_order_checks<L, LFut, Q, QFut>(
                     &tx,
                     OpenListing::Batched,
                     &list_open,
-                    &lookup,
+                    // Hyperliquid's lookup needs no venue order id.
+                    |key, _| lookup(key),
                 ) => {}
             }
         }

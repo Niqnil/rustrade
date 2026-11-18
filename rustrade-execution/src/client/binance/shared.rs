@@ -1941,6 +1941,23 @@ fn convert_listed_order<T: BinanceOrderFields>(
     Some(ListedOrder { order, reported })
 }
 
+/// The order a REST order row such as `GET /api/v3/order`'s describes, live or ended, as a report
+/// under `key`: a live one as a listing reports it ([`ListedOrder::into_report`]), an ended one as
+/// [`convert_ended_order`] reads it. `None`, with a warning, for a row that cannot be converted.
+pub(crate) fn convert_order_report<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    key: &UnindexedOrderKey,
+) -> Option<UnindexedOrderReport> {
+    if o.status().is_some_and(rest_order_is_open) {
+        // Spot rows report trailingDelta, so every kind decodes without the one the client holds.
+        convert_listed_order(o, exchange, &key.instrument, &|_| None).map(ListedOrder::into_report)
+    } else {
+        convert_ended_order(o, exchange, key, None)
+            .map(|order| OrderReport::state_only(order.map_state(OrderState::Inactive)))
+    }
+}
+
 /// How an order that has ended did end, from a REST order row such as `GET /api/v3/order`'s or
 /// `GET /sapi/v1/margin/order`'s, under `key`, the key it was asked for.
 ///
