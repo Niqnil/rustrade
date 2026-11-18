@@ -34,7 +34,9 @@ where
     /// update is refused and reported, rather than overwriting one order's state with another's.
     /// An order the venue has not named -- `VenueOrderId::ClientAssigned` -- carries no identifier
     /// to disagree with, so such a snapshot is applied, and a later snapshot bringing the venue's
-    /// own identifier is adopted in the ordinary way.
+    /// own identifier is adopted in the ordinary way. The reverse never happens: a snapshot naming
+    /// no venue order is applied to an order the venue has named with that identifier kept, since
+    /// an identifier once assigned is never unassigned.
     ///
     /// Terminal snapshots are resolved by `ClientOrderId` alone with no such check, because the
     /// states they carry hold a plain `OrderId` that nothing compares for identity.

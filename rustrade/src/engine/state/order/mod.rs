@@ -953,13 +953,21 @@ where
         order.kind = amended.kind;
 
         // The venue's state after the amend, unless a later report already advanced the held one.
-        // The identifier is the amend's either way: the venue may have issued a new one.
+        // The identifier is the amend's either way, as the venue may have issued a new one, unless
+        // the answer names none.
         let open = match held {
-            Some(held) if !held.is_superseded_by(&amended.open) => Open {
-                id: amended.open.id.clone(),
-                ..held
-            },
-            _ => amended.open.clone(),
+            Some(held) => {
+                let answered = keep_held_id(&held.id, amended.open.clone());
+                if held.is_superseded_by(&answered) {
+                    answered
+                } else {
+                    Open {
+                        id: answered.id,
+                        ..held
+                    }
+                }
+            }
+            None => amended.open.clone(),
         };
 
         if open.quantity_remaining(order.quantity) <= Decimal::ZERO {
@@ -1325,6 +1333,7 @@ where
                     }
                     return SnapshotApplied::default();
                 }
+                let open = keep_held_id(&current.id, open);
 
                 // Terms are ordered by their own time, whether or not the state supersedes the one
                 // held (see "Terms times" on `TrackedOrder`).
@@ -1420,7 +1429,10 @@ where
                     .filter(|update| {
                         !current.id.contradicts(&update.id) && current.is_superseded_by(update)
                     })
-                    .unwrap_or_else(|| current.clone());
+                    .map_or_else(
+                        || current.clone(),
+                        |update| keep_held_id(&current.id, update),
+                    );
 
                 current_entry.get_mut().order.state =
                     ActiveOrderState::CancelInFlight(CancelInFlight {
@@ -1478,6 +1490,10 @@ where
 
                 // Terms are adopted as for an `Open` order, but the order is not retired whatever
                 // they leave it: the cancel's answer ends it.
+                let update = match &current.order {
+                    Some(held) => keep_held_id(&held.id, update),
+                    None => update,
+                };
                 let terms = reconcile_terms(current_entry.get_mut(), report, &update, None);
                 if update_open_is_latest {
                     current_entry.get_mut().order.state =
@@ -1527,6 +1543,7 @@ where
                     }
                     return SnapshotApplied::default();
                 }
+                let open = keep_held_id(&current.order.id, open);
                 let superseded = current.order.is_superseded_by(&open);
                 // Nothing is adopted while the amend is in flight: its answer settles the terms. A
                 // report matching neither the order before the amend nor after it is reported.
@@ -1588,7 +1605,10 @@ where
                     .filter(|update| {
                         !current.id.contradicts(&update.id) && current.is_superseded_by(update)
                     })
-                    .unwrap_or_else(|| current.clone());
+                    .map_or_else(
+                        || current.clone(),
+                        |update| keep_held_id(&current.id, update),
+                    );
 
                 current_entry.get_mut().order.state =
                     ActiveOrderState::CancelInFlight(CancelInFlight {
@@ -1631,6 +1651,24 @@ fn reported_id<AssetKey, InstrumentKey>(
         }
         OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => None,
     }
+}
+
+/// `incoming`, a later state of the order `held` describes, to be applied in its place, with
+/// `held`'s venue order id kept when `incoming` names none.
+///
+/// A venue order id, once assigned, is never unassigned. A report may still name the order by its
+/// client order id alone, as [`VenueOrderId::ClientAssigned`]: a source lacking the venue's id
+/// built it, or the venue acknowledges some orders unnamed. Taken wholesale, it would lose the id
+/// the engine learned, and with it what cancels, amends and fills address the order by, and what
+/// [`VenueOrderId::contradicts`] compares to refuse a report of another order under the same
+/// client order id.
+///
+/// The caller has established that the two are the same order (see [`Open::is_superseded_by`]).
+fn keep_held_id(held: &VenueOrderId, mut incoming: Open) -> Open {
+    if incoming.id == VenueOrderId::ClientAssigned {
+        incoming.id = held.clone();
+    }
+    incoming
 }
 
 /// The venue order id `state` names, when the venue has assigned one (see [`reported_id`]).
@@ -5064,6 +5102,179 @@ mod tests {
         }
     }
 
+    /// A report naming the order by its client order id alone keeps the venue order id the
+    /// engine holds, on every transition that applies a reported working state.
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+    mod kept_venue_id {
+        use super::*;
+        use rustrade_execution::order::{
+            amend::{AmendPatch, Amended},
+            report::ReportedTerms,
+            request::OrderResponseAmend,
+            state::AmendInFlight,
+        };
+
+        fn t(secs: i64) -> DateTime<Utc> {
+            time_plus_secs(DateTime::<Utc>::MIN_UTC, secs)
+        }
+
+        fn cid() -> ClientOrderId {
+            ClientOrderId::new("named")
+        }
+
+        fn tracked(state: ActiveOrderState) -> Orders<ExchangeId, u64> {
+            orders([order(cid(), state)])
+        }
+
+        /// The order the venue named "1", at `secs` with `filled` done.
+        fn named(secs: i64, filled: Decimal) -> Open {
+            Open {
+                filled_quantity: filled,
+                ..open_assigned("1", t(secs))
+            }
+        }
+
+        /// The same order reported by its client order id alone.
+        fn unnamed(secs: i64, filled: Decimal) -> Open {
+            Open {
+                filled_quantity: filled,
+                ..open_client_assigned(t(secs))
+            }
+        }
+
+        fn apply(orders: &mut Orders<ExchangeId, u64>, state: ActiveOrderState) {
+            let report: OrderReport<ExchangeId, u64, u64> =
+                OrderReport::new(order(cid(), OrderState::active(state)), ReportedTerms::NONE);
+            orders.update_from_order_snapshot(Snapshot(&report));
+        }
+
+        fn state_of(orders: &Orders<ExchangeId, u64>) -> ActiveOrderState {
+            orders.get(&cid()).expect("tracked").state.clone()
+        }
+
+        fn amend_in_flight(open: Open) -> ActiveOrderState {
+            ActiveOrderState::AmendInFlight(AmendInFlight::new(
+                open,
+                AmendPatch::default().with_price(dec!(2)),
+                TIME_SENT,
+            ))
+        }
+
+        fn cancel_in_flight(open: Open) -> ActiveOrderState {
+            ActiveOrderState::CancelInFlight(CancelInFlight::new(Some(open), TIME_SENT))
+        }
+
+        /// An `Open` order takes a later unnamed report's state but keeps its id, so a report of
+        /// another venue order under the same client order id is still refused. An unnamed order
+        /// takes the id a report names.
+        #[test]
+        fn an_open_order_keeps_its_venue_order_id() {
+            let mut orders = tracked(ActiveOrderState::Open(named(0, dec!(0))));
+
+            apply(&mut orders, ActiveOrderState::Open(unnamed(1, dec!(0.5))));
+            assert_eq!(
+                state_of(&orders),
+                ActiveOrderState::Open(named(1, dec!(0.5)))
+            );
+
+            let other = Open {
+                filled_quantity: dec!(0.5),
+                ..open_assigned("2", t(2))
+            };
+            apply(&mut orders, ActiveOrderState::Open(other));
+            assert_eq!(
+                state_of(&orders),
+                ActiveOrderState::Open(named(1, dec!(0.5)))
+            );
+
+            let mut orders = tracked(ActiveOrderState::Open(unnamed(0, dec!(0))));
+            apply(&mut orders, ActiveOrderState::Open(named(1, dec!(0.5))));
+            assert_eq!(
+                state_of(&orders),
+                ActiveOrderState::Open(named(1, dec!(0.5)))
+            );
+        }
+
+        /// A cancel carrying an unnamed state keeps the id of the working order it cancels,
+        /// whether the order was `Open` or had an amend in flight.
+        #[test]
+        fn a_cancel_carrying_an_unnamed_state_keeps_the_venue_order_id() {
+            for held in [
+                ActiveOrderState::Open(named(0, dec!(0))),
+                amend_in_flight(named(0, dec!(0))),
+            ] {
+                let mut orders = tracked(held.clone());
+
+                apply(&mut orders, cancel_in_flight(unnamed(1, dec!(0.5))));
+
+                assert_eq!(
+                    state_of(&orders),
+                    cancel_in_flight(named(1, dec!(0.5))),
+                    "{held:?}"
+                );
+            }
+        }
+
+        /// A cancel in flight takes a later unnamed report's state but keeps the id it holds.
+        #[test]
+        fn a_cancel_in_flight_keeps_the_venue_order_id() {
+            let mut orders = tracked(cancel_in_flight(named(0, dec!(0))));
+
+            apply(&mut orders, ActiveOrderState::Open(unnamed(1, dec!(0.5))));
+
+            assert_eq!(state_of(&orders), cancel_in_flight(named(1, dec!(0.5))));
+        }
+
+        /// An amend in flight takes a later unnamed report's state but keeps the id it holds.
+        #[test]
+        fn an_amend_in_flight_keeps_the_venue_order_id() {
+            let mut orders = tracked(amend_in_flight(named(0, dec!(0))));
+
+            apply(&mut orders, ActiveOrderState::Open(unnamed(1, dec!(0.5))));
+
+            assert_eq!(state_of(&orders), amend_in_flight(named(1, dec!(0.5))));
+        }
+
+        /// An amend answered with an unnamed state keeps the id, whether the answer's state or a
+        /// later one already held is applied.
+        #[test]
+        fn an_amend_answered_unnamed_keeps_the_venue_order_id() {
+            // (held, answered, applied)
+            let cases = [
+                (
+                    named(0, dec!(0)),
+                    unnamed(1, dec!(0.5)),
+                    named(1, dec!(0.5)),
+                ),
+                (
+                    named(2, dec!(0.5)),
+                    unnamed(1, dec!(0)),
+                    named(2, dec!(0.5)),
+                ),
+            ];
+            for (held, answered, applied) in cases {
+                let mut orders = tracked(amend_in_flight(held.clone()));
+
+                orders.update_from_amend_response(&OrderResponseAmend::<ExchangeId, u64, u64> {
+                    key: order(cid(), ()).key,
+                    state: Ok(Amended::new(
+                        answered,
+                        Some(dec!(2)),
+                        dec!(1),
+                        OrderKind::Limit,
+                        None,
+                    )),
+                });
+
+                assert_eq!(
+                    state_of(&orders),
+                    ActiveOrderState::Open(applied),
+                    "{held:?}"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
     mod replaced {
         use super::*;
@@ -5555,14 +5766,12 @@ mod tests {
                 let tracked = orders.tracked(&old_cid()).expect("not moved");
                 assert!(tracked.superseded_ids().is_empty(), "{cid}");
                 // Under the same client order id the unlinked report is then applied as any
-                // other: its state, being newer, replaces the one held, id included, so only a
-                // move is checked.
-                if cid == new_cid() {
-                    assert_eq!(
-                        tracked.order.state.open_meta().map(|open| &open.id),
-                        Some(&VenueOrderId::Assigned(id("1")))
-                    );
-                }
+                // other: its newer state is taken, but the id held is kept.
+                assert_eq!(
+                    tracked.order.state.open_meta().map(|open| &open.id),
+                    Some(&VenueOrderId::Assigned(id("1"))),
+                    "{cid}"
+                );
                 assert!(applied.orders.replaced.is_empty(), "{cid}");
             }
         }

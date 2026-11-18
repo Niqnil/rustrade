@@ -803,6 +803,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The engine keeps an order's venue order id when a report names the order by its client order
+  id alone** (`rustrade`). A working report carrying `VenueOrderId::ClientAssigned` for an order
+  the engine already held a venue id for replaced the held state whole, id included, whenever it
+  was the later state. The engine then lost the id it had learned, and could no longer refuse a
+  report of a different venue order under the same client order id. The report's state is now
+  taken with the held id kept, for an `Open` order, an order with a cancel or an amend in flight,
+  a cancel's carried state, and an amend's answer.
 - **The Binance margin docs now say that margin debt and margin notices are streamed for cross
   margin only** (`rustrade-execution`, `binance`). They said only that Binance had not been seen to
   send `liabilityChange` for an isolated pair, and described how an isolated pair's
