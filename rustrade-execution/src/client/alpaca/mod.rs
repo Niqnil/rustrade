@@ -411,6 +411,22 @@ pub struct AlpacaConfig {
     /// Use paper trading endpoints instead of production.
     #[serde(default = "default_paper")]
     pub paper: bool,
+    /// How long a REST request may take, from connecting to the last byte of its answer, before
+    /// it fails with [`ConnectivityError::Timeout`]. [`DEFAULT_REQUEST_TIMEOUT`] by default.
+    ///
+    /// It bounds every REST request: orders, cancels, order lookups, listings and each page of
+    /// account activities. An order or cancel that times out may have reached Alpaca and been
+    /// acted on, so it fails as [`OrderError::Connectivity`], whose outcome is unknown until the
+    /// order is looked up. A caller that bounds a request itself, as an execution manager bounds
+    /// orders and cancels with its own request timeout, gets the shorter of the two. Zero ends
+    /// every request at once, so each one fails with a timeout. Serialised as whole
+    /// milliseconds, under `request_timeout_ms`.
+    #[serde(
+        rename = "request_timeout_ms",
+        default = "default_request_timeout",
+        with = "crate::client::duration_millis"
+    )]
+    pub request_timeout: Duration,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
     #[serde(skip)]
@@ -430,6 +446,21 @@ fn default_paper() -> bool {
     true
 }
 
+/// How long an Alpaca REST request may take by default: see [`AlpacaConfig::request_timeout`].
+///
+/// Generous next to Alpaca's usual answer, since an order whose answer arrives later than this is
+/// left with an unknown outcome.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `#[serde(default = "…")]` takes a function, not a constant.
+fn default_request_timeout() -> Duration {
+    DEFAULT_REQUEST_TIMEOUT
+}
+
+/// How long a REST request may take to connect, within [`AlpacaConfig::request_timeout`], so a
+/// host that never accepts the connection fails before the whole request's time runs out.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Custom Debug to avoid leaking credentials in logs.
 impl std::fmt::Debug for AlpacaConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -437,6 +468,7 @@ impl std::fmt::Debug for AlpacaConfig {
             .field("api_key", &"***")
             .field("secret_key", &"***")
             .field("paper", &self.paper)
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -454,6 +486,7 @@ impl AlpacaConfig {
             api_key,
             secret_key,
             paper: true,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             #[cfg(test)]
             base_url_override: None,
             #[cfg(test)]
@@ -470,6 +503,7 @@ impl AlpacaConfig {
             api_key,
             secret_key,
             paper: false,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             #[cfg(test)]
             base_url_override: None,
             #[cfg(test)]
@@ -529,6 +563,16 @@ impl AlpacaConfig {
         }
     }
 
+    /// This config with REST requests bounded by `request_timeout`: see
+    /// [`request_timeout`](Self::request_timeout).
+    #[must_use]
+    pub fn with_request_timeout(self, request_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            ..self
+        }
+    }
+
     /// Test-only: create config with a custom base URL for wiremock testing.
     #[cfg(test)]
     pub fn with_base_url(api_key: String, secret_key: String, base_url: String) -> Self {
@@ -536,6 +580,7 @@ impl AlpacaConfig {
             api_key,
             secret_key,
             paper: true,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             base_url_override: Some(base_url),
             ws_url_override: None,
         }
@@ -1170,6 +1215,8 @@ impl AlpacaClient {
         );
         reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(config.request_timeout)
             .build()
             .expect("failed to build reqwest client for Alpaca")
     }
@@ -1329,10 +1376,9 @@ where
 {
     for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
         rate_limiter.wait_if_blocked().await;
-        let response = build_request()
-            .send()
-            .await
-            .map_err(|e| connectivity_err(format!("Alpaca REST request failed: {e}")))?;
+        let response = build_request().send().await.map_err(|e| {
+            UnindexedClientError::Connectivity(transport_error("Alpaca REST request failed", &e))
+        })?;
 
         let status = response.status();
 
@@ -1372,10 +1418,9 @@ where
             ));
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| connectivity_err(format!("Alpaca REST read body failed: {e}")))?;
+        let bytes = response.bytes().await.map_err(|e| {
+            UnindexedClientError::Connectivity(transport_error("Alpaca REST read body failed", &e))
+        })?;
 
         // A 2xx body that does not fit the model is not transient: retrying returns the same
         // body. An order path must still treat it as status unknown; see `order_post_error`.
@@ -1436,9 +1481,7 @@ async fn rest_delete_with_retry(
     for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
         rate_limiter.wait_if_blocked().await;
         let response = build_request().send().await.map_err(|e| {
-            UnindexedOrderError::Connectivity(ConnectivityError::Socket(format!(
-                "Alpaca cancel request failed: {e}"
-            )))
+            UnindexedOrderError::Connectivity(transport_error("Alpaca cancel request failed", &e))
         })?;
 
         let status = response.status();
@@ -6040,6 +6083,18 @@ fn parse_order_error(
     UnindexedOrderError::Rejected(parse_api_error(status, code, message))
 }
 
+/// The connectivity error for a REST request that failed in transport: [`ConnectivityError::Timeout`]
+/// when it ran past [`AlpacaConfig::request_timeout`], logged with `context` since the error
+/// carries none, and otherwise [`ConnectivityError::Socket`] naming `context` and the cause.
+fn transport_error(context: &'static str, error: &reqwest::Error) -> ConnectivityError {
+    if error.is_timeout() {
+        warn!(%error, context, "Alpaca REST request timed out");
+        ConnectivityError::Timeout
+    } else {
+        ConnectivityError::Socket(format!("{context}: {error}"))
+    }
+}
+
 fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
     UnindexedClientError::Connectivity(ConnectivityError::Socket(msg.into()))
 }
@@ -6323,6 +6378,32 @@ mod tests {
 
         assert!(!cfg.paper);
         assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+    }
+
+    /// Every constructor bounds REST requests by the default, a config file sets the bound in
+    /// whole milliseconds, and `with_request_timeout` replaces it.
+    #[test]
+    fn test_alpaca_config_request_timeout() {
+        for cfg in [
+            AlpacaConfig::new("k".into(), "s".into()),
+            AlpacaConfig::production("k".into(), "s".into()),
+            serde_json::from_str(r#"{"api_key": "k", "secret_key": "s"}"#).unwrap(),
+        ] {
+            assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        }
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(10));
+
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{"api_key": "k", "secret_key": "s", "request_timeout_ms": 2500}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.request_timeout, Duration::from_millis(2500));
+        assert!(format!("{cfg:?}").contains("request_timeout: 2.5s"));
+
+        let cfg = AlpacaConfig::paper("k".into(), "s".into())
+            .with_request_timeout(Duration::from_millis(300));
+        assert_eq!(cfg.request_timeout, Duration::from_millis(300));
+        assert!(cfg.paper, "the builder keeps the rest of the config");
     }
 
     #[test]
@@ -10181,6 +10262,165 @@ mod tests {
                 ),
                 "{:?}",
                 order.state
+            );
+        }
+
+        /// A client whose REST requests time out after `timeout`, against `server`.
+        fn client_timing_out_after(server: &MockServer, timeout: Duration) -> AlpacaClient {
+            AlpacaClient::new(
+                AlpacaConfig::with_base_url("test-key".into(), "test-secret".into(), server.uri())
+                    .with_request_timeout(timeout),
+            )
+        }
+
+        /// An answer slower than the request timeout, by far, so a test never waits for it.
+        fn too_slow(response: ResponseTemplate) -> ResponseTemplate {
+            response.set_delay(Duration::from_secs(30))
+        }
+
+        /// A read that Alpaca does not answer within the request timeout fails as a timeout,
+        /// rather than waiting for an answer that may never come.
+        #[tokio::test]
+        async fn a_read_alpaca_does_not_answer_in_time_fails_as_a_timeout() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(too_slow(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([])),
+                ))
+                .mount(&server)
+                .await;
+
+            let result = client_timing_out_after(&server, Duration::from_millis(200))
+                .fetch_open_orders(&[])
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Connectivity(
+                        ConnectivityError::Timeout
+                    ))
+                ),
+                "{result:?}"
+            );
+        }
+
+        /// An order whose answer does not arrive within the request timeout fails as a timeout,
+        /// the connectivity error whose outcome is unknown: the order was sent and may be live.
+        #[tokio::test]
+        async fn an_order_alpaca_does_not_answer_in_time_fails_with_its_outcome_unknown() {
+            use crate::client::ExecutionClient;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use crate::order::{OrderKind, TimeInForce};
+            use rustrade_instrument::Side;
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(too_slow(ResponseTemplate::new(200)))
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let order = client_timing_out_after(&server, Duration::from_millis(200))
+                .open_order(OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &instrument,
+                        StrategyId::new("test-strategy"),
+                        ClientOrderId::new("test-cid"),
+                    ),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None,
+                        Decimal::new(10, 0),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
+                })
+                .await;
+
+            let OrderState::Inactive(InactiveOrderState::OpenFailed(error)) = &order.state else {
+                panic!("expected OpenFailed, got {:?}", order.state);
+            };
+            assert_eq!(
+                *error,
+                OrderError::Connectivity(ConnectivityError::Timeout),
+                "{error:?}"
+            );
+            assert!(error.is_outcome_unknown());
+        }
+
+        /// A cancel whose answer does not arrive within the request timeout fails as a timeout.
+        #[tokio::test]
+        async fn a_cancel_alpaca_does_not_answer_in_time_fails_as_a_timeout() {
+            use crate::client::ExecutionClient;
+            use crate::order::request::{OrderRequestCancel, RequestCancel};
+
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/abc"))
+                .respond_with(too_slow(ResponseTemplate::new(204)))
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let cancel = client_timing_out_after(&server, Duration::from_millis(200))
+                .cancel_order(OrderRequestCancel {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &instrument,
+                        StrategyId::new("test-strategy"),
+                        ClientOrderId::new("test-cid"),
+                    ),
+                    state: RequestCancel {
+                        id: Some(VenueOrderId::Assigned(OrderId::new("abc"))),
+                    },
+                })
+                .await;
+
+            assert_eq!(
+                cancel.state,
+                Err(OrderError::Connectivity(ConnectivityError::Timeout)),
+                "{cancel:?}"
+            );
+        }
+
+        /// A request that fails in transport for another reason than the timeout, here a refused
+        /// connection, stays a socket error naming its cause, within the timeout.
+        #[tokio::test]
+        async fn a_request_refused_in_transport_is_a_socket_error_not_a_timeout() {
+            use crate::client::ExecutionClient;
+
+            // Bind then drop, so nothing listens on the port.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let client = AlpacaClient::new(
+                AlpacaConfig::with_base_url(
+                    "test-key".into(),
+                    "test-secret".into(),
+                    format!("http://127.0.0.1:{port}"),
+                )
+                .with_request_timeout(Duration::from_secs(5)),
+            );
+
+            let result = client.fetch_open_orders(&[]).await;
+
+            let Err(UnindexedClientError::Connectivity(ConnectivityError::Socket(message))) =
+                &result
+            else {
+                panic!("expected a socket error, got {result:?}");
+            };
+            assert!(
+                message.starts_with("Alpaca REST request failed: "),
+                "{message}"
             );
         }
 
