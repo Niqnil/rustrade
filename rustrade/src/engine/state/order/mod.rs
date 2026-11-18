@@ -5246,7 +5246,7 @@ mod tests {
         /// An amend answered with an unnamed state keeps the id, whether the answer's state or a
         /// later one already held is applied, and whether an amend or a cancel was in flight.
         /// An answer naming the id the amend replaced keeps nothing: the order is no longer
-        /// addressed by it.
+        /// addressed by it, and it is recorded as replaced.
         #[test]
         fn an_amend_answered_unnamed_keeps_the_venue_order_id() {
             // (held, answered, previous id, applied)
@@ -5278,6 +5278,11 @@ mod tests {
             ];
             for (held, answered, previous, applied) in cases {
                 let mut orders = tracked(held.clone());
+                let replaced: Vec<OrderId> = previous
+                    .iter()
+                    .filter_map(VenueOrderId::assigned)
+                    .cloned()
+                    .collect();
 
                 orders.update_from_amend_response(&OrderResponseAmend::<ExchangeId, u64, u64> {
                     key: order(cid(), ()).key,
@@ -5291,6 +5296,11 @@ mod tests {
                 });
 
                 assert_eq!(state_of(&orders), applied, "{held:?}");
+                assert_eq!(
+                    orders.tracked(&cid()).expect("tracked").superseded_ids(),
+                    replaced.as_slice(),
+                    "{held:?}"
+                );
             }
         }
     }
