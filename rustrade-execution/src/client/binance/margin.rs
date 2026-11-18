@@ -87,7 +87,7 @@ use super::shared::{
     rest_read_with_retry, trailing_params, unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
-use crate::rules::{OrderRules, PreSendRules};
+use crate::rules::{InstrumentSpecError, OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     InstrumentBalanceSnapshot, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
@@ -150,7 +150,9 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::{
+        kind::InstrumentKindDiscriminant, name::InstrumentNameExchange, spec::InstrumentSpec,
+    },
 };
 use serde::Deserialize;
 use smol_str::format_smolstr;
@@ -651,6 +653,39 @@ impl BinanceMargin {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// Load the order rules of `instruments` from Binance now, as
+    /// [`load_rules`](Self::load_rules) does, and return each instrument's as an
+    /// [`InstrumentSpec`] whose quantity is counted in the symbol's base asset, named as Binance
+    /// names it (`BTC`). The rules are the pair's spot rules, as
+    /// [`load_rules`](Self::load_rules) says.
+    ///
+    /// The spec's quantity step is the grid a market order's quantity sits on, which an order of
+    /// any kind can close: see [`OrderRules::instrument_spec`]. It is a copy of the rules as
+    /// loaded; the rules this client checks orders against are reloaded later, the spec is not.
+    ///
+    /// The base asset's name must match the one the instrument's
+    /// [`Underlying`](rustrade_instrument::Underlying) gives its base, or
+    /// [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
+    /// reads no step from the spec. Building an instrument index from names that differ only in
+    /// case fails.
+    ///
+    /// # Errors
+    /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its
+    /// [`InstrumentSpecError`]. One Binance lists without a base asset is left out, with a
+    /// warning.
+    pub async fn load_specs(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<
+        HashMap<
+            InstrumentNameExchange,
+            Result<InstrumentSpec<AssetNameExchange>, InstrumentSpecError>,
+        >,
+        UnindexedClientError,
+    > {
+        self.rules.load_specs(instruments).await
     }
 
     /// The next hourly interest rate of each of `assets` on this client's cross or isolated
@@ -6760,7 +6795,7 @@ mod tests {
         wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "timezone": "UTC", "serverTime": 1_700_000_000_000_i64,
             "symbols": [{
-                "symbol": "BTCUSDT", "status": "TRADING",
+                "symbol": "BTCUSDT", "status": "TRADING", "baseAsset": "BTC",
                 "filters": [
                     {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "0", "tickSize": "0.01"},
                     {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
@@ -6952,6 +6987,50 @@ mod tests {
         assert_eq!(
             rules.map(|rules| (rules.price.step, rules.quantity.step, rules.notional.min)),
             Some((Some(dec!(0.01)), Some(dec!(0.001)), Some(dec!(5))))
+        );
+
+        let mut request = margin_open_request(&btcusdt, "x");
+        request.state.price = Some(dec!(100.001));
+        let refused = client.open_order(request).await;
+        assert!(
+            matches!(refused.state, OrderState::Inactive(_)),
+            "{refused:?}"
+        );
+    }
+
+    /// `load_specs` returns each pair's spot rules as a spec counted in its base asset, and holds
+    /// the rules, so the first order needs no load.
+    #[tokio::test]
+    async fn load_specs_returns_the_specs_and_the_first_order_reuses_the_rules() {
+        use rustrade_instrument::instrument::spec::{
+            InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity, OrderQuantityUnits,
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(btcusdt_exchange_info())
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 0).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let loaded = client.load_specs(std::slice::from_ref(&btcusdt)).await;
+        assert_eq!(
+            loaded,
+            Ok(HashMap::from([(
+                btcusdt.clone(),
+                Ok(InstrumentSpec::new(
+                    InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+                    InstrumentSpecQuantity::new(
+                        OrderQuantityUnits::Asset(AssetNameExchange::new("BTC")),
+                        dec!(0.001),
+                        dec!(0.001),
+                    ),
+                    InstrumentSpecNotional::new(dec!(5)),
+                )),
+            )]))
         );
 
         let mut request = margin_open_request(&btcusdt, "x");
