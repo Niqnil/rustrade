@@ -40,7 +40,7 @@
 //! for equities placed outside regular/extended hours may sit unfilled until markets open.
 //! Crypto orders (e.g., BTC/USD) can be placed 24/7.
 //!
-//! Tests whose name ends in `market_hours` need the US regular session open, and fail when it is
+//! Tests whose name contains `market_hours` need the US regular session open, and fail when it is
 //! closed. Skip them outside it with `-- --ignored --skip market_hours`.
 
 #![cfg(feature = "alpaca")]
@@ -865,22 +865,56 @@ async fn assert_a_replaced_order_is_followed(
             ),
         })
         .await;
+    // From here until the order is cancelled, a failure cancels what rests before panicking:
+    // even an answer that is not `Open` may leave an order resting at Alpaca.
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        eprintln!(
+            "the {instrument} limit order did not rest: {:?}",
+            response.state
+        );
+        cancel_open_orders(&client, &instrument).await;
         panic!(
             "the {instrument} limit order did not rest: {:?}",
             response.state
         );
     };
     let VenueOrderId::Assigned(old_id) = &open.id else {
+        eprintln!("Alpaca names the order it placed: {open:?}");
+        cancel_open_orders(&client, &instrument).await;
         panic!("Alpaca names the order it placed: {open:?}");
     };
 
-    // From here until the order is cancelled, a failure cancels what rests before panicking.
+    let http = reqwest::Client::new();
+    let order_url = format!("{}/v2/orders/{old_id}", config.rest_base_url());
     let replace = async {
-        let replaced: serde_json::Value = reqwest::Client::new()
-            .patch(format!("{}/v2/orders/{old_id}", config.rest_base_url()))
-            .header("APCA-API-KEY-ID", api_key)
-            .header("APCA-API-SECRET-KEY", secret_key)
+        // Alpaca refuses to replace an order it has not yet acknowledged `new`; an equity order
+        // can stay `accepted` or `pending_new` for a moment after it is placed.
+        let mut acknowledged = false;
+        for _ in 0..40 {
+            let order: serde_json::Value = http
+                .get(&order_url)
+                .header("APCA-API-KEY-ID", &api_key)
+                .header("APCA-API-SECRET-KEY", &secret_key)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|error| format!("the order could not be read: {error}"))?
+                .json()
+                .await
+                .map_err(|error| format!("the order read is not JSON: {error}"))?;
+            if !matches!(order["status"].as_str(), Some("accepted" | "pending_new")) {
+                acknowledged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !acknowledged {
+            return Err("Alpaca did not acknowledge the order `new` within ten seconds".to_owned());
+        }
+        let replaced: serde_json::Value = http
+            .patch(&order_url)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &secret_key)
             .json(&serde_json::json!({ "limit_price": new_price }))
             .send()
             .await
