@@ -3759,7 +3759,7 @@ async fn read_replacement(
 /// Only a live replacement is reported. One that has ended already sends its own stream events
 /// (its fill, or its cancel), which name the order it replaces, so they release the end held. A
 /// read that failed, or found no order, is logged at `warn`; the end held for it is then reported
-/// when its hold runs out, without it.
+/// without it once its hold runs out, or was already, if the read outlasted the hold.
 fn replacement_read_events(
     id: &SmolStr,
     read: Result<Option<AlpacaOrderResponse>, UnindexedClientError>,
@@ -3771,7 +3771,7 @@ fn replacement_read_events(
         Ok(None) => {
             warn!(
                 replacement_id = %id,
-                "Alpaca WS: Alpaca does not know the order replacing a replaced order - the replaced order's end is reported once its hold runs out"
+                "Alpaca WS: Alpaca does not know the order replacing a replaced order - the replaced order's end is reported without it once its hold runs out, or was already"
             );
             return Vec::new();
         }
@@ -3779,7 +3779,7 @@ fn replacement_read_events(
             warn!(
                 replacement_id = %id,
                 %error,
-                "Alpaca WS: could not read the order replacing a replaced order - the replaced order's end is reported once its hold runs out"
+                "Alpaca WS: could not read the order replacing a replaced order - the replaced order's end is reported without it once its hold runs out, or was already"
             );
             return Vec::new();
         }
