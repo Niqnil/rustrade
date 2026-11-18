@@ -758,7 +758,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - **A client order id a rename left is not mistaken for the order held.** Binance accepts a
       new order under it, and a lookup by it then finds that order. A lookup, on reconnect or in
       `fetch_ended_orders`, that finds an order under another venue order id than the one held
-      looks the order held up by its venue order id instead.
+      looks the order held up by its venue order id instead, and the reconnect's listing does not
+      count an order listed under the held client order id but another venue order id as the
+      order held.
     - **An amend down to the filled quantity or below ends the order**: Binance sends that one
       report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report
       after it, so it is reported as an order snapshot ended as `Expired`, with what filled, on

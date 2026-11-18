@@ -919,12 +919,13 @@ async fn fetch_all_open_orders(
 /// where `held_id` is the venue order id the client holds for it, by that id when the client order
 /// id no longer finds it (weight 4 more).
 ///
-/// The lookup by client order id comes first, since a cancel-replace keeps the order's client
-/// order id on a new `orderId`. A keep-priority amend can instead give the order a new client
-/// order id under the same `orderId`, after which Binance does not know the old one (`-2013`), and
-/// may even accept a new order under it. So the lookup by `held_id` answers when the client order
-/// id finds no order, or finds one under another `orderId`. An order found there under another
-/// client order id is [`OrderLookup::Replaced`], linked to the order asked about.
+/// The lookup by client order id comes first, as the key asked about. A keep-priority amend can
+/// give the order a new client order id under the same `orderId`, after which Binance does not
+/// know the old one (`-2013`), and may even accept a new order under it. So the lookup by
+/// `held_id` answers when the client order id finds no order, or finds one under another
+/// `orderId`: that is another order, placed under the client order id once the order held had
+/// left it, and the order held is answered by its own `orderId`. An order found there under
+/// another client order id is [`OrderLookup::Replaced`], linked to the order asked about.
 async fn fetch_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
@@ -8846,7 +8847,7 @@ mod tests {
             .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([order_row("live", "NEW")])),
+                    .set_body_json(serde_json::json!([held_row("live", "NEW")])),
             )
             .mount(&server)
             .await;
@@ -8870,13 +8871,17 @@ mod tests {
     /// The client order ids [`held_orders`] holds, each under its index as its `orderId`.
     const HELD: [&str; 3] = ["live", "gone", "unknown"];
 
-    /// `GET /api/v3/order`'s row for the order [`held_orders`] holds under `cid`, under the
-    /// `orderId` it holds.
-    fn held_row_response(cid: &str, status: &str) -> wiremock::ResponseTemplate {
+    /// The row of the order [`held_orders`] holds under `cid`, under the `orderId` it holds.
+    fn held_row(cid: &str, status: &str) -> serde_json::Value {
         let mut row = order_row(cid, status);
         let order_id = HELD.iter().position(|held| *held == cid).unwrap();
         row["orderId"] = serde_json::json!(order_id);
-        wiremock::ResponseTemplate::new(200).set_body_json(row)
+        row
+    }
+
+    /// `GET /api/v3/order`'s answer with [`held_row`].
+    fn held_row_response(cid: &str, status: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(held_row(cid, status))
     }
 
     /// `live`, `gone` and `unknown`, all held as live on BTCUSDT, each under its index in
@@ -9316,6 +9321,57 @@ mod tests {
             assert!(!known.contains(&ClientOrderId::new("old")));
             assert!(!known.contains(&ClientOrderId::new("new")));
         }
+    }
+
+    /// A listing showing a new order under the client order id a rename left is not taken for
+    /// the order held: that is looked up by its `orderId`, and reported as found there.
+    #[tokio::test]
+    async fn a_reused_client_order_id_in_the_listing_is_not_taken_for_the_order_held() {
+        let mut reuse = order_row("old", "NEW");
+        reuse["orderId"] = serde_json::json!(8);
+        let server = venue_listing(serde_json::json!([reuse.clone()])).await;
+        mount_order(
+            &server,
+            "old",
+            wiremock::ResponseTemplate::new(200).set_body_json(reuse),
+        )
+        .await;
+        mount_order_by_id(&server, 7, row_response("new", "CANCELED")).await;
+        let known = held_old();
+
+        let sent = check_spot(&server, &known).await;
+
+        let report = only_report(&sent);
+        assert_eq!(report.order.key.cid, ClientOrderId::new("new"));
+        assert!(
+            matches!(report.order.state, OrderState::Inactive(_)),
+            "{report:?}"
+        );
+        assert_eq!(report.replaces, link_to_old());
+        assert_eq!(looked_up_by_id(&server).await, ["7"]);
+        assert!(!known.lock().contains(&ClientOrderId::new("old")));
+    }
+
+    /// An order held without its venue order id, which Binance no longer knows by its client
+    /// order id, cannot be looked up by `orderId`: it is dropped as unknown.
+    #[tokio::test]
+    async fn an_order_held_without_its_order_id_is_looked_up_by_client_order_id_alone() {
+        let server = venue_listing(serde_json::json!([])).await;
+        mount_order(&server, "old", venue_error(-2013)).await;
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        known.lock().live(
+            &spot_key("BTCUSDT", "old"),
+            Decimal::TWO,
+            OrderKind::Limit,
+            &Open::new(VenueOrderId::ClientAssigned, Utc::now(), Decimal::ZERO),
+        );
+
+        let sent = check_spot(&server, &known).await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(looked_up(&server).await, ["old"]);
+        assert!(looked_up_by_id(&server).await.is_empty());
+        assert!(!known.lock().contains(&ClientOrderId::new("old")));
     }
 
     /// `fetch_ended_orders` looks an order this client holds up by its `orderId` too, and leaves

@@ -775,8 +775,6 @@ impl KnownLiveOrders {
     }
 
     /// The venue order id of the order held as live under `cid`, where known.
-    // Only Binance spot looks an order up by the venue order id it holds.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn order_id_of(&self, cid: &ClientOrderId) -> Option<OrderId> {
         self.orders
             .get(cid)
@@ -1014,7 +1012,8 @@ pub(crate) struct HeldOrder {
 /// nothing more.
 #[derive(Debug, Default)]
 pub(crate) struct Listed {
-    cids: FnvHashSet<ClientOrderId>,
+    /// The listed client order ids, each with the venue order id its report names, where known.
+    cids: FnvHashMap<ClientOrderId, Option<OrderId>>,
     /// The venue order ids of the listed reports, by instrument.
     ids: FnvHashSet<(InstrumentNameExchange, OrderId)>,
     reports: Vec<UnindexedOrderReport>,
@@ -1026,18 +1025,30 @@ impl Listed {
     #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn extend(&mut self, reports: impl IntoIterator<Item = UnindexedOrderReport>) {
         for report in reports {
-            self.cids.insert(report.order.key.cid.clone());
-            if let Some(id) = reported_id(&report.order.state) {
-                self.ids.insert((report.order.key.instrument.clone(), id));
+            let id = reported_id(&report.order.state);
+            if let Some(id) = &id {
+                self.ids
+                    .insert((report.order.key.instrument.clone(), id.clone()));
             }
+            self.cids.insert(report.order.key.cid.clone(), id);
             self.reports.push(report);
         }
     }
 
     /// Whether the listing shows `held` live: under its client order id, or, in a listing of
     /// reports, under its venue order id, whatever client order id it is listed under.
+    ///
+    /// An order listed under the held client order id but another venue order id is not the
+    /// order held: the venue accepted a new order under the id a rename left. The order held is
+    /// then not shown by its client order id, and is looked up by its venue order id.
     fn shows(&self, held: &HeldOrder) -> bool {
-        self.cids.contains(&held.key.cid)
+        let by_cid = self.cids.get(&held.key.cid).is_some_and(|listed_id| {
+            match (listed_id, &held.order_id) {
+                (Some(listed_id), Some(held_id)) => listed_id == held_id,
+                _ => true,
+            }
+        });
+        by_cid
             || held.order_id.as_ref().is_some_and(|id| {
                 self.ids
                     .contains(&(held.key.instrument.clone(), id.clone()))
@@ -1048,7 +1059,7 @@ impl Listed {
 impl From<FnvHashSet<ClientOrderId>> for Listed {
     fn from(cids: FnvHashSet<ClientOrderId>) -> Self {
         Self {
-            cids,
+            cids: cids.into_iter().map(|cid| (cid, None)).collect(),
             ..Self::default()
         }
     }
@@ -1577,8 +1588,9 @@ fn follow_listed(
             followed.insert(old);
             continue;
         }
-        // An order already held, or seen to end, under the new id is left to the lookup of the
-        // order held, which settles it as the stream would.
+        // An order already held, or seen to end, under the new id is not taken for the order
+        // held. The order held stays held: the listing shows its venue order id open, so it is
+        // not looked up, and the stream's next report of that id settles it.
         if known.holds(&key.cid) || known.recently_ended.contains(&key.cid) {
             continue;
         }
@@ -3613,9 +3625,97 @@ pub(crate) mod tests {
         assert!(known.lock().contains(&new.cid));
     }
 
+    /// A listed report linking the order it replaces, after the stream followed that link while
+    /// the listing was read, is not sent again, and the old id is not looked up.
+    #[tokio::test]
+    async fn a_listed_link_the_stream_followed_is_not_sent_again() {
+        let (known, mut unchecked) = held_old();
+        let new = key("BTCUSDT", "new");
+        let link = Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old"));
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(new.clone(), live_state("9")).with_replaces(link.clone())],
+            |known| known.observe(&linked(new.clone(), live_state("9"), link.clone())),
+            |_, key| panic!("{key:?} was followed by the stream, not looked up"),
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(asked.is_empty());
+        let known = known.lock();
+        assert!(known.contains(&new.cid));
+        assert!(!known.contains(&ClientOrderId::new("old")));
+    }
+
+    /// A listing read before the stream followed a rename shows the order under its old id. That
+    /// is not taken for a rename back to the old id: nothing is sent and nothing looked up.
+    #[tokio::test]
+    async fn a_listing_read_before_the_stream_followed_a_rename_links_nothing() {
+        let (known, mut unchecked) = held_old();
+        let new = key("BTCUSDT", "new");
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(key("BTCUSDT", "old"), live_state("7"))],
+            |known| {
+                known.observe(&linked(
+                    new.clone(),
+                    live_state("7"),
+                    Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")),
+                ));
+            },
+            |_, key| panic!("{key:?} is listed by its venue order id, not looked up"),
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(asked.is_empty());
+        let known = known.lock();
+        assert!(known.contains(&new.cid));
+        assert!(!known.contains(&ClientOrderId::new("old")));
+        known.assert_consistent();
+    }
+
+    /// An order listed under the held client order id but another venue order id is a new order
+    /// placed under the id a rename left, not the order held, which is looked up by its venue
+    /// order id. A listing of ids alone cannot tell them apart, and shows the order held.
+    #[tokio::test]
+    async fn a_reused_client_order_id_in_the_listing_does_not_show_the_order_held() {
+        let (known, mut unchecked) = held_old();
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(key("BTCUSDT", "old"), live_state("8"))],
+            |_| {},
+            |_, _| OrderLookup::NotEnded,
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(
+            asked,
+            [(ClientOrderId::new("old"), Some(OrderId::new("7")))]
+        );
+
+        let held = HeldOrder {
+            key: key("BTCUSDT", "old"),
+            order_id: Some(OrderId::new("7")),
+        };
+        let ids_only = Listed::from(FnvHashSet::from_iter([ClientOrderId::new("old")]));
+        assert!(ids_only.shows(&held));
+        let mut same_id = Listed::default();
+        same_id.extend([report(key("BTCUSDT", "old"), live_state("7"))]);
+        assert!(same_id.shows(&held));
+    }
+
     /// A listed order under a client order id already held is not taken for the order held under
     /// its venue order id, which is not linked to it. The listing shows that order live by its
-    /// venue order id, so it is not looked up either, and both stay held.
+    /// venue order id, so it is not looked up, and both stay held. The order held under the listed
+    /// client order id, with another venue order id, is not the one listed, and is looked up.
     #[tokio::test]
     async fn a_listed_order_under_an_id_already_held_is_not_linked() {
         let (known, mut unchecked) = held_old();
@@ -3629,12 +3729,12 @@ pub(crate) mod tests {
             &mut unchecked,
             vec![report(new.clone(), live_state("7"))],
             |_| {},
-            |_, key| panic!("{key:?} is listed by its venue order id, not looked up"),
+            |_, _| OrderLookup::NotEnded,
         )
         .await;
 
         assert!(sent.is_empty(), "{sent:?}");
-        assert!(asked.is_empty());
+        assert_eq!(asked, [(new.cid.clone(), Some(OrderId::new("9")))]);
         let known = known.lock();
         assert!(known.contains(&ClientOrderId::new("old")));
         assert!(known.contains(&new.cid));
