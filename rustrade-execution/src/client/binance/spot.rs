@@ -3085,7 +3085,7 @@ mod tests {
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::error::StreamTerminationReason;
-    use crate::order::report::{OrderReport, ReportedTerms, UnindexedOrderReport};
+    use crate::order::report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport};
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use smol_str::SmolStr;
 
@@ -5071,48 +5071,102 @@ mod tests {
         }
     }
 
-    /// An amend under a new client order id names it in `c` and the old one in `C`. The engine
-    /// knows the order by the old id, so nothing is reported for it; an unknown execution type
-    /// reports nothing either.
+    /// An amend under a new client order id names it in `c` and the old one in `C`: the order is
+    /// reported live on its new terms under the new id, linked to the order it renames by its
+    /// own venue order id and the old client order id. An unknown execution type reports nothing.
     #[test]
-    fn an_amend_under_a_new_client_order_id_produces_nothing() {
-        let renamed = ExecutionReport {
-            orig_client_order_id: Some("client-0".to_string()),
-            ..resting_report("REPLACED", "0.002")
-        };
-        assert!(convert(renamed).is_empty());
+    fn an_amend_under_a_new_client_order_id_is_linked_to_the_order_it_renames() {
+        for status in ["NEW", "PARTIALLY_FILLED"] {
+            let renamed = ExecutionReport {
+                orig_client_order_id: Some("client-0".to_string()),
+                order_status: Some(status.to_string()),
+                cumulative_filled_quantity: Some("0.001".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(renamed)).expect("an amend report");
+            assert_eq!(
+                report.order.key.cid,
+                ClientOrderId::new("client-1"),
+                "{status}"
+            );
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("12345")).with_cid(ClientOrderId::new("client-0"))),
+                "{status}"
+            );
+            assert_eq!(report.order.quantity, Decimal::new(2, 3), "{status}");
+            assert_eq!(report.reported, ReportedTerms::ALL, "{status}");
+            let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
+                report.order.state
+            else {
+                panic!("{status}: expected Open, got {:?}", report.order.state);
+            };
+            assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("12345")));
+            assert_eq!(open.filled_quantity, Decimal::new(1, 3), "{status}");
+        }
         assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
+    }
+
+    /// An amend that keeps the client order id links nothing, whether `C` is empty, missing or
+    /// names the same id.
+    #[test]
+    fn an_amend_that_keeps_the_client_order_id_links_nothing() {
+        for previous in [Some(""), Some("client-1"), None] {
+            let amend = ExecutionReport {
+                orig_client_order_id: previous.map(str::to_string),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(amend)).expect("an amend report");
+            assert_eq!(report.replaces, None, "C = {previous:?}");
+        }
+    }
+
+    /// How an order report ended, as expired, if it did.
+    fn expired(report: &UnindexedOrderReport) -> &crate::order::state::Expired {
+        match &report.order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Expired(expired)) => {
+                expired
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
     }
 
     /// An amend down to the filled quantity ends the order in that one report (`X = EXPIRED`,
     /// expiry reason `EXHAUSTED`, `q == z`), with no `EXPIRED` report after it, so the report ends
-    /// the order with what filled, as an `EXPIRED` one does. The frame is the shape spot testnet
-    /// sent, with the amend keeping its client order id.
+    /// the order as expired, with what filled, on its new terms. The frames are the shapes spot
+    /// testnet sent, keeping the client order id (`C` naming it) and taking a new one (`C` naming
+    /// the old), which links the order renamed.
     #[test]
     fn an_amend_down_to_the_filled_quantity_ends_the_order() {
-        let frame = serde_json::json!({
-            "e": "executionReport", "E": 1_700_000_002_001_i64, "s": "BTCUSDT",
-            "c": "client-1", "S": "BUY", "o": "LIMIT", "f": "GTC", "q": "0.00150000",
-            "p": "50000.00", "x": "REPLACED", "X": "EXPIRED", "r": "NONE", "i": 12345_i64,
-            "l": "0.00000000", "z": "0.00150000", "T": 1_700_000_002_000_i64, "w": false,
-            "C": "client-1", "eR": "EXHAUSTED",
-        });
-        let report: ExecutionReport =
-            serde_json::from_value(frame).expect("the observed amend report decodes");
-        let event = sole_event(convert(report)).expect("an amend that ends the order");
-        let AccountEventKind::OrderCancelled(response) = event.kind else {
-            panic!("expected OrderCancelled, got {:?}", event.kind);
-        };
-        assert_eq!(response.key.cid, ClientOrderId::new("client-1"));
-        let Ok(cancelled) = response.state else {
-            panic!("expected Ok, got {:?}", response.state);
-        };
-        assert_eq!(cancelled.id, OrderId::new("12345"));
-        assert_eq!(cancelled.filled_quantity, Some(Decimal::new(15, 4)));
-        assert_eq!(
-            cancelled.time_exchange,
-            DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000).unwrap()
-        );
+        for (previous, replaces) in [
+            ("client-1", None),
+            (
+                "client-0",
+                Some(Replaces::new(OrderId::new("12345")).with_cid(ClientOrderId::new("client-0"))),
+            ),
+        ] {
+            let frame = serde_json::json!({
+                "e": "executionReport", "E": 1_700_000_002_001_i64, "s": "BTCUSDT",
+                "c": "client-1", "S": "BUY", "o": "LIMIT", "f": "GTC", "q": "0.00150000",
+                "p": "50000.00", "x": "REPLACED", "X": "EXPIRED", "r": "NONE", "i": 12345_i64,
+                "l": "0.00000000", "z": "0.00150000", "T": 1_700_000_002_000_i64, "w": false,
+                "C": previous, "eR": "EXHAUSTED",
+            });
+            let report: ExecutionReport =
+                serde_json::from_value(frame).expect("the observed amend report decodes");
+            let report = order_report(convert(report)).expect("an amend that ends the order");
+            assert_eq!(report.order.key.cid, ClientOrderId::new("client-1"));
+            assert_eq!(report.replaces, replaces, "C = {previous}");
+            assert_eq!(report.order.quantity, Decimal::new(15, 4));
+            assert_eq!(report.reported, ReportedTerms::ALL);
+            let expired = expired(&report);
+            assert_eq!(expired.id, OrderId::new("12345"));
+            assert_eq!(expired.filled_quantity, Some(Decimal::new(15, 4)));
+            assert_eq!(
+                expired.time_exchange,
+                DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000).unwrap()
+            );
+        }
     }
 
     /// An amend of a partly filled order to more than its fill leaves it live
@@ -5134,8 +5188,8 @@ mod tests {
         assert_eq!(open.filled_quantity, Decimal::new(15, 4));
     }
 
-    /// Any order status that leaves the order nothing to fill ends it on an amend report, as on a
-    /// self-trade prevention one, with what filled.
+    /// Any order status that leaves the order nothing to fill ends it on an amend report, as
+    /// expired, as on a self-trade prevention one, with what filled.
     #[test]
     fn an_amend_with_any_status_that_leaves_nothing_to_fill_ends_the_order() {
         for status in ["EXPIRED", "EXPIRED_IN_MATCH", "FILLED"] {
@@ -5144,18 +5198,9 @@ mod tests {
                 cumulative_filled_quantity: Some("0.002".to_string()),
                 ..resting_report("REPLACED", "0.002")
             };
-            let event = sole_event(convert(amend)).expect("an amend that ends the order");
-            let AccountEventKind::OrderCancelled(response) = event.kind else {
-                panic!(
-                    "X = {status}: expected OrderCancelled, got {:?}",
-                    event.kind
-                );
-            };
-            let Ok(cancelled) = response.state else {
-                panic!("X = {status}: expected Ok, got {:?}", response.state);
-            };
+            let report = order_report(convert(amend)).expect("an amend that ends the order");
             assert_eq!(
-                cancelled.filled_quantity,
+                expired(&report).filled_quantity,
                 Some(Decimal::new(2, 3)),
                 "X = {status}"
             );
@@ -5163,11 +5208,10 @@ mod tests {
     }
 
     /// An amend whose order status (`X`) is neither live nor an end, or missing, could leave the
-    /// order live or end it, so it is reported as neither; so is one under a new client order id,
-    /// which the engine holds under its old id. Each is logged, and a renamed one that ended the
-    /// order says that it ended.
+    /// order live or end it, so it is reported as neither, under its own client order id or a new
+    /// one, and logged.
     #[test]
-    fn an_amend_with_an_unknown_status_or_a_new_id_produces_nothing() {
+    fn an_amend_with_an_unknown_status_produces_nothing() {
         let logged = |report: ExecutionReport| {
             let (events, logs) = rustrade_instrument::test_utils::logs::capture(|| convert(report));
             assert!(events.is_empty(), "{events:?}");
@@ -5175,37 +5219,20 @@ mod tests {
                 .map(|event| event.message().to_string())
                 .collect::<Vec<_>>()
         };
-        for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
-            let messages = logged(ExecutionReport {
-                order_status: status.map(str::to_string),
-                ..resting_report("REPLACED", "0.002")
-            });
-            assert!(
-                messages
-                    .iter()
-                    .any(|m| m.contains("neither live nor an end")),
-                "X = {status:?}: {messages:?}"
-            );
-        }
-        for (status, ended) in [("EXPIRED", true), ("NEW", false)] {
-            let messages = logged(ExecutionReport {
-                order_status: Some(status.to_string()),
-                orig_client_order_id: Some("client-0".to_string()),
-                ..resting_report("REPLACED", "0.002")
-            });
-            assert!(
-                messages
-                    .iter()
-                    .any(|m| m.contains("amended under a new client order id")),
-                "X = {status}: {messages:?}"
-            );
-            assert_eq!(
-                messages
-                    .iter()
-                    .any(|m| m.contains("ended - the engine still holds it as live")),
-                ended,
-                "X = {status}: {messages:?}"
-            );
+        for previous in ["", "client-0"] {
+            for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
+                let messages = logged(ExecutionReport {
+                    order_status: status.map(str::to_string),
+                    orig_client_order_id: Some(previous.to_string()),
+                    ..resting_report("REPLACED", "0.002")
+                });
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.contains("neither live nor an end")),
+                    "C = {previous:?}, X = {status:?}: {messages:?}"
+                );
+            }
         }
     }
 

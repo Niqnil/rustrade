@@ -18,7 +18,7 @@ use crate::{
     order::{
         OrderKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
-        report::OrderReport,
+        report::{OrderReport, Replaces},
         state::{ActiveOrderState, Open, OrderState, UnindexedOrderState},
     },
 };
@@ -547,9 +547,19 @@ impl KnownLiveOrders {
     /// On the stream, an [`OrderCancelled`](AccountEventKind::OrderCancelled) always reports an
     /// order leaving the book, as an error when the venue rejected it after accepting it. A cancel
     /// request that fails is answered only to its caller, and never reaches this.
+    ///
+    /// A report linking the order it replaces under another client order id
+    /// ([`OrderReport::replaces`]) moves that order to the report's id first (see
+    /// [`follow_replaced`](Self::follow_replaced)), so a reconnect asks about it by the id the
+    /// venue now knows it by.
     pub(crate) fn observe(&mut self, event: &UnindexedAccountEvent) {
         match &event.kind {
-            AccountEventKind::OrderSnapshot(Snapshot(OrderReport { order, .. })) => {
+            AccountEventKind::OrderSnapshot(Snapshot(OrderReport {
+                order, replaces, ..
+            })) => {
+                if let Some(replaces) = replaces {
+                    self.follow_replaced(&order.key, replaces);
+                }
                 match &order.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => {
                         self.live(&order.key, order.quantity, order.kind, open);
@@ -584,6 +594,57 @@ impl KnownLiveOrders {
             }
             _ => {}
         }
+    }
+
+    /// Move the order a report under `key` replaces to `key`'s client order id, when it is held
+    /// under another: the one under the client order id `replaces` names, or else the one held
+    /// under its venue order id on `key`'s instrument.
+    ///
+    /// The order keeps its age and kind, and the old id is remembered as ended, so a late report
+    /// of the order under it does not hold it again. If an order is already held under `key`'s
+    /// id, or one under it was seen to end, the old id alone is dropped. The report itself is then applied as usual, which updates
+    /// the order's quantity and venue order id, or ends it.
+    fn follow_replaced(&mut self, key: &UnindexedOrderKey, replaces: &Replaces) {
+        let old = match &replaces.cid {
+            Some(old) => old.clone(),
+            None => match self
+                .by_order_id
+                .get(&(key.instrument.clone(), replaces.id.clone()))
+            {
+                Some(old) => old.clone(),
+                None => return,
+            },
+        };
+        if old == key.cid {
+            return;
+        }
+        let Some(known) = self.orders.remove(&old) else {
+            return;
+        };
+        self.recently_ended.put(old.clone(), ());
+        let recalled = self.recalled.remove(&old);
+        self.by_instrument.remove(&known.instrument, &old);
+        if let Some(order_id) = &known.order_id {
+            self.by_order_id
+                .remove(&(known.instrument.clone(), order_id.clone()));
+        }
+        // An order already held under the new id, or seen to end under it (a late replay of the
+        // replace), is not taken over.
+        if self.orders.contains_key(&key.cid) || self.recently_ended.contains(&key.cid) {
+            self.by_age.remove(&known.seq);
+            return;
+        }
+        let new = key.cid.clone();
+        self.by_age.insert(known.seq, new.clone());
+        self.by_instrument.insert(&known.instrument, &new);
+        if let Some(order_id) = &known.order_id {
+            self.by_order_id
+                .insert((known.instrument.clone(), order_id.clone()), new.clone());
+        }
+        if let Some(kind) = recalled {
+            self.recalled.entry(new.clone()).or_insert(kind);
+        }
+        self.orders.insert(new, known);
     }
 
     /// The kind the client knows the order `cid` by: the kind it is held as live with, or else
@@ -1464,6 +1525,186 @@ pub(crate) mod tests {
             order_filled,
             AssetFees::new(AssetNameExchange::new("usdt"), Decimal::ZERO, None),
         )))
+    }
+
+    /// `snapshot`'s event, linked as replacing what `replaces` names.
+    fn linked(
+        key: UnindexedOrderKey,
+        state: OrderState<AssetNameExchange, InstrumentNameExchange>,
+        replaces: Replaces,
+    ) -> UnindexedAccountEvent {
+        let mut event = snapshot(key, state);
+        if let AccountEventKind::OrderSnapshot(Snapshot(report)) = &mut event.kind {
+            report.replaces = Some(replaces);
+        }
+        event
+    }
+
+    /// A report renaming a held order moves it to the new client order id, found by the old id
+    /// the link names or, without one, by its venue order id: the old id is no longer held, a
+    /// late live report under it does not hold it again, and the order's fill and end are
+    /// followed under the new id.
+    #[test]
+    fn a_renamed_order_is_held_under_its_new_client_order_id() {
+        for named in [true, false] {
+            let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+            let (old, new) = (key("BTCUSDT", "old"), key("BTCUSDT", "new"));
+            let other = key("BTCUSDT", "other");
+            known.live(
+                &old,
+                dec!(2),
+                trailing_fixed_limit(),
+                &open("7", Decimal::ZERO),
+            );
+            known.live(&other, dec!(2), OrderKind::Limit, &open("8", Decimal::ZERO));
+            let replaces = Replaces::new(OrderId::new("7"));
+            let replaces = if named {
+                replaces.with_cid(old.cid.clone())
+            } else {
+                replaces
+            };
+
+            known.observe(&linked(
+                new.clone(),
+                OrderState::active(open("7", Decimal::ZERO)),
+                replaces,
+            ));
+            known.assert_consistent();
+            assert!(known.contains(&new.cid), "named {named}");
+            assert!(!known.contains(&old.cid), "named {named}");
+            assert_eq!(
+                known.kind_of(&new.cid),
+                Some(trailing_fixed_limit()),
+                "kept its kind"
+            );
+            assert_eq!(
+                known
+                    .keys_on(ExchangeId::BinanceSpot, &old.instrument)
+                    .len(),
+                2
+            );
+
+            known.observe(&snapshot(
+                old.clone(),
+                OrderState::active(open("7", Decimal::ZERO)),
+            ));
+            assert!(!known.contains(&old.cid), "a late report under the old id");
+
+            known.observe(&fill("7", Some(dec!(2))));
+            known.assert_consistent();
+            assert!(
+                !known.contains(&new.cid),
+                "its fill ends it under the new id"
+            );
+            assert!(known.contains(&other.cid));
+        }
+    }
+
+    /// A renamed order keeps its place in the order the set forgets in.
+    #[test]
+    fn a_renamed_order_keeps_its_age() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let (old, new) = (key("BTCUSDT", "old"), key("BTCUSDT", "new"));
+        known.live(&old, dec!(2), OrderKind::Limit, &open("0", Decimal::ZERO));
+        for n in 1..MAX_KNOWN_LIVE_ORDERS {
+            let cid = format!("o{n}");
+            known.live(
+                &key("BTCUSDT", &cid),
+                dec!(2),
+                OrderKind::Limit,
+                &open(&n.to_string(), Decimal::ZERO),
+            );
+        }
+        known.observe(&linked(
+            new.clone(),
+            OrderState::active(open("0", Decimal::ZERO)),
+            Replaces::new(OrderId::new("0")).with_cid(old.cid.clone()),
+        ));
+        known.live(
+            &key("BTCUSDT", "newest"),
+            dec!(2),
+            OrderKind::Limit,
+            &open("newest", Decimal::ZERO),
+        );
+        known.assert_consistent();
+        assert!(!known.contains(&new.cid), "the oldest is forgotten first");
+        assert!(known.contains(&key("BTCUSDT", "o1").cid));
+    }
+
+    /// A renaming report that ends the order drops both ids.
+    #[test]
+    fn a_renamed_order_that_ended_is_no_longer_held_under_either_id() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let (old, new) = (key("BTCUSDT", "old"), key("BTCUSDT", "new"));
+        known.live(&old, dec!(2), OrderKind::Limit, &open("7", dec!(1)));
+        known.observe(&linked(
+            new.clone(),
+            OrderState::expired(Expired::new(OrderId::new("7"), Utc::now(), Some(dec!(1)))),
+            Replaces::new(OrderId::new("7")).with_cid(old.cid.clone()),
+        ));
+        known.assert_consistent();
+        assert!(!known.contains(&old.cid));
+        assert!(!known.contains(&new.cid));
+        known.observe(&snapshot(
+            new.clone(),
+            OrderState::active(open("7", dec!(1))),
+        ));
+        assert!(
+            !known.contains(&new.cid),
+            "a late live report under the new id"
+        );
+    }
+
+    /// A link moves nothing when it names the report's own client order id or no order held, as
+    /// for a venue that replaces an order under a new venue order id alone; and when the new id
+    /// is already held, or seen to end, the old id alone is dropped.
+    #[test]
+    fn a_link_moves_only_an_order_held_under_another_id_onto_a_free_one() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let (old, new) = (key("BTCUSDT", "old"), key("BTCUSDT", "new"));
+        known.live(&old, dec!(2), OrderKind::Limit, &open("7", Decimal::ZERO));
+        known.observe(&linked(
+            old.clone(),
+            OrderState::active(open("9", Decimal::ZERO)),
+            Replaces::new(OrderId::new("7")),
+        ));
+        known.assert_consistent();
+        assert!(
+            known.contains(&old.cid),
+            "a new venue order id under the same cid"
+        );
+        known.observe(&linked(
+            new.clone(),
+            OrderState::active(open("10", Decimal::ZERO)),
+            Replaces::new(OrderId::new("404")),
+        ));
+        known.assert_consistent();
+        assert!(known.contains(&old.cid), "a link naming no order held");
+        assert!(known.contains(&new.cid));
+
+        known.observe(&linked(
+            new.clone(),
+            OrderState::active(open("10", Decimal::ZERO)),
+            Replaces::new(OrderId::new("9")).with_cid(old.cid.clone()),
+        ));
+        known.assert_consistent();
+        assert!(!known.contains(&old.cid), "the old id is dropped");
+        assert!(known.contains(&new.cid));
+
+        let (gone, ended) = (key("BTCUSDT", "gone"), key("BTCUSDT", "ended"));
+        known.live(&gone, dec!(2), OrderKind::Limit, &open("11", Decimal::ZERO));
+        known.ended(&ended.cid);
+        known.observe(&linked(
+            ended.clone(),
+            OrderState::active(open("11", Decimal::ZERO)),
+            Replaces::new(OrderId::new("11")).with_cid(gone.cid.clone()),
+        ));
+        known.assert_consistent();
+        assert!(!known.contains(&gone.cid));
+        assert!(
+            !known.contains(&ended.cid),
+            "an id seen to end is not held again"
+        );
     }
 
     /// The set keeps the kind an order was first learned with, from a placement or a report, and

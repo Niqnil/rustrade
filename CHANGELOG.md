@@ -707,17 +707,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ConditionalUnresolved`), a time in force read as `Unreported`, and a zero quantity (an order
     sized in the quote asset). A report or row stamped with this host's clock, because Binance
     sent no time, states none, and so does a row whose only time is its creation.
-  - **A Binance spot keep-priority amend that kept the client order id is reported as the order's
-    new state**, on its new quantity, where it was logged and dropped. The stream's deduplication now
-    tells a report's stated terms apart, so the amend is not taken for a replay of the order's
-    acknowledgement. An amend down to the filled quantity or below ends the order: Binance sends
-    that one report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED`
-    report after it, so it is reported as `OrderCancelled` with what filled, as an `EXPIRED`
-    report is. Any order status that leaves the order nothing to fill (`EXPIRED`,
-    `EXPIRED_IN_MATCH`, `FILLED`) is read so, as on a self-trade prevention report. A same-id
-    amend whose order status is neither live nor one of those, or missing, is logged and dropped.
-    An amend under a new client order id is still logged and dropped, even one that ended the
-    order: the engine knows the order by its old id.
+  - **A Binance spot keep-priority amend is reported as the order's new state**, on its new
+    quantity, where it was logged and dropped. The stream's deduplication now tells a report's
+    stated terms apart, so the amend is not taken for a replay of the order's acknowledgement.
+    - **An amend under a new client order id** is reported under the new id, linked to the order
+      it renames (`OrderReport::replaces`: the same venue order id, and the old client order id),
+      so the engine moves the order to the new id, keeping its strategy and fills. Binance links
+      the two ids only in the amend's own report, and no longer finds the order by the old id.
+      The client's record of live orders follows the rename, so a reconnect asks about the order
+      by the id Binance knows it by. Known limitation: a rename made while the account stream was
+      disconnected is not learned. A reconnect then finds no order under the old id and stops
+      holding it, and the open-order listing shows the order under its new id as one the engine
+      did not place.
+    - **An amend down to the filled quantity or below ends the order**: Binance sends that one
+      report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report
+      after it, so it is reported as an order snapshot ended as `Expired`, with what filled, on
+      its new terms, and linked when the amend renamed the order. Any order status that leaves
+      the order nothing to fill (`EXPIRED`, `EXPIRED_IN_MATCH`, `FILLED`) is read so. An amend
+      whose order status is neither live nor one of those, or missing, is logged and dropped.
   - **Alpaca states the terms its reads carry.** An account-stream snapshot and an open order in
     `account_snapshot` state every term, less a limit price that does not parse and a time in
     force read as `Unreported`. One stamped with this host's clock, because Alpaca sent no time,
