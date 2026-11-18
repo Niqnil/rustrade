@@ -64,7 +64,7 @@ use super::shared::{
 use crate::client::listed_order::ListedOrder;
 use crate::client::log_excerpt::frame_excerpt;
 use crate::client::venue_clock::HostMoment;
-use crate::rules::{OrderRules, PreSendRules};
+use crate::rules::{InstrumentSpecError, OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -122,7 +122,9 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::{
+        kind::InstrumentKindDiscriminant, name::InstrumentNameExchange, spec::InstrumentSpec,
+    },
 };
 use serde::Deserialize;
 use smol_str::format_smolstr;
@@ -473,6 +475,41 @@ impl BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// Load the order rules of `instruments` from Binance now, as
+    /// [`load_rules`](Self::load_rules) does, and return each instrument's as an
+    /// [`InstrumentSpec`] whose quantity is counted in the symbol's base asset, named as Binance
+    /// names it (`BTC`).
+    ///
+    /// The spec's quantity step is the grid a market order's quantity sits on, which an order of
+    /// any kind can close: see [`OrderRules::instrument_spec`]. It is a copy of the rules as
+    /// loaded; the rules this client checks orders against are reloaded later, the spec is not.
+    ///
+    /// The base asset's name must match the one the instrument's
+    /// [`Underlying`](rustrade_instrument::Underlying) gives its base, or
+    /// [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
+    /// reads no step from the spec. On an instrument keyed by [`AssetNameExchange`], the names
+    /// are compared as spelled, so a base spelled `btc` reads no step from a spec in `BTC`, with
+    /// no error. An instrument to be indexed takes the spec re-keyed to the asset it gives its
+    /// base, mapping the name as its underlying's are mapped; building the index from two names
+    /// of one exchange that differ only in case fails.
+    ///
+    /// # Errors
+    /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its
+    /// [`InstrumentSpecError`]. One Binance lists without a base asset is left out, with a
+    /// warning.
+    pub async fn load_specs(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<
+        HashMap<
+            InstrumentNameExchange,
+            Result<InstrumentSpec<AssetNameExchange>, InstrumentSpecError>,
+        >,
+        UnindexedClientError,
+    > {
+        self.rules.load_specs(instruments).await
     }
 
     /// The account's commission rates on `instrument`: `GET /api/v3/account/commission`, at 20
@@ -3274,6 +3311,86 @@ mod tests {
         assert_eq!(
             rules.map(|rules| rules.quantity.step),
             Some(Some(Decimal::new(1, 3)))
+        );
+    }
+
+    /// `load_specs` returns each symbol's rules as a spec counted in its base asset, with the
+    /// quantity step a market order sits on; a symbol whose rules make no spec maps to why, and
+    /// one listed without a base asset is left out.
+    #[tokio::test]
+    async fn load_specs_returns_a_spec_per_symbol_in_its_base_asset() {
+        use rustrade_instrument::instrument::spec::OrderQuantityUnits;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [
+                    {
+                        "symbol": "BTCUSDT", "status": "TRADING", "baseAsset": "BTC",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.05", "maxQty": "100", "stepSize": "0.05"},
+                            {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "maxQty": "10", "stepSize": "0.02"},
+                        ],
+                    },
+                    {
+                        "symbol": "ETHUSDT", "status": "TRADING",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "100", "stepSize": "0.01"},
+                        ],
+                    },
+                    {
+                        "symbol": "ODDUSDT", "status": "TRADING", "baseAsset": "ODD",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0", "maxQty": "0",
+                             "stepSize": "7.922816251426433759354395033"},
+                            {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "maxQty": "0",
+                             "stepSize": "7.922816251426433759354395031"},
+                        ],
+                    },
+                ]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let [btcusdt, ethusdt, oddusdt] =
+            ["BTCUSDT", "ETHUSDT", "ODDUSDT"].map(InstrumentNameExchange::new);
+
+        let mut loaded = client
+            .load_specs(&[btcusdt.clone(), ethusdt.clone(), oddusdt.clone()])
+            .await
+            .unwrap();
+
+        let btc = loaded.remove(&btcusdt).unwrap().unwrap();
+        assert_eq!(
+            btc.quantity.unit,
+            OrderQuantityUnits::Asset(AssetNameExchange::new("BTC"))
+        );
+        assert_eq!(
+            (btc.quantity.min, btc.quantity.increment),
+            (Decimal::new(5, 2), Decimal::new(1, 1))
+        );
+        assert!(matches!(
+            loaded.remove(&oddusdt),
+            Some(Err(InstrumentSpecError::QuantityGridOverflow { .. }))
+        ));
+        assert!(
+            loaded.is_empty(),
+            "no spec without a base asset: {loaded:?}"
         );
     }
 

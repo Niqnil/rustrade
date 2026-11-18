@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An instrument spec from loaded order rules** (`rustrade-execution`).
+  `OrderRules::instrument_spec(unit)` describes the rules as an `InstrumentSpec`, and
+  `BinanceSpot::load_specs` / `BinanceMargin::load_specs` load a set of symbols' rules from
+  `exchangeInfo` (holding them for the pre-send check, as `load_rules` does) and return each as a
+  spec counted in the symbol's base asset, named as Binance names it (`BTC`). The spec's quantity
+  step, which `Instrument::quantity_step` gives the engine to round a position to when a fill's fee
+  is taken from the base asset, is the grid a market order's quantity must sit on: the grid the
+  lot and market lot steps share, or the lot step where the market step is off. A position on it
+  can be closed by an order of any kind. The quantity minimum is the larger of the two, and the
+  price minimum and tick and the notional minimum carry over. When a `Decimal` cannot hold the
+  shared grid, the conversion fails with `InstrumentSpecError::QuantityGridOverflow` rather than
+  taking the finer step. A spec is a copy of the rules as loaded: a later reload of the rules does
+  not change it.
 - **Hyperliquid clients follow an order the venue replaces.** A modify gives an order a new venue
   id and restarts its size and fill. The account stream now reports the new order linked to the
   one it replaced (`OrderReport::replaces`), with the fill of the old order added back to its

@@ -39,7 +39,7 @@ use super::shared::{
 use crate::{
     error::{OrderError, UnindexedClientError},
     order::OrderKind,
-    rules::{OrderRules, PreSendRules, ValueRule},
+    rules::{InstrumentSpecError, OrderRules, PreSendRules, ValueRule},
 };
 use binance_sdk::spot::rest_api::{
     ExchangeInfoParams, ExchangeInfoResponseSymbolsInner, MyFiltersResponseSymbolFiltersInner,
@@ -47,8 +47,14 @@ use binance_sdk::spot::rest_api::{
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
-use rustrade_instrument::Side;
-use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use rustrade_instrument::{
+    Side,
+    asset::name::AssetNameExchange,
+    instrument::{
+        name::InstrumentNameExchange,
+        spec::{InstrumentSpec, OrderQuantityUnits},
+    },
+};
 use smol_str::SmolStr;
 use std::{collections::HashMap, future::Future, str::FromStr, sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -135,15 +141,15 @@ impl RulesCache {
         }
     }
 
-    /// Hold `rules` as just loaded, for symbols loaded together.
-    pub(crate) fn store(&self, rules: &HashMap<SmolStr, OrderRules>) {
+    /// Hold the rules of `listed` as just loaded, for symbols loaded together.
+    pub(crate) fn store(&self, listed: &HashMap<SmolStr, ListedSymbol>) {
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        for (symbol, rules) in rules {
+        for (symbol, listed) in listed {
             entries.insert(
                 symbol.clone(),
                 Loaded {
-                    rules: Some(*rules),
+                    rules: Some(listed.rules),
                     loaded_at: now,
                     retry_at: None,
                 },
@@ -227,10 +233,10 @@ impl RulesLoader {
             .cache
             .rules(symbol, || async {
                 let wanted = [symbol.to_owned()];
-                let mut loaded = fetch_rules(&self.rest, &self.rate_limiter, &wanted)
+                let mut loaded = fetch_symbols(&self.rest, &self.rate_limiter, &wanted)
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(loaded.remove(symbol))
+                Ok(loaded.remove(symbol).map(|listed| listed.rules))
             })
             .await;
         match rules {
@@ -244,6 +250,41 @@ impl RulesLoader {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
+        Ok(self
+            .load_listed(instruments)
+            .await?
+            .into_iter()
+            .map(|(symbol, listed)| (InstrumentNameExchange::new(symbol), listed.rules))
+            .collect())
+    }
+
+    /// Load the rules of `instruments` now, hold them, and return each as an [`InstrumentSpec`]
+    /// counted in the symbol's base asset, as `load_specs` on the clients.
+    pub(crate) async fn load_specs(&self, instruments: &[InstrumentNameExchange]) -> LoadedSpecs {
+        Ok(self
+            .load_listed(instruments)
+            .await?
+            .into_iter()
+            .filter_map(|(symbol, listed)| {
+                let Some(base) = listed.base_asset else {
+                    warn!(%symbol, "Binance names no base asset for the symbol: no spec for it");
+                    return None;
+                };
+                let unit = OrderQuantityUnits::Asset(AssetNameExchange::new(base));
+                Some((
+                    InstrumentNameExchange::new(symbol),
+                    listed.rules.instrument_spec(unit),
+                ))
+            })
+            .collect())
+    }
+
+    /// Read `instruments` from `exchangeInfo` and hold their rules. Asks for nothing when
+    /// `instruments` is empty.
+    async fn load_listed(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<HashMap<SmolStr, ListedSymbol>, UnindexedClientError> {
         if instruments.is_empty() {
             return Ok(HashMap::new());
         }
@@ -251,26 +292,37 @@ impl RulesLoader {
             .iter()
             .map(|instrument| instrument.name().to_string())
             .collect();
-        let loaded = fetch_rules(&self.rest, &self.rate_limiter, &symbols)
+        let loaded = fetch_symbols(&self.rest, &self.rate_limiter, &symbols)
             .await
             .map_err(|error| classify_rest_query_error(&error, None))?;
         self.cache.store(&loaded);
-        Ok(loaded
-            .into_iter()
-            .map(|(symbol, rules)| (InstrumentNameExchange::new(symbol), rules))
-            .collect())
+        Ok(loaded)
     }
 }
 
-/// Read the rules of `symbols` from the spot `exchangeInfo`, with the rate-limit retry the
+/// What `load_specs` on the clients returns: each instrument's spec, or why its rules make none.
+pub(crate) type LoadedSpecs = Result<
+    HashMap<InstrumentNameExchange, Result<InstrumentSpec<AssetNameExchange>, InstrumentSpecError>>,
+    UnindexedClientError,
+>;
+
+/// One symbol as `exchangeInfo` lists it: its rules, and the asset its quantity is counted in.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ListedSymbol {
+    pub(crate) rules: OrderRules,
+    /// `baseAsset`, as Binance spells it (`BTC`). `None` when the listing leaves it out.
+    pub(crate) base_asset: Option<SmolStr>,
+}
+
+/// Read `symbols` from the spot `exchangeInfo`, with the rate-limit retry the
 /// clients' other requests have. A symbol Binance lists no rules for is absent from the result.
 ///
 /// Binance refuses the whole request when one symbol is not listed.
-pub(crate) async fn fetch_rules(
+pub(crate) async fn fetch_symbols(
     rest: &Arc<RestApi>,
     rate_limiter: &RateLimitTracker,
     symbols: &[String],
-) -> anyhow::Result<HashMap<SmolStr, OrderRules>> {
+) -> anyhow::Result<HashMap<SmolStr, ListedSymbol>> {
     let response = rest_call_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
         let symbols = symbols.to_vec();
         Box::pin(async move {
@@ -286,7 +338,11 @@ pub(crate) async fn fetch_rules(
         .iter()
         .filter_map(|symbol| {
             let name = symbol.symbol.as_deref()?;
-            Some((SmolStr::new(name), parse_symbol_rules(symbol)))
+            let listed = ListedSymbol {
+                rules: parse_symbol_rules(symbol),
+                base_asset: symbol.base_asset.as_deref().map(SmolStr::new),
+            };
+            Some((SmolStr::new(name), listed))
         })
         .collect())
 }
@@ -708,7 +764,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stored_rules_are_used_without_a_load() {
         let cache = RulesCache::new(PreSendRules::Enforce);
-        cache.store(&HashMap::from([(SmolStr::new("BTCUSDT"), some_rules())]));
+        cache.store(&HashMap::from([(
+            SmolStr::new("BTCUSDT"),
+            ListedSymbol {
+                rules: some_rules(),
+                base_asset: None,
+            },
+        )]));
         let rules = cache
             .rules("BTCUSDT", || async { Err("must not load".to_owned()) })
             .await;
