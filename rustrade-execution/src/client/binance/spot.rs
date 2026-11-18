@@ -5084,6 +5084,131 @@ mod tests {
         assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
     }
 
+    /// An amend down to the filled quantity ends the order in that one report (`X = EXPIRED`,
+    /// expiry reason `EXHAUSTED`, `q == z`), with no `EXPIRED` report after it, so the report ends
+    /// the order with what filled, as an `EXPIRED` one does. The frame is the shape spot testnet
+    /// sent, with the amend keeping its client order id.
+    #[test]
+    fn an_amend_down_to_the_filled_quantity_ends_the_order() {
+        let frame = serde_json::json!({
+            "e": "executionReport", "E": 1_700_000_002_001_i64, "s": "BTCUSDT",
+            "c": "client-1", "S": "BUY", "o": "LIMIT", "f": "GTC", "q": "0.00150000",
+            "p": "50000.00", "x": "REPLACED", "X": "EXPIRED", "r": "NONE", "i": 12345_i64,
+            "l": "0.00000000", "z": "0.00150000", "T": 1_700_000_002_000_i64, "w": false,
+            "C": "client-1", "eR": "EXHAUSTED",
+        });
+        let report: ExecutionReport =
+            serde_json::from_value(frame).expect("the observed amend report decodes");
+        let event = sole_event(convert(report)).expect("an amend that ends the order");
+        let AccountEventKind::OrderCancelled(response) = event.kind else {
+            panic!("expected OrderCancelled, got {:?}", event.kind);
+        };
+        assert_eq!(response.key.cid, ClientOrderId::new("client-1"));
+        let Ok(cancelled) = response.state else {
+            panic!("expected Ok, got {:?}", response.state);
+        };
+        assert_eq!(cancelled.id, OrderId::new("12345"));
+        assert_eq!(cancelled.filled_quantity, Some(Decimal::new(15, 4)));
+        assert_eq!(
+            cancelled.time_exchange,
+            DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000).unwrap()
+        );
+    }
+
+    /// An amend of a partly filled order to more than its fill leaves it live
+    /// (`X = PARTIALLY_FILLED`): the order on its new total, with its fill unchanged.
+    #[test]
+    fn an_amend_of_a_partly_filled_order_reports_it_live() {
+        let amend = ExecutionReport {
+            order_status: Some("PARTIALLY_FILLED".to_string()),
+            cumulative_filled_quantity: Some("0.0015".to_string()),
+            ..resting_report("REPLACED", "0.002")
+        };
+        let report = order_report(convert(amend)).expect("an amend report");
+        assert_eq!(report.order.quantity, Decimal::new(2, 3));
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
+            report.order.state
+        else {
+            panic!("expected Open, got {:?}", report.order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::new(15, 4));
+    }
+
+    /// Any order status that leaves the order nothing to fill ends it on an amend report, as on a
+    /// self-trade prevention one, with what filled.
+    #[test]
+    fn an_amend_with_any_status_that_leaves_nothing_to_fill_ends_the_order() {
+        for status in ["EXPIRED", "EXPIRED_IN_MATCH", "FILLED"] {
+            let amend = ExecutionReport {
+                order_status: Some(status.to_string()),
+                cumulative_filled_quantity: Some("0.002".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let event = sole_event(convert(amend)).expect("an amend that ends the order");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!(
+                    "X = {status}: expected OrderCancelled, got {:?}",
+                    event.kind
+                );
+            };
+            let Ok(cancelled) = response.state else {
+                panic!("X = {status}: expected Ok, got {:?}", response.state);
+            };
+            assert_eq!(
+                cancelled.filled_quantity,
+                Some(Decimal::new(2, 3)),
+                "X = {status}"
+            );
+        }
+    }
+
+    /// An amend whose order status (`X`) is neither live nor an end, or missing, could leave the
+    /// order live or end it, so it is reported as neither; so is one under a new client order id,
+    /// which the engine holds under its old id. Each is logged, and a renamed one that ended the
+    /// order says that it ended.
+    #[test]
+    fn an_amend_with_an_unknown_status_or_a_new_id_produces_nothing() {
+        let logged = |report: ExecutionReport| {
+            let (events, logs) = rustrade_instrument::test_utils::logs::capture(|| convert(report));
+            assert!(events.is_empty(), "{events:?}");
+            logs.iter()
+                .map(|event| event.message().to_string())
+                .collect::<Vec<_>>()
+        };
+        for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
+            let messages = logged(ExecutionReport {
+                order_status: status.map(str::to_string),
+                ..resting_report("REPLACED", "0.002")
+            });
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("neither live nor an end")),
+                "X = {status:?}: {messages:?}"
+            );
+        }
+        for (status, ended) in [("EXPIRED", true), ("NEW", false)] {
+            let messages = logged(ExecutionReport {
+                order_status: Some(status.to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            });
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("amended under a new client order id")),
+                "X = {status}: {messages:?}"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("ended - the engine still holds it as live")),
+                ended,
+                "X = {status}: {messages:?}"
+            );
+        }
+    }
+
     /// A report states its terms only when its time is the venue's, an amend's included. A limit
     /// price is stated only when the report carried one; a kind without a limit states that it
     /// has none. A zero quantity is not stated.

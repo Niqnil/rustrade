@@ -710,8 +710,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A Binance spot keep-priority amend that kept the client order id is reported as the order's
     new state**, on its new quantity, where it was logged and dropped. The stream's deduplication now
     tells a report's stated terms apart, so the amend is not taken for a replay of the order's
-    acknowledgement. An amend under a new client order id is still logged and dropped: the engine
-    knows the order by its old id.
+    acknowledgement. An amend down to the filled quantity or below ends the order: Binance sends
+    that one report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED`
+    report after it, so it is reported as `OrderCancelled` with what filled, as an `EXPIRED`
+    report is. Any order status that leaves the order nothing to fill (`EXPIRED`,
+    `EXPIRED_IN_MATCH`, `FILLED`) is read so, as on a self-trade prevention report. A same-id
+    amend whose order status is neither live nor one of those, or missing, is logged and dropped.
+    An amend under a new client order id is still logged and dropped, even one that ended the
+    order: the engine knows the order by its old id.
   - **Alpaca states the terms its reads carry.** An account-stream snapshot and an open order in
     `account_snapshot` state every term, less a limit price that does not parse and a time in
     force read as `Unreported`. One stamped with this host's clock, because Alpaca sent no time,
