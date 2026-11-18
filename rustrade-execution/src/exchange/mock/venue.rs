@@ -4595,9 +4595,9 @@ impl SimulatedVenue {
     ///
     /// # Errors
     /// [`AmendPatch::apply`]'s refusal, other than the quantity rule above; the venue's refusal;
-    /// [`AmendRefusal::Venue`] for a new client order id that already names an order resting
-    /// here; or for an order the venue no longer holds the reason a cancel would give. Each
-    /// changes nothing and reports nothing.
+    /// [`AmendRefusal::Venue`] for a new client order id that already names an order this venue
+    /// holds, queued or held for a later bar or a fresh market; or for an order the venue no
+    /// longer holds the reason a cancel would give. Each changes nothing and reports nothing.
     ///
     /// # Panics
     /// As [`amend_order`](Self::amend_order).
@@ -4616,7 +4616,7 @@ impl SimulatedVenue {
             && self.account.orders().contains(renamed)
         {
             return Err(OrderError::AmendRefused(AmendRefusal::Venue(format!(
-                "{renamed} already names an order resting on {}",
+                "{renamed} already names an order held on {}",
                 order.key.exchange
             ))));
         }
