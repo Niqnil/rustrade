@@ -273,8 +273,9 @@ pub(super) struct EventSink {
     /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
     /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
     ///
-    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` and `venue` are each taken and
-    /// released on their own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
+    /// Lock order: `revisions`, then `known`, then `tx`; `dedup`, `venue` and `clock` are each
+    /// taken and released on their own. Nothing takes `revisions` while holding another, nor
+    /// `known` while holding `tx`.
     revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
     /// The orders the client holds as live. Held across each send of an event it learns from,
     /// as the order check holds it across its own, so an order this stream reports ending and
@@ -284,6 +285,9 @@ pub(super) struct EventSink {
     /// IB's clock, from the times IB stamped on the executions the stream delivered. Taken and
     /// released on its own.
     venue: Arc<Mutex<VenueClock>>,
+    /// The client's order clock, which stamps a correction as it stamps the client's order
+    /// reports: IB gives a correction no time. Taken and released on its own.
+    clock: OrderClock,
 }
 
 /// The latest revision of an execution an [`EventSink`] delivered.
@@ -300,6 +304,7 @@ impl EventSink {
         tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
         dedup: SharedDedupCache,
         known: SharedKnownLiveOrders,
+        clock: OrderClock,
     ) -> Self {
         Self {
             tx: Arc::new(Mutex::new(Some(tx))),
@@ -307,6 +312,7 @@ impl EventSink {
             revisions: Arc::new(Mutex::new(LruCache::new(REVISIONS_REMEMBERED))),
             known,
             venue: Arc::new(Mutex::new(VenueClock::new())),
+            clock,
         }
     }
 
@@ -340,7 +346,8 @@ impl EventSink {
     /// consumer has gone.
     ///
     /// A correction (see [`ExecutionRevision`]) is sent as [`AccountEventKind::TradeAmended`],
-    /// [`Corrected`](TradeAmendmentKind::Corrected) with `trade` as the replacement. It names as
+    /// [`Corrected`](TradeAmendmentKind::Corrected) with `trade` as the replacement, stamped by
+    /// the client's [`OrderClock`] since IB gives a correction no time. It names as
     /// the original the latest revision this stream delivered. When it delivered none, because
     /// the execution predates the stream or has dropped out of what this sink remembers, it names
     /// the revision the correction's id says it corrects. Recovery passes an execution ahead of
@@ -391,7 +398,7 @@ impl EventSink {
                         trade.instrument.clone(),
                         trade.order_id.clone(),
                         // IB does not say when it corrected the execution.
-                        Utc::now(),
+                        self.clock.now(),
                         Some(original),
                         TradeAmendmentKind::Corrected { replacement: trade },
                     )),
@@ -1085,6 +1092,7 @@ mod tests {
             tx,
             crate::client::dedup::new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         assert_eq!(sink.venue_clock(), VenueClock::new());
 
@@ -1290,6 +1298,7 @@ mod tests {
                 tx,
                 new_dedup_cache(),
                 KnownLiveOrders::shared(ExchangeId::Ibkr),
+                OrderClock::default(),
             ),
             rx,
         )
@@ -1309,7 +1318,7 @@ mod tests {
 
         let known = KnownLiveOrders::shared(ExchangeId::Ibkr);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::new(tx, new_dedup_cache(), known.clone());
+        let sink = EventSink::new(tx, new_dedup_cache(), known.clone(), OrderClock::default());
         let snapshot = |cid: &str, state| {
             UnindexedAccountEvent::new(
                 ExchangeId::Ibkr,
@@ -1416,6 +1425,28 @@ mod tests {
 
     fn delivered_all(rx: &mut mpsc::UnboundedReceiver<UnindexedAccountEvent>) -> Vec<String> {
         drain(rx).into_iter().map(delivered).collect()
+    }
+
+    /// A correction is stamped by the client's order clock, so it is never stamped earlier than a
+    /// report the client stamped before it, even with the wall clock stepped back.
+    #[test]
+    fn a_correction_is_stamped_by_the_order_clock() {
+        let later = Utc::now() + chrono::TimeDelta::hours(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::new(
+            tx,
+            new_dedup_cache(),
+            KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::stamped_at(later),
+        );
+        assert!(sink.send_execution(trade("x.01.01")));
+        assert!(sink.send_execution(trade("x.01.02")));
+
+        let events = drain(&mut rx);
+        let AccountEventKind::TradeAmended(amendment) = &events[1].kind else {
+            panic!("expected an amendment, got {events:?}");
+        };
+        assert_eq!(amendment.time_exchange, later);
     }
 
     #[test]

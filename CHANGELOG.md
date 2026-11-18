@@ -794,9 +794,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     They state none. A tracked order whose listed terms do not read back keeps the terms held,
     and a tracked trailing stop-limit keeps the stop held for it.
   - **IBKR stamps the order reports it times itself with this host's clock held so that it never
-    goes back** (statuses, placement and cancel answers, open-order listings, and an ended order IB
-    lists without a completion time), across the client's threads, so a wall-clock step back
-    cannot stamp a later report earlier.
+    goes back** (statuses, placement and cancel answers, open-order listings, an ended order IB
+    lists without a completion time, and the `TradeAmended` of a corrected execution), across the
+    client's threads, so a wall-clock step back cannot stamp a later report earlier.
   - **Every other producer states no term yet**, the engine's own snapshots included. The engine
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").

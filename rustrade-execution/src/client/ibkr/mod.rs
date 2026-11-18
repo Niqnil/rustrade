@@ -2952,6 +2952,8 @@ impl ExecutionClient for IbkrClient {
     /// only in the digits after the final period (`….01.02` corrects `….01.01`).
     /// It is sent as `AccountEventKind::TradeAmended`, `Corrected`, with the
     /// correction as the replacement `Trade`, once its commission report arrives.
+    /// IB gives a correction no time, so its `time_exchange` is this host's, on
+    /// the clock the client stamps its order reports with, which never goes back.
     /// Its `original` is the revision this stream delivered before, or, for an
     /// execution from before the stream, the revision the correction's id says
     /// it corrects. A revision older than one already delivered is dropped.
@@ -3042,7 +3044,12 @@ impl ExecutionClient for IbkrClient {
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let sink = recovery::EventSink::new(tx, new_dedup_cache(), self.known_live.clone());
+        let sink = recovery::EventSink::new(
+            tx,
+            new_dedup_cache(),
+            self.known_live.clone(),
+            self.clock.clone(),
+        );
 
         // Spawned before the reader: if the reader fails to spawn, `rx` drops with the error and
         // the watcher sees its consumer gone.
@@ -5205,6 +5212,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         sink.terminate(StreamTerminationReason::Error("recovery failed".into()));
 
@@ -5218,6 +5226,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         drop(rx);
 
@@ -5242,6 +5251,7 @@ mod order_reader_tests {
                 tx,
                 new_dedup_cache(),
                 KnownLiveOrders::shared(ExchangeId::Ibkr),
+                OrderClock::default(),
             );
             let order_ids = OrderIdMap::new();
             let cid = ClientOrderId::new("cid-7");
@@ -5290,6 +5300,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         let order_ids = OrderIdMap::new();
         let cid = ClientOrderId::new("cid-7");
@@ -5341,6 +5352,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         let order_ids = OrderIdMap::new();
         let cid = ClientOrderId::new("reused");
@@ -5466,6 +5478,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
         reader(scope(0), &contracts, &order_ids).forward(
             [
@@ -5506,6 +5519,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
 
         let mut updates = unforwarded(1);
@@ -5531,6 +5545,7 @@ mod order_reader_tests {
             tx,
             new_dedup_cache(),
             KnownLiveOrders::shared(ExchangeId::Ibkr),
+            OrderClock::default(),
         );
 
         assert_eq!(run(&sink, unforwarded(3)), 3);
@@ -6523,6 +6538,7 @@ mod order_reader_tests {
                 tx,
                 new_dedup_cache(),
                 KnownLiveOrders::shared(ExchangeId::Ibkr),
+                OrderClock::default(),
             );
             reader(scope(CLIENT), &contracts(), &order_ids).forward(updates, &sink);
             let mut reports = Vec::new();
