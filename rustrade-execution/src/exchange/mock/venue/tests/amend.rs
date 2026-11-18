@@ -1478,6 +1478,38 @@ fn a_rename_onto_a_resting_order_is_refused_and_onto_its_own_id_keeps_it() {
     assert_eq!(reported.replaces, None);
 }
 
+/// A rename onto the client order id of an order that has ended forgets how that one ended, as
+/// placing a new order under it does: the id names the renamed order alone, listed once, as open.
+#[test]
+fn a_rename_onto_an_ended_orders_id_forgets_how_that_one_ended() {
+    let mut venue = resting_buy();
+    let _ = venue.open_order(limit_request("renamed", Side::Buy, "1", "46000", gtc()));
+    assert!(cancel(&mut venue, "renamed").response.state.is_ok());
+    let key = limit_request("renamed", Side::Buy, "1", "48000", gtc()).key;
+    assert_eq!(venue.orders_ended(std::slice::from_ref(&key)).len(), 1);
+
+    venue
+        .modify_externally(
+            &cid("resting"),
+            ExternalChange::new(quantity("0.5")).with_cid(cid("renamed")),
+        )
+        .unwrap();
+
+    assert!(venue.orders_ended(&[key]).is_empty());
+    let listed: Vec<_> = venue
+        .account_snapshot()
+        .instruments
+        .iter()
+        .flat_map(|instrument| &instrument.orders)
+        .filter(|report| report.order.key.cid == cid("renamed"))
+        .map(|report| report.order.state.clone())
+        .collect();
+    assert!(
+        matches!(listed.as_slice(), [OrderState::Active(_)]),
+        "{listed:?}"
+    );
+}
+
 /// A rename on a venue that also reassigns the venue order id links both old ids; restarted, the
 /// order under its old venue order id is reported ended under its old client order id.
 #[test]
