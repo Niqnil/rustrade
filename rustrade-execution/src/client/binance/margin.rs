@@ -2919,7 +2919,7 @@ async fn recover_margin_ended_orders(
                 is_isolated,
             )
         },
-        |key| {
+        |key, _| {
             // Held as live, so the client knows its kind, which the row may not show.
             let recorded_kind = known.lock().kind_of(&key.cid);
             fetch_margin_order_lookup(

@@ -139,10 +139,23 @@
 //!   amend's own report links the two ids, and Binance no longer finds the order by the old one.
 //! - **An amend down to the filled quantity or below** ends the order, in the amend's own report:
 //!   it is reported ended as [`Expired`](crate::order::state::Expired), with what filled.
-//! - **Known limitation: a rename made while the stream was disconnected is not learned.** A
-//!   reconnect asks Binance about the order by the client order id it was held under, finds none,
-//!   and stops holding it, reporting nothing. The open-order listing then shows the order under its
-//!   new id, unlinked, as an order the reader did not place.
+//! - **A rename made while the stream was disconnected** is followed by the reconnect's check of
+//!   the orders held as live, which reports the order under its new id, linked to the order held,
+//!   as the stream would have:
+//!   - **listed open** under a new client order id, with the venue order id held for the order:
+//!     from the open-order listing, with no further request;
+//!   - **not listed**, live or ended: Binance answers the client order id held with `-2013`, so the
+//!     order is looked up by the venue order id held (weight 4 more), and found there under its
+//!     new client order id.
+//!
+//!   An order held without its venue order id, as one whose placement the stream never confirmed,
+//!   cannot be found so, and is dropped as one Binance does not know, with a warning.
+//!   [`OrderStatusClient::fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders)
+//!   leaves such a renamed order out (see [`BinanceSpot`]'s implementation).
+//! - **A client order id a rename left can be reused.** Binance accepts a new order under it,
+//!   even while the renamed order is open, and a lookup by it then finds the new order. So a
+//!   lookup by client order id that finds an order under another venue order id than the one held
+//!   is not taken for the order held, which is looked up by its venue order id instead.
 //!
 //! # Signed requests are stamped on Binance's clock
 //!

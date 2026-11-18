@@ -3967,7 +3967,7 @@ async fn recover_alpaca_ended_orders(
                 instruments,
             )
         },
-        |key| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
+        |key, _| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
     )
     .await;
 }

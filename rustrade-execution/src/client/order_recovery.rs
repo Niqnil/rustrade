@@ -5,7 +5,8 @@
 //! when an order was created, so a window opening at the disconnect misses an order placed before
 //! it. So the client keeps the orders it knows to be live ([`KnownLiveOrders`]), and after a
 //! reconnect lists the open orders of each instrument it holds one on and asks about each held
-//! order no longer listed, by client order id ([`recover_ended_orders`]). [`UncheckedOrders`] holds
+//! order no longer listed ([`recover_ended_orders`]), following one the venue renamed meanwhile
+//! where the listing or the lookup shows it under a new client order id. [`UncheckedOrders`] holds
 //! which instruments still need that check, and when a failed one is retried. [`fetch_ended_by_key`]
 //! answers [`OrderStatusClient`](crate::client::OrderStatusClient) with the same lookup.
 //!
@@ -18,7 +19,7 @@ use crate::{
     order::{
         OrderKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
-        report::{OrderReport, Replaces},
+        report::{OrderReport, Replaces, UnindexedOrderReport},
         state::{ActiveOrderState, Open, OrderState, UnindexedOrderState},
     },
 };
@@ -761,6 +762,32 @@ impl KnownLiveOrders {
             .collect()
     }
 
+    /// The orders held as live on `instrument`, under `exchange`, each with its venue order id
+    /// where known, for a reconnect's check (see [`keys_on`](Self::keys_on)).
+    fn held_on(&self, exchange: ExchangeId, instrument: &InstrumentNameExchange) -> Vec<HeldOrder> {
+        self.keys_on(exchange, instrument)
+            .into_iter()
+            .map(|key| {
+                let order_id = self.order_id_of(&key.cid);
+                HeldOrder { key, order_id }
+            })
+            .collect()
+    }
+
+    /// The venue order id of the order held as live under `cid`, where known.
+    // Only Binance spot looks an order up by the venue order id it holds.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    pub(crate) fn order_id_of(&self, cid: &ClientOrderId) -> Option<OrderId> {
+        self.orders
+            .get(cid)
+            .and_then(|known| known.order_id.clone())
+    }
+
+    /// Whether an order is held as live under `cid`.
+    fn holds(&self, cid: &ClientOrderId) -> bool {
+        self.orders.contains_key(cid)
+    }
+
     fn remove(&mut self, cid: &ClientOrderId) -> bool {
         let Some(known) = self.orders.remove(cid) else {
             return false;
@@ -945,14 +972,84 @@ pub(crate) enum OrderLookup {
     NotEnded,
     /// The venue does not know the order under the key's instrument.
     Unknown,
+    /// The venue now knows the order under another client order id, as a replace or an amend
+    /// under a new client order id leaves it. The report is the order as the venue holds it now,
+    /// live or ended, under its new key, and [`replaces`](OrderReport::replaces) names the order
+    /// asked about: its client order id, and the venue order id it was held under. Boxed, as the
+    /// other variants carry little.
+    // Only Binance spot follows a rename in a lookup.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    Replaced(Box<UnindexedOrderReport>),
 }
 
 impl OrderLookup {
-    /// How the order ended, if it has.
+    /// How the order ended, if it has, under the key it was asked about.
+    ///
+    /// `None` for an order the venue now knows under another client order id
+    /// ([`Replaced`](Self::Replaced)), ended or not: an order reported under the key asked about
+    /// must be the order that key names, and the venue no longer knows it by that key.
     pub(crate) fn ended(self) -> Option<UnindexedInactiveOrder> {
         match self {
             Self::Ended(order) => Some(*order),
-            Self::NotEnded | Self::Unknown => None,
+            Self::NotEnded | Self::Unknown | Self::Replaced(_) => None,
+        }
+    }
+}
+
+/// An order held as live, as a reconnect's check asks about it: its key, and its venue order id
+/// where known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldOrder {
+    pub(crate) key: UnindexedOrderKey,
+    pub(crate) order_id: Option<OrderId>,
+}
+
+/// The open orders a listing shows, for a reconnect's check.
+///
+/// Built from the listed orders' reports where the venue's listing gives them
+/// ([`extend`](Self::extend)), or from their client order ids alone (`From`). Only a listing of
+/// reports lets the check follow an order renamed while the stream was disconnected: a listed
+/// order whose venue order id is held under another client order id, or whose report links the
+/// order it replaces. A listing of ids alone shows which held orders are still listed, and
+/// nothing more.
+#[derive(Debug, Default)]
+pub(crate) struct Listed {
+    cids: FnvHashSet<ClientOrderId>,
+    /// The venue order ids of the listed reports, by instrument.
+    ids: FnvHashSet<(InstrumentNameExchange, OrderId)>,
+    reports: Vec<UnindexedOrderReport>,
+}
+
+impl Listed {
+    /// Add these open orders' reports to the listing.
+    // Only Binance spot lists reports.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    pub(crate) fn extend(&mut self, reports: impl IntoIterator<Item = UnindexedOrderReport>) {
+        for report in reports {
+            self.cids.insert(report.order.key.cid.clone());
+            if let Some(id) = reported_id(&report.order.state) {
+                self.ids.insert((report.order.key.instrument.clone(), id));
+            }
+            self.reports.push(report);
+        }
+    }
+
+    /// Whether the listing shows `held` live: under its client order id, or, in a listing of
+    /// reports, under its venue order id, whatever client order id it is listed under.
+    fn shows(&self, held: &HeldOrder) -> bool {
+        self.cids.contains(&held.key.cid)
+            || held.order_id.as_ref().is_some_and(|id| {
+                self.ids
+                    .contains(&(held.key.instrument.clone(), id.clone()))
+            })
+    }
+}
+
+impl From<FnvHashSet<ClientOrderId>> for Listed {
+    fn from(cids: FnvHashSet<ClientOrderId>) -> Self {
+        Self {
+            cids,
+            ..Self::default()
         }
     }
 }
@@ -990,7 +1087,17 @@ where
     let mut reported = FnvHashSet::default();
     Ok(found
         .into_iter()
-        .filter_map(OrderLookup::ended)
+        .filter_map(|found| {
+            if let OrderLookup::Replaced(report) = &found {
+                debug!(
+                    instrument = %report.order.key.instrument,
+                    cid = %report.order.key.cid,
+                    replaces = ?report.replaces,
+                    "Order asked about is now known under another client order id; not reported"
+                );
+            }
+            found.ended()
+        })
         .filter(|order| reported.insert(order.key.cid.clone()))
         .collect())
 }
@@ -1019,11 +1126,27 @@ pub(crate) enum OpenListing {
 ///
 /// Checks only an instrument with no fills pending (see [`UncheckedOrders`]), so an order's
 /// recovered fills reach the stream before how it ended. It lists the open orders with
-/// `list_open`, which returns the client order ids listed on the instruments it is given, one
+/// `list_open`, which returns what is listed on the instruments it is given ([`Listed`]), one
 /// instrument or all of them at a time as `listing` says, and looks up with `lookup` each order
-/// held as live that the listing no longer shows: one request per listing plus one per order that
-/// ended, rather than one per order held. The orders held are read before the listings, so one
-/// placed after a listing cannot be taken for one that ended.
+/// held as live that the listing no longer shows, giving it the order's key and the venue order id
+/// held for it: one request per listing plus one per order that ended, rather than one per order
+/// held. The orders held are read before the listings, so one placed after a listing cannot be
+/// taken for one that ended.
+///
+/// An order renamed while the stream was disconnected, under a new client order id, is followed
+/// where the venue says so:
+/// - **From a listing of reports**: a listed order whose report links the order it replaces, or
+///   whose venue order id is held under another client order id, is sent as an
+///   [`AccountEventKind::OrderSnapshot`] linked to the order held
+///   ([`OrderReport::replaces`]), which moves to the new id, and the order held is not looked up.
+///   Not when the stream already followed the rename, or an order is already held, or was seen
+///   to end, under the new id. A listing of ids alone links nothing.
+/// - **From a lookup** answering [`OrderLookup::Replaced`]: its report is sent as it is, unless
+///   the order asked about is no longer held.
+///
+/// An order held without a venue order id, as one whose placement the stream never confirmed, can
+/// be linked only by a report that names its client order id. Otherwise its rename cannot be
+/// told from its end, and it is dropped as one the venue does not know, as below.
 ///
 /// Each order that has ended is sent as an [`AccountEventKind::OrderSnapshot`] of its inactive
 /// state, under [`StrategyId::unknown`], and leaves the set. One the stream reported ending in the
@@ -1048,7 +1171,7 @@ pub(crate) enum OpenListing {
 /// the venue's refusals in this check asked for, since a request sent sooner would be refused too.
 /// A longer wait read after an instrument was charged still holds it back, unless the check is
 /// dropped first.
-pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
+pub(crate) async fn recover_ended_orders<L, LFut, LT, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
     unchecked: &mut UncheckedOrders,
@@ -1059,8 +1182,9 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     lookup: Q,
 ) where
     L: Fn(Vec<InstrumentNameExchange>) -> LFut,
-    LFut: Future<Output = Result<FnvHashSet<ClientOrderId>, UnindexedClientError>>,
-    Q: Fn(UnindexedOrderKey) -> QFut,
+    LFut: Future<Output = Result<LT, UnindexedClientError>>,
+    LT: Into<Listed>,
+    Q: Fn(UnindexedOrderKey, Option<OrderId>) -> QFut,
     QFut: Future<Output = Result<OrderLookup, UnindexedClientError>>,
 {
     use futures::StreamExt as _;
@@ -1069,13 +1193,13 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     if ready.is_empty() {
         return;
     }
-    let mut held: Vec<(InstrumentNameExchange, Vec<UnindexedOrderKey>)> = {
+    let mut held: Vec<(InstrumentNameExchange, Vec<HeldOrder>)> = {
         let known = known.lock();
         ready
             .into_iter()
             .map(|instrument| {
-                let keys = known.keys_on(exchange, &instrument);
-                (instrument, keys)
+                let orders = known.held_on(exchange, &instrument);
+                (instrument, orders)
             })
             .collect()
     };
@@ -1096,7 +1220,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     );
 
     // One check per listing.
-    let checks: Vec<Vec<(InstrumentNameExchange, Vec<UnindexedOrderKey>)>> = match listing {
+    let checks: Vec<Vec<(InstrumentNameExchange, Vec<HeldOrder>)>> = match listing {
         OpenListing::PerInstrument => held.into_iter().map(|one| vec![one]).collect(),
         OpenListing::Batched => vec![held],
     };
@@ -1135,25 +1259,31 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                             Err(UnindexedClientError::Api(ApiError::rate_limited(None))),
                         );
                     }
-                    let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
-                    let listed = match list_open(listed_on).await {
-                        Ok(listed) => listed,
+                    let (listed_on, held): (Vec<_>, Vec<_>) = check.into_iter().unzip();
+                    let listed: Listed = match list_open(listed_on).await {
+                        Ok(listed) => listed.into(),
                         Err(e) => {
                             throttled.note(&e);
                             return (index, Err(e));
                         }
                     };
-                    let unlisted: Vec<UnindexedOrderKey> = keys
+                    let mut checked = CheckedListing::default();
+                    let Some((sent, followed)) = follow_listed(exchange, known, &listed, tx) else {
+                        checked.consumer_gone = true;
+                        return (index, Ok(checked));
+                    };
+                    checked.sent += sent;
+                    let unlisted: Vec<HeldOrder> = held
                         .into_iter()
                         .flatten()
-                        .filter(|key| !listed.contains(&key.cid))
+                        .filter(|held| !listed.shows(held) && !followed.contains(&held.key.cid))
                         .collect();
                     // How many lookups each instrument has still to settle, so a check stopped
                     // for the rate limit charges those it never started.
                     let mut unsettled: FnvHashMap<InstrumentNameExchange, usize> =
                         FnvHashMap::default();
-                    for key in &unlisted {
-                        *unsettled.entry(key.instrument.clone()).or_default() += 1;
+                    for held in &unlisted {
+                        *unsettled.entry(held.key.instrument.clone()).or_default() += 1;
                     }
                     // Each lookup is settled as it ends, so one that fails, or a pass that times
                     // out, loses none of those already answered. Once the venue has refused one
@@ -1161,12 +1291,11 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     // already started are settled as they answer.
                     let mut lookups = futures::stream::iter(unlisted)
                         .take_while(|_| std::future::ready(!throttled.stopped()))
-                        .map(|key| async move {
-                            let found = lookup(key.clone()).await;
-                            (key, found)
+                        .map(|held| async move {
+                            let found = lookup(held.key.clone(), held.order_id).await;
+                            (held.key, found)
                         })
                         .buffer_unordered(ORDER_LOOKUPS_IN_FLIGHT);
-                    let mut checked = CheckedListing::default();
                     while let Some((key, found)) = lookups.next().await {
                         if let Some(left) = unsettled.get_mut(&key.instrument) {
                             *left -= 1;
@@ -1387,6 +1516,103 @@ fn settle(
             Some(0)
         }
         OrderLookup::NotEnded => Some(0),
+        OrderLookup::Replaced(report) => {
+            // The stream followed the rename, or saw the order end, while this looked it up.
+            if !known.holds(&key.cid) {
+                return Some(0);
+            }
+            let event = UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::OrderSnapshot(Snapshot::new(*report)),
+            );
+            known.observe(&event);
+            tx.send_event(event).then_some(1)
+        }
+    }
+}
+
+/// Follow each order in `listed` that the venue renamed while the stream was disconnected: one
+/// whose report links the order it replaces, or whose venue order id is held under another client
+/// order id (see [`recover_ended_orders`]). Sends each as an [`AccountEventKind::OrderSnapshot`]
+/// linked to the order held, which [`KnownLiveOrders::observe`] moves to the new id.
+///
+/// Returns how many it sent, and the client order ids of the orders held that the listing shows
+/// under another id, linked now or followed by the stream already, which need no lookup. `None`
+/// if the consumer is gone.
+///
+/// The set's lock is held across each send, as [`settle`] holds it.
+fn follow_listed(
+    exchange: ExchangeId,
+    known: &SharedKnownLiveOrders,
+    listed: &Listed,
+    tx: &impl EventSender,
+) -> Option<(u32, FnvHashSet<ClientOrderId>)> {
+    let mut sent = 0;
+    let mut followed = FnvHashSet::default();
+    for report in &listed.reports {
+        let key = &report.order.key;
+        let mut known = known.lock();
+        let link = match &report.replaces {
+            Some(replaces) => {
+                let old = replaces.cid.clone().or_else(|| {
+                    known
+                        .by_order_id
+                        .get(&(key.instrument.clone(), replaces.id.clone()))
+                        .cloned()
+                });
+                old.map(|old| (old, replaces.id.clone()))
+            }
+            None => reported_id(&report.order.state).and_then(|id| {
+                known
+                    .by_order_id
+                    .get(&(key.instrument.clone(), id.clone()))
+                    .map(|old| (old.clone(), id))
+            }),
+        };
+        let Some((old, id)) = link.filter(|(old, _)| *old != key.cid) else {
+            continue;
+        };
+        // Followed by the stream already: nothing to send, nothing to look up.
+        if !known.holds(&old) {
+            followed.insert(old);
+            continue;
+        }
+        // An order already held, or seen to end, under the new id is left to the lookup of the
+        // order held, which settles it as the stream would.
+        if known.holds(&key.cid) || known.recently_ended.contains(&key.cid) {
+            continue;
+        }
+        followed.insert(old.clone());
+        debug!(
+            %exchange,
+            instrument = %key.instrument,
+            cid = %key.cid,
+            replaced_cid = %old,
+            replaced_id = %id,
+            "An order held as live is listed under a new client order id; following it"
+        );
+        let event = UnindexedAccountEvent::new(
+            exchange,
+            AccountEventKind::OrderSnapshot(Snapshot::new(
+                report
+                    .clone()
+                    .with_replaces(Replaces::new(id).with_cid(old)),
+            )),
+        );
+        known.observe(&event);
+        if !tx.send_event(event) {
+            return None;
+        }
+        sent += 1;
+    }
+    Some((sent, followed))
+}
+
+/// The venue order id a live report names, if the venue assigned one.
+fn reported_id(state: &UnindexedOrderState) -> Option<OrderId> {
+    match state {
+        OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
+        _ => None,
     }
 }
 
@@ -2679,7 +2905,7 @@ pub(crate) mod tests {
                 }
                 Ok(FnvHashSet::default())
             },
-            |key: UnindexedOrderKey| async move {
+            |key: UnindexedOrderKey, _| async move {
                 Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
             },
         )
@@ -2708,11 +2934,11 @@ pub(crate) mod tests {
                 }
                 // SLOW's listing is in flight before AAA's is refused.
                 tokio::task::yield_now().await;
-                Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                Err::<Listed, _>(UnindexedClientError::Api(ApiError::rate_limited(Some(
                     long,
                 ))))
             },
-            |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+            |_: UnindexedOrderKey, _| async { panic!("nothing listed, nothing looked up") },
         )
         .await;
 
@@ -2826,7 +3052,7 @@ pub(crate) mod tests {
                 assert_eq!(instruments.len(), 2, "one listing of both");
                 async { Ok(FnvHashSet::default()) }
             },
-            |key: UnindexedOrderKey| async move {
+            |key: UnindexedOrderKey, _| async move {
                 if key.cid.0 == "btc-failing" {
                     Err(UnindexedClientError::Connectivity(
                         ConnectivityError::Timeout,
@@ -2899,7 +3125,7 @@ pub(crate) mod tests {
                 listings.fetch_add(1, Ordering::Relaxed);
                 async { Ok(FnvHashSet::default()) }
             },
-            |_| {
+            |_, _| {
                 lookups.fetch_add(1, Ordering::Relaxed);
                 async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
@@ -2932,7 +3158,7 @@ pub(crate) mod tests {
             &tx,
             OpenListing::PerInstrument,
             |_| async { Ok(FnvHashSet::default()) },
-            move |_| async move {
+            move |_, _| async move {
                 Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
                     wait,
                 ))))
@@ -2985,7 +3211,7 @@ pub(crate) mod tests {
                         // AAA's failure is read first.
                         if instruments[0].name().as_str() == "AAA" {
                             tokio::task::yield_now().await;
-                            return Err(first);
+                            return Err::<Listed, _>(first);
                         }
                         for _ in 0..3 {
                             tokio::task::yield_now().await;
@@ -2995,7 +3221,7 @@ pub(crate) mod tests {
                         ))))
                     }
                 },
-                |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+                |_: UnindexedOrderKey, _| async { panic!("nothing listed, nothing looked up") },
             )
             .await;
 
@@ -3070,7 +3296,7 @@ pub(crate) mod tests {
             &tx,
             OpenListing::Batched,
             |_| async { Ok(FnvHashSet::default()) },
-            |_| {
+            |_, _| {
                 lookups.fetch_add(1, Ordering::Relaxed);
                 async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
@@ -3105,7 +3331,7 @@ pub(crate) mod tests {
             &tx,
             OpenListing::Batched,
             |_| async { Ok(FnvHashSet::default()) },
-            |key: UnindexedOrderKey| {
+            |key: UnindexedOrderKey, _| {
                 let first = lookups.fetch_add(1, Ordering::Relaxed) == 0;
                 async move {
                     // Every lookup answers later, so all those started are sent before the
@@ -3154,9 +3380,9 @@ pub(crate) mod tests {
             OpenListing::PerInstrument,
             |_| {
                 listings.fetch_add(1, Ordering::Relaxed);
-                async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
+                async { Err::<Listed, _>(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
-            |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+            |_: UnindexedOrderKey, _| async { panic!("nothing listed, nothing looked up") },
         )
         .await;
 
@@ -3184,7 +3410,7 @@ pub(crate) mod tests {
                 std::future::pending::<()>().await;
                 Ok(FnvHashSet::default())
             },
-            |_: UnindexedOrderKey| async { Ok(OrderLookup::NotEnded) },
+            |_: UnindexedOrderKey, _| async { Ok(OrderLookup::NotEnded) },
         )
         .await;
 
@@ -3207,5 +3433,318 @@ pub(crate) mod tests {
                 "{instrument} has failed once"
             );
         }
+    }
+
+    // ---- Renames missed while disconnected --------------------------------------------------
+
+    /// The report `snapshot`'s event carries.
+    fn report(
+        key: UnindexedOrderKey,
+        state: OrderState<AssetNameExchange, InstrumentNameExchange>,
+    ) -> UnindexedOrderReport {
+        match snapshot(key, state).kind {
+            AccountEventKind::OrderSnapshot(Snapshot(report)) => report,
+            _ => unreachable!("snapshot builds an order snapshot"),
+        }
+    }
+
+    fn live_state(order_id: &str) -> OrderState<AssetNameExchange, InstrumentNameExchange> {
+        OrderState::Active(ActiveOrderState::Open(open(order_id, Decimal::ZERO)))
+    }
+
+    fn cancelled_state(order_id: &str) -> OrderState<AssetNameExchange, InstrumentNameExchange> {
+        OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled::new(
+            OrderId::new(order_id),
+            Utc::now(),
+            Some(Decimal::ZERO),
+        )))
+    }
+
+    /// The order `old` held on BTCUSDT under venue order id 7, due for a check.
+    fn held_old() -> (SharedKnownLiveOrders, UncheckedOrders) {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        known.lock().live(
+            &key("BTCUSDT", "old"),
+            dec!(2),
+            OrderKind::Limit,
+            &open("7", Decimal::ZERO),
+        );
+        let mut unchecked = UncheckedOrders::default();
+        unchecked.open([InstrumentNameExchange::new("BTCUSDT")]);
+        (known, unchecked)
+    }
+
+    /// Run a check whose listing shows `listed`, after `before_listing` has run on the set, and
+    /// whose lookups answer with `lookup`. Returns the events sent and the keys looked up, each
+    /// with the venue order id it was given.
+    async fn check_listed(
+        known: &SharedKnownLiveOrders,
+        unchecked: &mut UncheckedOrders,
+        listed: Vec<UnindexedOrderReport>,
+        before_listing: impl Fn(&mut KnownLiveOrders),
+        lookup: impl Fn(&SharedKnownLiveOrders, &UnindexedOrderKey) -> OrderLookup,
+    ) -> (
+        Vec<UnindexedAccountEvent>,
+        Vec<(ClientOrderId, Option<OrderId>)>,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let (listed, asked_ref, lookup, before_listing) =
+            (&listed, &asked, &lookup, &before_listing);
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            known,
+            unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |_: Vec<InstrumentNameExchange>| async move {
+                before_listing(&mut known.lock());
+                let mut shown = Listed::default();
+                shown.extend(listed.iter().cloned());
+                Ok::<_, UnindexedClientError>(shown)
+            },
+            |key: UnindexedOrderKey, held: Option<OrderId>| async move {
+                asked_ref.lock().unwrap().push((key.cid.clone(), held));
+                Ok(lookup(known, &key))
+            },
+        )
+        .await;
+        let sent = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        (sent, asked.into_inner().unwrap())
+    }
+
+    /// The one order snapshot in `sent`.
+    fn only_report(sent: &[UnindexedAccountEvent]) -> &UnindexedOrderReport {
+        match sent {
+            [
+                UnindexedAccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(report)),
+                    ..
+                },
+            ] => report,
+            _ => panic!("one order snapshot: {sent:?}"),
+        }
+    }
+
+    /// A listed order whose venue order id is held under another client order id is the order
+    /// held, renamed: it is sent linked to the order held, which moves to the new id, and is not
+    /// looked up.
+    #[tokio::test]
+    async fn a_listed_order_under_a_new_client_order_id_is_followed_without_a_lookup() {
+        let (known, mut unchecked) = held_old();
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(key("BTCUSDT", "new"), live_state("7"))],
+            |_| {},
+            |_, key| panic!("{key:?} is listed under its new id, not looked up"),
+        )
+        .await;
+
+        let linked = only_report(&sent);
+        assert_eq!(linked.order.key.cid, ClientOrderId::new("new"));
+        assert_eq!(
+            linked.replaces,
+            Some(Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")))
+        );
+        assert!(asked.is_empty());
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("new")));
+        assert!(!known.contains(&ClientOrderId::new("old")));
+        known.assert_consistent();
+        drop(known);
+        assert!(unchecked.is_empty());
+    }
+
+    /// A listed report already linking the order it replaces, by venue order id alone and under a
+    /// new venue order id, is sent linked to the order held under that id.
+    #[tokio::test]
+    async fn a_listed_report_linking_the_order_it_replaces_is_followed() {
+        let (known, mut unchecked) = held_old();
+        let replacement = report(key("BTCUSDT", "new"), live_state("9"))
+            .with_replaces(Replaces::new(OrderId::new("7")));
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![replacement],
+            |_| {},
+            |_, key| panic!("{key:?} is listed as replaced, not looked up"),
+        )
+        .await;
+
+        assert_eq!(
+            only_report(&sent).replaces,
+            Some(Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")))
+        );
+        assert!(asked.is_empty());
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("new")));
+        assert!(!known.contains(&ClientOrderId::new("old")));
+        known.assert_consistent();
+    }
+
+    /// A rename the stream followed while the listing was read is not sent again, and the old id
+    /// is not looked up.
+    #[tokio::test]
+    async fn a_listed_rename_the_stream_followed_is_not_sent_again() {
+        let (known, mut unchecked) = held_old();
+        let new = key("BTCUSDT", "new");
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(new.clone(), live_state("7"))],
+            |known| {
+                known.observe(&linked(
+                    new.clone(),
+                    live_state("7"),
+                    Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")),
+                ));
+            },
+            |_, key| panic!("{key:?} was followed by the stream, not looked up"),
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(asked.is_empty());
+        assert!(known.lock().contains(&new.cid));
+    }
+
+    /// A listed order under a client order id already held is not taken for the order held under
+    /// its venue order id, which is not linked to it. The listing shows that order live by its
+    /// venue order id, so it is not looked up either, and both stay held.
+    #[tokio::test]
+    async fn a_listed_order_under_an_id_already_held_is_not_linked() {
+        let (known, mut unchecked) = held_old();
+        let new = key("BTCUSDT", "new");
+        known
+            .lock()
+            .live(&new, dec!(2), OrderKind::Limit, &open("9", Decimal::ZERO));
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(new.clone(), live_state("7"))],
+            |_| {},
+            |_, key| panic!("{key:?} is listed by its venue order id, not looked up"),
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(asked.is_empty());
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("old")));
+        assert!(known.contains(&new.cid));
+    }
+
+    /// An order held under a venue order id the listing does not show is looked up with that id.
+    #[tokio::test]
+    async fn an_unlisted_order_is_looked_up_with_its_venue_order_id() {
+        let (known, mut unchecked) = held_old();
+
+        let (sent, asked) = check_listed(
+            &known,
+            &mut unchecked,
+            vec![report(key("BTCUSDT", "other"), live_state("8"))],
+            |_| {},
+            |_, _| OrderLookup::NotEnded,
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(
+            asked,
+            [(ClientOrderId::new("old"), Some(OrderId::new("7")))]
+        );
+    }
+
+    /// A lookup finding the order under another client order id sends its report, live or
+    /// ended, and the set follows it: held under the new id while live, held under neither once
+    /// ended.
+    #[tokio::test]
+    async fn a_lookup_finding_the_order_renamed_sends_it_linked() {
+        for ended in [false, true] {
+            let (known, mut unchecked) = held_old();
+            let state = if ended {
+                cancelled_state("7")
+            } else {
+                live_state("7")
+            };
+            let link = Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old"));
+            let found = report(key("BTCUSDT", "new"), state).with_replaces(link.clone());
+
+            let (sent, asked) = check_listed(
+                &known,
+                &mut unchecked,
+                Vec::new(),
+                |_| {},
+                |_, _| OrderLookup::Replaced(Box::new(found.clone())),
+            )
+            .await;
+
+            assert_eq!(only_report(&sent), &found, "ended: {ended}");
+            assert_eq!(
+                asked,
+                [(ClientOrderId::new("old"), Some(OrderId::new("7")))]
+            );
+            let known = known.lock();
+            assert!(
+                !known.contains(&ClientOrderId::new("old")),
+                "ended: {ended}"
+            );
+            assert_eq!(
+                known.contains(&ClientOrderId::new("new")),
+                !ended,
+                "ended: {ended}"
+            );
+            known.assert_consistent();
+        }
+    }
+
+    /// A rename the stream followed while the lookup ran is not sent again.
+    #[tokio::test]
+    async fn a_lookup_finding_a_rename_the_stream_followed_sends_nothing() {
+        let (known, mut unchecked) = held_old();
+        let new = key("BTCUSDT", "new");
+        let link = Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old"));
+
+        let (sent, _) = check_listed(
+            &known,
+            &mut unchecked,
+            Vec::new(),
+            |_| {},
+            |known, _| {
+                known
+                    .lock()
+                    .observe(&linked(new.clone(), live_state("7"), link.clone()));
+                OrderLookup::Replaced(Box::new(
+                    report(new.clone(), live_state("7")).with_replaces(link.clone()),
+                ))
+            },
+        )
+        .await;
+
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(known.lock().contains(&new.cid));
+    }
+
+    /// `fetch_ended_orders` reports an order only under the key it was asked for, so one the
+    /// venue now knows under another client order id is left out, ended or not.
+    #[tokio::test]
+    async fn an_order_found_renamed_is_not_reported_as_ended() {
+        let old = key("BTCUSDT", "old");
+        let ended = fetch_ended_by_key(std::slice::from_ref(&old), |_| async {
+            Ok(OrderLookup::Replaced(Box::new(
+                report(key("BTCUSDT", "new"), cancelled_state("7")).with_replaces(
+                    Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")),
+                ),
+            )))
+        })
+        .await
+        .unwrap();
+        assert!(ended.is_empty(), "{ended:?}");
     }
 }

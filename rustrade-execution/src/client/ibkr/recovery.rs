@@ -872,7 +872,7 @@ impl RecoveryWatcher {
             self.session_zone,
         );
         let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
-        let lookup = |key| {
+        let lookup = |key, _| {
             let found = reader.lookup(&key);
             if let Ok(OrderLookup::Ended(order)) = &found {
                 release_ended(order, &self.order_ids, &self.pending_cancels);

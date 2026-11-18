@@ -55,11 +55,11 @@ use super::shared::{
     binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
-    trailing_params, unix_ms, unreadable_answer,
+    convert_order_report, dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
 use crate::client::log_excerpt::frame_excerpt;
@@ -72,8 +72,8 @@ use crate::{
     client::{
         ExecutionClient, OrderStatusClient,
         order_recovery::{
-            KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
-            fetch_ended_by_key, recover_ended_orders,
+            KnownLiveOrders, Listed, OpenListing, OrderLookup, SharedKnownLiveOrders,
+            UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
         reconnect_budget::{BackoffLimits, ReconnectBudget},
     },
@@ -87,6 +87,7 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind, UnindexedInactiveOrder,
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        report::Replaces,
         request::{
             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
             UnindexedOrderResponseCancel,
@@ -105,7 +106,8 @@ use binance_sdk::{
     spot::{
         SpotRestApi, SpotWsApi,
         rest_api::{
-            GetAccountParams, GetOpenOrdersParams, GetOrderParams, MyTradesParams, RestApi,
+            GetAccountParams, GetOpenOrdersParams, GetOrderParams, GetOrderResponse,
+            MyTradesParams, RestApi,
         },
         websocket_api::{
             OrderCancelParams, OrderPlaceParams, OrderPlaceSideEnum, OrderPlaceTimeInForceEnum,
@@ -115,7 +117,6 @@ use binance_sdk::{
     },
 };
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
-use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -914,44 +915,132 @@ async fn fetch_all_open_orders(
     Ok(orders)
 }
 
-/// Look the order under `key` up with `GET /api/v3/order` by its client order id (weight 4).
+/// Look the order under `key` up with `GET /api/v3/order` by its client order id (weight 4), and,
+/// where `held_id` is the venue order id the client holds for it, by that id when the client order
+/// id no longer finds it (weight 4 more).
+///
+/// The lookup by client order id comes first, since a cancel-replace keeps the order's client
+/// order id on a new `orderId`. A keep-priority amend can instead give the order a new client
+/// order id under the same `orderId`, after which Binance does not know the old one (`-2013`), and
+/// may even accept a new order under it. So the lookup by `held_id` answers when the client order
+/// id finds no order, or finds one under another `orderId`. An order found there under another
+/// client order id is [`OrderLookup::Replaced`], linked to the order asked about.
 async fn fetch_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     key: UnindexedOrderKey,
+    held_id: Option<OrderId>,
     kind: RequestKind,
 ) -> Result<OrderLookup, UnindexedClientError> {
+    let held = held_id.as_ref().and_then(|id| match id.0.parse::<i64>() {
+        Ok(order_id) => Some(order_id),
+        Err(_) => {
+            warn!(instrument = %key.instrument, cid = %key.cid, order_id = %id, "BinanceSpot lookup: held orderId not numeric, looking up by client order id alone");
+            None
+        }
+    });
+    let by_cid = GetOrder::ClientOrderId(key.cid.0.to_string());
+    match fetch_order_row(&rest, &rate_limiter, &key.instrument, by_cid, kind).await? {
+        Some(row) if held.is_none_or(|held| row.order_id.is_none_or(|id| id == held)) => {
+            return Ok(lookup_from_row(&row, &key));
+        }
+        Some(row) => {
+            debug!(instrument = %key.instrument, cid = %key.cid, held_order_id = ?held, order_id = ?row.order_id, "BinanceSpot client order id now names another order; looking up the one held");
+        }
+        None => {}
+    }
+    let (Some(held), Some(held_id)) = (held, held_id) else {
+        debug!(instrument = %key.instrument, cid = %key.cid, "BinanceSpot does not know this order");
+        return Ok(OrderLookup::Unknown);
+    };
+    let Some(row) = fetch_order_row(
+        &rest,
+        &rate_limiter,
+        &key.instrument,
+        GetOrder::OrderId(held),
+        kind,
+    )
+    .await?
+    else {
+        debug!(instrument = %key.instrument, cid = %key.cid, order_id = held, "BinanceSpot does not know this order by its orderId either");
+        return Ok(OrderLookup::Unknown);
+    };
+    let renamed = row
+        .client_order_id
+        .as_deref()
+        .filter(|cid| !cid.is_empty() && *cid != key.cid.0.as_str())
+        .map(ClientOrderId::new);
+    let Some(renamed) = renamed else {
+        // Still under the client order id asked about.
+        return Ok(lookup_from_row(&row, &key));
+    };
+    let renamed_key = UnindexedOrderKey {
+        cid: renamed,
+        ..key.clone()
+    };
+    Ok(
+        match convert_order_report(&row, ExchangeId::BinanceSpot, &renamed_key) {
+            Some(report) => OrderLookup::Replaced(Box::new(
+                report.with_replaces(Replaces::new(held_id).with_cid(key.cid)),
+            )),
+            // Asked about again later, rather than dropped on a row this version cannot read.
+            None => OrderLookup::NotEnded,
+        },
+    )
+}
+
+/// How the order `row` describes ended, if it has, under `key`.
+fn lookup_from_row(row: &GetOrderResponse, key: &UnindexedOrderKey) -> OrderLookup {
+    // Spot rows report trailingDelta, so every kind decodes without the one the client holds.
+    convert_ended_order(row, ExchangeId::BinanceSpot, key, None)
+        .map_or(OrderLookup::NotEnded, |order| {
+            OrderLookup::Ended(Box::new(order))
+        })
+}
+
+/// How [`fetch_order_row`] names the order it reads.
+#[derive(Clone)]
+enum GetOrder {
+    ClientOrderId(String),
+    OrderId(i64),
+}
+
+/// The row `GET /api/v3/order` (weight 4) returns for the order `by` names on `instrument`, or
+/// `None` if Binance does not know it.
+async fn fetch_order_row(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    by: GetOrder,
+    kind: RequestKind,
+) -> Result<Option<GetOrderResponse>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
-    let symbol = key.instrument.name().to_string();
-    let cid = key.cid.0.to_string();
-    let response = match rest_call_with_retry(&rest, &rate_limiter, kind, |rest| {
-        let (symbol, cid) = (symbol.clone(), cid.clone());
+    let symbol = instrument.name().to_string();
+    let response = match rest_call_with_retry(rest, rate_limiter, kind, |rest| {
+        let (symbol, by) = (symbol.clone(), by.clone());
         Box::pin(async move {
-            let params = GetOrderParams::builder(symbol)
-                .orig_client_order_id(cid)
-                .build()?;
+            let params = match by {
+                GetOrder::ClientOrderId(cid) => GetOrderParams::builder(symbol)
+                    .orig_client_order_id(cid)
+                    .build()?,
+                GetOrder::OrderId(order_id) => {
+                    GetOrderParams::builder(symbol).order_id(order_id).build()?
+                }
+            };
             rest.get_order(params).await
         })
     })
     .await
     {
         Ok(response) => response,
-        Err(e) if is_unknown_order(&e) => {
-            debug!(instrument = %key.instrument, cid = %key.cid, error = %e, "BinanceSpot does not know this order");
-            return Ok(OrderLookup::Unknown);
-        }
-        Err(e) => return Err(classify_rest_query_error(&e, Some(&key.instrument))),
+        Err(e) if is_unknown_order(&e) => return Ok(None),
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
     };
-
-    let row = response.data().await.map_err(response_decode_error)?;
-
-    // Spot rows report trailingDelta, so every kind decodes without the one the client holds.
-    Ok(
-        convert_ended_order(&row, ExchangeId::BinanceSpot, &key, None)
-            .map_or(OrderLookup::NotEnded, |order| {
-                OrderLookup::Ended(Box::new(order))
-            }),
-    )
+    response
+        .data()
+        .await
+        .map(Some)
+        .map_err(response_decode_error)
 }
 
 /// The client order id of the order `order_id` on `instrument`, read with `GET /api/v3/order`
@@ -963,38 +1052,28 @@ async fn fetch_order_cid(
     instrument: &InstrumentNameExchange,
     order_id: i64,
 ) -> Result<Option<ClientOrderId>, UnindexedClientError> {
-    let symbol = instrument.name().to_string();
-    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
-        let symbol = symbol.clone();
-        Box::pin(async move {
-            let params = GetOrderParams::builder(symbol).order_id(order_id).build()?;
-            rest.get_order(params).await
-        })
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(e) if is_unknown_order(&e) => {
-            debug!(%instrument, order_id, error = %e, "BinanceSpot does not know this order");
-            return Ok(None);
-        }
-        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    let by = GetOrder::OrderId(order_id);
+    let Some(row) =
+        fetch_order_row(rest, rate_limiter, instrument, by, RequestKind::Essential).await?
+    else {
+        debug!(%instrument, order_id, "BinanceSpot does not know this order");
+        return Ok(None);
     };
-    let row = response.data().await.map_err(response_decode_error)?;
     Ok(row
         .client_order_id
         .filter(|cid| !cid.is_empty())
         .map(ClientOrderId::new))
 }
 
-/// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
-/// time), for a reconnect's check of the orders held as live.
-async fn listed_open_cids(
+/// The open orders `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a time),
+/// as reports, for a reconnect's check of the orders held as live, which follows one listed under a
+/// new client order id.
+async fn listed_open_orders(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     instruments: Vec<InstrumentNameExchange>,
-) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
-    let mut listed = FnvHashSet::default();
+) -> Result<Listed, UnindexedClientError> {
+    let mut listed = Listed::default();
     for instrument in instruments {
         let (_, listing) = fetch_open_orders_for_instrument(
             rest.clone(),
@@ -1003,12 +1082,12 @@ async fn listed_open_cids(
             RequestKind::Essential,
         )
         .await?;
-        listed.extend(listing.orders.into_iter().map(|entry| entry.order.key.cid));
+        listed.extend(listing.orders.into_iter().map(ListedOrder::into_report));
     }
     Ok(listed)
 }
 
-/// [`recover_ended_orders`] on Binance Spot: listings by [`listed_open_cids`] and lookups by
+/// [`recover_ended_orders`] on Binance Spot: listings by [`listed_open_orders`] and lookups by
 /// [`fetch_order_lookup`], both [`RequestKind::Essential`], as fill recovery's reads are.
 async fn recover_spot_ended_orders(
     rest: &Arc<RestApi>,
@@ -1025,12 +1104,13 @@ async fn recover_spot_ended_orders(
         unrecovered,
         tx,
         OpenListing::PerInstrument,
-        |instruments| listed_open_cids(rest.clone(), rate_limiter.clone(), instruments),
-        |key| {
+        |instruments| listed_open_orders(rest.clone(), rate_limiter.clone(), instruments),
+        |key, held_id| {
             fetch_order_lookup(
                 rest.clone(),
                 rate_limiter.clone(),
                 key,
+                held_id,
                 RequestKind::Essential,
             )
         },
@@ -2002,6 +2082,16 @@ impl ExecutionClient for BinanceSpot {
 /// exist) is omitted. A row whose status this version does not know is omitted too, with a
 /// warning, as is a `PENDING_CANCEL` one, which Binance does not use.
 ///
+/// A keep-priority amend can give an order a new client order id while keeping its `orderId`.
+/// Binance then no longer knows the old client order id, and may accept a new order under it. So
+/// for an order this client holds as live, with its `orderId`, a key whose client order id finds
+/// no order, or finds one under another `orderId`, is looked up again by that `orderId` (weight 4
+/// more). An order found there under another client order id is omitted, ended or not: each order
+/// returned carries the key it was asked for, and the venue no longer knows the order by it. The
+/// account stream follows the rename, linking the order to its old client order id. An order this
+/// client does not hold, or holds without its `orderId`, is looked up by its client order id
+/// alone.
+///
 /// The account stream runs the same lookup itself after a reconnect; see
 /// [`account_stream`](ExecutionClient::account_stream).
 impl OrderStatusClient for BinanceSpot {
@@ -2010,10 +2100,12 @@ impl OrderStatusClient for BinanceSpot {
         orders: &[UnindexedOrderKey],
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         fetch_ended_by_key(orders, |key| {
+            let held_id = self.known_live.lock().order_id_of(&key.cid);
             fetch_order_lookup(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 key,
+                held_id,
                 RequestKind::Query,
             )
         })
@@ -8746,7 +8838,7 @@ mod tests {
     }
 
     /// A venue whose BTCUSDT listing shows only `live`, and whose order lookups answer `gone` as
-    /// cancelled after `delay` and `unknown` as unknown.
+    /// cancelled after `delay` and `unknown` as unknown, by client order id and by `orderId`.
     async fn venue_after_a_disconnect(delay: Duration) -> wiremock::MockServer {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -8761,17 +8853,37 @@ mod tests {
         mount_order(
             &server,
             "gone",
-            row_response("gone", "CANCELED").set_delay(delay),
+            held_row_response("gone", "CANCELED").set_delay(delay),
         )
         .await;
         mount_order(&server, "unknown", venue_error(-2013)).await;
+        // Nor does it know `unknown` by the `orderId` held for it.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/order"))
+            .and(wiremock::matchers::query_param("orderId", "2"))
+            .respond_with(venue_error(-2013))
+            .mount(&server)
+            .await;
         server
     }
 
-    /// `live`, `gone` and `unknown`, all held as live on BTCUSDT.
+    /// The client order ids [`held_orders`] holds, each under its index as its `orderId`.
+    const HELD: [&str; 3] = ["live", "gone", "unknown"];
+
+    /// `GET /api/v3/order`'s row for the order [`held_orders`] holds under `cid`, under the
+    /// `orderId` it holds.
+    fn held_row_response(cid: &str, status: &str) -> wiremock::ResponseTemplate {
+        let mut row = order_row(cid, status);
+        let order_id = HELD.iter().position(|held| *held == cid).unwrap();
+        row["orderId"] = serde_json::json!(order_id);
+        wiremock::ResponseTemplate::new(200).set_body_json(row)
+    }
+
+    /// `live`, `gone` and `unknown`, all held as live on BTCUSDT, each under its index in
+    /// [`HELD`] as its `orderId`.
     fn held_orders() -> SharedKnownLiveOrders {
         let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
-        for (n, cid) in ["live", "gone", "unknown"].into_iter().enumerate() {
+        for (n, cid) in HELD.into_iter().enumerate() {
             known.lock().live(
                 &spot_key("BTCUSDT", cid),
                 Decimal::TWO,
@@ -8942,7 +9054,7 @@ mod tests {
             ("gone", "PENDING_CANCEL"),
             ("unknown", "WHAT"),
         ] {
-            mount_order(&server, cid, row_response(cid, status)).await;
+            mount_order(&server, cid, held_row_response(cid, status)).await;
         }
         let known = held_orders();
         let mut unchecked = btcusdt_unchecked();
@@ -9012,6 +9124,246 @@ mod tests {
             "ETHUSDT waits for its retry"
         );
         assert!(known.lock().contains(&eth.cid));
+    }
+
+    // ---- Renames missed while disconnected ------------------------------------------------
+
+    /// Answer `GET /api/v3/order` by `orderId` with `response`.
+    async fn mount_order_by_id(
+        server: &wiremock::MockServer,
+        order_id: i64,
+        response: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/order"))
+            .and(wiremock::matchers::query_param(
+                "orderId",
+                order_id.to_string(),
+            ))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    /// The `orderId`s asked about with `GET /api/v3/order`.
+    async fn looked_up_by_id(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/v3/order")
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "orderId")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .collect()
+    }
+
+    /// A venue whose BTCUSDT listing shows `listed`.
+    async fn venue_listing(listed: serde_json::Value) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/openOrders"))
+            .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(listed))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `old` held as live on BTCUSDT under `orderId` 7, the id [`order_row`] gives every row.
+    fn held_old() -> SharedKnownLiveOrders {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        known.lock().live(
+            &spot_key("BTCUSDT", "old"),
+            Decimal::TWO,
+            OrderKind::Limit,
+            &Open::new(
+                VenueOrderId::Assigned(OrderId::new("7")),
+                Utc::now(),
+                Decimal::ZERO,
+            ),
+        );
+        known
+    }
+
+    async fn check_spot(
+        server: &wiremock::MockServer,
+        known: &SharedKnownLiveOrders,
+    ) -> Vec<UnindexedAccountEvent> {
+        let mut unchecked = btcusdt_unchecked();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        recover_spot_ended_orders(
+            &rest_at(server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            known,
+            &mut unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+        )
+        .await;
+        assert!(unchecked.is_empty());
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The one order report in `sent`.
+    fn only_report(sent: &[UnindexedAccountEvent]) -> &UnindexedOrderReport {
+        match sent {
+            [
+                UnindexedAccountEvent {
+                    kind:
+                        AccountEventKind::OrderSnapshot(
+                            rustrade_integration::collection::snapshot::Snapshot(report),
+                        ),
+                    ..
+                },
+            ] => report,
+            _ => panic!("one order snapshot: {sent:?}"),
+        }
+    }
+
+    fn link_to_old() -> Option<Replaces> {
+        Some(Replaces::new(OrderId::new("7")).with_cid(ClientOrderId::new("old")))
+    }
+
+    /// An order renamed while the stream was disconnected, which Binance no longer knows by the
+    /// client order id held (`-2013`), is found by the `orderId` held, and reported linked to the
+    /// order held, which the set then holds under its new id.
+    #[tokio::test]
+    async fn a_reconnect_follows_an_order_renamed_while_disconnected() {
+        let server = venue_listing(serde_json::json!([])).await;
+        mount_order(&server, "old", venue_error(-2013)).await;
+        mount_order_by_id(&server, 7, row_response("new", "PARTIALLY_FILLED")).await;
+        let known = held_old();
+
+        let sent = check_spot(&server, &known).await;
+
+        let report = only_report(&sent);
+        assert_eq!(report.order.key.cid, ClientOrderId::new("new"));
+        assert_eq!(report.replaces, link_to_old());
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
+            &report.order.state
+        else {
+            panic!("live: {report:?}");
+        };
+        assert_eq!(open.filled_quantity, Decimal::ONE);
+        assert_eq!(
+            looked_up(&server).await,
+            ["old"],
+            "by client order id first"
+        );
+        assert_eq!(looked_up_by_id(&server).await, ["7"]);
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("new")));
+        assert!(!known.contains(&ClientOrderId::new("old")));
+    }
+
+    /// An order renamed and listed under its new client order id is followed from the listing,
+    /// with no lookup.
+    #[tokio::test]
+    async fn a_reconnect_follows_an_order_listed_under_a_new_client_order_id() {
+        let server = venue_listing(serde_json::json!([order_row("new", "NEW")])).await;
+        let known = held_old();
+
+        let sent = check_spot(&server, &known).await;
+
+        let report = only_report(&sent);
+        assert_eq!(report.order.key.cid, ClientOrderId::new("new"));
+        assert_eq!(report.replaces, link_to_old());
+        assert!(looked_up(&server).await.is_empty());
+        assert!(looked_up_by_id(&server).await.is_empty());
+        assert!(known.lock().contains(&ClientOrderId::new("new")));
+    }
+
+    /// Binance accepts a new order under the client order id a rename left, so a lookup by it can
+    /// answer with another order. That answer is not taken for the order held: it is looked up by
+    /// the `orderId` held instead, and reported as found there, renamed or under the id asked.
+    #[tokio::test]
+    async fn a_reused_client_order_id_is_not_taken_for_the_order_held() {
+        for (cid_at_7, expected_cid) in [("new", "new"), ("old", "old")] {
+            let server = venue_listing(serde_json::json!([])).await;
+            let mut reuse = order_row("old", "NEW");
+            reuse["orderId"] = serde_json::json!(8);
+            mount_order(
+                &server,
+                "old",
+                wiremock::ResponseTemplate::new(200).set_body_json(reuse),
+            )
+            .await;
+            mount_order_by_id(&server, 7, row_response(cid_at_7, "CANCELED")).await;
+            let known = held_old();
+
+            let sent = check_spot(&server, &known).await;
+
+            let report = only_report(&sent);
+            assert_eq!(report.order.key.cid, ClientOrderId::new(expected_cid));
+            assert!(
+                matches!(report.order.state, OrderState::Inactive(_)),
+                "{report:?}"
+            );
+            let expected_link = if expected_cid == "new" {
+                link_to_old()
+            } else {
+                None
+            };
+            assert_eq!(report.replaces, expected_link, "at 7: {cid_at_7}");
+            assert_eq!(looked_up_by_id(&server).await, ["7"]);
+            let known = known.lock();
+            assert!(!known.contains(&ClientOrderId::new("old")));
+            assert!(!known.contains(&ClientOrderId::new("new")));
+        }
+    }
+
+    /// `fetch_ended_orders` looks an order this client holds up by its `orderId` too, and leaves
+    /// out one found renamed, ended or not, while reporting one found under the id asked, as
+    /// after a reused client order id.
+    #[tokio::test]
+    async fn fetch_ended_orders_omits_an_order_found_renamed() {
+        for (cid_at_7, reported) in [("new", false), ("old", true)] {
+            let server = wiremock::MockServer::start().await;
+            mount_order(&server, "old", venue_error(-2013)).await;
+            mount_order_by_id(&server, 7, row_response(cid_at_7, "CANCELED")).await;
+            let mut client = <BinanceSpot as ExecutionClient>::new(
+                BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+            );
+            client.rest = rest_at(&server);
+            client.known_live = held_old();
+
+            let ended = client
+                .fetch_ended_orders(&[spot_key("BTCUSDT", "old")])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                ended.len(),
+                usize::from(reported),
+                "at 7: {cid_at_7}: {ended:?}"
+            );
+            assert_eq!(looked_up_by_id(&server).await, ["7"]);
+        }
+    }
+
+    /// An order this client does not hold is looked up by its client order id alone.
+    #[tokio::test]
+    async fn fetch_ended_orders_looks_an_order_not_held_up_by_its_client_order_id_alone() {
+        let server = wiremock::MockServer::start().await;
+        mount_order(&server, "old", venue_error(-2013)).await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+
+        let ended = client
+            .fetch_ended_orders(&[spot_key("BTCUSDT", "old")])
+            .await
+            .unwrap();
+
+        assert!(ended.is_empty());
+        assert!(looked_up_by_id(&server).await.is_empty());
     }
 
     #[tokio::test]
