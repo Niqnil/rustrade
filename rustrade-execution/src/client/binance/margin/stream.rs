@@ -1991,24 +1991,31 @@ mod tests {
         }
     }
 
-    /// An amend under a new client order id leaves the order live, so its report emits no event,
-    /// but it is reported loudly: the engine still holds the order under its old id and quantity.
+    /// An amend under a new client order id is reported under the new id, linked to the order it
+    /// renames, as on spot: margin has no amend request, but its stream reads the report alike.
     #[test]
-    fn margin_ws_amend_under_a_new_id_is_logged_without_an_event() {
+    fn margin_ws_amend_under_a_new_id_is_linked_to_the_order_it_renames() {
         let frame = push(serde_json::json!({
-            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
-            "x": "REPLACED", "X": "NEW", "i": 8_i64, "c": "amended", "C": "cid-3",
+            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT", "f": "GTC",
+            "p": "50000", "x": "REPLACED", "X": "NEW", "i": 8_i64, "c": "amended", "C": "cid-3",
             "q": "0.5", "z": "0", "T": 1_700_000_000_000_i64,
         }));
         let mut buf = Vec::new();
-        let (terminated, messages) = log_messages(|| cross_frame(&frame, &mut buf));
+        let terminated = cross_frame(&frame, &mut buf);
         assert!(!terminated);
-        assert!(buf.is_empty(), "{buf:?}");
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("amended under a new client order id")),
-            "{messages:?}"
+        let [event] = buf.as_slice() else {
+            panic!("expected one event, got {buf:?}")
+        };
+        let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
+            panic!("expected OrderSnapshot, got {:?}", event.kind)
+        };
+        assert_eq!(snap.0.order.key.cid, ClientOrderId::new("amended"));
+        assert_eq!(
+            snap.0.replaces,
+            Some(
+                crate::order::report::Replaces::new(crate::order::id::OrderId::new("8"))
+                    .with_cid(ClientOrderId::new("cid-3"))
+            )
         );
     }
 

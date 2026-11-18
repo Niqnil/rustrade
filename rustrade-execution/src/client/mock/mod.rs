@@ -507,7 +507,11 @@ impl TimeInForceRules {
 /// - **Changed outside the client.**
 ///   [`SimulatedVenue::modify_externally`](crate::exchange::mock::SimulatedVenue::modify_externally)
 ///   is not limited by this, which says what a client may ask to amend. The other rules above
-///   are the book's and apply to it too, except that it can change a seeded order.
+///   are the book's and apply to it too, except that it can change a seeded order, can rename
+///   the order to a new client order id, and ends an order amended down to its filled quantity
+///   rather than refusing it.
+/// - **Client order ids.** A client's amend keeps the order's client order id. A venue whose
+///   amends give the order a new one is simulated only for a change outside the client.
 ///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
 /// start from [`AmendConfig::FULL`] or [`AmendConfig::NONE`] and the `with_*` methods. A field

@@ -477,15 +477,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the report of the amended order, which stays in totals.
 
 - **A test hook to change a resting order on the simulated venue from outside any client**
-  (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, patch)` amends the order as a
+  (`rustrade-execution`). `SimulatedVenue::modify_externally(cid, change)` amends the order as a
   change made in the venue's own interface would, and reports it only on the account stream, for a
-  test of how a consumer learns of an order changed without it. The change never passes through a
-  client, so the venue's `AmendConfig` (what a client may ask to amend) does not limit it, and it
-  may change an order seeded through `initial_state`, which then holds what it needs. The book's
-  rules apply as to `amend_order`: the venue's refusals, trading, queue priority, a reassigned id
-  and the reported events. A running `MockExchange` takes it as
-  `MockExchangeRequest::modify_externally`, whose events go to the account stream. `RestingOrder` gains `kept_place_since`: the time an
-  order joined its queue, kept when an amend that keeps its place moves its `time_exchange`.
+  test of how a consumer learns of an order changed without it. `change` is an `ExternalChange`
+  (an `AmendPatch` converts into one): the patch, and optionally a new client order id
+  (`ExternalChange::with_cid`). The change never passes through a client, so the venue's
+  `AmendConfig` (what a client may ask to amend) does not limit it, and it may change an order
+  seeded through `initial_state`, which then holds what it needs. The book's rules apply as to
+  `amend_order`: the venue's refusals, trading, queue priority, a reassigned id and the reported
+  events. Two differ:
+  - **A new client order id renames the order**, as a venue's amend or replace under a new client
+    order id does. The order works on under the new id with its venue order id (unless one is
+    reassigned), its queue position as the priority rule allows, its deadline and its hold, and
+    the old id no longer finds it. Its snapshot is linked to the order it renames
+    (`OrderReport::replaces`: its venue order id before the change, and the old client order id).
+    A new id that already names an order the venue holds is refused with `AmendRefusal::Venue`.
+  - **An amend to a positive quantity no more than the filled quantity ends the order**, as a
+    Binance spot amend does, instead of being refused: its hold is released and it is reported
+    ended as `Expired`, with what filled, its quantity cut to that. A price in the patch is not
+    applied, and the market refusals do not apply. Whether other venues end such an order or
+    refuse the amend is not known, so the rule is not configurable yet. A client's own amend is
+    still refused (`AmendRefusal::QuantityNotAboveFilled`).
+
+  A running `MockExchange` takes it as `MockExchangeRequest::modify_externally`, whose events go
+  to the account stream. `RestingOrder` gains `kept_place_since`: the time an order joined its
+  queue, kept when an amend that keeps its place moves its `time_exchange`.
+  `OpenOrders::amend_renaming` and `AccountState::amend_order_renaming` amend an order queued
+  under one client order id onto another.
 
 ### Changed
 - **`binance-sdk` 78.0.0 → 78.1.0** (`rustrade-execution`, `binance` feature, #968). The SDK adds
@@ -707,17 +725,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ConditionalUnresolved`), a time in force read as `Unreported`, and a zero quantity (an order
     sized in the quote asset). A report or row stamped with this host's clock, because Binance
     sent no time, states none, and so does a row whose only time is its creation.
-  - **A Binance spot keep-priority amend that kept the client order id is reported as the order's
-    new state**, on its new quantity, where it was logged and dropped. The stream's deduplication now
-    tells a report's stated terms apart, so the amend is not taken for a replay of the order's
-    acknowledgement. An amend down to the filled quantity or below ends the order: Binance sends
-    that one report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED`
-    report after it, so it is reported as `OrderCancelled` with what filled, as an `EXPIRED`
-    report is. Any order status that leaves the order nothing to fill (`EXPIRED`,
-    `EXPIRED_IN_MATCH`, `FILLED`) is read so, as on a self-trade prevention report. A same-id
-    amend whose order status is neither live nor one of those, or missing, is logged and dropped.
-    An amend under a new client order id is still logged and dropped, even one that ended the
-    order: the engine knows the order by its old id.
+  - **A Binance spot keep-priority amend is reported as the order's new state**, on its new
+    quantity, where it was logged and dropped. The stream's deduplication now tells a report's
+    stated terms apart, so the amend is not taken for a replay of the order's acknowledgement.
+    - **An amend under a new client order id** is reported under the new id, linked to the order
+      it renames (`OrderReport::replaces`: the same venue order id, and the old client order id),
+      so the engine moves the order to the new id, keeping its strategy and fills. Binance links
+      the two ids only in the amend's own report, and no longer finds the order by the old id.
+      The client's record of live orders follows the rename, so a reconnect asks about the order
+      by the id Binance knows it by. Known limitation: a rename made while the account stream was
+      disconnected is not learned. A reconnect then finds no order under the old id and stops
+      holding it, and the open-order listing shows the order under its new id as one the engine
+      did not place.
+    - **An amend down to the filled quantity or below ends the order**: Binance sends that one
+      report with order status `EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report
+      after it, so it is reported as an order snapshot ended as `Expired`, with what filled, on
+      its new terms, and linked when the amend renamed the order. Any order status that leaves
+      the order nothing to fill (`EXPIRED`, `EXPIRED_IN_MATCH`, `FILLED`) is read so. An amend
+      whose order status is neither live nor one of those, or missing, is logged and dropped.
   - **Alpaca states the terms its reads carry.** An account-stream snapshot and an open order in
     `account_snapshot` state every term, less a limit price that does not parse and a time in
     force read as `Unreported`. One stamped with this host's clock, because Alpaca sent no time,

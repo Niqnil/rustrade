@@ -1,6 +1,6 @@
 //! Binance Spot order terms against testnet: what the account stream and an account snapshot
-//! state about an order changed outside this client, by a keep-priority amend, and how the stream
-//! reports an amend that ends the order.
+//! state about an order changed outside this client, by a keep-priority amend, how the stream
+//! links an amend that renames the order, and how it reports an amend that ends the order.
 //!
 //! # Prerequisites
 //!
@@ -44,10 +44,11 @@ use rustrade_execution::{
     },
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
+        id::OrderId,
         id::{ClientOrderId, StrategyId},
-        report::{ReportedTerms, UnindexedOrderReport},
+        report::{Replaces, ReportedTerms, UnindexedOrderReport},
         request::{RequestCancel, RequestOpen},
-        state::{ActiveOrderState, OrderState},
+        state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
 };
 use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
@@ -247,6 +248,90 @@ async fn an_amend_that_keeps_the_client_order_id_is_reported_on_its_new_terms() 
     }
 }
 
+/// An amend under a new client order id is reported under the new id, live on its new quantity,
+/// linked to the order it renames by its venue order id and its old client order id. Binance then
+/// knows the order only by the new id, so the cancel goes under it.
+#[tokio::test]
+#[ignore]
+async fn an_amend_under_a_new_client_order_id_is_linked_to_the_order_it_renames() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("rustrade_execution=info")
+        .try_init();
+    let client = client();
+    let instrument = InstrumentNameExchange::new("BTCUSDT");
+    let stamp = chrono::Utc::now().timestamp_millis();
+    let cid = ClientOrderId::new(format!("rename-{stamp}"));
+    let renamed = ClientOrderId::new(format!("renamed-{stamp}"));
+    // Below the market, inside PERCENT_PRICE_BY_SIDE's bid floor, so it rests.
+    let price = (average_price(&instrument).await * dec!(0.7)).round_dp(2);
+    let mut stream = client
+        .account_stream(&[], std::slice::from_ref(&instrument))
+        .await
+        .expect("account_stream");
+
+    let placed = client
+        .open_order(OrderEvent {
+            key: key(&instrument, &cid),
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(price),
+                dec!(0.003),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        })
+        .await;
+    let body = async {
+        let OrderState::Active(ActiveOrderState::Open(open)) = &placed.state else {
+            panic!("the order should rest: {:?}", placed.state);
+        };
+        let order_id: OrderId = open.id.assigned().expect("Binance names the order").clone();
+        next_report(&mut stream, &cid, dec!(0.003))
+            .await
+            .expect("the stream reports the order as placed");
+
+        outside_client()
+            .order_amend_keep_priority(
+                OrderAmendKeepPriorityParams::builder(instrument.to_string(), dec!(0.002))
+                    .orig_client_order_id(Some(cid.0.to_string()))
+                    .new_client_order_id(Some(renamed.0.to_string()))
+                    .build()
+                    .expect("amend parameters"),
+            )
+            .await
+            .expect("the amend is accepted");
+
+        let amended = next_report(&mut stream, &renamed, dec!(0.002))
+            .await
+            .expect("the stream reports the order under its new id");
+        assert_eq!(
+            amended.replaces,
+            Some(Replaces::new(order_id.clone()).with_cid(cid.clone()))
+        );
+        assert_eq!(amended.reported, ReportedTerms::ALL);
+        let OrderState::Active(ActiveOrderState::Open(open)) = &amended.order.state else {
+            panic!("the amended order is live: {:?}", amended.order.state);
+        };
+        assert_eq!(open.id.assigned(), Some(&order_id));
+    };
+    let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(60), body))
+        .catch_unwind()
+        .await;
+    // Under the new id once the amend has landed; under the old one when the test stopped first.
+    for cid in [&renamed, &cid] {
+        let _ = client
+            .cancel_order(OrderEvent {
+                key: key(&instrument, cid),
+                state: RequestCancel::new(None),
+            })
+            .await;
+    }
+    match outcome {
+        Ok(finished) => finished.expect("the test finishes within a minute"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 /// A limit order placed by [`outside_client`] with self-trade prevention off, so it can trade
 /// against another order of this account.
 async fn place_self_trading(
@@ -272,11 +357,25 @@ async fn place_self_trading(
 }
 
 /// An amend down to the filled quantity ends the order, in the amend's own report, so the stream
-/// reports the order cancelled with what filled. The order is filled in part by a sell of this
+/// reports the order expired with what filled. The order is filled in part by a sell of this
 /// account's own, on a pair whose testnet spread leaves room for both inside it.
 #[tokio::test]
 #[ignore]
 async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
+    amend_down_to_the_fill(false).await;
+}
+
+/// An amend down to the filled quantity that also renames the order ends it under its new client
+/// order id, linked to the order it renames.
+#[tokio::test]
+#[ignore]
+async fn an_amend_down_to_the_filled_quantity_under_a_new_client_order_id_ends_the_order() {
+    amend_down_to_the_fill(true).await;
+}
+
+/// Fill a buy in part against a sell of this account's own, then amend it down to its fill,
+/// under a new client order id when `rename`, and check the stream reports it expired.
+async fn amend_down_to_the_fill(rename: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rustrade_execution=info")
         .try_init();
@@ -306,6 +405,8 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
     let stamp = chrono::Utc::now().timestamp_millis();
     let sell = ClientOrderId::new(format!("exhaust-s-{stamp}"));
     let buy = ClientOrderId::new(format!("exhaust-b-{stamp}"));
+    let renamed = ClientOrderId::new(format!("exhaust-r-{stamp}"));
+    let amended = if rename { &renamed } else { &buy };
     let mut stream = client
         .account_stream(&[], std::slice::from_ref(&instrument))
         .await
@@ -353,7 +454,7 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
             .order_amend_keep_priority(
                 OrderAmendKeepPriorityParams::builder(instrument.to_string(), unit)
                     .orig_client_order_id(Some(buy.0.to_string()))
-                    .new_client_order_id(Some(buy.0.to_string()))
+                    .new_client_order_id(Some(amended.0.to_string()))
                     .build()
                     .expect("amend parameters"),
             )
@@ -364,20 +465,30 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
         let mut ended = None;
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, stream.next()).await {
             match event.kind {
-                AccountEventKind::OrderCancelled(response) if response.key.cid == buy => {
-                    ended = Some(response.state);
-                    break;
+                AccountEventKind::OrderCancelled(response)
+                    if [&buy, amended].contains(&&response.key.cid) =>
+                {
+                    panic!("the amend is reported as a cancel: {response:?}")
                 }
-                AccountEventKind::OrderSnapshot(snapshot) if snapshot.0.order.key.cid == buy => {
-                    panic!("the amend is reported as a live order: {snapshot:?}")
+                AccountEventKind::OrderSnapshot(snapshot)
+                    if [&buy, amended].contains(&&snapshot.0.order.key.cid) =>
+                {
+                    ended = Some(snapshot.0);
+                    break;
                 }
                 _ => {}
             }
         }
-        let cancelled = ended
-            .expect("the stream reports the order ended")
-            .expect("the order ended, not refused");
-        assert_eq!(cancelled.filled_quantity, Some(unit));
+        let ended = ended.expect("the stream reports the amended order");
+        assert_eq!(&ended.order.key.cid, amended);
+        let OrderState::Inactive(InactiveOrderState::Expired(expired)) = &ended.order.state else {
+            panic!("the amend is reported as expired: {ended:?}");
+        };
+        assert_eq!(expired.filled_quantity, Some(unit));
+        assert_eq!(
+            ended.replaces,
+            rename.then(|| Replaces::new(expired.id.clone()).with_cid(buy.clone()))
+        );
     };
     // Cancel what was placed whatever the outcome, a failed assertion included, then report it.
     let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(60), body))
@@ -385,7 +496,7 @@ async fn an_amend_down_to_the_filled_quantity_ends_the_order() {
         .await;
     // Both orders have usually ended by now (the sell filled, the buy amended to its fill), so
     // these cancels are expected to fail; they matter only when the test stopped early.
-    for cid in [&buy, &sell] {
+    for cid in [&buy, &renamed, &sell] {
         let _ = client
             .cancel_order(OrderEvent {
                 key: key(&instrument, cid),

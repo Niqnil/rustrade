@@ -390,23 +390,56 @@ impl OpenOrders {
         rank: Rank,
     ) -> Result<RestingOrder, NotQueued> {
         let cid = order.key.cid.clone();
-        if !self.is_queued(&cid) {
+        self.amend_renaming(&cid, order, reservation, rank)
+    }
+
+    /// [`amend`](Self::amend)s the order queued under `from`, moving it to `order`'s
+    /// [`ClientOrderId`]: the order keeps its deadline, and its place in its queue under
+    /// [`Rank::Kept`], under the new id, and no longer rests under `from`. With `from` equal to
+    /// `order`'s id, this is `amend`.
+    ///
+    /// # Errors
+    /// [`NotQueued`], as for `amend`, if no order is queued under `from`.
+    ///
+    /// # Panics
+    /// As for `amend`, and if another order already rests under `order`'s id: the caller checks
+    /// that before anything moves.
+    pub fn amend_renaming(
+        &mut self,
+        from: &ClientOrderId,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        rank: Rank,
+    ) -> Result<RestingOrder, NotQueued> {
+        let cid = order.key.cid.clone();
+        if !self.is_queued(from) {
             return Err(NotQueued(Box::new(RestingOrder::new(order, reservation))));
         }
-        let Some(replaced) = self.by_id.remove(&cid) else {
-            unreachable!("OpenOrders found {cid} queued, which only an order in by_id is");
+        let renamed = *from != cid;
+        assert!(
+            !(renamed && self.by_id.contains_key(&cid)),
+            "OpenOrders renamed {from} to {cid}, which already names an order resting here"
+        );
+        let Some(replaced) = self.by_id.remove(from) else {
+            unreachable!("OpenOrders found {from} queued, which only an order in by_id is");
         };
         let before = &replaced.order;
         assert!(
-            before.key == order.key
+            before.key.exchange == order.key.exchange
+                && before.key.instrument == order.key.instrument
+                && before.key.strategy == order.key.strategy
                 && before.side == order.side
                 && before.kind == order.kind
                 && before.time_in_force == order.time_in_force,
-            "OpenOrders amended {cid} into a different order: only its price, quantity and state \
-             may change"
+            "OpenOrders amended {from} into a different order: only its client order id, price, \
+             quantity and state may change"
         );
         // The deadline was fixed when the order was accepted, and an amend does not move it, so
-        // its entry among the deadlines stands as it was.
+        // its entry among the deadlines stands as it was, under the order's new id.
+        if renamed && let Some(expiry) = replaced.expires_at() {
+            self.expiries.remove(&(expiry, from.clone()));
+            self.expiries.insert((expiry, cid.clone()));
+        }
         let mut amended = RestingOrder {
             order,
             reservation,
@@ -423,6 +456,9 @@ impl OpenOrders {
                 let queued_at = replaced.queued_at();
                 amended.kept_place_since =
                     (queued_at != amended.order.state.time_exchange).then_some(queued_at);
+                if renamed {
+                    self.refile(&replaced, &cid);
+                }
             }
             Rank::Lost => {
                 self.dequeue(&replaced);
@@ -640,16 +676,46 @@ impl OpenOrders {
     }
 
     fn dequeue(&mut self, resting: &RestingOrder) {
-        let order = &resting.order;
-        let Some(price) = order.price else {
-            // Never queued — see the type's note on orders with no price and held orders.
+        let Some((key, position)) = self.queue_position(resting) else {
             return;
         };
+        let Some(queue) = self.queues.get_mut(&key) else {
+            unreachable!("OpenOrders found a queue position in a queue it does not have");
+        };
+        queue.remove(&position);
+        if queue.is_empty() {
+            self.queues.remove(&key);
+        }
+    }
+
+    /// Files the queued order `resting` under `cid` in its place in its queue, for an order moved
+    /// to a new client order id that keeps its place.
+    fn refile(&mut self, resting: &RestingOrder, cid: &ClientOrderId) {
+        let Some((key, position)) = self.queue_position(resting) else {
+            return;
+        };
+        if let Some(filed) = self
+            .queues
+            .get_mut(&key)
+            .and_then(|queue| queue.get_mut(&position))
+        {
+            *filed = cid.clone();
+        }
+    }
+
+    /// Where the queued order `resting` is filed: its queue's key and its position in it. `None`
+    /// for an order with no price, which is never queued, and, after a debug assertion, for one
+    /// whose ranking fields changed while it was on the book.
+    fn queue_position(
+        &self,
+        resting: &RestingOrder,
+    ) -> Option<((InstrumentNameExchange, Side), QueuePosition)> {
+        let order = &resting.order;
+        // Never queued — see the type's note on orders with no price and held orders.
+        let price = order.price?;
 
         let key = (order.key.instrument.clone(), order.side);
-        let Some(queue) = self.queues.get_mut(&key) else {
-            return;
-        };
+        let queue = self.queues.get(&key)?;
 
         // The position's `seq` is not known from the order, so this finds it by value. Queues are
         // per instrument and side, and an order appears in exactly one, so this is a scan of one
@@ -673,14 +739,7 @@ impl OpenOrders {
             order.side,
             resting.queued_at()
         );
-
-        if let Some(position) = position {
-            queue.remove(&position);
-        }
-
-        if queue.is_empty() {
-            self.queues.remove(&key);
-        }
+        Some((key, position?))
     }
 
     /// Every open order with what is held against it and where it stands, in an order that
