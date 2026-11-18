@@ -538,7 +538,12 @@ pub struct AmendConfig {
     /// before the answer that says which id it replaced, as a live venue's stream can.
     ///
     /// The order keeps its client order id. A venue that replaces an order under a new client
-    /// order id too, as Alpaca does, cannot be simulated yet.
+    /// order id too, as Alpaca does, can be simulated only for a change made from outside any
+    /// client: [`SimulatedVenue::modify_externally`] with
+    /// [`ExternalChange::with_cid`] renames the order. A client's own amend cannot rename it yet.
+    ///
+    /// [`SimulatedVenue::modify_externally`]: crate::exchange::mock::SimulatedVenue::modify_externally
+    /// [`ExternalChange::with_cid`]: crate::exchange::mock::ExternalChange::with_cid
     pub reassign_id: bool,
     /// With [`reassign_id`](Self::reassign_id): whether the order under its new id starts
     /// afresh, as a venue that carries out an amend by cancelling the order and placing a new
