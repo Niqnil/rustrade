@@ -39,11 +39,15 @@
 //! Order placement tests work on paper accounts regardless of market hours, but orders
 //! for equities placed outside regular/extended hours may sit unfilled until markets open.
 //! Crypto orders (e.g., BTC/USD) can be placed 24/7.
+//!
+//! Tests whose name ends in `market_hours` need the US regular session open, and fail when it is
+//! closed. Skip them outside it with `-- --ignored --skip market_hours`.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind,
@@ -815,22 +819,24 @@ async fn test_a_resting_equity_order_states_its_terms() {
     assert_eq!(terms(&listed), expected);
 }
 
-/// An order replaced at Alpaca, here by a `PATCH` this client does not send itself, goes on as
-/// its replacement: the account stream reports the replacement linked to the order it replaces,
-/// by its order id and client order id, then the old order ended as cancelled, and an account
-/// snapshot lists the replacement linked by order id. Crypto, so it runs at any hour: an equity
-/// order placed outside market hours waits `accepted`, which Alpaca refuses to replace.
-#[tokio::test]
-#[ignore]
-#[serial]
-async fn test_a_replaced_crypto_order_is_followed() {
-    init_logging();
+/// Replace a resting buy limit order on `instrument` at Alpaca, by a `PATCH` to `new_price` this
+/// client does not send itself, and check the order goes on as its replacement: the account
+/// stream reports the replacement linked to the order it replaces, by its order id and client
+/// order id, then the old order ended as cancelled, and an account snapshot lists the
+/// replacement linked by order id. `price` must be far enough from the market that the order
+/// rests. Cancels what it placed, also when a step fails.
+async fn assert_a_replaced_order_is_followed(
+    instrument: InstrumentNameExchange,
+    quantity: Decimal,
+    price: Decimal,
+    new_price: &str,
+    time_in_force: TimeInForce,
+) {
     let config = test_config();
     let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
     let secret_key =
         std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
     let client = AlpacaClient::new(config.clone());
-    let instrument = btc_instrument();
     let instruments = [instrument.clone()];
     let mut stream = client
         .account_stream(&[], &instruments)
@@ -852,15 +858,18 @@ async fn test_a_replaced_crypto_order_is_followed() {
             key: key(&old_cid),
             state: RequestOpen::new(
                 Side::Buy,
-                Some(dec!(1000.00)),
-                dec!(0.01),
+                Some(price),
+                quantity,
                 OrderKind::Limit,
-                TimeInForce::GoodUntilCancelled { post_only: false },
+                time_in_force,
             ),
         })
         .await;
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
-        panic!("BTC/USD limit order did not rest: {:?}", response.state);
+        panic!(
+            "the {instrument} limit order did not rest: {:?}",
+            response.state
+        );
     };
     let VenueOrderId::Assigned(old_id) = &open.id else {
         panic!("Alpaca names the order it placed: {open:?}");
@@ -872,7 +881,7 @@ async fn test_a_replaced_crypto_order_is_followed() {
             .patch(format!("{}/v2/orders/{old_id}", config.rest_base_url()))
             .header("APCA-API-KEY-ID", api_key)
             .header("APCA-API-SECRET-KEY", secret_key)
-            .json(&serde_json::json!({ "limit_price": "1001" }))
+            .json(&serde_json::json!({ "limit_price": new_price }))
             .send()
             .await
             .map_err(|error| format!("the replace request was not sent: {error}"))?
@@ -972,6 +981,69 @@ async fn test_a_replaced_crypto_order_is_followed() {
         .expect("account_snapshot failed")
         .expect("the account snapshot lists the replacement");
     assert_eq!(listed.replaces, Some(Replaces::new(old_id.clone())));
+}
+
+/// A replaced crypto order is followed (see [`assert_a_replaced_order_is_followed`]). Alpaca
+/// reports the replacement on the stream itself. Crypto, so it runs at any hour.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_replaced_crypto_order_is_followed() {
+    init_logging();
+    assert_a_replaced_order_is_followed(
+        btc_instrument(),
+        dec!(0.01),
+        dec!(1000.00),
+        "1001",
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    )
+    .await;
+}
+
+/// A replaced equity order is followed (see [`assert_a_replaced_order_is_followed`]). In regular
+/// hours Alpaca streams only `replaced` for the old order and nothing for the replacement, so
+/// the client reads the replacement over REST before it reports the old order ended.
+///
+/// Needs the US regular session open, and fails at once when it is closed: an equity order placed
+/// outside it waits `accepted`, which Alpaca refuses to replace. The `market_hours` suffix lets a
+/// run at any hour skip it (`--skip market_hours`).
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_a_replaced_equity_order_is_followed_market_hours() {
+    init_logging();
+    require_regular_session().await;
+    assert_a_replaced_order_is_followed(
+        spy_instrument(),
+        dec!(1),
+        dec!(1.00),
+        "1.01",
+        TimeInForce::GoodUntilEndOfDay,
+    )
+    .await;
+}
+
+/// Panic unless Alpaca's clock says the US regular session is open.
+async fn require_regular_session() {
+    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
+    let secret_key =
+        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
+    let clock: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/v2/clock", test_config().rest_base_url()))
+        .header("APCA-API-KEY-ID", api_key)
+        .header("APCA-API-SECRET-KEY", secret_key)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("Alpaca's clock is readable")
+        .json()
+        .await
+        .expect("Alpaca's clock is JSON");
+    assert_eq!(
+        clock["is_open"],
+        serde_json::Value::Bool(true),
+        "this test needs the US regular session open; Alpaca's clock: {clock}"
+    );
 }
 
 #[tokio::test]

@@ -75,10 +75,12 @@ jobs:
         with:
           shared-key: "rustrade-ci-test"
 
-      - name: Execution tests
+      # A push or PR runs at any hour, so tests that need the US regular session are skipped here;
+      # `alpaca-weekly.yml` runs them in session.
+      - name: Execution tests (skip market_hours)
         id: exec-tests
         continue-on-error: true
-        run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_integration -- --ignored
+        run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_integration -- --ignored --skip market_hours
 
       - name: Market data tests (skip IEX, SIP, OPRA)
         id: data-tests
