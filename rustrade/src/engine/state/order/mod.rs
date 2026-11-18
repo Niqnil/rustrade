@@ -953,21 +953,23 @@ where
         order.kind = amended.kind;
 
         // The venue's state after the amend, unless a later report already advanced the held one.
-        // The identifier is the amend's either way, as the venue may have issued a new one, unless
-        // the answer names none.
+        // The identifier is the amend's either way, as the venue may have issued a new one. An
+        // answer naming none keeps the held one, unless it names the one the amend replaced: the
+        // order is then no longer addressed by the held id, which is recorded as replaced below.
+        let previous = amended
+            .previous_id
+            .as_ref()
+            .and_then(VenueOrderId::assigned);
+        let answered = match (&held, previous) {
+            (Some(held), None) => keep_held_id(&held.id, amended.open.clone()),
+            _ => amended.open.clone(),
+        };
         let open = match held {
-            Some(held) => {
-                let answered = keep_held_id(&held.id, amended.open.clone());
-                if held.is_superseded_by(&answered) {
-                    answered
-                } else {
-                    Open {
-                        id: answered.id,
-                        ..held
-                    }
-                }
-            }
-            None => amended.open.clone(),
+            Some(held) if !held.is_superseded_by(&answered) => Open {
+                id: answered.id,
+                ..held
+            },
+            _ => answered,
         };
 
         if open.quantity_remaining(order.quantity) <= Decimal::ZERO {
@@ -997,11 +999,7 @@ where
             state => *state = ActiveOrderState::Open(open),
         }
         // A late report of the order before the amend names the identifier it replaced.
-        if let Some(previous) = amended
-            .previous_id
-            .as_ref()
-            .and_then(VenueOrderId::assigned)
-        {
+        if let Some(previous) = previous {
             entry.get_mut().supersede(previous.clone());
         }
         // The venue's answer states the terms just applied, at the time of the state it gives:
@@ -1665,7 +1663,7 @@ fn reported_id<AssetKey, InstrumentKey>(
 ///
 /// The caller has established that the two are the same order (see [`Open::is_superseded_by`]).
 fn keep_held_id(held: &VenueOrderId, mut incoming: Open) -> Open {
-    if incoming.id == VenueOrderId::ClientAssigned {
+    if incoming.id.assigned().is_none() {
         incoming.id = held.clone();
     }
     incoming
@@ -5215,7 +5213,8 @@ mod tests {
             }
         }
 
-        /// A cancel in flight takes a later unnamed report's state but keeps the id it holds.
+        /// A cancel in flight takes a later unnamed report's state but keeps the id it holds, if
+        /// it holds one.
         #[test]
         fn a_cancel_in_flight_keeps_the_venue_order_id() {
             let mut orders = tracked(cancel_in_flight(named(0, dec!(0))));
@@ -5223,6 +5222,15 @@ mod tests {
             apply(&mut orders, ActiveOrderState::Open(unnamed(1, dec!(0.5))));
 
             assert_eq!(state_of(&orders), cancel_in_flight(named(1, dec!(0.5))));
+
+            // A cancel sent before the order was reported holds no id to keep.
+            let mut orders = tracked(ActiveOrderState::CancelInFlight(CancelInFlight::new(
+                None, TIME_SENT,
+            )));
+
+            apply(&mut orders, ActiveOrderState::Open(unnamed(1, dec!(0.5))));
+
+            assert_eq!(state_of(&orders), cancel_in_flight(unnamed(1, dec!(0.5))));
         }
 
         /// An amend in flight takes a later unnamed report's state but keeps the id it holds.
@@ -5236,24 +5244,40 @@ mod tests {
         }
 
         /// An amend answered with an unnamed state keeps the id, whether the answer's state or a
-        /// later one already held is applied.
+        /// later one already held is applied, and whether an amend or a cancel was in flight.
+        /// An answer naming the id the amend replaced keeps nothing: the order is no longer
+        /// addressed by it.
         #[test]
         fn an_amend_answered_unnamed_keeps_the_venue_order_id() {
-            // (held, answered, applied)
+            // (held, answered, previous id, applied)
             let cases = [
                 (
-                    named(0, dec!(0)),
+                    amend_in_flight(named(0, dec!(0))),
                     unnamed(1, dec!(0.5)),
-                    named(1, dec!(0.5)),
+                    None,
+                    ActiveOrderState::Open(named(1, dec!(0.5))),
                 ),
                 (
-                    named(2, dec!(0.5)),
+                    amend_in_flight(named(2, dec!(0.5))),
                     unnamed(1, dec!(0)),
-                    named(2, dec!(0.5)),
+                    None,
+                    ActiveOrderState::Open(named(2, dec!(0.5))),
+                ),
+                (
+                    cancel_in_flight(named(0, dec!(0))),
+                    unnamed(1, dec!(0.5)),
+                    None,
+                    cancel_in_flight(named(1, dec!(0.5))),
+                ),
+                (
+                    amend_in_flight(named(0, dec!(0))),
+                    unnamed(1, dec!(0.5)),
+                    Some(VenueOrderId::Assigned(OrderId::new("1"))),
+                    ActiveOrderState::Open(unnamed(1, dec!(0.5))),
                 ),
             ];
-            for (held, answered, applied) in cases {
-                let mut orders = tracked(amend_in_flight(held.clone()));
+            for (held, answered, previous, applied) in cases {
+                let mut orders = tracked(held.clone());
 
                 orders.update_from_amend_response(&OrderResponseAmend::<ExchangeId, u64, u64> {
                     key: order(cid(), ()).key,
@@ -5262,15 +5286,11 @@ mod tests {
                         Some(dec!(2)),
                         dec!(1),
                         OrderKind::Limit,
-                        None,
+                        previous,
                     )),
                 });
 
-                assert_eq!(
-                    state_of(&orders),
-                    ActiveOrderState::Open(applied),
-                    "{held:?}"
-                );
+                assert_eq!(state_of(&orders), applied, "{held:?}");
             }
         }
     }
