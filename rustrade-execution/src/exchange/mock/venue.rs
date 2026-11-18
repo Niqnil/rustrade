@@ -99,6 +99,8 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 
 /// Response type of [`SimulatedVenue::amend_order`].
+pub type AmendOutcome = VenueOutcome<UnindexedOrderResponseAmend>;
+
 /// A change [`SimulatedVenue::modify_externally`] makes to an order, as if from outside any
 /// client: an amend's [`patch`](Self::patch), and optionally a new client order id.
 ///
@@ -135,8 +137,6 @@ impl From<AmendPatch> for ExternalChange {
         Self::new(patch)
     }
 }
-
-pub type AmendOutcome = VenueOutcome<UnindexedOrderResponseAmend>;
 
 /// A venue's view of one instrument: what it is worth, how much of it is left to take, and when
 /// that view was last replaced.
@@ -4579,8 +4579,10 @@ impl SimulatedVenue {
     ///   down to the filled quantity does, rather than being refused. The order leaves the book, what it
     ///   held is released, and it is reported ended as [`Expired`], with what filled, its quantity
     ///   the filled quantity. The rest of the patch must still be one the order can take, though
-    ///   it changes nothing. Whether other venues end such an order or refuse the amend is not
-    ///   known, so this rule is not configurable yet.
+    ///   it changes nothing: a price in it is not applied, and the market refusals above (a stale
+    ///   market, a post-only order the market crosses, what the account cannot afford) do not
+    ///   apply, since nothing is left to trade. Whether other venues end such an order or refuse
+    ///   the amend is not known, so this rule is not configurable yet.
     /// - **A [new client order id](ExternalChange::with_cid)** renames the order, as a venue's
     ///   amend or replace under a new client order id does. It works on under the new id, keeping
     ///   its venue order id (unless one is reassigned), its place in the queue as the rule above

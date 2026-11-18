@@ -491,12 +491,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reassigned), its queue position as the priority rule allows, its deadline and its hold, and
     the old id no longer finds it. Its snapshot is linked to the order it renames
     (`OrderReport::replaces`: its venue order id before the change, and the old client order id).
-    A new id that already names a resting order is refused with `AmendRefusal::Venue`.
+    A new id that already names an order the venue holds is refused with `AmendRefusal::Venue`.
   - **An amend to a positive quantity no more than the filled quantity ends the order**, as a
     Binance spot amend does, instead of being refused: its hold is released and it is reported
-    ended as `Expired`, with what filled, its quantity cut to that. Whether other venues end such
-    an order or refuse the amend is not known, so the rule is not configurable yet. A client's own
-    amend is still refused (`AmendRefusal::QuantityNotAboveFilled`).
+    ended as `Expired`, with what filled, its quantity cut to that. A price in the patch is not
+    applied, and the market refusals do not apply. Whether other venues end such an order or
+    refuse the amend is not known, so the rule is not configurable yet. A client's own amend is
+    still refused (`AmendRefusal::QuantityNotAboveFilled`).
 
   A running `MockExchange` takes it as `MockExchangeRequest::modify_externally`, whose events go
   to the account stream. `RestingOrder` gains `kept_place_since`: the time an order joined its

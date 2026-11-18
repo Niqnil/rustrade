@@ -1478,6 +1478,35 @@ fn a_rename_onto_a_resting_order_is_refused_and_onto_its_own_id_keeps_it() {
     assert_eq!(reported.replaces, None);
 }
 
+/// A new client order id that names an order held off the book, not queued, is refused too,
+/// changing nothing: the id names an order the venue still holds.
+#[test]
+fn a_rename_onto_a_held_orders_id_is_refused() {
+    let mut venue = venue_waiting();
+    let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "90", gtc()));
+    advance(&mut venue, time(12));
+    // Held until a fresh market, where a quantity amend alone is still made.
+    let _ = venue.open_order(limit_request("held", Side::Buy, "1", "95", gtc()));
+    assert!(venue.account.orders().holds(&instrument_name()));
+    let before = resting(&venue, "resting");
+
+    assert!(matches!(
+        venue.modify_externally(
+            &cid("resting"),
+            ExternalChange::new(quantity("0.5")).with_cid(cid("held")),
+        ),
+        Err(OrderError::AmendRefused(AmendRefusal::Venue(_)))
+    ));
+    assert_eq!(resting(&venue, "resting"), before);
+    assert_eq!(queue(&venue, Side::Buy), ["resting"]);
+    assert!(venue.account.orders().holds(&instrument_name()));
+
+    let events = venue
+        .modify_externally(&cid("resting"), quantity("0.5"))
+        .unwrap();
+    assert_eq!(report_of(events.last().unwrap()).order.quantity, d("0.5"));
+}
+
 /// A rename onto the client order id of an order that has ended forgets how that one ended, as
 /// placing a new order under it does: the id names the renamed order alone, listed once, as open.
 #[test]
