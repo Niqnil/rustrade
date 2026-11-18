@@ -128,6 +128,43 @@ impl AmendPatch {
     }
 }
 
+/// What an amend made at the venue does to an order: see [`AmendPatch::apply_at_venue`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum VenueAmend {
+    /// The order as the patch leaves it, still working.
+    Amended(AmendTarget),
+    /// The patch's quantity is not above what has filled, so nothing is left to fill and the
+    /// order ends.
+    Ends,
+}
+
+impl AmendPatch {
+    /// [`apply`](Self::apply) for an amend the venue makes itself, as a change outside any client
+    /// is: a positive quantity not above `filled` ends the order, as a venue that accepts such an
+    /// amend does, rather than refusing it. The rest of the patch is checked as `apply` checks
+    /// it, except that the end is a change, so a patch whose other fields change nothing is not
+    /// refused for it. A quantity of zero or less is refused as `apply` refuses it.
+    pub(crate) fn apply_at_venue(
+        &self,
+        current: &AmendTarget,
+        filled: Decimal,
+    ) -> Result<VenueAmend, AmendRefusal> {
+        match self.quantity {
+            Some(quantity) if quantity <= filled && quantity > Decimal::ZERO => {
+                let rest = Self {
+                    quantity: None,
+                    ..*self
+                };
+                match rest.apply(current, filled) {
+                    Ok(_) | Err(AmendRefusal::NoChange) => Ok(VenueAmend::Ends),
+                    Err(refusal) => Err(refusal),
+                }
+            }
+            _ => self.apply(current, filled).map(VenueAmend::Amended),
+        }
+    }
+}
+
 /// The order an amend applies to, as tracked when the amend was sent.
 ///
 /// A venue that takes an amend only as the whole order sent again reads the fields an amend
@@ -523,6 +560,57 @@ mod tests {
                 .unwrap()
                 .quantity,
             dec!(5)
+        );
+    }
+
+    /// At the venue, a positive quantity not above what filled ends the order instead of being
+    /// refused, whatever else the patch changes or leaves; a field the order cannot take is still
+    /// refused, as are a quantity of zero or less, and a quantity above the fill amends as `apply`
+    /// does.
+    #[test]
+    fn at_the_venue_a_quantity_not_above_what_filled_ends_the_order() {
+        for quantity in [dec!(4), dec!(3)] {
+            for patch in [
+                AmendPatch::default().with_quantity(quantity),
+                AmendPatch::default()
+                    .with_quantity(quantity)
+                    .with_price(dec!(99)),
+                AmendPatch::default()
+                    .with_quantity(quantity)
+                    .with_price(dec!(100)),
+            ] {
+                assert_eq!(
+                    patch.apply_at_venue(&limit(), dec!(4)),
+                    Ok(VenueAmend::Ends),
+                    "{patch:?}"
+                );
+            }
+        }
+        assert_eq!(
+            AmendPatch::default()
+                .with_quantity(dec!(4))
+                .with_trigger_price(dec!(90))
+                .apply_at_venue(&limit(), dec!(4)),
+            Err(AmendRefusal::NotOnKind {
+                field: AmendField::TriggerPrice
+            })
+        );
+        for quantity in [dec!(0), dec!(-1)] {
+            assert_eq!(
+                AmendPatch::default()
+                    .with_quantity(quantity)
+                    .apply_at_venue(&limit(), dec!(4)),
+                Err(AmendRefusal::QuantityNotAboveFilled { filled: dec!(4) })
+            );
+        }
+        let above = AmendPatch::default().with_quantity(dec!(5));
+        assert_eq!(
+            above.apply_at_venue(&limit(), dec!(4)),
+            above.apply(&limit(), dec!(4)).map(VenueAmend::Amended)
+        );
+        assert_eq!(
+            AmendPatch::default().apply_at_venue(&limit(), dec!(4)),
+            Err(AmendRefusal::NoChange)
         );
     }
 

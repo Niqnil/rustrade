@@ -31,7 +31,8 @@ pub mod request;
 pub mod venue;
 
 pub use venue::{
-    AmendOutcome, CancelOutcome, OpenOutcome, SimulatedVenue, VenueInstrumentMarket, VenueOutcome,
+    AmendOutcome, CancelOutcome, ExternalChange, OpenOutcome, SimulatedVenue,
+    VenueInstrumentMarket, VenueOutcome,
 };
 
 /// The clock a [`market-driven`](MockExchange::new_market_driven) [`MockExchange`] stamps
@@ -454,8 +455,8 @@ impl MockExchange {
             MockExchangeRequestKind::ModifyExternally {
                 response_tx,
                 cid,
-                patch,
-            } => match self.venue.modify_externally(&cid, patch) {
+                change,
+            } => match self.venue.modify_externally(&cid, change) {
                 Ok(events) => emit.respond(events, response_tx, Ok(())),
                 Err(error) => emit.respond(Vec::new(), response_tx, Err(error)),
             },

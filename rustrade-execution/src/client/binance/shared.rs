@@ -33,7 +33,7 @@ use crate::{
         ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TimeInForceKind,
         TrailingOffsetType, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        report::{OrderReport, ReportedTerms},
+        report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport},
         request::UnindexedOrderResponseCancel,
         state::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
@@ -2915,6 +2915,13 @@ fn trade_order_is_live(status: &str) -> bool {
     matches!(status, "PARTIALLY_FILLED" | "FILLED")
 }
 
+/// Whether an `executionReport`'s order status (`X`) says the order has nothing left to fill, on a
+/// report whose execution type does not end the order itself: self-trade prevention, or an amend
+/// down to the filled quantity.
+fn report_left_nothing_to_fill(status: &str) -> bool {
+    matches!(status, "EXPIRED_IN_MATCH" | "EXPIRED" | "FILLED")
+}
+
 /// When an `executionReport`'s execution happened, and whose clock says so: its transaction time
 /// `T`, else its event time `E`, else this host's clock, as [`TimeSource::Host`].
 ///
@@ -3116,8 +3123,7 @@ pub(crate) fn convert_execution_report(
             // the expire modes the order leaves the book (`EXPIRED_IN_MATCH`); in `DECREMENT` it
             // may stay live with less left to fill, which an order snapshot cannot express.
             match report.order_status.as_deref() {
-                // The statuses Binance gives an order once prevention leaves it nothing to fill.
-                Some("EXPIRED_IN_MATCH" | "EXPIRED" | "FILLED") => buf.push(cancelled_event(
+                Some(status) if report_left_nothing_to_fill(status) => buf.push(cancelled_event(
                     report,
                     exchange,
                     symbol,
@@ -3163,34 +3169,66 @@ pub(crate) fn convert_execution_report(
         }
         "REPLACED" => {
             // An amend (Order Amend Keep Priority): the order stays live under the same `orderId`
-            // with a smaller total quantity (`q`). An amend that kept the client order id leaves
-            // `C` empty and is reported as the order's new state. Spot alone offers the amend;
-            // margin has no amend request, but its stream sends the same report shape, so a
-            // margin report is read the same way. One that took a new client order
-            // id names it in `c` and the old one in `C`; the engine knows the order by the old id
-            // and cannot follow it. A cancel-replace is not this: it reports `CANCELED` for the
+            // with a smaller total quantity (`q`). Spot alone offers the amend; margin has no
+            // amend request, but its stream sends the same report shape, so a margin report is
+            // read the same way. A cancel-replace is not this: it reports `CANCELED` for the
             // original and `NEW` for the replacement.
+            //
+            // An amend that kept the client order id leaves `C` empty (or naming the same id). One
+            // that took a new client order id names it in `c` and the old one in `C`, and only
+            // this report links them: later reports name the new id alone, and Binance no longer
+            // finds the order by the old one. So the report is linked to the order it renames, by
+            // its own `orderId` and the old client order id, for a reader to follow it.
+            //
+            // An amend down to the filled quantity or below ends the order: Binance sends this one
+            // report with `X = EXPIRED` (expiry reason `EXHAUSTED`) and no `EXPIRED` report after
+            // it, so this report ends the order, as expired, with what filled. Any status that
+            // leaves the order nothing to fill is read so, as self-trade prevention's are; only
+            // `EXPIRED` has been seen on an amend, which trades nothing.
             let renamed_from = report
                 .orig_client_order_id
                 .as_deref()
-                .filter(|previous| !previous.is_empty() && *previous != cid.0.as_str());
-            match renamed_from {
-                None => buf.extend(convert_order_snapshot(
-                    report,
-                    exchange,
-                    symbol,
-                    cid,
-                    order_id,
-                    (time_exchange, time_source),
-                )),
-                Some(previous) => warn!(
-                    %exchange, %symbol, %order_id,
-                    client_order_id = %cid,
-                    previous_client_order_id = previous,
-                    "Binance order amended under a new client order id - the engine still holds \
-                     it under its old id and quantity"
-                ),
+                .filter(|previous| !previous.is_empty() && *previous != cid.0.as_str())
+                .map(ClientOrderId::new);
+            let ended = match report.order_status.as_deref() {
+                Some(status) if rest_order_is_open(status) => false,
+                Some(status) if report_left_nothing_to_fill(status) => true,
+                // Any other status, or none, could describe a live order or an ended one, so it
+                // is taken as neither. Not sampled: each one leaves the engine holding the order
+                // as it was before the amend.
+                status => {
+                    warn!(
+                        %exchange, %symbol, %order_id,
+                        client_order_id = %cid,
+                        previous_client_order_id = renamed_from.as_ref().map(|c| c.0.as_str()),
+                        status = status.unwrap_or("<missing>"),
+                        "Binance REPLACED report with an order status (X) that is neither live \
+                         nor an end, dropping - the engine still holds the order as it was \
+                         before the amend"
+                    );
+                    return;
+                }
+            };
+            let Some(mut amended) = build_order_report(
+                report,
+                exchange,
+                symbol,
+                cid,
+                order_id.clone(),
+                (time_exchange, time_source),
+                ended,
+            ) else {
+                return;
+            };
+            if let Some(previous) = renamed_from {
+                amended = amended.with_replaces(Replaces::new(order_id).with_cid(previous));
             }
+            buf.push(UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::OrderSnapshot(
+                    rustrade_integration::collection::snapshot::Snapshot::new(amended),
+                ),
+            ));
         }
         _ => {
             // PENDING_NEW and PENDING_CANCEL are transient; the terminal state
@@ -3238,8 +3276,31 @@ fn convert_order_snapshot(
     symbol: InstrumentNameExchange,
     cid: ClientOrderId,
     order_id: OrderId,
-    (time_exchange, time_source): (DateTime<Utc>, TimeSource),
+    times: (DateTime<Utc>, TimeSource),
 ) -> Option<UnindexedAccountEvent> {
+    let order = build_order_report(report, exchange, symbol, cid, order_id, times, false)?;
+    Some(UnindexedAccountEvent::new(
+        exchange,
+        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
+            order,
+        )),
+    ))
+}
+
+/// The order a report describes, stating the terms it carries: live, or, when `expired`, ended
+/// as expired with what filled (`z`), as an amend that leaves nothing to fill ends it.
+///
+/// Returns `None` when a field the report cannot be built without is missing or unparseable;
+/// each such case is warned about individually.
+fn build_order_report(
+    report: &ExecutionReport,
+    exchange: ExchangeId,
+    symbol: InstrumentNameExchange,
+    cid: ClientOrderId,
+    order_id: OrderId,
+    (time_exchange, time_source): (DateTime<Utc>, TimeSource),
+    expired: bool,
+) -> Option<UnindexedOrderReport> {
     // parse_side already logs a warning on unknown values.
     let Some(side) = report.side.as_deref().and_then(parse_side) else {
         warn!(%exchange, %symbol, "Binance order report missing/unknown side (S), dropping snapshot");
@@ -3318,14 +3379,28 @@ fn convert_order_snapshot(
         }
     };
     let time_in_force = parse_time_in_force(order_type, report.time_in_force.as_deref());
-    // Field `z`: the order's cumulative filled quantity. Usually 0 on a NEW, but read it there
-    // too in case of an immediate partial fill on an aggressive order; on a TRADE it is the whole
-    // point of the snapshot.
-    let filled_qty = report
-        .cumulative_filled_quantity
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
+    let state = if expired {
+        let filled_qty = binance_filled_qty(
+            exchange,
+            &order_id,
+            report.cumulative_filled_quantity.as_deref(),
+        );
+        OrderState::expired(Expired::new(order_id, time_exchange, filled_qty))
+    } else {
+        // Field `z`: the order's cumulative filled quantity. Usually 0 on a NEW, but read it
+        // there too in case of an immediate partial fill on an aggressive order; on a TRADE it is
+        // the whole point of the snapshot.
+        let filled_qty = report
+            .cumulative_filled_quantity
+            .as_deref()
+            .and_then(|s| Decimal::from_str(s).ok())
+            .unwrap_or(Decimal::ZERO);
+        OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty,
+        ))
+    };
 
     let order = Order {
         key: OrderKey::new(
@@ -3339,23 +3414,14 @@ fn convert_order_snapshot(
         quantity,
         kind,
         time_in_force,
-        state: OrderState::active(Open::new(
-            VenueOrderId::Assigned(order_id),
-            time_exchange,
-            filled_qty,
-        )),
+        state,
     };
 
     // Binance reports a zero quantity for an order sized in the quote asset (`quoteOrderQty`),
     // which `from_venue_read` leaves unstated.
     let reported =
         ReportedTerms::from_venue_read(time_source, &order.kind, order.price, order.quantity);
-    Some(UnindexedAccountEvent::new(
-        exchange,
-        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
-            OrderReport::new(order, reported),
-        )),
-    ))
+    Some(OrderReport::new(order, reported))
 }
 
 // ---------------------------------------------------------------------------

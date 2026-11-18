@@ -22,7 +22,10 @@
 //!   not a guarantee: the filters that need a reference price or account state stay the venue's.
 //! - **Loading.** Rules refresh hourly. A failed refresh keeps the old rules for up to 24 hours,
 //!   and a symbol with no rules is sent unchecked, with a warning. `load_rules` on each client
-//!   loads a set of symbols ahead of their first order.
+//!   loads a set of symbols ahead of their first order, and `load_specs` loads them the same way
+//!   and returns each as an `InstrumentSpec` for the symbol's
+//!   [`Instrument`](rustrade_instrument::instrument::Instrument), counted in its base asset (see
+//!   [`OrderRules::instrument_spec`](crate::rules::OrderRules::instrument_spec)).
 //! - **Margin** has no rules endpoint of its own, so [`BinanceMargin`] uses the pair's spot
 //!   rules, which a margin order obeys.
 //! - **Turning it off.** `pre_send_rules` on each config takes
@@ -121,6 +124,25 @@
 //!   one at a time, so a restatement read can delay a retry due meanwhile by up to its 30 s.
 //! - **Cost.** One account read per reconnect: weight 20 on spot, 10 on cross margin, and 10 per
 //!   five isolated pairs.
+//!
+//! # Orders amended outside the client
+//!
+//! A spot keep-priority amend made outside this client, such as in Binance's interface or by
+//! another program, keeps the order's venue order id and lowers its quantity. [`BinanceSpot`]'s
+//! account stream reports it as the order's new state. Margin has no amend.
+//!
+//! - **A new client order id.** An amend that names a new client order id, or names none, so that
+//!   Binance gives the order a random one, renames the order. The stream reports it under the new
+//!   id, linked to the order it renames
+//!   ([`OrderReport::replaces`](crate::order::report::OrderReport::replaces): the same venue order
+//!   id and the old client order id), and a reader follows the order to its new id. Only the
+//!   amend's own report links the two ids, and Binance no longer finds the order by the old one.
+//! - **An amend down to the filled quantity or below** ends the order, in the amend's own report:
+//!   it is reported ended as [`Expired`](crate::order::state::Expired), with what filled.
+//! - **Known limitation: a rename made while the stream was disconnected is not learned.** A
+//!   reconnect asks Binance about the order by the client order id it was held under, finds none,
+//!   and stops holding it, reporting nothing. The open-order listing then shows the order under its
+//!   new id, unlinked, as an order the reader did not place.
 //!
 //! # Signed requests are stamped on Binance's clock
 //!

@@ -12,14 +12,25 @@
 //!
 //! A pass is not a guarantee. The check covers the rules a client has loaded, from the last time
 //! it loaded them, and only the ones that can be read off the request. The venue has the last say.
+//!
+//! [`OrderRules::instrument_spec`] describes the same rules as an [`InstrumentSpec`], the static
+//! description an [`Instrument`](rustrade_instrument::instrument::Instrument) carries, whose
+//! quantity step sets the grid a position is rounded to.
 
 use crate::{
     error::{Bound, BoundsViolation, OrderError, OrderField, PrecisionLimit, PrecisionViolation},
     order::{OrderKind, TrailingOffsetType},
 };
 use rust_decimal::Decimal;
-use rustrade_instrument::Side;
+use rustrade_instrument::{
+    Side,
+    instrument::spec::{
+        InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
+        OrderQuantityUnits,
+    },
+};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Whether a client checks an order against its instrument's [`OrderRules`] before sending it.
 #[non_exhaustive]
@@ -306,6 +317,62 @@ impl OrderRules {
         round_up_to(quantity, self.quantity_grid(kind)?)
     }
 
+    /// These rules as an [`InstrumentSpec`] whose quantity is counted in `unit`.
+    ///
+    /// The spec has one quantity step where these rules have two, one for every order and one
+    /// more for a market order. It takes the grid a market order's quantity must sit on, the one
+    /// [`round_quantity_down`](Self::round_quantity_down) rounds a market order to: the grid
+    /// [`quantity`](Self::quantity)'s and [`market_quantity`](Self::market_quantity)'s steps
+    /// share, or the one step that is on. That grid lies on every order kind's grid, so a
+    /// position rounded to it can be closed by an order of any kind, a market order included.
+    /// [`Trade::holding_move`](crate::trade::Trade::holding_move) rounds a position to this step
+    /// toward zero when a fill's fee is taken from the base asset. Where the market step is
+    /// coarser than the lot step, a position built from limit fills can sit between its points
+    /// and lose up to one step to dust there. Where a venue's market step is off, the two grids
+    /// are the same.
+    ///
+    /// - **Quantity:** that step, and the larger of the two minimums, the smallest quantity every
+    ///   order kind may have.
+    /// - **Price:** [`price`](Self::price)'s minimum and step, as the minimum and tick size.
+    /// - **Notional:** [`notional`](Self::notional)'s minimum.
+    ///
+    /// A part that is off becomes zero, which the spec reads as no rule. The maximums,
+    /// [`market_notional`](Self::market_notional) and the trailing offsets have no place in a spec
+    /// and are left out.
+    ///
+    /// The spec is a copy of these rules as they are now. A venue can change its rules, and a
+    /// client that reloads them does not change a spec made earlier.
+    ///
+    /// # Errors
+    /// [`InstrumentSpecError::QuantityGridOverflow`] when a [`Decimal`] cannot hold the step of
+    /// the grid the two quantity steps share. Neither step alone is put in its place: a position
+    /// rounded to the finer grid alone could be left with a quantity a market order cannot close.
+    pub fn instrument_spec<AssetKey>(
+        &self,
+        unit: OrderQuantityUnits<AssetKey>,
+    ) -> Result<InstrumentSpec<AssetKey>, InstrumentSpecError> {
+        let increment = self
+            .quantity_grid(OrderKind::Market)
+            .ok_or(InstrumentSpecError::QuantityGridOverflow {
+                quantity: self.quantity.grid().unwrap_or_default(),
+                market_quantity: self.market_quantity.grid().unwrap_or_default(),
+            })?
+            .unwrap_or_default();
+        let min_quantity = self
+            .quantity
+            .min
+            .max(self.market_quantity.min)
+            .unwrap_or_default();
+        Ok(InstrumentSpec::new(
+            InstrumentSpecPrice::new(
+                self.price.min.unwrap_or_default(),
+                self.price.grid().unwrap_or_default(),
+            ),
+            InstrumentSpecQuantity::new(unit, min_quantity, increment),
+            InstrumentSpecNotional::new(self.notional.min.unwrap_or_default()),
+        ))
+    }
+
     /// The step of the grid an order of `kind`'s quantity must sit on: `Some(None)` when there is
     /// none, `None` when a `Decimal` cannot hold the step of the grid the two steps share.
     fn quantity_grid(&self, kind: OrderKind) -> Option<Option<Decimal>> {
@@ -457,6 +524,24 @@ impl OrderRules {
         };
         range.check(OrderField::TrailingOffset, offset)
     }
+}
+
+/// Why [`OrderRules::instrument_spec`] could not describe an instrument's rules.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
+pub enum InstrumentSpecError {
+    /// A [`Decimal`] cannot hold the step of the grid the quantity step and the market quantity
+    /// step share.
+    #[error(
+        "no Decimal holds the grid the quantity step {quantity} and the market quantity step \
+         {market_quantity} share"
+    )]
+    QuantityGridOverflow {
+        /// [`OrderRules::quantity`]'s step.
+        quantity: Decimal,
+        /// [`OrderRules::market_quantity`]'s step.
+        market_quantity: Decimal,
+    },
 }
 
 #[cfg(test)]
@@ -1360,5 +1445,119 @@ mod tests {
         };
         let on = ValueRule::new(dec!(1), dec!(0), dec!(0));
         assert_eq!(loaded, OrderRules::new(on, on, on, on));
+    }
+
+    /// The spec of BTCUSDT-like rules with a lot step of `lot` and a market step of `market`,
+    /// each `0` for off, counted in BTC. Steps whose shared grid a `Decimal` holds.
+    fn spec_with_steps(lot: Decimal, market: Decimal) -> InstrumentSpec<&'static str> {
+        let rules = OrderRules::new(
+            ValueRule::new(dec!(0.01), dec!(1000000), dec!(0.01)),
+            ValueRule::new(dec!(0.001), dec!(100), lot),
+            ValueRule::new(dec!(0), dec!(10), market),
+            ValueRule::new(dec!(5), dec!(9000000), dec!(0)),
+        );
+        match rules.instrument_spec(OrderQuantityUnits::Asset("btc")) {
+            Ok(spec) => spec,
+            Err(error) => panic!("steps {lot} and {market}: {error}"),
+        }
+    }
+
+    #[test]
+    fn a_spec_takes_the_market_orders_quantity_grid_and_the_minimums() {
+        let spec = spec_with_steps(dec!(0.001), dec!(0));
+        assert_eq!(
+            spec,
+            InstrumentSpec::new(
+                InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+                InstrumentSpecQuantity::new(
+                    OrderQuantityUnits::Asset("btc"),
+                    dec!(0.001),
+                    dec!(0.001)
+                ),
+                InstrumentSpecNotional::new(dec!(5)),
+            )
+        );
+        // Both steps on: the grid they share, which a market order is rounded to.
+        let shared = spec_with_steps(dec!(0.05), dec!(0.02));
+        assert_eq!(shared.quantity.increment, dec!(0.1));
+        assert_eq!(
+            rules_with_steps(dec!(0.05), dec!(0.02))
+                .round_quantity_down(OrderKind::Market, dec!(0.19)),
+            Some(shared.quantity.increment)
+        );
+        // The market step alone.
+        assert_eq!(
+            spec_with_steps(dec!(0), dec!(0.02)).quantity.increment,
+            dec!(0.02)
+        );
+    }
+
+    fn rules_with_steps(lot: Decimal, market: Decimal) -> OrderRules {
+        OrderRules::new(
+            ValueRule::default(),
+            stepped(lot),
+            stepped(market),
+            ValueRule::default(),
+        )
+    }
+
+    #[test]
+    fn a_spec_takes_the_larger_quantity_minimum_and_zero_for_what_is_off() {
+        let rules = OrderRules::new(
+            ValueRule::default(),
+            ValueRule::new(dec!(0.001), dec!(0), dec!(0)),
+            ValueRule::new(dec!(0.01), dec!(0), dec!(0)),
+            ValueRule::default(),
+        );
+        assert_eq!(
+            rules.instrument_spec(OrderQuantityUnits::<()>::Contract),
+            Ok(InstrumentSpec::new(
+                InstrumentSpecPrice::new(dec!(0), dec!(0)),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Contract, dec!(0.01), dec!(0)),
+                InstrumentSpecNotional::new(dec!(0)),
+            ))
+        );
+
+        let lot_minimum_only = OrderRules::new(
+            ValueRule::default(),
+            ValueRule::new(dec!(0.001), dec!(0), dec!(0)),
+            ValueRule::default(),
+            ValueRule::default(),
+        );
+        let min = |rules: OrderRules| {
+            rules
+                .instrument_spec(OrderQuantityUnits::<()>::Quote)
+                .map(|spec| spec.quantity.min)
+        };
+        assert_eq!(min(lot_minimum_only), Ok(dec!(0.001)));
+        assert_eq!(min(OrderRules::default()), Ok(dec!(0)));
+    }
+
+    #[test]
+    fn a_spec_whose_shared_quantity_grid_a_decimal_cannot_hold_is_refused() {
+        let a = Decimal::from_i128_with_scale(7_922_816_251_426_433_759_354_395_033, 27);
+        let b = Decimal::from_i128_with_scale(7_922_816_251_426_433_759_354_395_031, 27);
+        assert_eq!(
+            rules_with_steps(a, b).instrument_spec(OrderQuantityUnits::<()>::Contract),
+            Err(InstrumentSpecError::QuantityGridOverflow {
+                quantity: a,
+                market_quantity: b,
+            })
+        );
+    }
+
+    /// The spec's step is the one an instrument rounds positions to.
+    #[test]
+    fn a_spec_gives_a_spot_instrument_its_quantity_step() {
+        use rustrade_instrument::{Underlying, exchange::ExchangeId, instrument::Instrument};
+
+        let instrument = Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot-btc_usdt",
+            "BTCUSDT",
+            Underlying::new("btc", "usdt"),
+            Some(spec_with_steps(dec!(0.05), dec!(0.02))),
+        );
+        assert_eq!(instrument.quantity_step(), Some(dec!(0.1)));
     }
 }

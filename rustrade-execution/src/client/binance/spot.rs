@@ -64,7 +64,7 @@ use super::shared::{
 use crate::client::listed_order::ListedOrder;
 use crate::client::log_excerpt::frame_excerpt;
 use crate::client::venue_clock::HostMoment;
-use crate::rules::{OrderRules, PreSendRules};
+use crate::rules::{InstrumentSpecError, OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -122,7 +122,9 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::{
+        kind::InstrumentKindDiscriminant, name::InstrumentNameExchange, spec::InstrumentSpec,
+    },
 };
 use serde::Deserialize;
 use smol_str::format_smolstr;
@@ -473,6 +475,41 @@ impl BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// Load the order rules of `instruments` from Binance now, as
+    /// [`load_rules`](Self::load_rules) does, and return each instrument's as an
+    /// [`InstrumentSpec`] whose quantity is counted in the symbol's base asset, named as Binance
+    /// names it (`BTC`).
+    ///
+    /// The spec's quantity step is the grid a market order's quantity sits on, which an order of
+    /// any kind can close: see [`OrderRules::instrument_spec`]. It is a copy of the rules as
+    /// loaded; the rules this client checks orders against are reloaded later, the spec is not.
+    ///
+    /// The base asset's name must match the one the instrument's
+    /// [`Underlying`](rustrade_instrument::Underlying) gives its base, or
+    /// [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
+    /// reads no step from the spec. On an instrument keyed by [`AssetNameExchange`], the names
+    /// are compared as spelled, so a base spelled `btc` reads no step from a spec in `BTC`, with
+    /// no error. An instrument to be indexed takes the spec re-keyed to the asset it gives its
+    /// base, mapping the name as its underlying's are mapped; building the index from two names
+    /// of one exchange that differ only in case fails.
+    ///
+    /// # Errors
+    /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its
+    /// [`InstrumentSpecError`]. One Binance lists without a base asset is left out, with a
+    /// warning.
+    pub async fn load_specs(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<
+        HashMap<
+            InstrumentNameExchange,
+            Result<InstrumentSpec<AssetNameExchange>, InstrumentSpecError>,
+        >,
+        UnindexedClientError,
+    > {
+        self.rules.load_specs(instruments).await
     }
 
     /// The account's commission rates on `instrument`: `GET /api/v3/account/commission`, at 20
@@ -3085,7 +3122,7 @@ mod tests {
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::error::StreamTerminationReason;
-    use crate::order::report::{OrderReport, ReportedTerms, UnindexedOrderReport};
+    use crate::order::report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport};
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use smol_str::SmolStr;
 
@@ -3274,6 +3311,86 @@ mod tests {
         assert_eq!(
             rules.map(|rules| rules.quantity.step),
             Some(Some(Decimal::new(1, 3)))
+        );
+    }
+
+    /// `load_specs` returns each symbol's rules as a spec counted in its base asset, with the
+    /// quantity step a market order sits on; a symbol whose rules make no spec maps to why, and
+    /// one listed without a base asset is left out.
+    #[tokio::test]
+    async fn load_specs_returns_a_spec_per_symbol_in_its_base_asset() {
+        use rustrade_instrument::instrument::spec::OrderQuantityUnits;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [
+                    {
+                        "symbol": "BTCUSDT", "status": "TRADING", "baseAsset": "BTC",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.05", "maxQty": "100", "stepSize": "0.05"},
+                            {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "maxQty": "10", "stepSize": "0.02"},
+                        ],
+                    },
+                    {
+                        "symbol": "ETHUSDT", "status": "TRADING",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "100", "stepSize": "0.01"},
+                        ],
+                    },
+                    {
+                        "symbol": "ODDUSDT", "status": "TRADING", "baseAsset": "ODD",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0", "maxQty": "0",
+                             "stepSize": "7.922816251426433759354395033"},
+                            {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "maxQty": "0",
+                             "stepSize": "7.922816251426433759354395031"},
+                        ],
+                    },
+                ]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let [btcusdt, ethusdt, oddusdt] =
+            ["BTCUSDT", "ETHUSDT", "ODDUSDT"].map(InstrumentNameExchange::new);
+
+        let mut loaded = client
+            .load_specs(&[btcusdt.clone(), ethusdt.clone(), oddusdt.clone()])
+            .await
+            .unwrap();
+
+        let btc = loaded.remove(&btcusdt).unwrap().unwrap();
+        assert_eq!(
+            btc.quantity.unit,
+            OrderQuantityUnits::Asset(AssetNameExchange::new("BTC"))
+        );
+        assert_eq!(
+            (btc.quantity.min, btc.quantity.increment),
+            (Decimal::new(5, 2), Decimal::new(1, 1))
+        );
+        assert!(matches!(
+            loaded.remove(&oddusdt),
+            Some(Err(InstrumentSpecError::QuantityGridOverflow { .. }))
+        ));
+        assert!(
+            loaded.is_empty(),
+            "no spec without a base asset: {loaded:?}"
         );
     }
 
@@ -5071,17 +5188,169 @@ mod tests {
         }
     }
 
-    /// An amend under a new client order id names it in `c` and the old one in `C`. The engine
-    /// knows the order by the old id, so nothing is reported for it; an unknown execution type
-    /// reports nothing either.
+    /// An amend under a new client order id names it in `c` and the old one in `C`: the order is
+    /// reported live on its new terms under the new id, linked to the order it renames by its
+    /// own venue order id and the old client order id. An unknown execution type reports nothing.
     #[test]
-    fn an_amend_under_a_new_client_order_id_produces_nothing() {
-        let renamed = ExecutionReport {
-            orig_client_order_id: Some("client-0".to_string()),
+    fn an_amend_under_a_new_client_order_id_is_linked_to_the_order_it_renames() {
+        for status in ["NEW", "PARTIALLY_FILLED"] {
+            let renamed = ExecutionReport {
+                orig_client_order_id: Some("client-0".to_string()),
+                order_status: Some(status.to_string()),
+                cumulative_filled_quantity: Some("0.001".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(renamed)).expect("an amend report");
+            assert_eq!(
+                report.order.key.cid,
+                ClientOrderId::new("client-1"),
+                "{status}"
+            );
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("12345")).with_cid(ClientOrderId::new("client-0"))),
+                "{status}"
+            );
+            assert_eq!(report.order.quantity, Decimal::new(2, 3), "{status}");
+            assert_eq!(report.reported, ReportedTerms::ALL, "{status}");
+            let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
+                report.order.state
+            else {
+                panic!("{status}: expected Open, got {:?}", report.order.state);
+            };
+            assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("12345")));
+            assert_eq!(open.filled_quantity, Decimal::new(1, 3), "{status}");
+        }
+        assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
+    }
+
+    /// An amend that keeps the client order id links nothing, whether `C` is empty, missing or
+    /// names the same id.
+    #[test]
+    fn an_amend_that_keeps_the_client_order_id_links_nothing() {
+        for previous in [Some(""), Some("client-1"), None] {
+            let amend = ExecutionReport {
+                orig_client_order_id: previous.map(str::to_string),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(amend)).expect("an amend report");
+            assert_eq!(report.replaces, None, "C = {previous:?}");
+        }
+    }
+
+    /// How an order report ended, as expired, if it did.
+    fn expired(report: &UnindexedOrderReport) -> &crate::order::state::Expired {
+        match &report.order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Expired(expired)) => {
+                expired
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    /// An amend down to the filled quantity ends the order in that one report (`X = EXPIRED`,
+    /// expiry reason `EXHAUSTED`, `q == z`), with no `EXPIRED` report after it, so the report ends
+    /// the order as expired, with what filled, on its new terms. The frames are the shapes spot
+    /// testnet sent, keeping the client order id (`C` naming it) and taking a new one (`C` naming
+    /// the old), which links the order renamed.
+    #[test]
+    fn an_amend_down_to_the_filled_quantity_ends_the_order() {
+        for (previous, replaces) in [
+            ("client-1", None),
+            (
+                "client-0",
+                Some(Replaces::new(OrderId::new("12345")).with_cid(ClientOrderId::new("client-0"))),
+            ),
+        ] {
+            let frame = serde_json::json!({
+                "e": "executionReport", "E": 1_700_000_002_001_i64, "s": "BTCUSDT",
+                "c": "client-1", "S": "BUY", "o": "LIMIT", "f": "GTC", "q": "0.00150000",
+                "p": "50000.00", "x": "REPLACED", "X": "EXPIRED", "r": "NONE", "i": 12345_i64,
+                "l": "0.00000000", "z": "0.00150000", "T": 1_700_000_002_000_i64, "w": false,
+                "C": previous, "eR": "EXHAUSTED",
+            });
+            let report: ExecutionReport =
+                serde_json::from_value(frame).expect("the observed amend report decodes");
+            let report = order_report(convert(report)).expect("an amend that ends the order");
+            assert_eq!(report.order.key.cid, ClientOrderId::new("client-1"));
+            assert_eq!(report.replaces, replaces, "C = {previous}");
+            assert_eq!(report.order.quantity, Decimal::new(15, 4));
+            assert_eq!(report.reported, ReportedTerms::ALL);
+            let expired = expired(&report);
+            assert_eq!(expired.id, OrderId::new("12345"));
+            assert_eq!(expired.filled_quantity, Some(Decimal::new(15, 4)));
+            assert_eq!(
+                expired.time_exchange,
+                DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000).unwrap()
+            );
+        }
+    }
+
+    /// An amend of a partly filled order to more than its fill leaves it live
+    /// (`X = PARTIALLY_FILLED`): the order on its new total, with its fill unchanged.
+    #[test]
+    fn an_amend_of_a_partly_filled_order_reports_it_live() {
+        let amend = ExecutionReport {
+            order_status: Some("PARTIALLY_FILLED".to_string()),
+            cumulative_filled_quantity: Some("0.0015".to_string()),
             ..resting_report("REPLACED", "0.002")
         };
-        assert!(convert(renamed).is_empty());
-        assert!(convert(resting_report("REPLACE", "0.002")).is_empty());
+        let report = order_report(convert(amend)).expect("an amend report");
+        assert_eq!(report.order.quantity, Decimal::new(2, 3));
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) =
+            report.order.state
+        else {
+            panic!("expected Open, got {:?}", report.order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::new(15, 4));
+    }
+
+    /// Any order status that leaves the order nothing to fill ends it on an amend report, as
+    /// expired, as on a self-trade prevention one, with what filled.
+    #[test]
+    fn an_amend_with_any_status_that_leaves_nothing_to_fill_ends_the_order() {
+        for status in ["EXPIRED", "EXPIRED_IN_MATCH", "FILLED"] {
+            let amend = ExecutionReport {
+                order_status: Some(status.to_string()),
+                cumulative_filled_quantity: Some("0.002".to_string()),
+                ..resting_report("REPLACED", "0.002")
+            };
+            let report = order_report(convert(amend)).expect("an amend that ends the order");
+            assert_eq!(
+                expired(&report).filled_quantity,
+                Some(Decimal::new(2, 3)),
+                "X = {status}"
+            );
+        }
+    }
+
+    /// An amend whose order status (`X`) is neither live nor an end, or missing, could leave the
+    /// order live or end it, so it is reported as neither, under its own client order id or a new
+    /// one, and logged.
+    #[test]
+    fn an_amend_with_an_unknown_status_produces_nothing() {
+        let logged = |report: ExecutionReport| {
+            let (events, logs) = rustrade_instrument::test_utils::logs::capture(|| convert(report));
+            assert!(events.is_empty(), "{events:?}");
+            logs.iter()
+                .map(|event| event.message().to_string())
+                .collect::<Vec<_>>()
+        };
+        for previous in ["", "client-0"] {
+            for status in [Some("SOME_FUTURE_STATUS"), Some("PENDING_CANCEL"), None] {
+                let messages = logged(ExecutionReport {
+                    order_status: status.map(str::to_string),
+                    orig_client_order_id: Some(previous.to_string()),
+                    ..resting_report("REPLACED", "0.002")
+                });
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.contains("neither live nor an end")),
+                    "C = {previous:?}, X = {status:?}: {messages:?}"
+                );
+            }
+        }
     }
 
     /// A report states its terms only when its time is the venue's, an amend's included. A limit

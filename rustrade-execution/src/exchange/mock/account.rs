@@ -190,6 +190,32 @@ impl AccountState {
         self.orders_open.amend(order, reservation, rank)
     }
 
+    /// [`amend_order`](Self::amend_order) for the order queued under `from`, moving it to
+    /// `order`'s [`ClientOrderId`]: see [`OpenOrders::amend_renaming`]. Forgets how an earlier
+    /// order under the new id ended, as [`book`](Self::book) does.
+    ///
+    /// # Errors
+    /// [`NotQueued`], as [`OpenOrders::amend_renaming`], leaving the book exactly as it was.
+    ///
+    /// # Panics
+    /// As [`OpenOrders::amend_renaming`].
+    pub fn amend_order_renaming(
+        &mut self,
+        from: &ClientOrderId,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        rank: Rank,
+    ) -> Result<RestingOrder, NotQueued> {
+        let cid = order.key.cid.clone();
+        let replaced = self
+            .orders_open
+            .amend_renaming(from, order, reservation, rank)?;
+        if *from != cid {
+            self.forget_ended(&cid);
+        }
+        Ok(replaced)
+    }
+
     /// Puts `resting` on the book, the order holding its reservation until its deadline if it has
     /// one, unless an order is already resting under its [`ClientOrderId`].
     ///
