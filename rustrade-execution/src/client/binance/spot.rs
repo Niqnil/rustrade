@@ -489,8 +489,11 @@ impl BinanceSpot {
     /// The base asset's name must match the one the instrument's
     /// [`Underlying`](rustrade_instrument::Underlying) gives its base, or
     /// [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
-    /// reads no step from the spec. Building an instrument index from names that differ only in
-    /// case fails.
+    /// reads no step from the spec. On an instrument keyed by [`AssetNameExchange`], the names
+    /// are compared as spelled, so a base spelled `btc` reads no step from a spec in `BTC`, with
+    /// no error. An instrument to be indexed takes the spec re-keyed to the asset it gives its
+    /// base, mapping the name as its underlying's are mapped; building the index from two names
+    /// of one exchange that differ only in case fails.
     ///
     /// # Errors
     /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its
@@ -3316,7 +3319,6 @@ mod tests {
     /// one listed without a base asset is left out.
     #[tokio::test]
     async fn load_specs_returns_a_spec_per_symbol_in_its_base_asset() {
-        use crate::rules::InstrumentSpecError;
         use rustrade_instrument::instrument::spec::OrderQuantityUnits;
 
         let server = wiremock::MockServer::start().await;
