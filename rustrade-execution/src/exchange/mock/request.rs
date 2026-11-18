@@ -3,9 +3,9 @@ use crate::{
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
     error::{UnindexedApiError, UnindexedOrderError},
+    exchange::mock::ExternalChange,
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
-        amend::AmendPatch,
         id::ClientOrderId,
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
@@ -152,21 +152,21 @@ impl MockExchangeRequest {
         )
     }
 
-    /// A request to amend the order resting under `cid` as if from outside any client: see
+    /// A request to change the order resting under `cid` as if from outside any client: see
     /// [`MockExchangeRequestKind::ModifyExternally`]. What the change reports goes to the account
     /// stream; `response_tx` hears only whether it was made.
     pub fn modify_externally(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
         cid: ClientOrderId,
-        patch: AmendPatch,
+        change: impl Into<ExternalChange>,
     ) -> Self {
         Self::new(
             time_request,
             MockExchangeRequestKind::ModifyExternally {
                 response_tx,
                 cid,
-                patch,
+                change: change.into(),
             },
         )
     }
@@ -235,13 +235,13 @@ pub enum MockExchangeRequestKind {
         response_tx: oneshot::Sender<UnindexedOrderResponseAmend>,
         request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
     },
-    /// A test hook: amend the order resting under `cid` by `patch` as if from outside any client,
-    /// reporting only on the account stream, and answer whether it was made. See
+    /// A test hook: change the order resting under `cid` as `change` says, as if from outside
+    /// any client, reporting only on the account stream, and answer whether it was made. See
     /// [`SimulatedVenue::modify_externally`](crate::exchange::mock::SimulatedVenue::modify_externally).
     ModifyExternally {
         response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
         cid: ClientOrderId,
-        patch: AmendPatch,
+        change: ExternalChange,
     },
     OpenOrder {
         response_tx:

@@ -27,7 +27,7 @@ use crate::{
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
         UnindexedOrderSnapshot,
-        amend::{AmendPatch, AmendSupport, AmendTarget, Amended, RequestAmend},
+        amend::{AmendPatch, AmendSupport, AmendTarget, Amended, RequestAmend, VenueAmend},
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport},
         request::{
@@ -99,6 +99,43 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 
 /// Response type of [`SimulatedVenue::amend_order`].
+/// A change [`SimulatedVenue::modify_externally`] makes to an order, as if from outside any
+/// client: an amend's [`patch`](Self::patch), and optionally a new client order id.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Build one with
+/// [`new`](Self::new), or from an [`AmendPatch`] alone, then [`with_cid`](Self::with_cid).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ExternalChange {
+    /// The order's new terms.
+    pub patch: AmendPatch,
+    /// The client order id the order takes, as a venue's amend or replace under a new client
+    /// order id gives it. `None`, or the order's own id, keeps it.
+    pub cid: Option<ClientOrderId>,
+}
+
+impl ExternalChange {
+    /// A change of the order's terms by `patch`, keeping its client order id.
+    pub fn new(patch: AmendPatch) -> Self {
+        Self { patch, cid: None }
+    }
+
+    /// This change, giving the order the client order id `cid`.
+    #[must_use]
+    pub fn with_cid(self, cid: ClientOrderId) -> Self {
+        Self {
+            cid: Some(cid),
+            ..self
+        }
+    }
+}
+
+impl From<AmendPatch> for ExternalChange {
+    fn from(patch: AmendPatch) -> Self {
+        Self::new(patch)
+    }
+}
+
 pub type AmendOutcome = VenueOutcome<UnindexedOrderResponseAmend>;
 
 /// A venue's view of one instrument: what it is worth, how much of it is left to take, and when
@@ -2515,10 +2552,21 @@ impl SimulatedVenue {
     /// order]`: it never traded, so this is the last chance to report it.
     fn retire_expired(
         &mut self,
+        resting: RestingOrder,
+        time_exchange: DateTime<Utc>,
+    ) -> Vec<UnindexedAccountEvent> {
+        self.retire_expired_linked(resting, time_exchange, None)
+    }
+
+    /// [`retire_expired`](Self::retire_expired), its terminal snapshot linked to the order it
+    /// replaces, if `replaces` says one.
+    fn retire_expired_linked(
+        &mut self,
         RestingOrder {
             order, reservation, ..
         }: RestingOrder,
         time_exchange: DateTime<Utc>,
+        replaces: Option<Replaces>,
     ) -> Vec<UnindexedAccountEvent> {
         let flows = reservation
             .as_ref()
@@ -2552,9 +2600,11 @@ impl SimulatedVenue {
 
         self.account.ack_expired(expired_order.clone());
 
-        events.push(
-            self.build_account_event(Snapshot(booked_report(UnindexedOrder::from(expired_order)))),
-        );
+        let mut report = booked_report(UnindexedOrder::from(expired_order));
+        if let Some(replaces) = replaces {
+            report = report.with_replaces(replaces);
+        }
+        events.push(self.build_account_event(Snapshot(report)));
         events
     }
 
@@ -4503,9 +4553,9 @@ impl SimulatedVenue {
         }
     }
 
-    /// Amends the order resting under `cid` by `patch` as if from outside any client of this
-    /// venue, such as in the venue's own interface: a test hook for how a consumer learns of an
-    /// order changed without it.
+    /// Changes the order resting under `cid` as `change` says, as if from outside any client of
+    /// this venue, such as in the venue's own interface: a test hook for how a consumer learns of
+    /// an order changed without it.
     ///
     /// The change never passes through a client, so the client's own checks do not apply to it:
     /// [`MockExecutionConfig::amend`] is what a client may ask to amend, and an external change is
@@ -4517,31 +4567,68 @@ impl SimulatedVenue {
     /// twice.
     ///
     /// Everything else is the book's, and is as [`amend_order`](Self::amend_order) describes:
-    /// `patch` is applied to the order as this venue holds it; the venue's refusals (an order held
-    /// for a later bar or a fresh market, an option order, a stale market, a post-only order the
-    /// market crosses, shortability, and what the account cannot afford) refuse it too; and it
-    /// trades, keeps or loses its place in the queue, takes a reassigned id, and is reported
-    /// alike. Only the account stream hears of it: the returned events are those `amend_order`
-    /// reports, ending with the order's snapshot, and no client is answered.
+    /// the change's [`patch`](ExternalChange::patch) is applied to the order as this venue holds
+    /// it; the venue's refusals (an order held for a later bar or a fresh market, an option order,
+    /// a stale market, a post-only order the market crosses, shortability, and what the account
+    /// cannot afford) refuse it too; and it trades, keeps or loses its place in the queue, takes a
+    /// reassigned id, and is reported alike. Only the account stream hears of it: the returned
+    /// events are those `amend_order` reports, ending with the order's snapshot, and no client is
+    /// answered. Two things differ from a client's amend:
+    ///
+    /// - **A positive quantity not above what has filled ends the order**, as a Binance spot amend
+    ///   down to the filled quantity does, rather than being refused. The order leaves the book, what it
+    ///   held is released, and it is reported ended as [`Expired`], with what filled, its quantity
+    ///   the filled quantity. The rest of the patch must still be one the order can take, though
+    ///   it changes nothing. Whether other venues end such an order or refuse the amend is not
+    ///   known, so this rule is not configurable yet.
+    /// - **A [new client order id](ExternalChange::with_cid)** renames the order, as a venue's
+    ///   amend or replace under a new client order id does. It works on under the new id, keeping
+    ///   its venue order id (unless one is reassigned), its place in the queue as the rule above
+    ///   allows, its deadline and what it holds, and no longer rests under `cid`: a cancel or
+    ///   amend under `cid` then finds no order. Its snapshot is linked to the order it renames
+    ///   ([`OrderReport::replaces`]: its venue order id before the change, and `cid`). A fill the
+    ///   change itself makes is reported under `cid`, and an order the change fills outright ends
+    ///   under `cid`, unrenamed. Under [`AmendConfig::filled_restarts`] the order's old id is
+    ///   reported ended under `cid`. A new client order id equal to `cid` keeps it.
     ///
     /// # Errors
-    /// [`AmendPatch::apply`]'s refusal, the venue's refusal, or for an order the venue no longer
-    /// holds the reason a cancel would give, changing nothing and reporting nothing.
+    /// [`AmendPatch::apply`]'s refusal, other than the quantity rule above; the venue's refusal;
+    /// [`AmendRefusal::Venue`] for a new client order id that already names an order resting
+    /// here; or for an order the venue no longer holds the reason a cancel would give. Each
+    /// changes nothing and reports nothing.
     ///
     /// # Panics
     /// As [`amend_order`](Self::amend_order).
     pub fn modify_externally(
         &mut self,
         cid: &ClientOrderId,
-        patch: AmendPatch,
+        change: impl Into<ExternalChange>,
     ) -> Result<Vec<UnindexedAccountEvent>, UnindexedOrderError> {
+        let ExternalChange {
+            patch,
+            cid: renamed,
+        } = change.into();
         let (order, reservation) = self.amendable(cid)?;
+        let rename = renamed.filter(|renamed| renamed != cid);
+        if let Some(renamed) = &rename
+            && self.account.orders().contains(renamed)
+        {
+            return Err(OrderError::AmendRefused(AmendRefusal::Venue(format!(
+                "{renamed} already names an order resting on {}",
+                order.key.exchange
+            ))));
+        }
         // The patch never reads reduce-only, which the venue does not keep on its orders.
-        let amended = patch
-            .apply(&amend_target(&order, None), order.state.filled_quantity)
+        let change = patch
+            .apply_at_venue(&amend_target(&order, None), order.state.filled_quantity)
             .map_err(OrderError::AmendRefused)?;
         let mut events = Vec::new();
-        let result = self.amend_on_book(order, reservation, amended, &mut events);
+        let result = match change {
+            VenueAmend::Amended(amended) => self
+                .amend_on_book(order, reservation, amended, rename, &mut events)
+                .map(drop),
+            VenueAmend::Ends => self.end_by_amend(&order, rename, &mut events),
+        };
         // Every refusal comes before the amend moves anything, so a refused one reports nothing.
         debug_assert!(
             result.is_ok() || events.is_empty(),
@@ -4551,6 +4638,35 @@ impl SimulatedVenue {
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         Ok(events)
+    }
+
+    /// [`modify_externally`](Self::modify_externally)'s end of `order` by an amend to no more
+    /// than it has filled, renaming it to `rename` if given: the order leaves the book as if it
+    /// expired, its quantity cut to what filled, pushing what that reports onto `events`.
+    ///
+    /// Refused, changing nothing, as an amend on the book is for an order not resting there or an
+    /// option order.
+    fn end_by_amend(
+        &mut self,
+        order: &OpenOrder,
+        rename: Option<ClientOrderId>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) -> Result<(), UnindexedOrderError> {
+        let cid = &order.key.cid;
+        self.check_amendable_on_book(cid, &order.key.instrument)?;
+        let time_exchange = self.time_exchange();
+        let Some(mut resting) = self.account.remove_order(cid) else {
+            unreachable!("SimulatedVenue found {cid} resting a moment ago");
+        };
+        let link = rename
+            .as_ref()
+            .map(|_| Replaces::new(order.state.id.or_client_id(cid)).with_cid(cid.clone()));
+        if let Some(rename) = rename {
+            resting.order.key.cid = rename;
+        }
+        resting.order.quantity = resting.order.state.filled_quantity;
+        events.extend(self.retire_expired_linked(resting, time_exchange, link));
+        Ok(())
     }
 
     /// The order resting under `cid` and what the venue holds against it, cloned out so the ledger
@@ -4613,29 +4729,17 @@ impl SimulatedVenue {
             ))));
         }
 
-        self.amend_on_book(order, reservation, amended, events)
+        self.amend_on_book(order, reservation, amended, None, events)
     }
 
-    /// The book's part of an amend, a client's or an external one: amends `order`, resting on the
-    /// book against `reservation`, to `amended`, the terms its patch leaves it with, pushing what
-    /// the amend reports onto `events`.
-    ///
-    /// An order holding no reservation, one seeded through `initial_state`, takes what the order
-    /// as amended needs afresh, as an arriving order does.
-    ///
-    /// Every refusal comes before anything moves, so a refused amend pushes nothing.
-    fn amend_on_book(
-        &mut self,
-        order: OpenOrder,
-        reservation: Option<Reservation>,
-        amended: AmendTarget,
-        events: &mut Vec<UnindexedAccountEvent>,
-    ) -> Result<Amended, UnindexedOrderError> {
-        let cid = &order.key.cid;
-        let instrument = &order.key.instrument;
-        let time_exchange = self.time_exchange();
+    /// Refuses an amend of the order resting under `cid` that the book cannot make whatever it
+    /// changes: one not queued on the book, or an option order.
+    fn check_amendable_on_book(
+        &self,
+        cid: &ClientOrderId,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<(), UnindexedOrderError> {
         let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
-
         // Only a limit order the venue booked on the book is queued: a held order waits for a
         // bar or a fresh market, and an order with no price never rests. An immediate order
         // never rests either, so every order past this check works until cancelled or a date.
@@ -4650,6 +4754,34 @@ impl SimulatedVenue {
                 "SimulatedVenue does not amend an option order: {instrument}"
             )));
         }
+        Ok(())
+    }
+
+    /// The book's part of an amend, a client's or an external one: amends `order`, resting on the
+    /// book against `reservation`, to `amended`, the terms its patch leaves it with, pushing what
+    /// the amend reports onto `events`.
+    ///
+    /// An order holding no reservation, one seeded through `initial_state`, takes what the order
+    /// as amended needs afresh, as an arriving order does.
+    ///
+    /// With `rename`, the order moves to that client order id, which names no order resting here
+    /// (the caller checks), as [`modify_externally`](Self::modify_externally) describes.
+    ///
+    /// Every refusal comes before anything moves, so a refused amend pushes nothing.
+    fn amend_on_book(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+        amended: AmendTarget,
+        rename: Option<ClientOrderId>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) -> Result<Amended, UnindexedOrderError> {
+        let cid = &order.key.cid;
+        let instrument = &order.key.instrument;
+        let time_exchange = self.time_exchange();
+        let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
+
+        self.check_amendable_on_book(cid, instrument)?;
 
         let filled = order.state.filled_quantity;
         let Some(limit) = amended.price else {
@@ -4785,6 +4917,8 @@ impl SimulatedVenue {
         } else {
             Rank::Lost
         };
+        // What a rename links the order to when it keeps its venue order id.
+        let held_id = order.state.id.or_client_id(cid);
         // Minted only now the amend has succeeded, so a refused amend uses up no id.
         let (id, previous_id) = if self.amend.reassign_id {
             let id = VenueOrderId::Assigned(self.order_id_sequence_fetch_add());
@@ -4793,22 +4927,42 @@ impl SimulatedVenue {
             (order.state.id, None)
         };
         let open = Open::new(id, time_exchange, filled_total);
+        let renamed_from = rename.is_some().then(|| cid.clone());
         let booked = Order {
+            key: match rename {
+                Some(rename) => UnindexedOrderKey {
+                    cid: rename,
+                    ..candidate.key.clone()
+                },
+                None => candidate.key.clone(),
+            },
             state: open.clone(),
             ..candidate
         };
         // The book reports the order as it now rests, as it reports every other change to it,
-        // linked to the id it replaces. Restarted, the order under the old id has ended, which is
-        // reported after its replacement, as a producer holds such a report back.
+        // linked to the id it replaces, and to the client order id it renames. Restarted, the
+        // order under the old id has ended, which is reported after its replacement, under its
+        // old client order id, as a producer holds such a report back.
         let replaced = previous_id
             .as_ref()
             .and_then(VenueOrderId::assigned)
             .cloned();
+        let link = match (&replaced, &renamed_from) {
+            (None, None) => None,
+            (replaced, renamed_from) => {
+                let id = replaced.clone().unwrap_or(held_id);
+                let link = Replaces::new(id);
+                Some(match renamed_from {
+                    Some(renamed_from) => link.with_cid(renamed_from.clone()),
+                    None => link,
+                })
+            }
+        };
         let ended_leg = replaced
             .as_ref()
             .filter(|_| self.amend.filled_restarts)
             .map(|replaced| Order {
-                key: booked.key.clone(),
+                key: order.key.clone(),
                 side: booked.side,
                 price: order.price,
                 quantity: order.quantity,
@@ -4821,8 +4975,8 @@ impl SimulatedVenue {
                 }),
             });
         let mut report = booked_report(booked.clone().map_state(OrderState::active));
-        if let Some(replaced) = replaced {
-            report = report.with_replaces(Replaces::new(replaced));
+        if let Some(link) = link {
+            report = report.with_replaces(link);
         }
         let answer = Amended::new(
             open,
@@ -4831,7 +4985,10 @@ impl SimulatedVenue {
             booked.kind,
             previous_id,
         );
-        if let Err(NotQueued(refused)) = self.account.amend_order(booked, Some(reservation), rank) {
+        if let Err(NotQueued(refused)) =
+            self.account
+                .amend_order_renaming(cid, booked, Some(reservation), rank)
+        {
             unreachable!(
                 "SimulatedVenue amended {} off the book: amend_resting checks it is queued",
                 refused.order.key.cid

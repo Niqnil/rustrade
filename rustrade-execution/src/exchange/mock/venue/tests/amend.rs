@@ -1359,3 +1359,259 @@ fn a_market_order_held_for_its_next_bar_is_not_amended() {
     assert_eq!(free_quote(&venue), free);
     assert!(venue.account.orders().holds(&instrument_name()));
 }
+
+// --- An external change under a new client order id, and one that ends the order -----------
+
+/// A cancel of the order resting under `name`, by its client order id alone.
+fn cancel(venue: &mut SimulatedVenue, name: &str) -> CancelOutcome {
+    venue.cancel_order(OrderRequestCancel {
+        key: limit_request(name, Side::Buy, "1", "48000", gtc()).key,
+        state: RequestCancel { id: None },
+    })
+}
+
+/// An external change under a new client order id moves the order there: it keeps its venue
+/// order id and, lowered in quantity alone, its place in the queue; its snapshot is linked to the
+/// order it renames; and the old id no longer finds it.
+#[test]
+fn an_external_change_under_a_new_client_order_id_renames_the_order() {
+    let mut venue = resting_buy();
+    let _ = venue.open_order(limit_request("behind", Side::Buy, "1", "48000", gtc()));
+    let before = resting(&venue, "resting");
+    let id = before
+        .state
+        .id
+        .assigned()
+        .cloned()
+        .expect("the venue named it");
+
+    let events = venue
+        .modify_externally(
+            &cid("resting"),
+            ExternalChange::new(quantity("0.5")).with_cid(cid("renamed")),
+        )
+        .unwrap();
+
+    let reported = report_of(events.last().expect("the order is reported"));
+    let after = resting(&venue, "renamed");
+    assert_eq!(after.key.cid, cid("renamed"));
+    assert_eq!(after.quantity, d("0.5"));
+    assert_eq!(
+        after.state.id, before.state.id,
+        "it keeps its venue order id"
+    );
+    assert_eq!(reported.order, after.clone().map_state(OrderState::active));
+    assert_eq!(
+        reported.replaces,
+        Some(Replaces::new(id).with_cid(cid("resting")))
+    );
+    assert_eq!(queue(&venue, Side::Buy), ["renamed", "behind"]);
+    assert!(venue.account.orders().get(&cid("resting")).is_none());
+    assert!(matches!(
+        refusal(&amend(&mut venue, "resting", price("47000"))),
+        OrderError::Rejected(_)
+    ));
+    assert!(cancel(&mut venue, "resting").response.state.is_err());
+    assert!(cancel(&mut venue, "renamed").response.state.is_ok());
+}
+
+/// A renamed order that loses its place goes behind the orders at its new price, under the new
+/// id, and keeps its deadline under it.
+#[test]
+fn a_renamed_order_keeps_its_deadline_and_is_queued_under_its_new_id() {
+    let mut venue = resting_buy();
+    let _ = venue.open_order(limit_request(
+        "dated",
+        Side::Buy,
+        "1",
+        "47000",
+        TimeInForce::GoodTillDate { expiry: time(5) },
+    ));
+    let _ = venue.open_order(limit_request("there", Side::Buy, "1", "46000", gtc()));
+
+    venue
+        .modify_externally(
+            &cid("dated"),
+            ExternalChange::new(price("46000")).with_cid(cid("renamed")),
+        )
+        .unwrap();
+    assert_eq!(queue(&venue, Side::Buy), ["resting", "there", "renamed"]);
+
+    let retired = venue.advance_time(time(5));
+    let ended = retired
+        .iter()
+        .find_map(|event| match &event.kind {
+            AccountEventKind::OrderSnapshot(report) => Some(&report.0),
+            _ => None,
+        })
+        .expect("the deadline retires it");
+    assert_eq!(ended.order.key.cid, cid("renamed"));
+    assert!(matches!(ended.order.state, OrderState::Inactive(_)));
+    assert_eq!(queue(&venue, Side::Buy), ["resting", "there"]);
+}
+
+/// A new client order id that names an order already resting is refused, changing nothing; one
+/// equal to the order's own keeps it, linking nothing.
+#[test]
+fn a_rename_onto_a_resting_order_is_refused_and_onto_its_own_id_keeps_it() {
+    let mut venue = resting_buy();
+    let _ = venue.open_order(limit_request("other", Side::Buy, "1", "46000", gtc()));
+    let before = resting(&venue, "resting");
+
+    assert!(matches!(
+        venue.modify_externally(
+            &cid("resting"),
+            ExternalChange::new(quantity("0.5")).with_cid(cid("other")),
+        ),
+        Err(OrderError::AmendRefused(AmendRefusal::Venue(_)))
+    ));
+    assert_eq!(resting(&venue, "resting"), before);
+
+    let events = venue
+        .modify_externally(
+            &cid("resting"),
+            ExternalChange::new(quantity("0.5")).with_cid(cid("resting")),
+        )
+        .unwrap();
+    let reported = report_of(events.last().expect("the order is reported"));
+    assert_eq!(reported.order.key.cid, cid("resting"));
+    assert_eq!(reported.replaces, None);
+}
+
+/// A rename on a venue that also reassigns the venue order id links both old ids; restarted, the
+/// order under its old venue order id is reported ended under its old client order id.
+#[test]
+fn a_rename_with_a_reassigned_id_links_both_old_ids() {
+    for restarts in [false, true] {
+        let mut venue = resting_buy_amending(
+            AmendConfig::FULL
+                .with_reassign_id(true)
+                .with_filled_restarts(restarts),
+        );
+        let old = resting(&venue, "resting").state.id;
+        let old_id = old.assigned().cloned().expect("the venue named it");
+
+        let events = venue
+            .modify_externally(
+                &cid("resting"),
+                ExternalChange::new(price("47000")).with_cid(cid("renamed")),
+            )
+            .unwrap();
+
+        let after = resting(&venue, "renamed");
+        assert_ne!(after.state.id, old, "restarts {restarts}");
+        let reports: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.kind, AccountEventKind::OrderSnapshot(_)))
+            .map(report_of)
+            .collect();
+        let (replacement, ended) = match reports.as_slice() {
+            [replacement] => (replacement, None),
+            [replacement, ended] => (replacement, Some(ended)),
+            other => panic!("restarts {restarts}: {other:?}"),
+        };
+        assert_eq!(replacement.order.key.cid, cid("renamed"));
+        assert_eq!(
+            replacement.replaces,
+            Some(Replaces::new(old_id.clone()).with_cid(cid("resting")))
+        );
+        assert_eq!(ended.is_some(), restarts);
+        if let Some(ended) = ended {
+            assert_eq!(ended.order.key.cid, cid("resting"));
+            assert!(matches!(ended.order.state, OrderState::Inactive(_)));
+        }
+    }
+}
+
+/// [`resting_buy`] after an amend fills 0.4 of it at 49,100 and rests the rest at 49,200.
+fn partly_filled_buy() -> SimulatedVenue {
+    let mut venue = resting_buy_amending(AmendConfig::FULL);
+    offer_only(&mut venue, "0.4");
+    let outcome = amend(&mut venue, "resting", price("49200"));
+    assert_eq!(amended(&outcome).open.filled_quantity, d("0.4"));
+    venue
+}
+
+/// An external amend down to the filled quantity or below ends the order, as Binance does: its
+/// hold is released and it is reported expired with what filled, its quantity cut to that, as the
+/// venue then remembers it; under a new client order id, linked to the order it renames.
+#[test]
+fn an_external_amend_down_to_the_fill_ends_the_order() {
+    for (amended_to, rename) in [("0.4", None), ("0.1", None), ("0.4", Some("renamed"))] {
+        let mut venue = partly_filled_buy();
+        let before = resting(&venue, "resting");
+        let id = before
+            .state
+            .id
+            .assigned()
+            .cloned()
+            .expect("the venue named it");
+        let free = free_quote(&venue);
+        let mut change = ExternalChange::new(quantity(amended_to));
+        if let Some(rename) = rename {
+            change = change.with_cid(cid(rename));
+        }
+
+        let events = venue.modify_externally(&cid("resting"), change).unwrap();
+
+        let case = format!("{amended_to} {rename:?}");
+        let [restated, reported] = events.as_slice() else {
+            panic!("{case}: the released hold, then the order: {events:?}");
+        };
+        assert!(
+            balance_of(restated).balance.free > free,
+            "{case}: the hold is released"
+        );
+        let reported = report_of(reported);
+        let name = rename.unwrap_or("resting");
+        assert_eq!(reported.order.key.cid, cid(name), "{case}");
+        assert_eq!(reported.order.quantity, d("0.4"), "{case}");
+        assert_eq!(reported.order.price, before.price, "{case}");
+        assert_eq!(reported.reported, ReportedTerms::ALL, "{case}");
+        assert_eq!(
+            reported.order.state,
+            OrderState::expired(Expired::new(id.clone(), time(2), Some(d("0.4")))),
+            "{case}"
+        );
+        assert_eq!(
+            reported.replaces,
+            rename.map(|_| Replaces::new(id.clone()).with_cid(cid("resting"))),
+            "{case}"
+        );
+        assert!(venue.account.orders().is_empty(), "{case}");
+        let key = OrderKey {
+            cid: cid(name),
+            ..limit_request("resting", Side::Buy, "1", "48000", gtc()).key
+        };
+        let [ended] = &venue.orders_ended(&[key])[..] else {
+            panic!("{case}: the venue remembers how it ended");
+        };
+        assert!(
+            matches!(ended.state, InactiveOrderState::Expired(_)),
+            "{case}"
+        );
+    }
+}
+
+/// A client's own amend down to the fill is still refused: the refusal is the library's, before
+/// any request leaves. And an external one the book cannot make, or that changes a field the
+/// order cannot take, is refused, changing nothing.
+#[test]
+fn only_an_external_amend_down_to_the_fill_ends_the_order() {
+    let mut venue = partly_filled_buy();
+    let before = resting(&venue, "resting");
+    assert_eq!(
+        *amend_refusal(&amend(&mut venue, "resting", quantity("0.4"))),
+        AmendRefusal::QuantityNotAboveFilled { filled: d("0.4") }
+    );
+    assert!(matches!(
+        venue.modify_externally(
+            &cid("resting"),
+            AmendPatch::default()
+                .with_quantity(d("0.4"))
+                .with_trigger_price(d("1")),
+        ),
+        Err(OrderError::AmendRefused(AmendRefusal::NotOnKind { .. }))
+    ));
+    assert_eq!(resting(&venue, "resting"), before);
+}

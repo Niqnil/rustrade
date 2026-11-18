@@ -6,7 +6,8 @@
 //! Whether the order goes on under its new id or starts afresh there, its old id reported
 //! cancelled, the engine follows it to the new id and keeps tracking it: after a change made
 //! outside any client, reported as a replace, and after the engine's own amend, answered with the
-//! id it replaced.
+//! id it replaced. A change outside any client under a new client order id moves the order to it,
+//! keeping its strategy, and one that amends it down to its fill ends it.
 
 use std::sync::Arc;
 
@@ -23,10 +24,10 @@ use rustrade_execution::{
     AccountSnapshot, UnindexedAccountEvent,
     balance::{AssetBalance, Balance},
     client::mock::{AmendConfig, MockExecutionConfig},
-    exchange::mock::SimulatedVenue,
+    exchange::mock::{ExternalChange, SimulatedVenue},
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
-    market::{MarketObservation, MarketSnapshot},
+    market::{MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
         amend::{AmendPatch, AmendTarget, RequestAmend},
@@ -317,5 +318,91 @@ fn the_engines_own_amend_under_a_new_id_keeps_the_order_tracked() {
             .unwrap();
         assert_eq!(held.order.price, Some(dec!(95)), "{amend:?}");
         assert_eq!(held.superseded_ids(), [old], "{amend:?}");
+    }
+}
+
+/// A change outside any client under a new client order id moves the order to it, keeping its
+/// strategy and terms: whether the venue keeps the order's venue order id, reassigns one, or
+/// starts it afresh under one, the old one reported cancelled under the old client order id.
+#[test]
+fn an_order_renamed_outside_the_engine_is_followed_to_its_new_client_order_id() {
+    let renamed = ClientOrderId::new("renamed");
+    for amend in [AmendConfig::FULL, configs()[0], configs()[1]] {
+        let (mut venue, indexer, mut engine) = resting(amend);
+        let old = held_id(&engine);
+
+        let events = venue
+            .modify_externally(
+                &cid(),
+                ExternalChange::new(AmendPatch::default().with_price(dec!(95)))
+                    .with_cid(renamed.clone()),
+            )
+            .unwrap();
+        let replaced = apply(&indexer, &mut engine, events);
+
+        let [replaced] = replaced.as_slice() else {
+            panic!("{amend:?}: expected one replace followed, got {replaced:?}");
+        };
+        assert_eq!(
+            replaced.replaced,
+            Replaces::new(old.clone()).with_cid(cid()),
+            "{amend:?}"
+        );
+        assert_eq!(replaced.key.cid, renamed, "{amend:?}");
+        assert_eq!(replaced.key.strategy, key().strategy, "{amend:?}");
+        let orders = &engine
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .orders;
+        assert!(orders.get(&cid()).is_none(), "{amend:?}");
+        let held = orders.tracked(&renamed).expect("tracked under the new id");
+        assert_eq!(held.order.key.strategy, key().strategy, "{amend:?}");
+        assert_eq!(held.order.price, Some(dec!(95)), "{amend:?}");
+        assert!(
+            matches!(held.order.state, ActiveOrderState::Open(_)),
+            "{amend:?}: {:?}",
+            held.order.state
+        );
+    }
+}
+
+/// A change outside any client that amends a partly filled order down to its fill ends it,
+/// renamed or not: the engine no longer tracks it under either id.
+#[test]
+fn an_order_amended_down_to_its_fill_outside_the_engine_ends() {
+    let renamed = ClientOrderId::new("renamed");
+    for rename in [false, true] {
+        let (mut venue, indexer, mut engine) = resting(AmendConfig::FULL);
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(market()).with_depth(MarketDepth::new(None, Some(dec!(0.4)))),
+            TIME,
+        );
+        // Repriced to cross the ask, the order fills the 0.4 offered and rests the rest.
+        let events = venue
+            .modify_externally(&cid(), AmendPatch::default().with_price(dec!(101)))
+            .unwrap();
+        apply(&indexer, &mut engine, events);
+        let Some(ActiveOrderState::Open(open)) = tracked(&engine) else {
+            panic!(
+                "precondition: the order rests, partly filled: {:?}",
+                tracked(&engine)
+            );
+        };
+        assert_eq!(open.filled_quantity, dec!(0.4));
+
+        let mut change = ExternalChange::new(AmendPatch::default().with_quantity(dec!(0.4)));
+        if rename {
+            change = change.with_cid(renamed.clone());
+        }
+        let events = venue.modify_externally(&cid(), change).unwrap();
+        apply(&indexer, &mut engine, events);
+
+        let orders = &engine
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .orders;
+        assert!(orders.get(&cid()).is_none(), "rename {rename}");
+        assert!(orders.get(&renamed).is_none(), "rename {rename}");
     }
 }
