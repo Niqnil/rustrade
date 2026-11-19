@@ -17,17 +17,21 @@ and says so in the CHANGELOG.
 so with the pinned toolchain `cargo update` skips any crates.io release younger than that, and
 Dependabot holds back its version updates for as long. Most malicious releases are found and
 yanked within hours. Dependabot's cargo runs read that file too, so a crate's security update
-waits until the fix is 7 days old; GitHub still raises the alert at once, and a fix needed sooner
-is taken by hand as below. An exact (`=`) requirement on a release
-younger than 7 days makes `cargo update` fail with "is too new". To take such a release on
-purpose, review it, then run
-`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`, and
-raise the requirement in `Cargo.toml` to that version. Without the raised requirement, the next
-bare `cargo update` inside the 7 days quietly downgrades the crate again, printing only a
-"Downgrading" line. A transitive crate has no requirement to raise, so until its release ages,
-update other crates with `cargo update -p <crate>` rather than a bare `cargo update`, and check
-`Cargo.lock`'s diff for downgrades. CI's `cargo audit` flags a downgrade back to a version with a
-security advisory.
+waits until the fix is 7 days old. GitHub still raises the alert at once. An exact (`=`)
+requirement on a release younger than 7 days makes `cargo update` fail with "is too new".
+
+To take a younger release on purpose, usually a security fix:
+
+1. Confirm the advisory is real (RustSec or the GitHub Advisory Database). A fake advisory is the
+   easiest way past the window.
+2. Pick the lowest version that fixes it, not the newest: a malicious release can follow a genuine
+   fix within hours. Review it.
+3. Run `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`.
+4. Raise the requirement in `Cargo.toml` to that version. Otherwise the next bare `cargo update`
+   inside the 7 days quietly downgrades the crate again, printing only a "Downgrading" line. A
+   transitive crate has no requirement to raise, so until its release ages, update other crates
+   with `cargo update -p <crate>` rather than a bare `cargo update`, and check `Cargo.lock`'s diff
+   for downgrades. CI's `cargo audit` flags a downgrade back to a version with an advisory.
 
 **Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
 `.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
