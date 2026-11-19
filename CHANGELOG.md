@@ -923,10 +923,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hours, so the wait keeps a short-lived one out.
   - **Dependabot** holds back version updates for crates, GitHub Actions and the Rust toolchain
     until a release is 7 days old. Patch updates outside the high-risk list merge without review
-    once CI passes, so this matters most for them. Security updates are not delayed.
+    once CI passes, so this matters most for them.
   - **Cargo** (`.cargo/config.toml`, Cargo 1.100+) resolves no crates.io release younger than 7
-    days, in `cargo update` and the weekly latest-deps job. An exact (`=`) requirement on a
-    younger release makes `cargo update` fail as "too new"; `CONTRIBUTING.md` gives the override.
+    days, in `cargo update`, the weekly latest-deps job and Dependabot's own cargo runs. So a
+    crate's Dependabot security update waits until the fix is 7 days old (GitHub Actions and
+    toolchain security updates do not). An exact (`=`) requirement on a younger release makes
+    `cargo update` fail as "too new"; `CONTRIBUTING.md` gives the override.
 
 ### Fixed
 

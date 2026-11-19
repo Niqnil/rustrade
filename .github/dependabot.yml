@@ -6,7 +6,10 @@ version: 2
 # Every entry holds back a release until it is 7 days old. Most malicious releases are found and
 # pulled within hours of publication, so a week skips them, which matters most for the patch
 # updates dependabot-auto-merge.yml merges without review. The cooldown applies to version updates
-# only: security updates still open at once. A fix needed sooner can be bumped by hand.
+# only, but Dependabot's cargo runs read .cargo/config.toml and the pinned toolchain, so they also
+# honour its 7-day minimum publish age: a crate's security fix younger than that is proposed only
+# once it ages. GitHub still raises the alert at once; CONTRIBUTING.md says how to take a fix
+# sooner by hand.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"

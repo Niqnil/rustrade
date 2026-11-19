@@ -18,9 +18,9 @@ rustflags = [
 
 # Resolve no crates.io release younger than 7 days (Cargo 1.100+; older Cargo ignores the key).
 # Malicious releases are usually found and yanked within hours, so the window keeps them out of
-# `cargo update`, `cargo generate-lockfile` and CI's latest-deps job. Versions already in
-# `Cargo.lock` are unaffected, and `--locked` builds never resolve. To take a newer release on
-# purpose, after reviewing it:
+# `cargo update`, `cargo generate-lockfile`, CI's latest-deps job and Dependabot's cargo runs
+# (security updates included). Versions already in `Cargo.lock` are unaffected, and `--locked`
+# builds use the lock file as is. To take a newer release on purpose, after reviewing it:
 #   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>
 # and raise the requirement in Cargo.toml to it, or the next bare `cargo update` inside the
 # window downgrades it again (CONTRIBUTING.md has the transitive case).

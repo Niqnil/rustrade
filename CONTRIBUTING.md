@@ -15,8 +15,10 @@ and says so in the CHANGELOG.
 
 **New dependency releases wait a week.** `.cargo/config.toml` sets a 7-day minimum publish age,
 so with the pinned toolchain `cargo update` skips any crates.io release younger than that, and
-Dependabot holds back its version updates for as long (security updates are not delayed). Most
-malicious releases are found and yanked within hours. An exact (`=`) requirement on a release
+Dependabot holds back its version updates for as long. Most malicious releases are found and
+yanked within hours. Dependabot's cargo runs read that file too, so a crate's security update
+waits until the fix is 7 days old; GitHub still raises the alert at once, and a fix needed sooner
+is taken by hand as below. An exact (`=`) requirement on a release
 younger than 7 days makes `cargo update` fail with "is too new". To take such a release on
 purpose, review it, then run
 `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`, and
