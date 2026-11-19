@@ -64,7 +64,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{request::ExecutionRequest, sim::DEFAULT_FEEDBACK_LIMIT},
     risk::DefaultRiskManager,
     statistic::time::Daily,
@@ -441,7 +441,7 @@ async fn a_rejected_open_reaches_the_engine_instead_of_being_discarded_at_shutdo
     .expect_err("every open was rejected, so the run must report that rather than a summary");
 
     match error {
-        BarterError::BacktestAllOrdersRejected { rejected, reason } => {
+        RustradeError::BacktestAllOrdersRejected { rejected, reason } => {
             assert_eq!(
                 rejected, 1,
                 "one open was sent, so one rejection is expected"
@@ -550,7 +550,7 @@ async fn a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung() {
     .expect_err("a zero-delay feedback cycle is a failed configuration, not a run");
 
     match error {
-        BarterError::SimFeedbackLoop {
+        RustradeError::SimFeedbackLoop {
             exchange,
             time,
             limit,

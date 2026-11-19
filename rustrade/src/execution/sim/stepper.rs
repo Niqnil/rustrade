@@ -12,7 +12,7 @@ use crate::{
         execution_tx::MultiExchangeTxMap,
         state::{EngineState, position::PositionSeed},
     },
-    error::BarterError,
+    error::RustradeError,
     shutdown::Shutdown,
 };
 use chrono::{DateTime, Utc};
@@ -208,7 +208,7 @@ enum Ended {
     /// [`SimStepper::finish`] ran.
     Finished,
     /// A call failed with this error, which every later call returns.
-    Failed(BarterError),
+    Failed(RustradeError),
 }
 
 /// Why a [`SimStepper`] call failed. After any of them the stepper takes no further steps.
@@ -274,7 +274,7 @@ where
     pub fn new(
         venues: FnvIndexMap<ExchangeIndex, SimVenue>,
         clock: HistoricalClock,
-    ) -> Result<Self, BarterError> {
+    ) -> Result<Self, RustradeError> {
         let session_start = clock.time();
         let core = SimCore::new(venues, clock, DEFAULT_FEEDBACK_LIMIT).map_err(misconfigured)?;
 
@@ -288,7 +288,7 @@ where
     }
 
     /// Set how many account events one call may deliver with no market event or venue deadline in
-    /// between before it fails with [`BarterError::SimFeedbackLoop`]. Each call starts afresh. Defaults to
+    /// between before it fails with [`RustradeError::SimFeedbackLoop`]. Each call starts afresh. Defaults to
     /// [`DEFAULT_FEEDBACK_LIMIT`]; see [`SimRunner::with_feedback_limit`].
     ///
     /// [`SimRunner::with_feedback_limit`]: super::SimRunner::with_feedback_limit
@@ -329,7 +329,7 @@ where
         engine: &mut SimEngine<GlobalData, InstrumentData, Strategy, Risk>,
         time: DateTime<Utc>,
         events: impl IntoIterator<Item = EngineEvent<MarketKind>>,
-    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, BarterError>
+    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, RustradeError>
     where
         SimEngine<GlobalData, InstrumentData, Strategy, Risk>:
             Processor<EngineEvent<MarketKind>, Audit: Terminal + Debug>,
@@ -379,7 +379,7 @@ where
     /// - [`SimStepError::WrongEngine`] if `engine` was not built with this stepper's clock, and
     ///   [`SimStepError::StartMismatch`] if its positions on the venues' instruments differ from
     ///   the venues' [`SimStart`](super::SimStart). Both are checked on the first call only.
-    /// - [`BarterError::SimFeedbackLoop`] if the `Engine` keeps trading on its own fills with no
+    /// - [`RustradeError::SimFeedbackLoop`] if the `Engine` keeps trading on its own fills with no
     ///   simulated time passing — see [`with_feedback_limit`](Self::with_feedback_limit).
     /// - [`SimStepError::EngineStopped`] if the `Engine` reports a terminal audit.
     /// - [`SimStepError::Misconfigured`] if a venue produces an event its index cannot translate,
@@ -389,7 +389,7 @@ where
     pub fn settle<GlobalData, InstrumentData, Strategy, Risk>(
         &mut self,
         engine: &mut SimEngine<GlobalData, InstrumentData, Strategy, Risk>,
-    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, BarterError>
+    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, RustradeError>
     where
         SimEngine<GlobalData, InstrumentData, Strategy, Risk>:
             Processor<EngineEvent<MarketKind>, Audit: Terminal + Debug>,
@@ -423,7 +423,7 @@ where
     pub fn finish<GlobalData, InstrumentData, Strategy, Risk>(
         &mut self,
         engine: &mut SimEngine<GlobalData, InstrumentData, Strategy, Risk>,
-    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, BarterError>
+    ) -> Result<Vec<StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind>>, RustradeError>
     where
         SimEngine<GlobalData, InstrumentData, Strategy, Risk>:
             Processor<EngineEvent<MarketKind>, Audit: Terminal + Debug>,
@@ -452,8 +452,8 @@ where
     /// Run `call` unless the session has ended, and end it if `call` fails.
     fn guarded<T>(
         &mut self,
-        call: impl FnOnce(&mut Self) -> Result<T, BarterError>,
-    ) -> Result<T, BarterError> {
+        call: impl FnOnce(&mut Self) -> Result<T, RustradeError>,
+    ) -> Result<T, RustradeError> {
         match &self.ended {
             Some(Ended::Finished) => return Err(SimStepError::Finished.into()),
             Some(Ended::Failed(error)) => return Err(error.clone()),
@@ -493,7 +493,7 @@ where
         batch: &mut VecDeque<EngineEvent<MarketKind>>,
         until: Until,
         audits: &mut Vec<Processed::Audit>,
-    ) -> Result<(), BarterError>
+    ) -> Result<(), RustradeError>
     where
         Processed: Processor<EngineEvent<MarketKind>, Audit: Terminal + Debug>,
     {
@@ -573,7 +573,7 @@ fn process<Processed, MarketKind>(
     engine: &mut Processed,
     event: EngineEvent<MarketKind>,
     audits: &mut Vec<Processed::Audit>,
-) -> Result<(), BarterError>
+) -> Result<(), RustradeError>
 where
     Processed: Processor<EngineEvent<MarketKind>, Audit: Terminal + Debug>,
 {
@@ -661,7 +661,7 @@ fn check_start<GlobalData, InstrumentData>(
 }
 
 /// How a [`SimStepper`] reports a [`SimFault`], which [`SimRunner`](super::SimRunner) panics on.
-fn misconfigured(reason: SimFault) -> BarterError {
+fn misconfigured(reason: SimFault) -> RustradeError {
     SimStepError::Misconfigured(format!("SimStepper {reason}")).into()
 }
 

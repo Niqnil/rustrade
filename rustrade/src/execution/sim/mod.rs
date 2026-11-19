@@ -4,7 +4,7 @@ use crate::{
         clock::{EngineClock, HistoricalClock},
         state::position::PositionSeed,
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{
         AccountStreamEvent,
         request::{ExecutionRequest, dropped_open},
@@ -294,7 +294,7 @@ impl Ord for ScheduledEvent {
 /// three thousand simultaneous fills reach this limit too. The budget is per source event —
 /// `since_source` is reset when a source event is returned, *before* that event is routed to the
 /// venues, and when a venue is woken at its own deadline — so the accounting is right, but a run abandoned this way is reporting a wide book
-/// rather than the feedback cycle [`BarterError::SimFeedbackLoop`] names. Raise the limit with
+/// rather than the feedback cycle [`RustradeError::SimFeedbackLoop`] names. Raise the limit with
 /// [`SimRunner::with_feedback_limit`] if that is the case.
 ///
 /// # Booking a request does not spend from it
@@ -586,7 +586,7 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// account event then outranks every later source event forever: simulated time never advances and
 /// the source is never drawn again. At most [`with_feedback_limit`](Self::with_feedback_limit)
 /// account deliverables are therefore emitted with no intervening source event or venue deadline,
-/// after which the run is abandoned with [`BarterError::SimFeedbackLoop`], readable via [`error`](Self::error).
+/// after which the run is abandoned with [`RustradeError::SimFeedbackLoop`], readable via [`error`](Self::error).
 ///
 /// # Panics
 /// Panics if a venue reports an account event or response whose exchange, asset or instrument is
@@ -605,7 +605,7 @@ where
     /// from a caller's loop instead of from a source.
     core: SimCore<MarketKind>,
     /// Why the run was abandoned, if it was. Read through [`SimRunner::error`].
-    error: Option<BarterError>,
+    error: Option<RustradeError>,
     source_done: bool,
     /// Latch: [`Shutdown::AfterDrain`] is emitted exactly once, when the source is exhausted.
     drain_signalled: bool,
@@ -708,7 +708,7 @@ where
     /// single market event, or for a book deep enough that one tick fills that many resting orders
     /// — see [`DEFAULT_FEEDBACK_LIMIT`]. Raising it will not rescue a true zero-delay cycle — that
     /// has no limit at which it terminates — so a run hitting even a large limit is otherwise
-    /// reporting the configuration described in [`BarterError::SimFeedbackLoop`].
+    /// reporting the configuration described in [`RustradeError::SimFeedbackLoop`].
     pub fn with_feedback_limit(mut self, limit: usize) -> Self {
         self.core.feedback_limit = limit;
         self
@@ -722,7 +722,7 @@ where
     /// must check this once the stream has ended**, before treating the terminal state as a
     /// result: the statistics of an abandoned run describe only the portion of the dataset that was
     /// read. [`backtest`](crate::backtest::backtest) does so.
-    pub fn error(&self) -> Option<&BarterError> {
+    pub fn error(&self) -> Option<&RustradeError> {
         self.error.as_ref()
     }
 
@@ -1035,7 +1035,7 @@ where
     }
 
     /// Whether emitting the queue's head would exceed the feedback budget. See [`check_feedback`].
-    pub(crate) fn check_feedback(&self) -> Option<BarterError> {
+    pub(crate) fn check_feedback(&self) -> Option<RustradeError> {
         check_feedback(
             &self.venues,
             &self.pending,
@@ -1376,7 +1376,7 @@ fn check_feedback(
     pending: &BinaryHeap<Reverse<ScheduledEvent>>,
     since_source: usize,
     limit: usize,
-) -> Option<BarterError> {
+) -> Option<RustradeError> {
     if since_source < limit {
         return None;
     }
@@ -1387,7 +1387,7 @@ fn check_feedback(
         return None;
     }
 
-    Some(BarterError::SimFeedbackLoop {
+    Some(RustradeError::SimFeedbackLoop {
         exchange: venues.get(&next.exchange)?.venue.exchange,
         time: next.time,
         limit,
@@ -2940,7 +2940,7 @@ mod tests {
         assert!(harness.runner.is_terminated());
         assert_eq!(
             harness.runner.error(),
-            Some(&BarterError::SimFeedbackLoop {
+            Some(&RustradeError::SimFeedbackLoop {
                 exchange: EXCHANGE,
                 time: at(10),
                 limit: 4,
@@ -3010,7 +3010,7 @@ mod tests {
         let refused = SimExecutionBuilder::new(&instruments)
             .add_venue_with_options(config(0), options.clone());
         assert!(
-            matches!(&refused, Err(BarterError::ExecutionBuilder(reason)) if reason.contains("no spot_margin")),
+            matches!(&refused, Err(RustradeError::ExecutionBuilder(reason)) if reason.contains("no spot_margin")),
             "{refused:?}"
         );
 
@@ -3041,7 +3041,7 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(BarterError::ExecutionBuilder(reason))
+                Err(RustradeError::ExecutionBuilder(reason))
                     if reason.contains("cannot be built: the configuration spells one asset two ways")
             ),
             "{refused:?}"

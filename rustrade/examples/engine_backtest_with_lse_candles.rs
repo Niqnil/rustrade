@@ -113,7 +113,7 @@ use rustrade::{
         EngineState, builder::EngineStateBuilder, global::DefaultGlobalData,
         instrument::data::DefaultInstrumentMarketData, trading::TradingState,
     },
-    error::BarterError,
+    error::RustradeError,
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::DefaultStrategy,
@@ -188,7 +188,7 @@ async fn main() {
         async move {
             Ok(replay_candles(client, sources, INTERVAL, start, end).map(
                 // The engine crate's error type; `DataError` converts into it directly.
-                |event| event.map_err(BarterError::from),
+                |event| event.map_err(RustradeError::from),
             ))
         }
     })

@@ -21,7 +21,7 @@ use crate::{
             EngineState, connectivity::reconcile_venue_roles, instrument::data::InstrumentDataState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     risk::RiskManager,
     statistic::time::TimeInterval,
     strategy::{
@@ -85,8 +85,9 @@ pub struct BacktestArgsConstant<MarketData, SummaryInterval, State, AuxEvents = 
     /// with no entry models nothing extra, so an empty map is every venue as configured.
     ///
     /// An entry for an exchange no execution configuration mocks is refused with
-    /// [`BarterError::ExecutionBuilder`]: options that nothing would apply are a misconfiguration,
-    /// and ignoring them would run a backtest without the costs its author configured.
+    /// [`RustradeError::ExecutionBuilder`]: options that nothing would apply are a
+    /// misconfiguration, and ignoring them would run a backtest without the costs its author
+    /// configured.
     pub venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
     /// Historical market data to use for simulation.
     pub market_data: MarketData,
@@ -151,7 +152,7 @@ pub async fn run_backtests<
         >,
     >,
     args_dynamic_iter: impl IntoIterator<Item = BacktestArgsDynamic<Strategy, Risk>>,
-) -> Result<MultiBacktestSummary<SummaryInterval>, BarterError>
+) -> Result<MultiBacktestSummary<SummaryInterval>, RustradeError>
 where
     MarketData: BacktestMarketData<Kind = InstrumentData::MarketEventKind>,
     // The simulated venues are fed each market event before the `Engine` sees it, which needs
@@ -246,13 +247,13 @@ where
 ///   `price_entry_average`) without driving their own engine harness.
 ///
 /// # Errors
-/// Returns [`BarterError::BacktestAllOrdersRejected`] when the strategy sent open requests and
+/// Returns [`RustradeError::BacktestAllOrdersRejected`] when the strategy sent open requests and
 /// the exchange rejected every one of them. Such a run filled nothing, so its statistics describe
 /// no trading at all. Partial rejections are not an error — an insufficient balance is a
 /// legitimate simulated outcome — and a strategy that sends no requests is unaffected. Per-instrument
 /// counts and the first reason are on each `TearSheet`.
 ///
-/// Returns [`BarterError::SimFeedbackLoop`] when the strategy trades on its own fills against a
+/// Returns [`RustradeError::SimFeedbackLoop`] when the strategy trades on its own fills against a
 /// venue whose simulated round trip is zero. That is a zero-delay cycle rather than a slow run — no
 /// scheduling can order a response both after its cause and before the next input — so it is
 /// reported instead of being run. See [`SimRunner`].
@@ -307,7 +308,7 @@ pub async fn backtest<
         >,
     >,
     args_dynamic: BacktestArgsDynamic<Strategy, Risk>,
-) -> Result<BacktestResult<SummaryInterval, EngineState<GlobalData, InstrumentData>>, BarterError>
+) -> Result<BacktestResult<SummaryInterval, EngineState<GlobalData, InstrumentData>>, RustradeError>
 where
     MarketData: BacktestMarketData<Kind = InstrumentData::MarketEventKind>,
     // The simulated venues are fed each market event before the `Engine` sees it, which needs
@@ -410,7 +411,7 @@ where
         .keys()
         .find(|exchange| !mocked.contains(exchange))
     {
-        return Err(BarterError::ExecutionBuilder(format!(
+        return Err(RustradeError::ExecutionBuilder(format!(
             "BacktestArgsConstant::venue_options has options for {exchange}, which no execution \
              configuration mocks"
         )));
@@ -510,7 +511,7 @@ where
     // outcome that a strategy should experience -- and a strategy that sends no requests at all
     // never trips this.
     if trading_summary.rejected_every_order() {
-        return Err(BarterError::BacktestAllOrdersRejected {
+        return Err(RustradeError::BacktestAllOrdersRejected {
             rejected: trading_summary.orders_rejected,
             reason: trading_summary
                 .instruments
@@ -585,7 +586,7 @@ where
 #[pin_project::pin_project]
 struct TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, RustradeError>>,
 {
     #[pin]
     market: futures::stream::Peekable<St>,
@@ -593,14 +594,14 @@ where
         std::vec::IntoIter<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>,
     >,
     last_market_time: DateTime<Utc>,
-    source_error: Arc<OnceLock<BarterError>>,
+    source_error: Arc<OnceLock<RustradeError>>,
     terminated: bool,
 }
 
 impl<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey> Stream
     for TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, RustradeError>>,
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
 {
@@ -663,7 +664,7 @@ where
 impl<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey> FusedStream
     for TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, RustradeError>>,
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
 {
@@ -701,9 +702,9 @@ where
 /// reported. A stream whose first event precedes that contradicts its own source, and the aux merge
 /// was already seeded against the wrong instant, so it is the same violation.
 fn take_market<MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
-    polled: Poll<Option<Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>>,
+    polled: Poll<Option<Result<MarketStreamEvent<InstrumentKey, MarketKind>, RustradeError>>>,
     last_market_time: &mut DateTime<Utc>,
-    source_error: &Arc<OnceLock<BarterError>>,
+    source_error: &Arc<OnceLock<RustradeError>>,
 ) -> Poll<Option<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>>
 where
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
@@ -718,7 +719,7 @@ where
             if let MarketStreamEvent::Item(market_event) = &event
                 && market_event.time_exchange < *last_market_time
             {
-                let error = BarterError::BacktestMarketData(format!(
+                let error = RustradeError::BacktestMarketData(format!(
                     "market data must be sorted ascending by MarketEvent::time_exchange, but an \
                      event stamped {} arrived after the merge had advanced to {}",
                     market_event.time_exchange, last_market_time
@@ -779,10 +780,10 @@ fn merge_market_with_aux<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
     market: St,
     seed: DateTime<Utc>,
     aux: Vec<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>,
-    source_error: Arc<OnceLock<BarterError>>,
+    source_error: Arc<OnceLock<RustradeError>>,
 ) -> TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentKey, MarketKind>, RustradeError>>,
 {
     TimedMergeStream {
         market: market.peekable(),
@@ -866,10 +867,10 @@ mod tests {
 
     /// Merge a market script that may contain failures, returning the recorded source error.
     async fn merge_fallible(
-        market: Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>>,
+        market: Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>>,
         seed: DateTime<Utc>,
         aux: Vec<Timed<EngineEvent<DataKind>>>,
-    ) -> (Vec<EngineEvent<DataKind>>, Option<BarterError>) {
+    ) -> (Vec<EngineEvent<DataKind>>, Option<RustradeError>) {
         let source_error = Arc::new(OnceLock::new());
         // The merge's `Timed` wrapper is unwrapped here: these tests assert the *ordering* the
         // merge produces, which the sequence of values already expresses. `SimRunner`'s own tests
@@ -973,8 +974,8 @@ mod tests {
         assert_eq!(order, vec!["aux", "reconnecting"]);
     }
 
-    fn source_failure() -> BarterError {
-        BarterError::BacktestMarketData("truncated source".to_string())
+    fn source_failure() -> RustradeError {
+        RustradeError::BacktestMarketData("truncated source".to_string())
     }
 
     #[tokio::test]
@@ -1015,7 +1016,7 @@ mod tests {
     async fn merge_keeps_the_first_source_error() {
         let market = vec![
             Err(source_failure()),
-            Err(BarterError::BacktestMarketData("second".to_string())),
+            Err(RustradeError::BacktestMarketData("second".to_string())),
         ];
         let (merged, error) = merge_fallible(market, at(0), vec![]).await;
 
@@ -1055,7 +1056,7 @@ mod tests {
         // Reported, not merely stopped: a truncated run that returns `Ok` is the silent-partial
         // -result failure this path exists to prevent.
         let error = error.expect("an out-of-order event must be recorded like a source failure");
-        assert!(matches!(error, BarterError::BacktestMarketData(_)));
+        assert!(matches!(error, RustradeError::BacktestMarketData(_)));
         // Both instants are named, so the offending event is identifiable without a re-run.
         let message = error.to_string();
         assert!(message.contains("1970-01-01 00:00:10"), "{message}");

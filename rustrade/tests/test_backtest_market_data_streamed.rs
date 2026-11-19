@@ -47,7 +47,7 @@ use rustrade::{
         instrument::data::{DefaultInstrumentMarketData, InstrumentDataState},
         trading::TradingState,
     },
-    error::BarterError,
+    error::RustradeError,
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::DefaultStrategy,
@@ -71,9 +71,9 @@ const CONFIG_PATH: &str = concat!(
 type StreamedBacktestState = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
 
 /// One scripted market stream, replayed verbatim by the factory on every call.
-type Script = Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>>;
+type Script = Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>>;
 type ScriptStream = futures::stream::Iter<std::vec::IntoIter<ScriptItem>>;
-type ScriptItem = Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>;
+type ScriptItem = Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>;
 
 #[derive(Deserialize)]
 struct Config {
@@ -115,8 +115,8 @@ fn candle_at(close_time: DateTime<Utc>, close: Decimal) -> ScriptItem {
 }
 
 /// The failure a streaming source reports mid-read: a page fetch, a decode, a truncated file.
-fn source_failure() -> BarterError {
-    BarterError::BacktestMarketData("page 3 fetch failed".to_string())
+fn source_failure() -> RustradeError {
+    RustradeError::BacktestMarketData("page 3 fetch failed".to_string())
 }
 
 /// A stream factory replaying `script`, counting how many times it is called.
@@ -127,7 +127,7 @@ fn source_failure() -> BarterError {
 fn factory(
     script: Script,
     calls: Arc<AtomicUsize>,
-) -> impl Fn() -> std::future::Ready<Result<ScriptStream, BarterError>> {
+) -> impl Fn() -> std::future::Ready<Result<ScriptStream, RustradeError>> {
     move || {
         calls.fetch_add(1, Ordering::SeqCst);
         std::future::ready(Ok(futures::stream::iter(script.clone())))
@@ -147,8 +147,9 @@ fn paced_factory(
     yielded: Arc<AtomicUsize>,
     mid_stream: Arc<tokio::sync::Notify>,
     signal_after: usize,
-) -> impl Fn() -> std::future::Ready<Result<futures::stream::BoxStream<'static, ScriptItem>, BarterError>>
-{
+) -> impl Fn() -> std::future::Ready<
+    Result<futures::stream::BoxStream<'static, ScriptItem>, RustradeError>,
+> {
     move || {
         let yielded = Arc::clone(&yielded);
         let mid_stream = Arc::clone(&mid_stream);
@@ -182,8 +183,9 @@ fn paced_factory(
 fn gated_failure_factory(
     script: Script,
     mid_stream: Arc<tokio::sync::Notify>,
-) -> impl Fn() -> std::future::Ready<Result<futures::stream::BoxStream<'static, ScriptItem>, BarterError>>
-{
+) -> impl Fn() -> std::future::Ready<
+    Result<futures::stream::BoxStream<'static, ScriptItem>, RustradeError>,
+> {
     move || {
         let mid_stream = Arc::clone(&mid_stream);
         let stream = futures::StreamExt::chain(

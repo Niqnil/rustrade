@@ -1,4 +1,4 @@
-use crate::error::BarterError;
+use crate::error::RustradeError;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use rustrade_data::streams::consumer::MarketStreamEvent;
@@ -66,7 +66,7 @@ pub trait BacktestMarketData {
     /// Return the `DateTime<Utc>` of the first event in the market data `Stream`.
     ///
     /// Must be coherent with [`stream`](Self::stream) — see the trait-level caller obligations.
-    fn time_first_event(&self) -> impl Future<Output = Result<DateTime<Utc>, BarterError>>;
+    fn time_first_event(&self) -> impl Future<Output = Result<DateTime<Utc>, RustradeError>>;
 
     /// Return a `Stream` of `MarketStreamEvent`s, sorted ascending by `time_exchange`.
     ///
@@ -76,10 +76,10 @@ pub trait BacktestMarketData {
         &self,
     ) -> impl Future<
         Output = Result<
-            impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, BarterError>>
+            impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, RustradeError>>
             + Send
             + 'static,
-            BarterError,
+            RustradeError,
         >,
     >;
 }
@@ -102,17 +102,17 @@ where
 {
     type Kind = Kind;
 
-    async fn time_first_event(&self) -> Result<DateTime<Utc>, BarterError> {
+    async fn time_first_event(&self) -> Result<DateTime<Utc>, RustradeError> {
         Ok(self.time_first_event)
     }
 
     async fn stream(
         &self,
     ) -> Result<
-        impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, BarterError>>
+        impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, RustradeError>>
         + Send
         + 'static,
-        BarterError,
+        RustradeError,
     > {
         let events = Arc::clone(&self.events);
         let lazy_clone_iter = (0..events.len()).map(move |index| Ok(events[index].clone()));
@@ -205,7 +205,7 @@ impl<Kind> MarketDataInMemory<Kind> {
 ///
 /// A violation is nonetheless **observable rather than silent**: the harness's merge checks each
 /// event against the last as it passes, in release as well as debug, and a backwards step aborts
-/// the run with a [`BarterError::BacktestMarketData`] instead of producing statistics over a
+/// the run with a [`RustradeError::BacktestMarketData`] instead of producing statistics over a
 /// non-monotonic clock. That is a backstop, not a licence to hand this an unsorted source: it
 /// reports the first violation and stops, so it tells the factory it is wrong rather than repairing
 /// anything.
@@ -221,8 +221,8 @@ pub struct MarketDataStreamed<Factory, Kind> {
 impl<Factory, Fut, St, Kind> MarketDataStreamed<Factory, Kind>
 where
     Factory: Fn() -> Fut,
-    Fut: Future<Output = Result<St, BarterError>>,
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Kind>, BarterError>>
+    Fut: Future<Output = Result<St, RustradeError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Kind>, RustradeError>>
         + Send
         + 'static,
 {
@@ -233,10 +233,10 @@ where
     /// [`Reconnecting`](MarketStreamEvent::Reconnecting) events (which carry no timestamp).
     ///
     /// # Errors
-    /// - [`BarterError::BacktestMarketData`] if the source yields no `Item` at all — an empty
+    /// - [`RustradeError::BacktestMarketData`] if the source yields no `Item` at all — an empty
     ///   dataset has no clock start, so there is no backtest to run.
     /// - Whatever the factory or the source itself reports, propagated unchanged.
-    pub async fn new(factory: Factory) -> Result<Self, BarterError> {
+    pub async fn new(factory: Factory) -> Result<Self, RustradeError> {
         let stream = factory().await?;
         futures::pin_mut!(stream);
 
@@ -249,7 +249,7 @@ where
         }
 
         let Some(time_first_event) = time_first_event else {
-            return Err(BarterError::BacktestMarketData(
+            return Err(RustradeError::BacktestMarketData(
                 "source yielded no MarketStreamEvent::Item, so the backtest clock has no start"
                     .to_string(),
             ));
@@ -266,24 +266,24 @@ where
 impl<Factory, Fut, St, Kind> BacktestMarketData for MarketDataStreamed<Factory, Kind>
 where
     Factory: Fn() -> Fut,
-    Fut: Future<Output = Result<St, BarterError>>,
-    St: Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Kind>, BarterError>>
+    Fut: Future<Output = Result<St, RustradeError>>,
+    St: Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Kind>, RustradeError>>
         + Send
         + 'static,
 {
     type Kind = Kind;
 
-    async fn time_first_event(&self) -> Result<DateTime<Utc>, BarterError> {
+    async fn time_first_event(&self) -> Result<DateTime<Utc>, RustradeError> {
         Ok(self.time_first_event)
     }
 
     async fn stream(
         &self,
     ) -> Result<
-        impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, BarterError>>
+        impl Stream<Item = Result<MarketStreamEvent<InstrumentIndex, Self::Kind>, RustradeError>>
         + Send
         + 'static,
-        BarterError,
+        RustradeError,
     > {
         (self.factory)().await
     }
@@ -322,16 +322,16 @@ mod tests {
 
     /// Build a `MarketDataStreamed` over a fixed script of items, counting factory invocations.
     fn streamed(
-        script: Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>>,
+        script: Vec<Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>>,
         calls: Arc<AtomicUsize>,
     ) -> impl Fn() -> std::future::Ready<
         Result<
             futures::stream::Iter<
                 std::vec::IntoIter<
-                    Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>,
+                    Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>,
                 >,
             >,
-            BarterError,
+            RustradeError,
         >,
     > {
         move || {
@@ -401,7 +401,7 @@ mod tests {
 
         assert!(matches!(
             result.err(),
-            Some(BarterError::BacktestMarketData(_))
+            Some(RustradeError::BacktestMarketData(_))
         ));
     }
 
@@ -409,14 +409,14 @@ mod tests {
     async fn source_error_before_the_first_item_propagates_from_the_constructor() {
         let calls = Arc::new(AtomicUsize::new(0));
         let result = MarketDataStreamed::new(streamed(
-            vec![Err(BarterError::BacktestMarketData("boom".to_string()))],
+            vec![Err(RustradeError::BacktestMarketData("boom".to_string()))],
             calls,
         ))
         .await;
 
         assert!(matches!(
             result.err(),
-            Some(BarterError::BacktestMarketData(message)) if message == "boom"
+            Some(RustradeError::BacktestMarketData(message)) if message == "boom"
         ));
     }
 
@@ -426,18 +426,18 @@ mod tests {
             std::future::ready(Err::<
                 futures::stream::Iter<
                     std::vec::IntoIter<
-                        Result<MarketStreamEvent<InstrumentIndex, DataKind>, BarterError>,
+                        Result<MarketStreamEvent<InstrumentIndex, DataKind>, RustradeError>,
                     >,
                 >,
                 _,
-            >(BarterError::BacktestMarketData(
+            >(RustradeError::BacktestMarketData(
                 "cannot open".to_string(),
             )))
         };
 
         assert!(matches!(
             MarketDataStreamed::new(factory).await.err(),
-            Some(BarterError::BacktestMarketData(message)) if message == "cannot open"
+            Some(RustradeError::BacktestMarketData(message)) if message == "cannot open"
         ));
     }
 }

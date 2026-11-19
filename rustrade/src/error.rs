@@ -11,8 +11,9 @@ use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Every error this crate returns.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
-pub enum BarterError {
+pub enum RustradeError {
     #[error("IndexError: {0}")]
     IndexError(#[from] IndexError),
 
@@ -38,7 +39,7 @@ pub enum BarterError {
     /// it would have produced would cover only the portion of the dataset that was read.
     ///
     /// # Why a `String` rather than a typed source
-    /// `BarterError` derives `Clone`, `Eq`, `Ord`, `Hash` and both serde impls, so every payload
+    /// `RustradeError` derives `Clone`, `Eq`, `Ord`, `Hash` and both serde impls, so every payload
     /// must too. The sources this reports are caller-supplied and provider-specific — the LSE
     /// integration's own error is deliberately neither `Clone` nor `PartialEq`, matching every
     /// REST-backed integration in `rustrade-data` — so no typed variant could hold one. A source
@@ -47,7 +48,7 @@ pub enum BarterError {
     /// diagnostics.
     ///
     /// # Appended deliberately
-    /// New variants belong at the end. `BarterError` derives `Ord`/`PartialOrd` from declaration
+    /// New variants belong at the end. `RustradeError` derives `Ord`/`PartialOrd` from declaration
     /// order and `Serialize`/`Deserialize`, so inserting mid-enum reorders every comparison and
     /// shifts the variant index any index-based serializer writes.
     #[error("backtest market data: {0}")]
@@ -143,13 +144,13 @@ impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RxDropped {
     }
 }
 
-impl<T> From<tokio::sync::mpsc::error::SendError<T>> for BarterError {
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RustradeError {
     fn from(_: tokio::sync::mpsc::error::SendError<T>) -> Self {
         Self::ExecutionRxDropped(RxDropped)
     }
 }
 
-impl From<tokio::task::JoinError> for BarterError {
+impl From<tokio::task::JoinError> for RustradeError {
     fn from(value: tokio::task::JoinError) -> Self {
         Self::JoinError(format!("{value:?}"))
     }

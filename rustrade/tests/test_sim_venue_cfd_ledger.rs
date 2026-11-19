@@ -40,7 +40,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{request::ExecutionRequest, sim::SimVenueOptions},
     risk::DefaultRiskManager,
     statistic::time::Daily,
@@ -448,7 +448,7 @@ async fn try_round_trip(
     opening: Side,
     margin: Decimal,
     venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
-) -> Result<BacktestResult<Daily, BacktestState>, BarterError> {
+) -> Result<BacktestResult<Daily, BacktestState>, RustradeError> {
     try_round_trip_slipped(opening, margin, venue_options, SlippageConfig::none()).await
 }
 
@@ -458,7 +458,7 @@ async fn try_round_trip_slipped(
     margin: Decimal,
     venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
     slippage: SlippageConfig,
-) -> Result<BacktestResult<Daily, BacktestState>, BarterError> {
+) -> Result<BacktestResult<Daily, BacktestState>, RustradeError> {
     let mut cfd = instrument(EXCHANGE, "spx500", "usd");
     cfd.kind = InstrumentKind::Cfd(CfdContract {
         contract_size: contract_size(),
@@ -696,7 +696,7 @@ async fn a_backtest_short_the_venue_will_not_lend_is_refused() {
     )]);
 
     match try_round_trip(Side::Sell, margin, options).await {
-        Err(BarterError::BacktestAllOrdersRejected { rejected, reason }) => {
+        Err(RustradeError::BacktestAllOrdersRejected { rejected, reason }) => {
             assert_eq!(rejected, 1);
             assert!(
                 reason.contains("BorrowRejected") && reason.contains("NotShortable"),
