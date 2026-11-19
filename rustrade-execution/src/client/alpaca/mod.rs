@@ -415,12 +415,15 @@ pub struct AlpacaConfig {
     /// it fails with [`ConnectivityError::Timeout`]. [`DEFAULT_REQUEST_TIMEOUT`] by default.
     ///
     /// It bounds every REST request: orders, cancels, order lookups, listings and each page of
-    /// account activities. An order or cancel that times out may have reached Alpaca and been
-    /// acted on, so it fails as [`OrderError::Connectivity`], whose outcome is unknown until the
-    /// order is looked up. A caller that bounds a request itself, as an execution manager bounds
-    /// orders and cancels with its own request timeout, gets the shorter of the two. Zero ends
-    /// every request at once, so each one fails with a timeout. Serialised as whole
-    /// milliseconds, under `request_timeout_ms`.
+    /// account activities. It bounds each attempt: a request Alpaca refuses for its rate limit
+    /// (429) is sent again after the wait, and the retry has the whole timeout again.
+    ///
+    /// An order or cancel that times out may have reached Alpaca and been acted on, so it fails
+    /// as [`OrderError::Connectivity`], whose outcome is unknown until the order is looked up. A
+    /// caller that bounds a request itself, as an execution manager bounds orders and cancels with
+    /// its own request timeout, gets the shorter of the two. Zero ends every request at once, so
+    /// each one fails with a timeout. Serialised as whole milliseconds, under
+    /// `request_timeout_ms`.
     #[serde(
         rename = "request_timeout_ms",
         default = "default_request_timeout",
