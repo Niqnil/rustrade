@@ -12930,6 +12930,40 @@ mod tests {
             order
         }
 
+        /// Log lines written by [`capture_warnings`]'s subscriber.
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl CapturedLog {
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+            }
+        }
+
+        /// Capture `WARN` and above on this thread until the guard drops. A `#[tokio::test]` runs
+        /// on one thread, so this sees every event of code it awaits inline.
+        fn capture_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+            let log = CapturedLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
         /// Serve `order` as `GET /v2/orders/id-{cid}`, expecting `calls` reads.
         async fn mount_read(server: &MockServer, cid: &str, order: ResponseTemplate, calls: u64) {
             Mock::given(method("GET"))
@@ -13139,8 +13173,8 @@ mod tests {
 
         /// An order `replaced` that names no replacement, the order held or one further down its
         /// chain, leaves the order held reported as cancelled, not the order where the chain
-        /// breaks. The case at the order held pins behaviour that predates following replaces
-        /// (only its `warn` is new, and not asserted); the case further down tells the two apart.
+        /// breaks, with a warning naming the order where it breaks. The report in the case at the
+        /// order held predates following replaces; the case further down tells the two apart.
         #[tokio::test]
         async fn a_chain_that_names_no_replacement_leaves_the_order_held_cancelled() {
             for broken_at_held in [true, false] {
@@ -13164,7 +13198,17 @@ mod tests {
                 let held = alpaca_key("SPY", "a");
                 hold(&known, &held);
 
+                let (log, guard) = capture_warnings();
                 let reported = check_once(&server, &known).await;
+                drop(guard);
+
+                let warnings = log.text();
+                let broken = if broken_at_held { "id-a" } else { "id-b" };
+                assert!(
+                    warnings.contains("replaced without naming its replacement")
+                        && warnings.contains(&format!("replaced_id={broken}")),
+                    "broken at held: {broken_at_held}: {warnings}"
+                );
 
                 let [report] = reported.as_slice() else {
                     panic!("one report (broken at held: {broken_at_held}): {reported:?}");
