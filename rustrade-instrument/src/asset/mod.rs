@@ -231,6 +231,13 @@ mod tests {
         assert!(!Asset::new("btc", "XBT").is_same_asset(&Asset::new("btc", "BTC")));
     }
 
+    /// A marker names one asset, as a position keyed by it relies on to find its own carry.
+    #[test]
+    fn a_marker_is_always_the_same_asset() {
+        assert!(BaseAsset.is_same_asset(&BaseAsset));
+        assert!(QuoteAsset.is_same_asset(&QuoteAsset));
+    }
+
     #[test]
     fn an_index_and_an_internal_name_are_the_same_asset_when_equal() {
         assert!(AssetIndex(3).is_same_asset(&AssetIndex(3)));
