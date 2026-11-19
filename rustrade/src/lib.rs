@@ -50,6 +50,18 @@
 //!
 //! ## Getting Started Via Engine Examples
 //! [See Engine Examples](https://github.com/Niqnil/rustrade/tree/feat/docs_tests_readmes_examples/rustrade/examples)
+//!
+//! ## Dependency security
+//! Your build resolves rustrade's dependencies itself, so the 7-day wait this repository applies to
+//! new dependency releases protects only its own builds, not yours. Most malicious releases are
+//! found and yanked within hours. For the same protection, set a minimum release age in your
+//! Cargo config (Cargo 1.100 or later; older Cargo ignores the key), and commit your `Cargo.lock`:
+//!
+//! ```toml
+//! # ~/.cargo/config.toml, or .cargo/config.toml in your project
+//! [registry]
+//! global-min-publish-age = "7 days"
+//! ```
 
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]

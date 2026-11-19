@@ -929,6 +929,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     crate's Dependabot security update waits until the fix is 7 days old (GitHub Actions and
     toolchain security updates do not). An exact (`=`) requirement on a younger release makes
     `cargo update` fail as "too new"; `CONTRIBUTING.md` gives the override.
+  - **For users:** the window does not reach a dependent's build, which resolves rustrade's
+    dependencies itself. The README's "Dependency Security" section and the `rustrade` crate docs
+    show how to set the same window in your own Cargo config.
 
 ### Fixed
 

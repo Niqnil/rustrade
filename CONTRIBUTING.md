@@ -18,7 +18,10 @@ so with the pinned toolchain `cargo update` skips any crates.io release younger 
 Dependabot holds back its version updates for as long. Most malicious releases are found and
 yanked within hours. Dependabot's cargo runs read that file too, so a crate's security update
 waits until the fix is 7 days old. GitHub still raises the alert at once. An exact (`=`)
-requirement on a release younger than 7 days makes `cargo update` fail with "is too new".
+requirement on a release younger than 7 days makes `cargo update` fail with "is too new". The
+window protects this workspace only: the published crates are libraries, so a dependent resolves
+their dependencies itself, from our `Cargo.toml` requirements, ignoring our `Cargo.lock`. The
+README's "Dependency Security" section tells users how to set the window for themselves.
 
 To take a younger release on purpose, usually a security fix:
 

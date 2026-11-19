@@ -105,6 +105,22 @@ See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/example
 
 Rust 1.95 or later.
 
+## Dependency Security
+
+rustrade is a library, so your build resolves its dependencies itself: this repository's
+`Cargo.lock` and Cargo settings do not reach your project. This repository waits 7 days before it
+takes any new dependency release, because most malicious releases are found and yanked within
+hours. That protects only its own builds. For the same protection in yours, set a minimum release
+age in your Cargo config (Cargo 1.100 or later; older Cargo ignores the key):
+
+```toml
+# ~/.cargo/config.toml, or .cargo/config.toml in your project
+[registry]
+global-min-publish-age = "7 days"
+```
+
+Commit your `Cargo.lock` as well, so a dependency changes only when you update it.
+
 ## Disclaimer
 
 This software is for educational purposes only. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
