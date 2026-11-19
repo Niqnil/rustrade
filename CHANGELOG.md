@@ -564,8 +564,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not read back. A serialized `TrackedOrder` carries `split_unreported` while it is `true`,
   and one without the field reads back with it `false`. The audit replica applies the same
   rescale. A rescale that overflows `Decimal` rejects the whole action with
-  `ArithmeticOverflow`, as a position's does. The simulated venue still does nothing on a split,
-  so a backtest must still cancel the listed orders.
+  `ArithmeticOverflow`, as a position's does. What the simulated venue does on a split is in the
+  next entry.
+- **A split cancels the simulated venue's orders on the split equity** (`rustrade-execution`,
+  `rustrade`). The simulated venue did nothing on a split: it kept each order on its pre-split
+  terms and filled it against post-split prices, so a backtest had to cancel the orders itself.
+  `SimulatedVenue::apply_corporate_action` now applies a stock split as many venues do: it
+  cancels every order on the instrument, resting or held, releasing what each held and reporting
+  each as an ended `Cancelled` order snapshot stamped at the split, which the engine takes in
+  place of the rescaled order. Until the instrument's next market observation the venue trades
+  nothing on it: a market order is refused as unpriced, and a limit order, arriving or amended,
+  rests uncrossed (`VenueInstrumentMarket::split_at`). The market it holds still values what the
+  account holds. An action id applied once is not applied again (`CorporateActionResponse`), and
+  the venue's snapshot keeps the ids. A backtest (`SimRunner`, `SimStepper`) hands each injected
+  `EngineEvent::CorporateAction` to the venues listing its instrument as well as to the engine,
+  and drops the market it folded for the instrument. A paper venue applies one sent with
+  `PaperVenue::apply_corporate_action`, and a `MockExchange` one sent as
+  `MockExchangeRequest::corporate_action`. A backtest with orders resting across a split now ends
+  them at the split. Not yet modelled: the venue keeps balances and loans of the split asset, and
+  options on it, on their pre-split terms, and has no rule to adjust orders instead of cancelling
+  them, so a wrapper must still cancel the orders an `OpenOrdersAtSplit` lists on an option.
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
   (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had

@@ -3,7 +3,7 @@ use crate::{
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
     error::{UnindexedApiError, UnindexedOrderError},
-    exchange::mock::ExternalChange,
+    exchange::mock::{CorporateActionResponse, ExternalChange},
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
         id::ClientOrderId,
@@ -17,9 +17,10 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side, asset::name::AssetNameExchange, corporate_action::CorporateActionKind,
+    exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
+use smol_str::SmolStr;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -171,6 +172,27 @@ impl MockExchangeRequest {
         )
     }
 
+    /// A request to apply the corporate action `id` of `kind` to `instrument`: see
+    /// [`MockExchangeRequestKind::CorporateAction`]. What it causes goes to the account stream;
+    /// `response_tx` hears what the venue did with it.
+    pub fn corporate_action(
+        time_request: DateTime<Utc>,
+        response_tx: oneshot::Sender<CorporateActionResponse>,
+        id: SmolStr,
+        instrument: InstrumentNameExchange,
+        kind: CorporateActionKind,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::CorporateAction {
+                response_tx,
+                id,
+                instrument,
+                kind,
+            },
+        )
+    }
+
     pub fn open_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<
@@ -242,6 +264,17 @@ pub enum MockExchangeRequestKind {
         response_tx: oneshot::Sender<Result<(), UnindexedOrderError>>,
         cid: ClientOrderId,
         change: ExternalChange,
+    },
+    /// Apply the corporate action `id` of `kind` to `instrument`, as the venue that lists it would,
+    /// at the instant the driver books the request: see
+    /// [`SimulatedVenue::apply_corporate_action`](crate::exchange::mock::SimulatedVenue::apply_corporate_action).
+    /// So send it when the action takes effect. What it causes goes to the account stream, ahead
+    /// of the answer.
+    CorporateAction {
+        response_tx: oneshot::Sender<CorporateActionResponse>,
+        id: SmolStr,
+        instrument: InstrumentNameExchange,
+        kind: CorporateActionKind,
     },
     OpenOrder {
         response_tx:

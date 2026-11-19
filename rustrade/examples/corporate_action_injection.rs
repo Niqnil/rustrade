@@ -12,6 +12,8 @@
 //! This example shows **how to construct and inject the event**, on four paths:
 //! - **Backtest** (`main`, runnable): the split is supplied via an [`AuxEventsInMemory`] aux source,
 //!   merged with the market stream in simulated-time order, and the backtest runs to completion.
+//!   The backtest hands the split to the simulated venue too, which cancels its orders on the
+//!   split equity.
 //! - **Live** ([`live_injection_sketch`], shown but not executed — it needs a running broker
 //!   connection): the same event is sent directly through the public `System.feed_tx` channel.
 //! - **Standard option adjustment** ([`standard_option_split_sketch`]): a whole-number forward split

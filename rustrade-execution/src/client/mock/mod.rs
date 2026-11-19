@@ -7,7 +7,7 @@ use crate::{
         ClientError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
         UnindexedClientError, UnindexedOrderError,
     },
-    exchange::mock::request::MockExchangeRequest,
+    exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
     expiry::{ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
@@ -32,10 +32,12 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     calendar::{DailyClose, SessionCalendar},
+    corporate_action::CorporateActionKind,
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -1134,6 +1136,40 @@ pub async fn request_checkpoint(
     let (response_tx, response_rx) = oneshot::channel();
     request_tx
         .send(MockExchangeRequest::checkpoint(time_request, response_tx))
+        .map_err(|_| offline())?;
+    response_rx.await.map_err(|_| offline())
+}
+
+/// Asks the [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx` to apply
+/// the corporate action `id` of `kind` to `instrument`, with the request stamped `time_request`.
+///
+/// The exchange applies it when the request reaches it, as
+/// [`SimulatedVenue::apply_corporate_action`](crate::exchange::mock::venue::SimulatedVenue::apply_corporate_action)
+/// says, sends what it caused on its account stream, and answers with what it did. It applies it
+/// whether or not this call is still awaited.
+///
+/// # Errors
+/// [`ConnectivityError::ExchangeOffline`] for `mocked_exchange` when the exchange is not running:
+/// it never started, or it has stopped.
+pub async fn request_corporate_action(
+    request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+    mocked_exchange: ExchangeId,
+    time_request: DateTime<Utc>,
+    id: SmolStr,
+    instrument: InstrumentNameExchange,
+    kind: CorporateActionKind,
+) -> Result<CorporateActionResponse, UnindexedClientError> {
+    let offline =
+        || UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(mocked_exchange));
+    let (response_tx, response_rx) = oneshot::channel();
+    request_tx
+        .send(MockExchangeRequest::corporate_action(
+            time_request,
+            response_tx,
+            id,
+            instrument,
+            kind,
+        ))
         .map_err(|_| offline())?;
     response_rx.await.map_err(|_| offline())
 }

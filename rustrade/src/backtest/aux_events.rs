@@ -13,7 +13,10 @@ use std::sync::Arc;
 /// time-ordered [`Stream`](futures::Stream) **before** the engine channel, so an injected
 /// [`EngineEvent::CorporateAction`] (or [`EngineEvent::ContractExpiry`]) is processed at exactly
 /// the right point in the timeline. Live trading injects the same events directly via
-/// `System.feed_tx`; this trait is the backtest equivalent.
+/// `System.feed_tx`; this trait is the backtest equivalent. A backtest also hands each
+/// [`EngineEvent::CorporateAction`] to the simulated venues that list its instrument, as a live
+/// venue applies the action itself: see [`SimRunner`](crate::execution::sim::SimRunner)'s
+/// `# A corporate action reaches the venues too`.
 ///
 /// The default implementation, [`NoAuxEvents`], yields nothing — existing backtests opt out at
 /// negligible per-event overhead.

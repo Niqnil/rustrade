@@ -62,11 +62,12 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
-use smol_str::ToSmolStr;
+use smol_str::{SmolStr, ToSmolStr};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tracing::warn;
 
 mod config;
+mod corporate_action;
 mod liquidation;
 mod price_window;
 mod sell_out;
@@ -74,6 +75,9 @@ mod snapshot;
 mod spot_pairs;
 
 pub use config::{AssetSource, AssetSpelledTwice, VenueConfigError};
+pub use corporate_action::{
+    CorporateActionOutcome, CorporateActionRefusal, CorporateActionResponse,
+};
 pub use snapshot::{SimulatedVenueSnapshot, VenueCheckpoint, VenueRestoreError};
 
 use price_window::PriceWindow;
@@ -192,6 +196,17 @@ pub struct VenueInstrumentMarket {
     /// [`StaleMarketPolicy::Wait`] treats the market as stale however recent
     /// [`fresh_at`](Self::fresh_at) is.
     pub stale_since: Option<DateTime<Utc>>,
+
+    /// When a split was applied to this instrument, while nothing has been observed since, or
+    /// `None`.
+    ///
+    /// Set by [`apply_corporate_action`](SimulatedVenue::apply_corporate_action), and cleared by
+    /// the next [`apply_market`](SimulatedVenue::apply_market) on the instrument, fresh or not.
+    /// While it is set, [`snapshot`](Self::snapshot) still values what the account holds, but no
+    /// order trades against it: on a [`MarketDriven`](VenueRegime::MarketDriven) venue a market
+    /// order is refused as unpriced, and a limit order, whether it arrives or is amended, rests
+    /// uncrossed, as on an instrument the venue was never fed.
+    pub split_at: Option<DateTime<Utc>>,
 }
 
 /// Which price source a [`SimulatedVenue`] has, and therefore which orders it can accept.
@@ -959,6 +974,9 @@ pub struct SimulatedVenue {
     /// The first of [`sell_outs`](Self::sell_outs) after `accrued_through`, cached like
     /// [`next_charge`](Self::next_charge).
     next_sell_out: Option<DateTime<Utc>>,
+    /// The id of every corporate action this venue has applied, so that applying one again changes
+    /// nothing. See [`apply_corporate_action`](Self::apply_corporate_action).
+    corporate_actions_applied: FnvHashSet<SmolStr>,
 }
 
 impl SimulatedVenue {
@@ -1157,6 +1175,7 @@ impl SimulatedVenue {
             expiry_sell_out: config.expiry_sell_out,
             sell_outs,
             next_sell_out: None,
+            corporate_actions_applied: FnvHashSet::default(),
         }
     }
 
@@ -2806,6 +2825,8 @@ impl SimulatedVenue {
             entry.fresh_at = Some(time_exchange);
             entry.stale_since = None;
         }
+        // Whatever it shows was observed after the split.
+        entry.split_at = None;
         // Recorded before anything can borrow on this tick, so a loan it funds is valued with it.
         self.record_borrow_price(instrument, &snapshot, bar.as_ref(), time_exchange);
         // After the snapshot, which may be the underlying price an expired option was waiting for.
@@ -4243,6 +4264,26 @@ impl SimulatedVenue {
         self.market.get(instrument)
     }
 
+    /// The market an order on `instrument` trades against: the one this venue holds, unless a
+    /// split was applied to `instrument` since it was last observed (see
+    /// [`VenueInstrumentMarket::split_at`]). What the account holds is still valued at
+    /// [`market`](Self::market).
+    fn trading_market(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Option<&VenueInstrumentMarket> {
+        self.market(instrument)
+            .filter(|market| market.split_at.is_none())
+    }
+
+    /// Why an order on `instrument` has no price to trade at, if it is because a split was applied
+    /// to it since it was last observed.
+    fn split_unobserved(&self, instrument: &InstrumentNameExchange) -> Option<String> {
+        self.market(instrument)?
+            .split_at
+            .map(|at| format!("no market observed since a split applied at {at}"))
+    }
+
     /// Records that `instrument`'s feed is down as of `time_exchange`, so that under
     /// [`StaleMarketPolicy::Wait`] its market counts as stale, however recently it was observed
     /// fresh, until its next [`fresh`](MarketObservation::fresh) observation.
@@ -4837,7 +4878,7 @@ impl SimulatedVenue {
         let raised = amended.quantity > order.quantity;
 
         let market = self
-            .market(instrument)
+            .trading_market(instrument)
             .map(|market| market.snapshot)
             .unwrap_or_default();
         let marketable = crosses(order.side, limit, &market);
@@ -5357,7 +5398,7 @@ impl SimulatedVenue {
             }
             // `VenueInstrumentMarket` is `Copy`, so this leaves no borrow outstanding.
             VenueRegime::MarketDriven => self
-                .market(&request.key.instrument)
+                .trading_market(&request.key.instrument)
                 .map(|market| market.snapshot),
         }
     }
@@ -5617,7 +5658,7 @@ impl SimulatedVenue {
             return MarketAge::NoFeed;
         }
         let Some(market) = self
-            .market(instrument)
+            .trading_market(instrument)
             .filter(|market| !market.snapshot.is_empty())
         else {
             return MarketAge::Unpriced;
@@ -5721,9 +5762,11 @@ impl SimulatedVenue {
             None => (taker_estimate(), Liquidity::Taker),
         };
         let Some(estimate) = estimate else {
+            let cause = self
+                .split_unobserved(&request.key.instrument)
+                .unwrap_or_else(|| "no market price available yet".to_owned());
             let reason = format!(
-                "cannot price {} for {}: no market price available yet and OrderKind::{:?} carries \
-                 no limit price",
+                "cannot price {} for {}: {cause} and OrderKind::{:?} carries no limit price",
                 request.key.instrument, request.key.exchange, request.state.kind
             );
             return (
@@ -6227,10 +6270,11 @@ impl SimulatedVenue {
         // The two causes get different messages because they have different fixes: an absent
         // snapshot is a wiring problem in the caller, an empty one is a timing problem in the data.
         let Some(reference) = maybe_reference else {
-            let cause = if market_supplied {
-                "no market price available yet"
-            } else {
-                "the request carried no market snapshot (RequestOpen::market was None)"
+            let cause = match self.split_unobserved(&request.key.instrument) {
+                Some(cause) => cause,
+                None if market_supplied => "no market price available yet".to_owned(),
+                None => "the request carried no market snapshot (RequestOpen::market was None)"
+                    .to_owned(),
             };
             let reason = format!(
                 "cannot price {} for {}: {cause} and OrderKind::{:?} carries no limit price",
@@ -20503,6 +20547,7 @@ mod tests {
     mod borrow_price_window;
     mod collateral_ratio;
     mod construction;
+    mod corporate_action;
     mod fees;
     mod liquidation;
     mod options;

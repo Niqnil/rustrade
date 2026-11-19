@@ -62,12 +62,12 @@ fn amend_of(
 }
 
 /// Amends the spot order resting under `name`.
-fn amend(venue: &mut SimulatedVenue, name: &str, patch: AmendPatch) -> AmendOutcome {
+pub(super) fn amend(venue: &mut SimulatedVenue, name: &str, patch: AmendPatch) -> AmendOutcome {
     let request = amend_of(venue, instrument_name(), name, patch);
     venue.amend_order(request)
 }
 
-fn price(price: &str) -> AmendPatch {
+pub(super) fn price(price: &str) -> AmendPatch {
     AmendPatch::default().with_price(d(price))
 }
 
@@ -76,7 +76,7 @@ fn quantity(quantity: &str) -> AmendPatch {
 }
 
 /// The order an amend answered with, or a panic naming what it answered instead.
-fn amended(outcome: &AmendOutcome) -> &Amended {
+pub(super) fn amended(outcome: &AmendOutcome) -> &Amended {
     match &outcome.response.state {
         Ok(amended) => amended,
         Err(error) => panic!("expected the amend to be made, got: {error:?}"),

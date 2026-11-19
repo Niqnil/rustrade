@@ -1865,9 +1865,11 @@ pub enum EngineOutput<
     /// adjusts resting orders or cancels them, by its own rule, so an engine-side cancel or amend
     /// would act on a guess. The wrapper decides whether to cancel, keep or re-price each order.
     ///
-    /// In backtest, the simulated venue does nothing on a split: it keeps each order on its old
-    /// terms and fills it against post-split prices. So the wrapper **must** cancel these orders
-    /// in backtest.
+    /// In backtest, the simulated venue cancels every order on the split equity itself (see
+    /// [`SimulatedVenue::apply_corporate_action`](rustrade_execution::exchange::mock::SimulatedVenue::apply_corporate_action)),
+    /// and its cancel of each follows this output. It leaves orders on options of the equity on
+    /// their old terms, and would fill them against post-split prices, so the wrapper **must**
+    /// cancel those in backtest.
     OpenOrdersAtSplit {
         /// Instrument whose orders are listed.
         instrument: InstrumentKey,
