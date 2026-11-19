@@ -937,8 +937,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-integration` are rewritten to describe what each crate does today, and doc comments
   no longer use the name of the project rustrade was forked from. The `rustrade` docs link to the
   examples on `main` (the old link pointed to a branch that no longer exists), and the
-  `rustrade-data` docs and README list every feature-gated data provider. The `rustrade-data` and
-  `rustrade` package descriptions are updated to match.
+  `rustrade-data` docs and README now list the `alpha-vantage` and `sec-edgar` features too. The
+  `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
 

@@ -23,7 +23,7 @@ A Rust ecosystem for building algorithmic trading systems.
 
 rustrade is a collection of Rust libraries for live-trading, paper-trading, and backtesting. It provides:
 
-* **Fast**: Native Rust with minimal allocations. Data-oriented state management with O(1) lookups.
+* **Indexed state**: Engine state kept in indexed collections, with constant-time lookups.
 * **Robust**: Strongly typed and thread-safe.
 * **Customisable**: Plug-and-play Strategy and RiskManager components.
 * **Scalable**: Multithreaded architecture leveraging Tokio for async I/O.

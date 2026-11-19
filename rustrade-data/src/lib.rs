@@ -50,7 +50,9 @@
 //! adds Parquet export decoding), `massive`, `sec-edgar` and `thetadata`.
 //!
 //! Some data providers' terms forbid redistributing the data they serve, whatever this crate's
-//! own licence says. Each provider's module documentation states its terms.
+//! own licence says: Databento, London Strategic Edge, Massive and ThetaData among them, and Alpha
+//! Vantage's free terms are non-commercial. Their module docs give the terms; check any other
+//! provider's own terms before passing its data on.
 //!
 //! ## User API
 //! - [`StreamBuilder`](streams::builder::StreamBuilder) for initialising [`MarketStream`]s of specific data kinds.
