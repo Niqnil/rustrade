@@ -975,8 +975,8 @@ pub(crate) enum OrderLookup {
     /// live or ended, under its new key, and [`replaces`](OrderReport::replaces) names the order
     /// asked about: its client order id, and the venue order id it was held under. Boxed, as the
     /// other variants carry little.
-    // Only Binance spot follows a rename in a lookup.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    // Only Binance spot and Alpaca follow a rename in a lookup.
+    #[cfg_attr(not(any(feature = "binance", feature = "alpaca")), allow(dead_code))]
     Replaced(Box<UnindexedOrderReport>),
 }
 
@@ -1021,8 +1021,8 @@ pub(crate) struct Listed {
 
 impl Listed {
     /// Add these open orders' reports to the listing.
-    // Only Binance spot lists reports.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    // Only Binance spot and Alpaca list reports.
+    #[cfg_attr(not(any(feature = "binance", feature = "alpaca")), allow(dead_code))]
     pub(crate) fn extend(&mut self, reports: impl IntoIterator<Item = UnindexedOrderReport>) {
         for report in reports {
             let id = reported_id(&report.order.state);
@@ -1033,6 +1033,20 @@ impl Listed {
             self.cids.insert(report.order.key.cid.clone(), id);
             self.reports.push(report);
         }
+    }
+
+    /// Add an open order listed without a report, as one the venue lists in a form this version
+    /// cannot read, by its ids alone: it shows an order held under either id, and follows nothing.
+    // Only Alpaca lists an order it cannot report.
+    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))]
+    pub(crate) fn list_ids(
+        &mut self,
+        instrument: InstrumentNameExchange,
+        cid: ClientOrderId,
+        id: OrderId,
+    ) {
+        self.cids.insert(cid, Some(id.clone()));
+        self.ids.insert((instrument, id));
     }
 
     /// Whether the listing shows `held` live: under its client order id, or, in a listing of
