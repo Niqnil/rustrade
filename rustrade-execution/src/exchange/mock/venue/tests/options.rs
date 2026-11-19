@@ -2043,6 +2043,27 @@ fn a_seeded_short_cash_settled_call_panics() {
     );
 }
 
+/// Only a cash-settled call is unsecurable: a physically settled call is secured by the
+/// underlying, and a cash-settled put by cash.
+#[test]
+fn a_seeded_short_call_or_cash_settled_put_is_secured() {
+    for (kind, settlement) in [
+        (OptionKind::Call, OptionSettlement::Physical),
+        (OptionKind::Put, OptionSettlement::Cash),
+    ] {
+        let mut config = config_from_balances(
+            vec![funded(usd(), d("1000000")), funded(spy(), d("100"))],
+            FeeModelConfig::default(),
+        );
+        config.initial_state.instruments.push(held_short());
+
+        let built =
+            SimulatedVenue::try_new_market_driven(&config, driven_instruments(kind, settlement));
+
+        assert!(built.is_ok(), "{kind:?} {settlement:?}: {:?}", built.err());
+    }
+}
+
 #[test]
 #[should_panic(expected = "holds no balance of")]
 fn a_seeded_short_without_a_balance_of_its_collateral_asset_panics() {
