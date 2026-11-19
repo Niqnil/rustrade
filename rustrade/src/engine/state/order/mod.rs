@@ -189,9 +189,10 @@ pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
 /// may state some terms and not others: a report stating only the price says nothing of when the
 /// quantity last changed.
 ///
-/// Serialized as the order's own fields, with `terms_times` beside them once any is set: an order
-/// serialized without it reads back with none. That flattened layout needs a self-describing
-/// format, such as JSON, to read back, and it is why [`Order`] has no field named `terms_times`.
+/// Serialized as the order's own fields, with `terms_times`, `superseded_ids` and
+/// `split_unreported` beside them once set: an order serialized without one reads back with it
+/// empty or `false`. That flattened layout needs a self-describing format, such as JSON, to read
+/// back, and it is why [`Order`] has no field of any of those names.
 ///
 /// # After a split
 ///
@@ -202,14 +203,22 @@ pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
 /// order, whatever its time, replaces the state held, even with less filled, and every term it
 /// states is read (no term has a time, see [`terms_times`](Self::terms_times)): taken, or, while
 /// an amend is in flight, compared, as the amend's answer settles the terms.
-/// [`split_unreported`](Self::split_unreported) is `true` until that report arrives. A report that
-/// carries the order's state counts: a snapshot, an amend's answer, or a cancel in flight carrying
-/// the order. A fill does not, as it states no terms.
+/// [`split_unreported`](Self::split_unreported) is `true` until that report arrives, however long
+/// that takes. A report that carries the order's state counts: a snapshot, an amend's answer, or
+/// a cancel in flight carrying the order. A fill does not, as it states no terms. A report
+/// stating no terms, such as a listing that gives only the state, settles the filled quantity but
+/// leaves the rescaled terms in place. That includes an order whose open request was in flight at
+/// the split: its terms are rescaled with the rest, as a venue that accepted it before the split
+/// adjusts it as any other resting order.
 ///
-/// **Known limitation:** a report the venue sent before the split and the engine receives after
-/// it is taken as the venue's word on the split, putting the order back on its old scale until
-/// the next report. Splits take effect while the market is closed, so such a report would be
-/// unusually late.
+/// **Known limitations:**
+/// - A report the venue sent before the split and the engine receives after it is taken as the
+///   venue's word on the split, putting the order back on its old scale until the next report.
+///   A report's time cannot tell the two apart: the venue may adjust the order before the
+///   split's effective time, and some venues stamp a report with the order's creation time.
+///   Splits take effect while the market is closed, so such a report would be unusually late.
+/// - A fill from before a reverse split that arrives after it counts its cumulative on the old,
+///   larger scale, so it advances the rescaled order, and may retire it.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 pub struct TrackedOrder<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
     /// The order as tracked.
@@ -219,6 +228,8 @@ pub struct TrackedOrder<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentI
     terms_times: TermsTimes,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     superseded_ids: Vec<OrderId>,
+    /// Set only with `terms_times` empty, by the split's rescale, and cleared by
+    /// [`take_reported`](Self::take_reported).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     split_unreported: bool,
 }
@@ -246,6 +257,14 @@ impl<ExchangeKey, InstrumentKey> TrackedOrder<ExchangeKey, InstrumentKey> {
     /// first report since a split (see "After a split").
     fn is_replaced_by(&self, held: &Open, update: &Open) -> bool {
         self.split_unreported || held.is_superseded_by(update)
+    }
+
+    /// Hold `state`, which carries the order's working state as the venue reported it: the
+    /// venue's word on any split since (see "After a split"). Every transition that takes a
+    /// reported working state goes through here, so none can leave the order marked.
+    fn take_reported(&mut self, state: ActiveOrderState) {
+        self.order.state = state;
+        self.split_unreported = false;
     }
 
     /// When the venue last stated each of this order's terms (see "Terms times").
@@ -1032,21 +1051,26 @@ where
             "OrderManager applied an amend"
         );
         let time_exchange = open.time_exchange;
-        match &mut order.state {
-            ActiveOrderState::CancelInFlight(cancel) => cancel.order = Some(open),
-            state => *state = ActiveOrderState::Open(open),
-        }
+        let state = match &order.state {
+            ActiveOrderState::CancelInFlight(cancel) => {
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(open),
+                    time_sent: cancel.time_sent,
+                })
+            }
+            _ => ActiveOrderState::Open(open),
+        };
+        let tracked = entry.get_mut();
+        tracked.take_reported(state);
         // A late report of the order before the amend names the identifier it replaced.
         if let Some(previous) = previous {
-            entry.get_mut().supersede(previous.clone());
+            tracked.supersede(previous.clone());
         }
         // The venue's answer states the terms just applied, at the time of the state it gives:
         // the whole order except its time in force, which an amend does not change.
-        let tracked = entry.get_mut();
         tracked
             .terms_times
             .stated_at(ReportedTerms::ALL.with_time_in_force(false), time_exchange);
-        tracked.split_unreported = false;
     }
 }
 
@@ -1320,9 +1344,9 @@ where
                     self.1.insert(current_entry.remove().order.key.cid);
                     return SnapshotApplied::retired(terms);
                 }
-                let tracked = current_entry.get_mut();
-                tracked.order.state = ActiveOrderState::Open(open);
-                tracked.split_unreported = false;
+                current_entry
+                    .get_mut()
+                    .take_reported(ActiveOrderState::Open(open));
                 SnapshotApplied::working(terms)
             }
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::CancelInFlight(update)) => {
@@ -1334,7 +1358,14 @@ where
                     update = ?snapshot,
                     "OrderManager transitioned an OpenInFlight order to CancelInFlight"
                 );
-                current_entry.get_mut().order.state = ActiveOrderState::CancelInFlight(update);
+                let tracked = current_entry.get_mut();
+                let carries_order = update.order.is_some();
+                let state = ActiveOrderState::CancelInFlight(update);
+                if carries_order {
+                    tracked.take_reported(state);
+                } else {
+                    tracked.order.state = state;
+                }
                 SnapshotApplied::default()
             }
             (ActiveOrderState::Open(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -1412,9 +1443,9 @@ where
                         update = ?snapshot,
                         "OrderManager updating an Open order from a more recent snapshot"
                     );
-                    let tracked = current_entry.get_mut();
-                    tracked.order.state = ActiveOrderState::Open(open);
-                    tracked.split_unreported = false;
+                    current_entry
+                        .get_mut()
+                        .take_reported(ActiveOrderState::Open(open));
                     SnapshotApplied::working(terms)
                 } else {
                     debug!(
@@ -1475,11 +1506,16 @@ where
                 );
 
                 let tracked = current_entry.get_mut();
-                tracked.order.state = ActiveOrderState::CancelInFlight(CancelInFlight {
+                let state = ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(latest_open),
                     time_sent: update.time_sent,
                 });
-                tracked.split_unreported &= !reported;
+                // Falling back to the order held takes nothing the venue reported.
+                if reported {
+                    tracked.take_reported(state);
+                } else {
+                    tracked.order.state = state;
+                }
                 SnapshotApplied::default()
             }
             (ActiveOrderState::CancelInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -1537,12 +1573,12 @@ where
                 };
                 let terms = reconcile_terms(current_entry.get_mut(), report, &update, None);
                 if update_open_is_latest {
-                    let tracked = current_entry.get_mut();
-                    tracked.order.state = ActiveOrderState::CancelInFlight(CancelInFlight {
-                        order: Some(update),
-                        time_sent,
-                    });
-                    tracked.split_unreported = false;
+                    current_entry
+                        .get_mut()
+                        .take_reported(ActiveOrderState::CancelInFlight(CancelInFlight {
+                            order: Some(update),
+                            time_sent,
+                        }));
                 }
                 SnapshotApplied::working(terms)
             }
@@ -1590,6 +1626,7 @@ where
                 // Nothing is adopted while the amend is in flight: its answer settles the terms. A
                 // report matching neither the order before the amend nor after it is reported.
                 let patch = current.patch;
+                let time_sent = current.time_sent;
                 let terms = reconcile_terms(current_entry.get_mut(), report, &open, Some(&patch));
                 if !superseded {
                     debug!(
@@ -1620,11 +1657,13 @@ where
                     self.1.insert(current_entry.remove().order.key.cid);
                     return SnapshotApplied::retired(terms);
                 }
-                let tracked = current_entry.get_mut();
-                if let ActiveOrderState::AmendInFlight(amend) = &mut tracked.order.state {
-                    amend.order = open;
-                }
-                tracked.split_unreported = false;
+                current_entry
+                    .get_mut()
+                    .take_reported(ActiveOrderState::AmendInFlight(AmendInFlight {
+                        order: open,
+                        patch,
+                        time_sent,
+                    }));
                 SnapshotApplied::working(terms)
             }
             // A cancel supersedes the amend: the order is cancelled whatever the amend's answer.
@@ -1652,11 +1691,16 @@ where
                 );
 
                 let tracked = current_entry.get_mut();
-                tracked.order.state = ActiveOrderState::CancelInFlight(CancelInFlight {
+                let state = ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(latest_open),
                     time_sent: update.time_sent,
                 });
-                tracked.split_unreported &= !reported;
+                // Falling back to the order held takes nothing the venue reported.
+                if reported {
+                    tracked.take_reported(state);
+                } else {
+                    tracked.order.state = state;
+                }
                 SnapshotApplied::default()
             }
             // An amend is recorded only by `record_in_flight_amend`, never by a snapshot.
@@ -6235,11 +6279,12 @@ mod tests {
         }
 
         /// A report of a cancel in flight carrying the order counts as the venue's first report
-        /// after a split, from an open order and from one with an amend in flight.
+        /// after a split, from an order in flight, an open order, and one with an amend in flight.
         #[test]
         fn a_reported_cancel_carrying_the_order_is_taken_after_a_split() {
             let patch = AmendPatch::default().with_price(dec!(1.5));
             for held in [
+                ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 ActiveOrderState::Open(open_at(5, dec!(3))),
                 ActiveOrderState::AmendInFlight(AmendInFlight::new(
                     open_at(5, dec!(3)),
@@ -6268,6 +6313,37 @@ mod tests {
                 );
                 assert!(!tracked.split_unreported(), "from {held:?}");
             }
+        }
+
+        /// A reported cancel whose carried order names another venue order takes nothing from the
+        /// venue: the order held is kept, and so is the marker.
+        #[test]
+        fn a_reported_cancel_falling_back_to_the_order_held_keeps_the_marker() {
+            let mut orders = tracked(ActiveOrderState::Open(open_at(5, dec!(3))));
+            split(&mut orders, dec!(0.5));
+
+            let foreign = Open {
+                filled_quantity: dec!(1),
+                ..open_assigned("other", t(1))
+            };
+            apply(
+                &mut orders,
+                &report(
+                    ActiveOrderState::CancelInFlight(CancelInFlight::new(Some(foreign), TIME_SENT)),
+                    dec!(2),
+                    dec!(4),
+                ),
+            );
+
+            let tracked = tracked_order(&orders);
+            assert_eq!(
+                tracked.order.state,
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(
+                    Some(open_at(5, dec!(1.5))),
+                    TIME_SENT
+                ))
+            );
+            assert!(tracked.split_unreported());
         }
 
         /// An amend in flight at the split: the venue's first report replaces the order the amend

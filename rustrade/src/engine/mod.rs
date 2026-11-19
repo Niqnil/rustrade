@@ -2172,9 +2172,13 @@ pub enum EngineOutput<
 /// the amend. The engine rescales the amend's new values too, but the venue answers the amend it
 /// was sent, on the old scale, so wait for that answer, or cancel the order, before re-pricing it
 /// for the split.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller; build one with
+/// [`OpenOrderAtSplit::new`].
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
+#[non_exhaustive]
 pub struct OpenOrderAtSplit {
     /// Client order id of the order.
     pub cid: ClientOrderId,

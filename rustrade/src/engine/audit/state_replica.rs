@@ -169,7 +169,7 @@ where
     ///
     /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
     ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
-    ///   from the payload, as is the rescale of every tracked order — after re-running the same guards (unknown instrument / idempotency /
+    ///   from the payload — after re-running the same guards (unknown instrument / idempotency /
     ///   non-`Spot` /
     ///   unsupported-kind, plus the ambiguous-target and pre-validation guards inside the shared
     ///   prepare pass, all of which skip without mutating). The Floor-to-zero **close** is
@@ -178,7 +178,8 @@ where
     ///   `HistoricalClock` and therefore cannot be reproduced from the payload, so the replica
     ///   removes the slot and folds the *live* `PositionExit` into the tear sheet. Parity (incl.
     ///   tear sheets) is asserted by the replica-parity integration test, which guards against the
-    ///   live handler and this arm drifting apart.
+    ///   live handler and this arm drifting apart. The rescale of every tracked order is
+    ///   event-replayed too, from the same prepare pass.
     ///
     /// Adding a new event type: choose event replay (deterministic transition) or output
     /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce

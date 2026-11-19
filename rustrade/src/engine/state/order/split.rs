@@ -8,8 +8,8 @@
 //! a split" on [`TrackedOrder`]).
 //!
 //! What is a price is rescaled: the limit price, every trigger and activation price, a trailing
-//! stop's stop price and limit offset, and an [`Absolute`](TrailingOffsetType::Absolute) trailing
-//! offset. A [`Percentage`](TrailingOffsetType::Percentage) or
+//! stop-limit's stop price and limit offset, and an [`Absolute`](TrailingOffsetType::Absolute)
+//! trailing offset. A [`Percentage`](TrailingOffsetType::Percentage) or
 //! [`BasisPoints`](TrailingOffsetType::BasisPoints) offset is a proportion, which a split leaves
 //! as it is. The time in force is not a quantity or a price.
 
@@ -172,6 +172,15 @@ fn split_kind(kind: OrderKind, ratio: Decimal) -> Option<OrderKind> {
             stop_price: stop_price.checked_div(ratio)?,
             limit_offset: limit_offset.checked_div(ratio)?,
         },
+        OrderKind::TrailingStopFixedLimit {
+            offset,
+            offset_type,
+            activation_price,
+        } => OrderKind::TrailingStopFixedLimit {
+            offset: split_offset(offset, offset_type, ratio)?,
+            offset_type,
+            activation_price: split_price(activation_price, ratio)?,
+        },
         OrderKind::ConditionalUnresolved {
             family,
             trigger_price,
@@ -181,8 +190,15 @@ fn split_kind(kind: OrderKind, ratio: Decimal) -> Option<OrderKind> {
         },
         // `OrderKind` is `#[non_exhaustive]` in another crate. A kind added there carrying a
         // price must gain an arm here; until then it keeps its terms, and the venue's next report
-        // of the order restates them.
-        other => other,
+        // of the order restates them. Warned of, so the gap shows. The audit replica runs this
+        // pass too, so it warns a second time.
+        other => {
+            tracing::warn!(
+                kind = ?other,
+                "A split rescaled an order of a kind it does not know - its prices keep the old scale"
+            );
+            other
+        }
     })
 }
 
@@ -371,6 +387,30 @@ mod tests {
                     offset_type: TrailingOffsetType::BasisPoints,
                     stop_price: dec!(10),
                     limit_offset: dec!(0.5),
+                },
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(8),
+                    offset_type: TrailingOffsetType::Absolute,
+                    activation_price: Some(dec!(40)),
+                },
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(2),
+                    offset_type: TrailingOffsetType::Absolute,
+                    activation_price: Some(dec!(10)),
+                },
+            ),
+            (
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(8),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
+                },
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(8),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 },
             ),
             (

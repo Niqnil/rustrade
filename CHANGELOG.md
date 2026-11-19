@@ -552,14 +552,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the engine refused it as stale and kept the old terms. Now `process_corporate_action` rescales
   each order of the split equity, and each order of an option a standard split adjusts, exactly,
   with no rounding: the quantity and the filled quantity × the ratio, and the limit price, every
-  trigger and activation price, a trailing stop's stop price and limit offset, and an absolute
-  trailing offset ÷ the ratio. A percentage or basis-point offset is unchanged. An amend in flight
+  trigger and activation price, a trailing stop-limit's stop price and limit offset, and an
+  absolute trailing offset ÷ the ratio. A percentage or basis-point offset is unchanged. An amend in flight
   has its new values rescaled too. The venue's next report of each order replaces the rescaled
   state whatever its time, even with less filled, and every term it states is taken
   (`TrackedOrder::split_unreported` is `true` until then). A fill does not count, as it states no
   terms. The engine still sends nothing on a split. `OpenOrderAtSplit` replaces
   `price_pre_split` and `quantity_pre_split` with `pre_split` and `post_split`, each an
-  `OrderTerms`, so a stop order's trigger is listed too. The audit replica applies the same
+  `OrderTerms`, so a stop order's trigger is listed too, and is now `#[non_exhaustive]` (build
+  one with `OpenOrderAtSplit::new`); an `OpenOrdersAtSplit` output serialized before this change
+  does not read back. A serialized `TrackedOrder` carries `split_unreported` while it is `true`,
+  and one without the field reads back with it `false`. The audit replica applies the same
   rescale. A rescale that overflows `Decimal` rejects the whole action with
   `ArithmeticOverflow`, as a position's does. The simulated venue still does nothing on a split,
   so a backtest must still cancel the listed orders.
