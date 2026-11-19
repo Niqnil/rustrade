@@ -66,12 +66,14 @@ use smol_str::ToSmolStr;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tracing::warn;
 
+mod config;
 mod liquidation;
 mod price_window;
 mod sell_out;
 mod snapshot;
 mod spot_pairs;
 
+pub use config::{AssetSource, AssetSpelledTwice, VenueConfigError};
 pub use snapshot::{SimulatedVenueSnapshot, VenueCheckpoint, VenueRestoreError};
 
 use price_window::PriceWindow;
@@ -965,20 +967,38 @@ impl SimulatedVenue {
     /// the regime that accepts limits.
     ///
     /// # Panics
-    /// - If `initial_state` holds an open CFD position with no entry price: see the caller
-    ///   obligations on [`SimulatedVenue`].
-    /// - If `initial_state` lists one client order id more than once among its open and cancelled
-    ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
-    /// - If `initial_state` holds a short option position that its seeded free balances do not
-    ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
-    ///   `# How an option is accounted` on [`SimulatedVenue`].
-    /// - If [`MockExecutionConfig::session_close`] cannot place the close of a day limit order
-    ///   seeded in `initial_state`.
+    /// If [`try_new`](Self::try_new) would refuse the configuration, with its
+    /// [`VenueConfigError`].
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     ) -> Self {
-        Self::with_regime(config, instruments, VenueRegime::RequestPriced)
+        Self::try_new(config, instruments).unwrap_or_else(|error| invalid_config(&error))
+    }
+
+    /// [`new`](Self::new), returning a configuration it cannot build a venue from as an error.
+    ///
+    /// # Errors
+    /// - [`VenueConfigError::AssetSpelledTwice`] if the instruments, `initial_state`'s balances,
+    ///   the fee asset, the spot margin configuration or the fee model overrides spell one asset
+    ///   two ways, such as `BTC` and `btc`: see [`AssetSpelledTwice`].
+    /// - [`VenueConfigError::DuplicateOrder`] if `initial_state` lists one client order id more
+    ///   than once among its open and cancelled orders.
+    /// - [`VenueConfigError::PositionWithoutEntry`] if `initial_state` holds an open CFD or option
+    ///   position with no entry price: see the caller obligations on [`SimulatedVenue`].
+    /// - [`VenueConfigError::OptionShortUnsecurable`],
+    ///   [`VenueConfigError::OptionCollateralNotHeld`] or
+    ///   [`VenueConfigError::OptionCollateralNotCovered`] if `initial_state` holds a short option
+    ///   position that is a cash-settled call, whose collateral asset it holds no balance of, or
+    ///   that its seeded free balances do not cover: see `# How an option is accounted` on
+    ///   [`SimulatedVenue`].
+    /// - [`VenueConfigError::SessionCalendar`] if [`MockExecutionConfig::session_close`] cannot
+    ///   place the close of a day limit order seeded in `initial_state`.
+    pub fn try_new(
+        config: &MockExecutionConfig,
+        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    ) -> Result<Self, VenueConfigError> {
+        Self::try_with_regime(config, instruments, VenueRegime::RequestPriced)
     }
 
     /// A venue whose driver feeds [`apply_market`](Self::apply_market), so limit orders are
@@ -991,36 +1011,49 @@ impl SimulatedVenue {
     /// See [`VenueRegime::MarketDriven`].
     ///
     /// # Panics
-    /// - If `initial_state` holds an open CFD position with no entry price: see the caller
-    ///   obligations on [`SimulatedVenue`].
-    /// - If `initial_state` lists one client order id more than once among its open and cancelled
-    ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
-    /// - If `initial_state` holds a short option position that its seeded free balances do not
-    ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
-    ///   `# How an option is accounted` on [`SimulatedVenue`].
-    /// - If [`MockExecutionConfig::session_close`] cannot place the close of a day limit order
-    ///   seeded in `initial_state`.
+    /// If [`try_new_market_driven`](Self::try_new_market_driven) would refuse the configuration,
+    /// with its [`VenueConfigError`].
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     ) -> Self {
-        Self::with_regime(config, instruments, VenueRegime::MarketDriven)
+        Self::try_new_market_driven(config, instruments)
+            .unwrap_or_else(|error| invalid_config(&error))
     }
 
-    fn with_regime(
+    /// [`new_market_driven`](Self::new_market_driven), returning a configuration it cannot build a
+    /// venue from as an error.
+    ///
+    /// # Errors
+    /// As [`try_new`](Self::try_new).
+    pub fn try_new_market_driven(
+        config: &MockExecutionConfig,
+        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    ) -> Result<Self, VenueConfigError> {
+        Self::try_with_regime(config, instruments, VenueRegime::MarketDriven)
+    }
+
+    fn try_with_regime(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
         regime: VenueRegime,
-    ) -> Self {
-        let positions = seeded_positions(&config.initial_state, &instruments);
-        let mut account = match AccountState::try_from(config.initial_state.clone()) {
-            Ok(account) => account,
-            Err(error) => panic!("invalid MockExecutionConfig::initial_state: {error}"),
-        };
+    ) -> Result<Self, VenueConfigError> {
+        // First, so every asset name the venue compares from here on is spelled one way.
+        config::check_spellings(config::configured_asset_names(
+            config,
+            &instruments,
+            config
+                .initial_state
+                .balances
+                .iter()
+                .map(|balance| &balance.asset),
+        ))?;
+        let positions = seeded_positions(&config.initial_state, &instruments)?;
+        let mut account = AccountState::try_from(config.initial_state.clone())?;
         if config.spot_margin.is_some() {
             account.enable_margin();
         }
-        hold_seeded_collateral(&mut account, &positions, &instruments);
+        hold_seeded_collateral(&mut account, &positions, &instruments)?;
         let order_id_start = first_unseeded_order_id(&account);
         let reported_debt = account
             .balances()
@@ -1036,13 +1069,10 @@ impl SimulatedVenue {
             order_id_start,
             reported_debt,
         );
-        if let Err(error) = venue.resolve_seeded_deadlines() {
-            panic!(
-                "MockExecutionConfig::session_close cannot place a seeded day order's close: \
-                 {error}"
-            );
-        }
         venue
+            .resolve_seeded_deadlines()
+            .map_err(VenueConfigError::SessionCalendar)?;
+        Ok(venue)
     }
 
     /// A venue configured by `config`, holding `account`, `positions` and `reported_debt`, whose
@@ -7455,7 +7485,7 @@ fn option_spots(
 /// balance `initial_state` seeded: the seeded balances are what the account holds before anything
 /// is set aside, as a fresh account's are. See `SimulatedVenue`'s `# How an option is accounted`.
 ///
-/// # Panics
+/// # Errors
 /// If the free balance does not cover a short's collateral, or the account holds none of its
 /// asset, or the short is a cash-settled call, which nothing in a cash account secures: like an
 /// absent balance, a mis-specified fixture.
@@ -7463,8 +7493,8 @@ fn hold_seeded_collateral(
     account: &mut AccountState,
     positions: &FnvHashMap<InstrumentNameExchange, NetPosition>,
     instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
-) {
-    // Sorted, so that which short a panic names does not depend on hash order.
+) -> Result<(), VenueConfigError> {
+    // Sorted, so that which short an error names does not depend on hash order.
     let shorts = positions
         .iter()
         .filter(|(_, position)| position.quantity.is_sign_negative())
@@ -7478,11 +7508,9 @@ fn hold_seeded_collateral(
         })
         .sorted_by(|a, b| a.0.cmp(b.0));
     for (name, quantity, contract, terms) in shorts {
-        assert!(
-            !(contract.kind == OptionKind::Call && contract.settlement == OptionSettlement::Cash),
-            "SimulatedVenue's initial_state reports a short position in the cash-settled call \
-             {name}, which nothing in a cash account secures"
-        );
+        if contract.kind == OptionKind::Call && contract.settlement == OptionSettlement::Cash {
+            return Err(VenueConfigError::OptionShortUnsecurable(name.clone()));
+        }
         let Some(Collateral { asset, amount }) = terms.short_collateral(quantity) else {
             unreachable!("an option's terms always secure a short")
         };
@@ -7491,20 +7519,24 @@ fn hold_seeded_collateral(
             .find(|balance| balance.asset == asset)
             .map(|balance| balance.time_exchange)
         else {
-            panic!(
-                "SimulatedVenue's initial_state reports a short position of {quantity} in the \
-                 option {name}, whose collateral of {amount} {asset} it holds no balance of"
-            );
+            return Err(VenueConfigError::OptionCollateralNotHeld {
+                instrument: name.clone(),
+                quantity,
+                asset,
+                amount,
+            });
         };
         if let Err(insufficient) = account.reserve(&asset, amount, time) {
-            panic!(
-                "SimulatedVenue's initial_state reports a short position of {quantity} in the \
-                 option {name}, whose collateral of {amount} {asset} the seeded free balance of \
-                 {} does not cover",
-                insufficient.free
-            );
+            return Err(VenueConfigError::OptionCollateralNotCovered {
+                instrument: name.clone(),
+                quantity,
+                asset,
+                amount,
+                free: insufficient.free,
+            });
         }
     }
+    Ok(())
 }
 
 /// The net positions an `initial_state` opens a venue with: one for each CFD and option the
@@ -7515,14 +7547,14 @@ fn hold_seeded_collateral(
 /// already paid. A position on a spot instrument is not seeded: a spot holding is a balance, not a
 /// position, on this venue.
 ///
-/// # Panics
-/// Panics if a seeded position reports no entry price. Closing a CFD credits margin and realised
-/// PnL computed from the entry, so an absent one is a mis-specified fixture, in the same class as
-/// an absent balance.
+/// # Errors
+/// [`VenueConfigError::PositionWithoutEntry`] if a seeded position reports no entry price.
+/// Closing a CFD credits margin and realised PnL computed from the entry, so an absent one is a
+/// mis-specified fixture, in the same class as an absent balance.
 fn seeded_positions(
     initial_state: &UnindexedAccountSnapshot,
     instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
-) -> FnvHashMap<InstrumentNameExchange, NetPosition> {
+) -> Result<FnvHashMap<InstrumentNameExchange, NetPosition>, VenueConfigError> {
     initial_state
         .instruments
         .iter()
@@ -7539,21 +7571,24 @@ fn seeded_positions(
         .filter_map(|snapshot| {
             let position = snapshot.position.open()?;
             let Some(entry) = position.entry_price else {
-                panic!(
-                    "SimulatedVenue's initial_state reports an open position in {} with no entry \
-                     price, so the margin and PnL its close would credit cannot be computed",
-                    snapshot.instrument
-                );
+                return Some(Err(VenueConfigError::PositionWithoutEntry(
+                    snapshot.instrument.clone(),
+                )));
             };
-            Some((
+            Some(Ok((
                 snapshot.instrument.clone(),
                 NetPosition {
                     quantity: position.quantity,
                     entry,
                 },
-            ))
+            )))
         })
         .collect()
+}
+
+/// Panics with `error`: what the constructors that panic do where their `try_` forms return it.
+fn invalid_config(error: &VenueConfigError) -> ! {
+    panic!("invalid SimulatedVenue configuration: {error}")
 }
 
 /// What `balance` owes: its loan and the interest on it, zero on a cash account.
@@ -20425,6 +20460,7 @@ mod tests {
     }
 
     mod amend;
+    mod asset_spelling;
     mod borrow_capacity;
     mod borrow_price_window;
     mod collateral_ratio;

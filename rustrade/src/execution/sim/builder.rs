@@ -122,6 +122,8 @@ impl SimVenueOptions {
 ///
 /// # Errors
 /// [`BarterError::ExecutionBuilder`] if:
+/// - `config` is refused by [`SimulatedVenue::try_new_market_driven`], for example because it
+///   spells one asset two ways;
 /// - `options` carries a [`margin_interest`](SimVenueOptions::margin_interest) model while
 ///   `config` has no [`spot_margin`](MockExecutionConfig::spot_margin);
 /// - `restore` is refused by [`SimulatedVenue::from_snapshot`], or is of a venue that was not
@@ -170,7 +172,13 @@ pub(crate) fn market_driven_venue(
 
     let venue_instruments = generate_mock_exchange_instruments(instruments, exchange);
     let venue = match restore {
-        None => SimulatedVenue::new_market_driven(config, venue_instruments),
+        None => {
+            SimulatedVenue::try_new_market_driven(config, venue_instruments).map_err(|error| {
+                BarterError::ExecutionBuilder(format!(
+                    "simulated venue {exchange} cannot be built: {error}"
+                ))
+            })?
+        }
         Some(snapshot) => {
             if snapshot.regime() != VenueRegime::MarketDriven {
                 return Err(BarterError::ExecutionBuilder(format!(

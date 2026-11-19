@@ -2766,6 +2766,25 @@ mod tests {
         );
     }
 
+    /// A configuration the venue refuses is the builder's error, not a panic.
+    #[test]
+    fn a_venue_configuration_spelling_one_asset_two_ways_is_refused() {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let mut respelled = config(0);
+        respelled.initial_state.balances[0].asset = AssetNameExchange::new("BTC");
+
+        let refused = SimExecutionBuilder::new(&instruments).add_venue(respelled);
+
+        assert!(
+            matches!(
+                &refused,
+                Err(BarterError::ExecutionBuilder(reason))
+                    if reason.contains("cannot be built: the configuration spells one asset two ways")
+            ),
+            "{refused:?}"
+        );
+    }
+
     /// A session calendar handed in through the options is the venue's: without it a day limit
     /// order is refused, and with it the order rests.
     #[test]

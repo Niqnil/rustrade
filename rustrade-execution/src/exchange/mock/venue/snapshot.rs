@@ -1,7 +1,11 @@
 //! A [`SimulatedVenue`]'s state as plain data, and the venue it restores.
 
 use super::price_window::PriceWindow;
-use super::{NetPosition, SimulatedVenue, VenueRegime, liquidation::LiquidationState};
+use super::{
+    NetPosition, SimulatedVenue, VenueRegime,
+    config::{self, AssetSpelledTwice},
+    liquidation::LiquidationState,
+};
 use crate::{
     balance::MarginDetails,
     client::mock::MockExecutionConfig,
@@ -236,6 +240,10 @@ pub enum VenueRestoreError {
         held: Decimal,
     },
 
+    /// The snapshot's balances, `instruments` and the configuration spell one asset two ways.
+    #[error(transparent)]
+    AssetSpelledTwice(#[from] AssetSpelledTwice),
+
     /// The configuration's [`session_close`](MockExecutionConfig::session_close) cannot place
     /// the close of a day limit order the snapshot holds with no deadline of its own: one seeded
     /// through a configured `initial_state` rather than accepted by the venue.
@@ -400,6 +408,8 @@ impl SimulatedVenue {
     /// - [`VenueRestoreError::OptionShortUnsecurable`] if it holds a short cash-settled call.
     /// - [`VenueRestoreError::OptionCollateralNotHeld`] if its balances do not hold the collateral
     ///   its short options secure.
+    /// - [`VenueRestoreError::AssetSpelledTwice`] if its balances, `instruments` and `config`
+    ///   spell one asset two ways, as [`try_new`](Self::try_new) refuses.
     /// - [`VenueRestoreError::SessionCalendar`] if `config`'s session close cannot place the
     ///   close of a day limit order the snapshot holds with no deadline of its own.
     ///
@@ -464,6 +474,14 @@ impl SimulatedVenue {
         {
             return Err(VenueRestoreError::DuplicateAsset(repeat.clone()));
         }
+        config::check_spellings(config::configured_asset_names(
+            config,
+            &instruments,
+            snapshot
+                .account
+                .balance_assets()
+                .chain(snapshot.reported_debt.iter().map(|(asset, _)| asset)),
+        ))?;
         if let Some((short, _)) = snapshot.positions.iter().find(|(name, position)| {
             matches!(
                 &instruments[name].kind,
