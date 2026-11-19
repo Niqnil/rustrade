@@ -2,24 +2,14 @@ name: "Alpaca Weekly"
 
 on:
   schedule:
-    # Wednesday 11:00 AM ET (15:00 UTC) - during US market hours
-    - cron: "0 15 * * 3"
+    # Wednesday 06:17 UTC, hours before the US regular session opens (13:30 or 14:30 UTC). GitHub
+    # starts scheduled runs late, by up to several hours lately, so the cron fires early and the
+    # wait jobs below hold the tests until the session opens. Off the hour, when fewer schedules
+    # are queued.
+    - cron: "17 6 * * 3"
   workflow_dispatch:
 
-concurrency:
-  # Deliberately the same group as `alpaca-integration.yml`: both run against the ONE Alpaca paper
-  # account, so they must exclude each other, not merely exclude themselves. Two overlapping runs
-  # contend for it -- one hits "connection limit exceeded" on the market-data stream while the other
-  # trips "cannot open a long buy while a short sell order is open" on a resting order it did not
-  # place. This workflow previously declared no concurrency at all, so a scheduled run could land on
-  # top of any push or PR run.
-  #
-  # `cancel-in-progress: false` matters as much as the shared group: cancelling a run mid-test can
-  # leave a resting order behind that poisons the next one.
-  group: alpaca-paper-account
-  cancel-in-progress: false
-
-# Read-only: the tests only need the checkout.
+# Read-only: the jobs only need the checkout.
 permissions:
   contents: read
 
@@ -30,10 +20,56 @@ env:
   ALPACA_PAPER: "true"
 
 jobs:
+  # Two chained jobs wait for the open by Alpaca's paper clock, since a GitHub-hosted job ends at
+  # 360 minutes; together they cover a run that starts up to about 11 hours before it. Each fails
+  # at once when the next open is further away than the waiting left (a market holiday, or a run
+  # that started after the close). A run dispatched during the session passes straight through;
+  # one that waited for the open waits two minutes more, so an order placed next is not queued.
+  # Not when the open falls in the gap between the two jobs: each knows only what it saw.
+  #
+  # Outside the paper-account concurrency group: waiting must not hold the account from the other
+  # runs.
+  wait-1:
+    name: Wait for the US regular session (1 of 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Wait
+        run: python3 -I .github/scripts/alpaca_wait_for_session.py 340 --horizon 680
+
+  wait-2:
+    name: Wait for the US regular session (2 of 2)
+    needs: wait-1
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Wait
+        run: python3 -I .github/scripts/alpaca_wait_for_session.py 340 --horizon 340 --final
+
   alpaca-tests:
     name: Alpaca full integration tests
+    needs: wait-2
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      # Deliberately the same group as `alpaca-integration.yml`: both run against the ONE Alpaca
+      # paper account, so they must exclude each other, not merely exclude themselves. Two
+      # overlapping runs contend for it -- one hits "connection limit exceeded" on the market-data
+      # stream while the other trips "cannot open a long buy while a short sell order is open" on a
+      # resting order it did not place. Set on this job rather than the workflow, so the wait jobs
+      # above do not hold the account.
+      #
+      # `cancel-in-progress: false` matters as much as the shared group: cancelling a run mid-test
+      # can leave a resting order behind that poisons the next one. It protects only the running
+      # job, though: a group holds one running and one pending job, and a newer entrant cancels the
+      # pending one. So this job, waiting while an integration run holds the account, is cancelled
+      # when a second integration run queues behind it. The `verdict` job below fails the run then.
+      group: alpaca-paper-account
+      cancel-in-progress: false
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -50,27 +86,53 @@ jobs:
         with:
           shared-key: "rustrade-ci-test"
 
-      # Includes the `market_hours` tests, which `alpaca-integration.yml` skips: the schedule above
-      # falls in the US regular session on a trading day.
+      # Includes the `market_hours` tests, which `alpaca-integration.yml` skips: the wait jobs
+      # above start this job in the US regular session.
       - name: Execution tests
         id: exec-tests
         continue-on-error: true
         run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_integration -- --ignored
 
+      # The IEX tests that wait for trades and quotes read Alpaca's clock first, so a run that
+      # reaches them after the close fails with a message saying the session is closed.
       - name: Market data tests (includes IEX, skip SIP/OPRA)
         id: data-tests
         continue-on-error: true
         run: cargo test --locked -p rustrade-data --features alpaca --test alpaca_data -- --ignored --skip sip --skip opra
 
-      # Option orders that fill, so only here: the schedule above falls in US regular trading hours
-      # on a trading day (10:00 or 11:00 AM ET), and each test checks Alpaca's clock first, so a
-      # Wednesday market holiday fails this step with a message saying the market is closed. A test
-      # that fails after placing an order cancels its orders and closes its position before failing.
+      # Option orders that fill, so only here: the wait jobs above start this job in US regular
+      # trading hours, and each test checks Alpaca's clock first, so a run that reaches them after
+      # the close fails this step with a message saying the market is closed. A test that fails
+      # after placing an order cancels its orders and closes its position before failing.
       - name: Options paper tests
         id: options-tests
         continue-on-error: true
         run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_options_paper -- --ignored --test-threads=1
 
+      # The tests clean up after themselves; this checks they did, so a leftover order or position
+      # fails this run instead of poisoning the next one.
+      - name: Flat check
+        id: flat-check
+        if: always()
+        continue-on-error: true
+        run: python3 -I .github/scripts/alpaca_flat_check.py
+
       - name: Check test results
-        if: steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure' || steps.options-tests.outcome == 'failure'
+        if: always() && (steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure' || steps.options-tests.outcome == 'failure' || steps.flat-check.outcome == 'failure')
         run: exit 1
+
+  # Fails the run unless the tests ran and passed, so a test job that was cancelled in the
+  # concurrency group, or skipped after a wait failed, shows as a failure, not a cancelled run.
+  verdict:
+    name: Weekly verdict
+    needs: alpaca-tests
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the test job's result
+        env:
+          RESULT: ${{ needs.alpaca-tests.result }}
+        run: |
+          echo "alpaca-tests: $RESULT"
+          test "$RESULT" = success
