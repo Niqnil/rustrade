@@ -388,7 +388,8 @@ pub enum VenueRegime {
 ///   price the underlying to assign it. Both with [`ApiError::OrderRejected`]. A short seeded
 ///   through `initial_state` must be covered by the seeded balances, which are what the account
 ///   holds before the venue sets the collateral aside; an uncovered one, or a seeded short
-///   cash-settled call, is a mis-specified fixture and panics.
+///   cash-settled call, is a mis-specified fixture, which [`try_new`](Self::try_new) refuses and
+///   [`new`](Self::new) panics on.
 /// - **Not modelled:** naked shorts, margin for a short against the underlying's price, credit
 ///   for a long option covering a short (a spread), and early assignment of an American short.
 /// - **An order placed at or after the contract's expiry** is refused with
@@ -566,7 +567,8 @@ pub enum VenueRegime {
 ///   fills were struck at different prices and this state carries one of them.
 /// - **A CFD position seeded by `initial_state` is where the venue's ledger starts, and must carry
 ///   an entry price.** Closing it credits the margin and realised PnL measured from that price, so
-///   a position with `entry_price: None` is a mis-specified fixture, and construction **panics**.
+///   a position with `entry_price: None` is a mis-specified fixture, which
+///   [`try_new`](Self::try_new) refuses and [`new`](Self::new) panics on.
 ///
 /// # How an order is priced
 ///
@@ -969,11 +971,15 @@ impl SimulatedVenue {
     /// # Panics
     /// If [`try_new`](Self::try_new) would refuse the configuration, with its
     /// [`VenueConfigError`].
+    #[track_caller]
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     ) -> Self {
-        Self::try_new(config, instruments).unwrap_or_else(|error| invalid_config(&error))
+        match Self::try_new(config, instruments) {
+            Ok(venue) => venue,
+            Err(error) => invalid_config(&error),
+        }
     }
 
     /// [`new`](Self::new), returning a configuration it cannot build a venue from as an error.
@@ -994,6 +1000,11 @@ impl SimulatedVenue {
     ///   [`SimulatedVenue`].
     /// - [`VenueConfigError::SessionCalendar`] if [`MockExecutionConfig::session_close`] cannot
     ///   place the close of a day limit order seeded in `initial_state`.
+    ///
+    /// The spelling check reads the configuration only. The models added afterwards, such as
+    /// [`with_margin_interest`](Self::with_margin_interest)'s, are given the venue's own asset names
+    /// when they are asked, so they cannot bring in another spelling, but one keyed internally by a
+    /// name the venue spells differently is not checked.
     pub fn try_new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -1013,12 +1024,15 @@ impl SimulatedVenue {
     /// # Panics
     /// If [`try_new_market_driven`](Self::try_new_market_driven) would refuse the configuration,
     /// with its [`VenueConfigError`].
+    #[track_caller]
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     ) -> Self {
-        Self::try_new_market_driven(config, instruments)
-            .unwrap_or_else(|error| invalid_config(&error))
+        match Self::try_new_market_driven(config, instruments) {
+            Ok(venue) => venue,
+            Err(error) => invalid_config(&error),
+        }
     }
 
     /// [`new_market_driven`](Self::new_market_driven), returning a configuration it cannot build a
@@ -7587,6 +7601,7 @@ fn seeded_positions(
 }
 
 /// Panics with `error`: what the constructors that panic do where their `try_` forms return it.
+#[track_caller]
 fn invalid_config(error: &VenueConfigError) -> ! {
     panic!("invalid SimulatedVenue configuration: {error}")
 }
@@ -9602,8 +9617,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no entry price")]
-    fn a_cfd_position_in_the_initial_state_without_an_entry_price_panics() {
+    fn a_cfd_position_in_the_initial_state_without_an_entry_price_is_refused() {
         let config = MockExecutionConfig::new(
             EXCHANGE,
             UnindexedAccountSnapshot {
@@ -9628,7 +9642,10 @@ mod tests {
             },
             0,
         );
-        let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
+        assert_eq!(
+            SimulatedVenue::try_new(&config, instruments_of(cfd_instrument())).err(),
+            Some(VenueConfigError::PositionWithoutEntry(cfd_instrument_name()))
+        );
     }
 
     // --- A resting CFD order holds only what it opens ------------------------------------------
@@ -20460,10 +20477,10 @@ mod tests {
     }
 
     mod amend;
-    mod asset_spelling;
     mod borrow_capacity;
     mod borrow_price_window;
     mod collateral_ratio;
+    mod construction;
     mod fees;
     mod liquidation;
     mod options;

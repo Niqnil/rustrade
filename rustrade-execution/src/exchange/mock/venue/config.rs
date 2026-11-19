@@ -54,9 +54,13 @@ pub enum VenueConfigError {
          collateral of {amount} {asset} it holds no balance of"
     )]
     OptionCollateralNotHeld {
+        /// The option.
         instrument: InstrumentNameExchange,
+        /// The position, negative.
         quantity: Decimal,
+        /// The asset its collateral is in.
         asset: AssetNameExchange,
+        /// The collateral the position secures.
         amount: Decimal,
     },
 
@@ -67,10 +71,15 @@ pub enum VenueConfigError {
          collateral of {amount} {asset} the seeded free balance of {free} does not cover"
     )]
     OptionCollateralNotCovered {
+        /// The option.
         instrument: InstrumentNameExchange,
+        /// The position, negative.
         quantity: Decimal,
+        /// The asset its collateral is in.
         asset: AssetNameExchange,
+        /// The collateral the position secures.
         amount: Decimal,
+        /// What the seeded balance of `asset` holds free, less than `amount`.
         free: Decimal,
     },
 
@@ -89,6 +98,7 @@ pub enum VenueConfigError {
 /// each spelling, or look a price or the fee asset up under one spelling and miss it under the
 /// other.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 #[error(
     "the configuration spells one asset two ways: {first} in {first_source}, {second} in \
      {second_source}"

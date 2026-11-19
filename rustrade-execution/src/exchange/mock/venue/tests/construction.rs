@@ -1,7 +1,9 @@
-//! A configuration that spells one asset two ways is refused when the venue is built or restored,
-//! naming both spellings and where each was read.
+//! A configuration the venue refuses when it is built or restored: one that spells an asset two
+//! ways, naming both spellings and where each was read, and one seeding an order twice. The
+//! refusals of seeded positions are tested with their instruments.
 
 use super::*;
+use crate::exchange::mock::account::DuplicateSeededOrder;
 
 fn asset(spelling: &str) -> AssetNameExchange {
     AssetNameExchange::new(spelling)
@@ -233,6 +235,34 @@ fn a_restore_refuses_a_configuration_spelling_the_snapshots_assets_differently()
             btcusdt(),
             "btc",
             AssetSource::FeeAsset,
+        )))
+    );
+}
+
+#[test]
+fn an_initial_state_seeding_one_order_twice_is_refused() {
+    let seeded = Order {
+        key: key_of("seeded"),
+        side: Side::Buy,
+        price: Some(d("48000")),
+        quantity: d("1"),
+        kind: OrderKind::Limit,
+        time_in_force: gtc(),
+        state: OrderState::inactive(Cancelled {
+            id: OrderId::new("seeded"),
+            time_exchange: time(0),
+            filled_quantity: None,
+        }),
+    };
+    let mut config = spot_config_holding("10", "1000000", seeded.clone());
+    config.initial_state.instruments[0]
+        .orders
+        .push(OrderReport::state_only(seeded));
+
+    assert_eq!(
+        SimulatedVenue::try_new(&config, spot_instruments()).err(),
+        Some(VenueConfigError::DuplicateOrder(DuplicateSeededOrder(
+            ClientOrderId::new("seeded")
         )))
     );
 }

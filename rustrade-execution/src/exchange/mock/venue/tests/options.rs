@@ -2020,26 +2020,40 @@ fn a_seeded_short_holds_its_collateral_out_of_the_seeded_balance() {
 }
 
 #[test]
-#[should_panic(expected = "does not cover")]
-fn a_seeded_short_the_seeded_balance_does_not_cover_panics() {
+fn a_seeded_short_the_seeded_balance_does_not_cover_is_refused() {
     let mut config = config("9999", FeeModelConfig::default());
     config.initial_state.instruments.push(held_short());
 
-    let _ = SimulatedVenue::new_market_driven(
+    let refused = SimulatedVenue::try_new_market_driven(
         &config,
         driven_instruments(OptionKind::Put, OptionSettlement::Physical),
+    );
+
+    assert_eq!(
+        refused.err(),
+        Some(VenueConfigError::OptionCollateralNotCovered {
+            instrument: option_name(),
+            quantity: d("-1"),
+            asset: usd(),
+            amount: d("10000"),
+            free: d("9999"),
+        })
     );
 }
 
 #[test]
-#[should_panic(expected = "cash-settled call")]
-fn a_seeded_short_cash_settled_call_panics() {
+fn a_seeded_short_cash_settled_call_is_refused() {
     let mut config = config("1000000", FeeModelConfig::default());
     config.initial_state.instruments.push(held_short());
 
-    let _ = SimulatedVenue::new_market_driven(
+    let refused = SimulatedVenue::try_new_market_driven(
         &config,
         driven_instruments(OptionKind::Call, OptionSettlement::Cash),
+    );
+
+    assert_eq!(
+        refused.err(),
+        Some(VenueConfigError::OptionShortUnsecurable(option_name()))
     );
 }
 
@@ -2065,14 +2079,23 @@ fn a_seeded_short_call_or_cash_settled_put_is_secured() {
 }
 
 #[test]
-#[should_panic(expected = "holds no balance of")]
-fn a_seeded_short_without_a_balance_of_its_collateral_asset_panics() {
+fn a_seeded_short_without_a_balance_of_its_collateral_asset_is_refused() {
     let mut config = config_from_balances(vec![funded(spy(), d("100"))], FeeModelConfig::default());
     config.initial_state.instruments.push(held_short());
 
-    let _ = SimulatedVenue::new_market_driven(
+    let refused = SimulatedVenue::try_new_market_driven(
         &config,
         driven_instruments(OptionKind::Put, OptionSettlement::Physical),
+    );
+
+    assert_eq!(
+        refused.err(),
+        Some(VenueConfigError::OptionCollateralNotHeld {
+            instrument: option_name(),
+            quantity: d("-1"),
+            asset: usd(),
+            amount: d("10000"),
+        })
     );
 }
 
