@@ -13,6 +13,14 @@ lints it adds. The MSRV, the oldest compiler users may build with, is `1.95` (`r
 compiler raises `rust-version` in the same PR, updates the version named here and in the README,
 and says so in the CHANGELOG.
 
+**New dependency releases wait a week.** `.cargo/config.toml` sets a 7-day minimum publish age,
+so with the pinned toolchain `cargo update` skips any crates.io release younger than that, and
+Dependabot holds back its version updates for as long (security updates are not delayed). Most
+malicious releases are found and yanked within hours. An exact (`=`) requirement on a release
+younger than 7 days makes `cargo update` fail with "is too new". To take such a release on
+purpose, review it, then run
+`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`.
+
 **Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
 `.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
 `x86_64-unknown-linux-gnu`, so without it every link fails:

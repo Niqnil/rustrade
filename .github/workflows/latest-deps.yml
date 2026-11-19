@@ -15,6 +15,12 @@ name: "Latest Deps (early warning)"
 #
 # Scope: tests the newest *semver-compatible* versions (what `cargo build` gives a
 # consumer). Breakage that requires a major-version bump is out of scope.
+#
+# `.cargo/config.toml`'s 7-day minimum publish age applies here too, so this job never
+# builds (or runs the build scripts of) a release younger than a week, and drift shows
+# up a week after the release. An exact (`=`) requirement bumped to a release younger
+# than 7 days fails `cargo update` with "is too new"; that is not drift, and the issue
+# closes itself once the release ages.
 
 on:
   schedule:
@@ -82,7 +88,7 @@ jobs:
 
           - Failing run: ${RUN_URL}
 
-          This is an *early warning*, not a regression in our own code, and it does **not** block any PR. To investigate locally:
+          This is an *early warning*, not a regression in our own code, and it does **not** block any PR. If \`cargo update\` failed with "is too new", an exact (\`=\`) requirement names a release younger than the 7-day minimum publish age in \`.cargo/config.toml\`: that is not drift, and this issue closes once the release ages. To investigate locally:
 
           \`\`\`
           cargo update

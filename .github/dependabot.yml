@@ -2,6 +2,11 @@
 # https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
 
 version: 2
+
+# Every entry holds back a release until it is 7 days old. Most malicious releases are found and
+# pulled within hours of publication, so a week skips them, which matters most for the patch
+# updates dependabot-auto-merge.yml merges without review. The cooldown applies to version updates
+# only: security updates still open at once. A fix needed sooner can be bumped by hand.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
@@ -18,6 +23,8 @@ updates:
           - "patch"
     commit-message:
       prefix: "deps"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
 
   - package-ecosystem: "github-actions"
@@ -36,6 +43,8 @@ updates:
           - "patch"
     commit-message:
       prefix: "ci"
+    cooldown:
+      default-days: 7
 
   # Proposes each new Rust release for rust-toolchain.toml. Fix any lints the new release adds in
   # that PR, so they never land in unrelated ones. Point releases (1.x.y -> 1.x.y+1) are patch
@@ -51,3 +60,5 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore"
+    cooldown:
+      default-days: 7
