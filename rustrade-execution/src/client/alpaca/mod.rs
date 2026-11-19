@@ -10401,17 +10401,12 @@ mod tests {
         async fn a_request_refused_in_transport_is_a_socket_error_not_a_timeout() {
             use crate::client::ExecutionClient;
 
-            // Bind then drop, so nothing listens on the port.
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
+            let (_refusing, addr) = crate::client::test_refusing::refusing_addr();
             let client = AlpacaClient::new(
                 AlpacaConfig::with_base_url(
                     "test-key".into(),
                     "test-secret".into(),
-                    format!("http://127.0.0.1:{port}"),
+                    format!("http://{addr}"),
                 )
                 .with_request_timeout(Duration::from_secs(5)),
             );
@@ -10737,10 +10732,9 @@ mod tests {
         /// stream, reporting the whole budget as spent.
         #[tokio::test(start_paused = true)]
         async fn failed_connects_end_the_stream_once_the_budget_is_spent() {
-            // A port nothing listens on, so every connect fails.
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
-            drop(listener);
+            // Every connect is refused.
+            let (_refusing, addr) = crate::client::test_refusing::refusing_addr();
+            let ws_url = format!("ws://{addr}");
             let mut config = AlpacaConfig::paper("key".into(), "secret".into());
             config.ws_url_override = Some(ws_url);
             let (tx, mut rx) = mpsc::unbounded_channel();

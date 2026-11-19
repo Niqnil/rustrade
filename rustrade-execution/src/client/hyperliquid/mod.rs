@@ -1949,13 +1949,11 @@ mod tests {
                 assert!(order.state.is_outcome_unknown(), "{case}");
             }
 
-            // Nothing listening: the send itself fails. A port bound and released, since a
-            // dropped mock server goes back to wiremock's pool still listening.
+            // Nothing listening: the send itself fails. Not a dropped mock server, which goes back
+            // to wiremock's pool still listening.
             let server = MockServer::start().await;
             let mut client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
-            let closed = std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|listener| listener.local_addr())
-                .unwrap();
+            let (_refusing, closed) = crate::client::test_refusing::refusing_addr();
             client.exchange_client = Arc::new(
                 super::super::common::info_tests::exchange_client_against(
                     format!("http://{closed}"),

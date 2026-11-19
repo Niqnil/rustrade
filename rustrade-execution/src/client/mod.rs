@@ -123,6 +123,11 @@ pub(crate) mod log_excerpt;
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 pub(crate) mod test_http;
 
+// A loopback address that refuses connections, for the transport-failure tests.
+#[cfg(all(test, any(feature = "alpaca", feature = "hyperliquid")))]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+pub(crate) mod test_refusing;
+
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
 pub mod alpaca;
