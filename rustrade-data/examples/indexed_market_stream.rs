@@ -70,11 +70,7 @@ fn indexed_instruments() -> IndexedInstruments {
             Underlying::new("btc", "usdt"),
             Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.0001), dec!(0.0)),
-                InstrumentSpecQuantity::new(
-                    OrderQuantityUnits::Quote,
-                    dec!(0.00001),
-                    dec!(0.00001),
-                ),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.00001), dec!(0.00001)),
                 InstrumentSpecNotional::new(dec!(5.0)),
             )),
         ))
@@ -85,7 +81,7 @@ fn indexed_instruments() -> IndexedInstruments {
             Underlying::new("eth", "usdt"),
             Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(OrderQuantityUnits::Quote, dec!(0.0001), dec!(0.0001)),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.0001), dec!(0.0001)),
                 InstrumentSpecNotional::new(dec!(5.0)),
             )),
         ))
@@ -96,7 +92,7 @@ fn indexed_instruments() -> IndexedInstruments {
             Underlying::new("sol", "usdt"),
             Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(OrderQuantityUnits::Quote, dec!(0.001), dec!(0.001)),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.001), dec!(0.001)),
                 InstrumentSpecNotional::new(dec!(5.0)),
             )),
         ))

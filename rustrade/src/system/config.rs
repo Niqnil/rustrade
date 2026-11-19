@@ -138,6 +138,7 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                         }
                         OrderQuantityUnits::Contract => OrderQuantityUnits::Contract,
                         OrderQuantityUnits::Quote => OrderQuantityUnits::Quote,
+                        OrderQuantityUnits::Base => OrderQuantityUnits::Base,
                     },
                     min: spec.quantity.min,
                     increment: spec.quantity.increment,
@@ -189,5 +190,22 @@ mod tests {
         let instrument = Instrument::from(config);
         assert_eq!(instrument.data_exchange(), &ExchangeId::LseCrypto);
         assert_eq!(instrument.data_name_exchange().as_ref(), "BTC/USD");
+    }
+
+    #[test]
+    fn an_instrument_config_spec_in_base_reaches_the_instrument() {
+        let config = instrument_config(
+            r#", "spec": {
+                "price": { "min": "0.01", "tick_size": "0.01" },
+                "quantity": { "unit": "Base", "min": "0.001", "increment": "0.001" },
+                "notional": { "min": "1" }
+            }"#,
+        );
+
+        let instrument = Instrument::from(config);
+        assert_eq!(
+            instrument.spec.map(|spec| spec.quantity.unit),
+            Some(OrderQuantityUnits::Base)
+        );
     }
 }

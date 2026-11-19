@@ -1404,6 +1404,25 @@ mod tests {
         );
     }
 
+    /// `Base` names no asset, so it registers none and stays `Base` once indexed.
+    #[test]
+    fn a_spec_in_base_registers_no_asset_of_its_own() {
+        let mut instrument = instrument(ExchangeId::BinanceSpot, "BTC", "USDT");
+        instrument.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(dec!(0.1), dec!(0.1)),
+            InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.001), dec!(0.001)),
+            InstrumentSpecNotional::new(dec!(10)),
+        ));
+
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument)
+            .build();
+
+        assert_eq!(indexed.assets().len(), 2);
+        let spec = indexed.instruments()[0].value.spec.as_ref().unwrap();
+        assert_eq!(spec.quantity.unit, OrderQuantityUnits::Base);
+    }
+
     #[test]
     fn test_builder_ordering() {
         // Add instruments in any order

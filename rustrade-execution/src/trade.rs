@@ -857,17 +857,13 @@ mod tests {
 
     // --- holding_move ------------------------------------------------------------------------
 
-    /// A spot BTC/USDT instrument, with a quantity step in BTC when `step` is given.
+    /// A spot BTC/USDT instrument, with a quantity step in its base when `step` is given.
     fn btc_usdt(step: Option<Decimal>) -> Instrument<ExchangeId, Asset> {
         let mut instrument = test_utils::instrument(ExchangeId::BinanceSpot, "btc", "usdt");
         instrument.spec = step.map(|step| {
             InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(
-                    OrderQuantityUnits::Asset(test_utils::asset("btc")),
-                    step,
-                    step,
-                ),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, step, step),
                 InstrumentSpecNotional::new(Decimal::ZERO),
             )
         });
