@@ -887,8 +887,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that names it `BTC` returned nothing, with no error. They now match as `SameAsset` compares
   names, as Alpaca already did, and return each balance under the venue's spelling. The Hyperliquid
   perpetual and spot clients ignored the requested assets and returned every balance; they now
-  return only those asked for (a HIP-3 DEX's balance is named `{dex}:{collateral}`, e.g.
-  `xyz:USDC`).
+  return only those asked for. On a per-DEX perpetual account a HIP-3 DEX's balance is named
+  `{dex}:{collateral}` (e.g. `xyz:USDC`); a unified account names each collateral token bare.
 - **The weekly Alpaca live tests run in the US regular session, one equity stream at a time**
   (`rustrade-data` tests, CI). The IEX and SIP stream tests now run serially: Alpaca allows one
   connection per data feed, and in parallel they failed with "connection limit exceeded". The tests

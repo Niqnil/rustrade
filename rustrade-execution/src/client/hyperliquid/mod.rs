@@ -1250,8 +1250,11 @@ impl ExecutionClient for HyperliquidClient {
     /// reads them: `userAbstraction` (weight 20), then either `spotClearinghouseState` or each
     /// DEX's `clearinghouseState` (weight 2 each).
     ///
-    /// Only the balances of `assets` are returned, all when it is empty. A HIP-3 DEX's balance is
-    /// named `{dex}:{collateral}` (`xyz:USDC`), so `USDC` asks for the default DEX's alone.
+    /// Only the balances of `assets` are returned, all when it is empty. The names depend on the
+    /// account mode: a per-DEX account names the default DEX's balance by its collateral (`USDC`)
+    /// and a HIP-3 DEX's as `{dex}:{collateral}` (`xyz:USDC`), so `USDC` asks for the default
+    /// DEX's alone; a unified or portfolio-margin account names each collateral token bare
+    /// (`USDC`, `USDH`), shared by every DEX margined in it, and has no `{dex}:` names.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -1822,19 +1825,11 @@ mod tests {
         }
     }
 
-    /// A client trading `xyz` and `flx` against `server`, built without the network, that places
-    /// and cancels on the assets in `coin_to_asset`. The default DEX lists `BTC`, with
-    /// `szDecimals` 5 as on mainnet.
-    /// A balance read returns only the collateral asked for, in any spelling: the default DEX's
-    /// under `USDC`, a HIP-3 DEX's only under its `{dex}:{collateral}` name.
+    /// A balance read returns only the collateral asked for, in any spelling. A per-DEX account
+    /// names the default DEX's `USDC` and a HIP-3 DEX's `{dex}:{collateral}`; a unified account
+    /// names each collateral token bare.
     #[tokio::test]
     async fn balances_are_filtered_by_asset_ignoring_case() {
-        let server = perp_account::tests::balance_server_answering_after(
-            "default",
-            std::time::Duration::ZERO,
-        )
-        .await;
-        let client = client_against(&server, HashMap::new()).await;
         let names = |balances: Vec<AssetBalance<AssetNameExchange>>| {
             let mut names = balances
                 .into_iter()
@@ -1843,18 +1838,33 @@ mod tests {
             names.sort();
             names
         };
+        let usdc = AssetNameExchange::new("usdc");
 
-        let requested = [
-            AssetNameExchange::new("usdc"),
-            AssetNameExchange::new("XYZ:usdc"),
-        ];
+        let server = perp_account::tests::balance_server_answering_after(
+            "default",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let requested = [usdc.clone(), AssetNameExchange::new("XYZ:usdc")];
         let balances = client.fetch_balances(&requested).await.unwrap();
         assert_eq!(names(balances), ["USDC", "xyz:USDC"]);
-
         let balances = client.fetch_balances(&[]).await.unwrap();
         assert_eq!(names(balances), ["USDC", "flx:USDH", "xyz:USDC"]);
+
+        let server = perp_account::tests::balance_server_answering_after(
+            "unifiedAccount",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let balances = client.fetch_balances(&[usdc]).await.unwrap();
+        assert_eq!(names(balances), ["USDC"]);
     }
 
+    /// A client trading `xyz` and `flx` against `server`, built without the network, that places
+    /// and cancels on the assets in `coin_to_asset`. The default DEX lists `BTC`, with
+    /// `szDecimals` 5 as on mainnet.
     async fn client_against(
         server: &wiremock::MockServer,
         coin_to_asset: HashMap<String, u32>,
