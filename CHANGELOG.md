@@ -564,6 +564,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation. `PartialEq` on the key types stays exact. The new `Underlying::classify`
   returns which asset of the pair a fee is in, `FeeAsset::Base`, `Quote` or `Other` (such as
   BNB), by the same rule.
+- **Breaking: the simulated venue refuses a configuration that spells one asset two ways, and
+  can return its configuration errors** (`rustrade-execution`, `rustrade`, #991). The venue keyed
+  balances and looked up prices and the fee asset by exact spelling, so a configuration naming one
+  asset as `BTC` in one place and `btc` in another split it in two, silently: a buy credited a new
+  `btc` balance beside the configured `BTC`, and a fee asset configured as `bnb` against a `BNB`
+  balance fell back to the base/quote fee rule. A live venue spells each asset one way. The venue
+  now reads every asset name its configuration gives it (the instruments' base, quote and
+  settlement assets, the account's balances, the fee asset, the spot margin configuration and the
+  fee model overrides) and refuses two that name one asset under `SameAsset` but differ in
+  spelling, with `AssetSpelledTwice` naming both and where each was read. New
+  `SimulatedVenue::try_new` and `try_new_market_driven` return a `VenueConfigError` for this and
+  for every refusal `new` and `new_market_driven` panicked on (a duplicate seeded order, a seeded
+  position with no entry price, an unsecured short option, a seeded day order the session close
+  cannot place); those two still panic, with the error. `SimulatedVenue::from_snapshot` refuses
+  the same with the new `VenueRestoreError::AssetSpelledTwice`. The backtest and paper trading
+  builders now return such a configuration as `BarterError::ExecutionBuilder` instead of
+  panicking.
 - **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
   rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as
   an `OrderSnapshot` of a cancelled order with what it filled, instead of `OrderCancelled`, so a

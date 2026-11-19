@@ -115,6 +115,9 @@ impl MockExchange {
     ///
     /// Each request is booked when it is received, at its own `time_request` plus half of
     /// `latency_ms`, and its output is emitted `latency_ms` of real time later.
+    ///
+    /// # Panics
+    /// If [`SimulatedVenue::try_new`] would refuse the configuration.
     pub fn new(
         config: MockExecutionConfig,
         request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,

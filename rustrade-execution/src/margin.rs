@@ -412,6 +412,28 @@ impl SpotMarginConfig {
         &self.0.valuation_asset
     }
 
+    /// Every asset this configuration names: the valuation asset, then each asset it sets a borrow
+    /// limit or a collateral ratio for, possibly more than once.
+    pub(crate) fn assets(&self) -> impl Iterator<Item = &AssetNameExchange> {
+        let SpotMarginRepr {
+            valuation_asset,
+            min_borrow,
+            max_borrow,
+            borrow_collateral_ratio,
+            liquidation_collateral_ratio,
+            max_leverage: _,
+            margin_effect: _,
+            auto_repay_at_cancel: _,
+            borrow_price_window_ms: _,
+            liquidation: _,
+        } = &self.0;
+        std::iter::once(valuation_asset)
+            .chain(min_borrow.keys())
+            .chain(max_borrow.keys())
+            .chain(borrow_collateral_ratio.keys())
+            .chain(liquidation_collateral_ratio.keys())
+    }
+
     /// The most the account may hold, as a multiple of its equity: its debt may reach
     /// `max_leverage − 1` times its equity.
     pub fn max_leverage(&self) -> Decimal {
