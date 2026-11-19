@@ -119,7 +119,8 @@ age in your Cargo config (Cargo 1.100 or later; older Cargo ignores the key):
 global-min-publish-age = "7 days"
 ```
 
-Commit your `Cargo.lock` as well, so a dependency changes only when you update it.
+If you build an application, commit its `Cargo.lock` as well, so a dependency changes only when
+you update it.
 
 ## Disclaimer
 

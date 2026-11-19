@@ -98,9 +98,10 @@ jobs:
       #
       # Packaging a crate resolves its dependencies, including the workspace crates this run
       # published seconds earlier, from the crates.io index, where `.cargo/config.toml`'s 7-day
-      # minimum publish age refuses them as too new (checked with `cargo package` on Cargo 1.100). The override lifts it for this step only. Other dependencies stay as the
-      # committed `Cargo.lock` locks them: the validate job builds `--locked`, so a lock that does
-      # not cover every requirement fails there, before anything is published.
+      # minimum publish age refuses them as too new (checked with `cargo package` on Cargo 1.100).
+      # The override lifts it for this step only. Other dependencies stay as the committed
+      # `Cargo.lock` locks them: the validate job builds `--locked`, so a lock that does not cover
+      # every requirement fails there, before anything is published.
       - name: Publish crates
         run: ./.github/scripts/publish-crates.sh
         env:
