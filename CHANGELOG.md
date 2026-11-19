@@ -536,6 +536,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queue, kept when an amend that keeps its place moves its `time_exchange`.
   `OpenOrders::amend_renaming` and `AccountState::amend_order_renaming` amend an order queued
   under one client order id onto another.
+- **Building the engine state logs each instrument without a quantity step** (`rustrade`).
+  `EngineStateBuilder::try_build` (and `build`) checks every instrument's
+  `Instrument::try_quantity_step` once: an instrument whose spec gives no step (counted in the
+  quote or another asset, or an increment not above zero) is logged at `warn` with the reason,
+  naming the asset the spec counts in, since its positions and close orders are then not rounded
+  to a step; an instrument with no spec is logged at `debug`, as is normal when running without
+  specs.
 
 ### Changed
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
