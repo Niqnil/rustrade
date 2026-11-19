@@ -19,6 +19,8 @@
 //! 2. Environment variables set (see .env.template):
 //!    - ALPACA_API_KEY: API key
 //!    - ALPACA_SECRET_KEY: Secret key
+//!    - ALPACA_PAPER: `true` for paper keys. Absent means live, as in `AlpacaRestClient::from_env`,
+//!      so the option tests and the market-hours clock check refuse paper keys without it.
 //!
 //! # Running
 //!
@@ -82,7 +84,7 @@ fn init_logging() {
 ///
 /// Called before a test opens an equity feed, so a run outside the session fails at once instead
 /// of waiting out its timeout while it holds the feed's one connection. Reads the paper host when
-/// `ALPACA_PAPER` is `true`, as `AlpacaRestClient::from_env` does.
+/// `ALPACA_PAPER` is `true` and the live host otherwise, as `AlpacaRestClient::from_env` does.
 async fn require_regular_session() {
     let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
     let secret_key =

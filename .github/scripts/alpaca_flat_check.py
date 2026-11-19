@@ -8,10 +8,10 @@ balances), then `FLAT` or `NOT FLAT`. Exit status: 0 when flat, 1 when anything 
 request fails. Needs ALPACA_API_KEY and ALPACA_SECRET_KEY.
 """
 
+import http.client
 import json
 import os
 import sys
-import urllib.error
 import urllib.request
 
 BASE = "https://paper-api.alpaca.markets"
@@ -33,7 +33,8 @@ def main():
     try:
         orders = get("/v2/orders?status=open&limit=500")
         positions = get("/v2/positions")
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+    # OSError covers URLError, timeouts and a connection reset mid-read.
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
         print(f"request failed: {error}")
         return 2
     for o in orders:

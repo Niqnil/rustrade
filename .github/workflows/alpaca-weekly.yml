@@ -23,7 +23,8 @@ jobs:
   # Two chained jobs wait for the open by Alpaca's paper clock, since a GitHub-hosted job ends at
   # 360 minutes; together they cover a run that starts up to about 11 hours before it. Each fails
   # at once when the next open is further away than the waiting left (a market holiday, or a run
-  # that started after the close). A run dispatched during the session passes straight through.
+  # that started after the close). A run dispatched during the session passes straight through;
+  # one that waited for the open waits two minutes more, so an order placed next is not queued.
   #
   # Outside the paper-account concurrency group: waiting must not hold the account from the other
   # runs.
@@ -62,7 +63,10 @@ jobs:
       # above do not hold the account.
       #
       # `cancel-in-progress: false` matters as much as the shared group: cancelling a run mid-test
-      # can leave a resting order behind that poisons the next one.
+      # can leave a resting order behind that poisons the next one. It protects only the running
+      # job, though: a group holds one running and one pending job, and a newer entrant cancels the
+      # pending one. So this job, waiting while an integration run holds the account, is cancelled
+      # when a second integration run queues behind it. The `verdict` job below fails the run then.
       group: alpaca-paper-account
       cancel-in-progress: false
     steps:
@@ -115,3 +119,19 @@ jobs:
       - name: Check test results
         if: always() && (steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure' || steps.options-tests.outcome == 'failure' || steps.flat-check.outcome == 'failure')
         run: exit 1
+
+  # Fails the run unless the tests ran and passed, so a test job that was cancelled in the
+  # concurrency group, or skipped after a wait failed, shows as a failure, not a cancelled run.
+  verdict:
+    name: Weekly verdict
+    needs: alpaca-tests
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the test job's result
+        env:
+          RESULT: ${{ needs.alpaca-tests.result }}
+        run: |
+          echo "alpaca-tests: $RESULT"
+          test "$RESULT" = success

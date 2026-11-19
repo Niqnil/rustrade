@@ -5,8 +5,9 @@ placed outside it waits `accepted`, and the IEX feed carries no trades or quotes
 
 Usage: alpaca_wait_for_session.py <budget minutes> [--horizon <minutes>] [--final]
 
-Returns once the session is open (exit 0), then waits two minutes more so an order placed next
-rests `new` rather than queued for the open. A GitHub-hosted job ends at 360 minutes, so a longer
+Returns once the session is open (exit 0). When this call saw the market closed first, it waits
+two minutes more, so an order placed next rests `new` rather than queued for the open; a call that
+finds the session already open returns at once. A GitHub-hosted job ends at 360 minutes, so a longer
 wait is split across chained jobs, each calling this with its own budget:
 - When the budget runs out first, it exits 0 so the next job carries on; with --final it exits 1.
 - With --horizon, it exits 1 at once when the next open is further away than that many minutes
@@ -15,12 +16,12 @@ wait is split across chained jobs, each calling this with its own budget:
 Needs ALPACA_API_KEY and ALPACA_SECRET_KEY. Prints only clock times.
 """
 
+import http.client
 import json
 import os
 import re
 import sys
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime
 
@@ -60,7 +61,8 @@ def main():
     while True:
         try:
             c = clock()
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        # OSError covers URLError, timeouts and a connection reset mid-read.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
             failures += 1
             print(f"clock request failed ({failures} of {MAX_FAILURES}): {error}", flush=True)
             if failures >= MAX_FAILURES:
@@ -70,7 +72,8 @@ def main():
         failures = 0
         if c["is_open"]:
             print(f"open at {c['timestamp']}; next close {c['next_close']}", flush=True)
-            time.sleep(120)
+            if not first:
+                time.sleep(120)
             return 0
         wait = (parse(c["next_open"]) - parse(c["timestamp"])).total_seconds()
         if first and horizon is not None and wait > horizon * 60:

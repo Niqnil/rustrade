@@ -832,7 +832,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clock in the message, when the session is closed, instead of waiting out their timeout while
   holding the feed's connection. The `Alpaca Weekly` workflow is scheduled before the open and
   waits for it by Alpaca's clock, since its scheduled runs were starting after the close. It also
-  fails when the paper account is not flat after the tests.
+  fails when the paper account is not flat after the tests, and when its test job is cancelled
+  while waiting for the paper account.
 - **The engine keeps an order's venue order id when a report names the order by its client order
   id alone** (`rustrade`). A working report carrying `VenueOrderId::ClientAssigned` for an order
   the engine already held a venue id for replaced the held state whole, id included, whenever it
