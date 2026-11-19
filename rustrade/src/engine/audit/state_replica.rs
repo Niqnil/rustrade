@@ -178,7 +178,8 @@ where
     ///   `HistoricalClock` and therefore cannot be reproduced from the payload, so the replica
     ///   removes the slot and folds the *live* `PositionExit` into the tear sheet. Parity (incl.
     ///   tear sheets) is asserted by the replica-parity integration test, which guards against the
-    ///   live handler and this arm drifting apart.
+    ///   live handler and this arm drifting apart. The rescale of every tracked order is
+    ///   event-replayed too, from the same prepare pass.
     ///
     /// Adding a new event type: choose event replay (deterministic transition) or output
     /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce
@@ -391,6 +392,17 @@ where
                     Err(_) => return,
                 };
 
+                // Rescale the equity's tracked orders (mirrors the live handler's Step 3). The
+                // replica tracks the same orders from the same reports, so the shared prepare pass
+                // rescaled exactly the orders it holds. The before/after terms feed only the live
+                // observable.
+                let _ = self
+                    .replica_engine_state_mut()
+                    .instruments
+                    .instrument_index_mut(&instrument)
+                    .orders
+                    .commit_split(split_plan.equity_orders);
+
                 // Last price for the eager `pnl_unrealised` recompute — same source the live
                 // handler reads. Identical here because the replica replayed the same market data.
                 let last_price = self
@@ -497,7 +509,11 @@ where
                         // before the unheld early-out, exactly as the live handler does.
                         option_state.corporate_actions_processed.insert(id.clone());
 
-                        // Unheld option: strike correction is the whole job (silent registry fix),
+                        // Rescale the option's tracked orders, held or unheld (mirrors the live
+                        // handler, which does so before its unheld early-out).
+                        let _ = option_state.orders.commit_split(opt_plan.orders);
+
+                        // Unheld option: strike correction and order rescale are the whole job,
                         // mirroring the live handler.
                         if opt_plan.positions.is_empty() {
                             continue;

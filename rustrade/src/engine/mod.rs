@@ -22,11 +22,10 @@ use crate::{
                 data::InstrumentDataState, filter::InstrumentFilter,
             },
             order::{
-                Orders,
                 applied::{OrderAdopted, OrderNotAdopted, OrderReplaced, OrderReportsApplied},
                 in_flight_recorder::InFlightRequestRecorder,
                 manager::OrderManager,
-                terms::{OrderTermsChanged, OrderTermsDiverged},
+                terms::{OrderTerms, OrderTermsChanged, OrderTermsDiverged},
             },
             position::{
                 EngineCheckpoint, Position, PositionDrift, PositionExited, PositionId,
@@ -995,9 +994,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// adjusting **every** open position and returning the observable outputs to fold into the
     /// audit.
     ///
-    /// Unlike `process_contract_expiry`, this **does not** cancel resting orders (a real broker
-    /// price-adjusts them, so an engine-side cancel would diverge) and **does not** require a
-    /// market price (the split is applied regardless; see below).
+    /// Unlike `process_contract_expiry`, this **does not** cancel resting orders (a venue adjusts
+    /// or cancels them by its own rule, so an engine-side cancel would act on a guess; the engine
+    /// rescales its view of them instead, step 3) and **does not** require a market price (the
+    /// split is applied regardless; see below).
     ///
     /// All outputs (and any folded `PositionExit`) are stamped at the engine clock's current time.
     /// The caller is expected to have advanced the clock to the event's `effective_time` before
@@ -1030,7 +1030,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    - another registered instrument is also split-eligible on the target's
     ///      `(base, quote, exchange)` ⇒ [`UnsupportedCorporateActionReason::AmbiguousSplitTarget`],
     ///      because the option chain below is resolved by that identity alone.
-    /// 3. Snapshot resting orders into [`EngineOutput::OpenOrdersAtSplit`] (no cancellation).
+    /// 3. Rescale the engine's view of every tracked order (quantity and filled × `ratio`, prices
+    ///    ÷ `ratio`, no rounding) and list them, with their terms before and after, in an
+    ///    [`EngineOutput::OpenOrdersAtSplit`]. Nothing is sent: no cancel, no amend. The venue's
+    ///    next report of each order replaces the rescaled state, even with less filled (see "After
+    ///    a split" on [`TrackedOrder`](crate::engine::state::order::TrackedOrder)).
     /// 4. Apply the split to every open position — the same per-position rescale as
     ///    [`Position::apply_split`](crate::engine::state::position::Position::apply_split), but the
     ///    handler does **not** call it directly: it pre-computes every affected position atomically
@@ -1045,8 +1049,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///      (strike ÷ `ratio`, contracts × `ratio` — the same rescale as
     ///      [`Position::apply_split`](crate::engine::state::position::Position::apply_split), multiplier
     ///      unchanged), emitting one [`EngineOutput::OptionPositionAdjustedForSplit`] per position
-    ///      plus — if the option has resting orders — an [`EngineOutput::OpenOrdersAtSplit`] for them
-    ///      (a real broker price-adjusts them; the engine cancels nothing). Because option positions
+    ///      plus — if the option has resting orders — an [`EngineOutput::OpenOrdersAtSplit`] for them,
+    ///      rescaled as the equity's are (contracts × `ratio`, premium ÷ `ratio`; the engine sends
+    ///      nothing). Because option positions
     ///      are held in **whole contracts**, a whole-number ratio applied to them disposes no
     ///      fractional sliver, so — unlike the equity path above, where a fractional remainder can
     ///      arise — **no** [`EngineOutput::SplitRemainder`] is emitted on this path;
@@ -1228,11 +1233,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             }
         };
 
-        // Step 3: snapshot resting orders as an observable — do NOT cancel (a broker price-adjusts
-        // them, so an engine-side cancel would diverge from the broker). Re-borrow the instrument
-        // state: pre-validation above released the earlier borrow.
-        let instrument_state = self.state.instruments.instrument_index(key);
-        let resting_orders = snapshot_open_orders_at_split(&instrument_state.orders);
+        // Step 3: rescale the engine's view of every tracked order (pre-computed in Step 2c) and
+        // keep each one's terms before and after for the observable — do NOT cancel or send
+        // anything (a venue adjusts or cancels resting orders itself, and its next report of each
+        // says which). Re-borrow the instrument state: pre-validation above released the earlier
+        // borrow.
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+        let resting_orders = instrument_state
+            .orders
+            .commit_split(split_plan.equity_orders);
 
         // Last price for the eager `pnl_unrealised` recompute. None ⇒ 0 (+ warn); the split is
         // still applied and the `id` recorded (NOT retryable).
@@ -1321,8 +1330,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     // Prune the hedging fill-routing map for the removed position. This must prune
                     // by VALUE (the removed `PositionId`), NOT via `cleanup_routing_tables` (which
                     // retains by `ClientOrderId` still present in `self.orders`): the split
-                    // deliberately leaves the position's resting order in place (a broker
-                    // price-adjusts it), so its CID is still in `orders` and `cleanup_routing_tables`
+                    // deliberately leaves the position's resting order in place (the venue adjusts
+                    // or cancels it), so its CID is still in `orders` and `cleanup_routing_tables`
                     // would keep the now-dangling `cid → removed_pos_id` mapping. Left stale, an
                     // `OmsMode::Hedging` late fill on that order would resolve the dead id and
                     // silently reopen a floored-out position.
@@ -1445,14 +1454,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             // position event, carries the same evidence a held one does.
             option_state.corporate_actions_processed.insert(id.clone());
 
-            // Snapshot the option's resting orders as an observable BEFORE the unheld early-out
-            // and before adjusting any positions — a broker price-adjusts them, so the engine
-            // cancels nothing, but the wrapper must know (and a backtest MockExchange would
-            // otherwise fill a now-stale-premium resting order against the post-split print).
-            // Mirrors the equity leg, which snapshots regardless of position state: an UNHELD
-            // option can still carry a resting order to *open* a position, whose premium is now
-            // stale against the post-split strike, so it must be surfaced just the same.
-            let option_orders = snapshot_open_orders_at_split(&option_state.orders);
+            // Rescale the option's tracked orders BEFORE the unheld early-out and before adjusting
+            // any positions, keeping each one's terms for the observable — the engine cancels
+            // nothing, but the wrapper must know (and a backtest's simulated venue would otherwise
+            // fill a now-stale-premium resting order against the post-split print). Mirrors the
+            // equity leg, which rescales regardless of position state: an UNHELD option can still
+            // carry a resting order to *open* a position, so it must be rescaled and surfaced just
+            // the same.
+            let option_orders = option_state.orders.commit_split(opt_plan.orders);
 
             // Unheld option: the strike correction + resting-order snapshot above are the whole
             // job — no positions to split (`opt_plan.positions` is empty). Still surface any
@@ -1704,23 +1713,6 @@ where
     }
 }
 
-/// Snapshot every resting order in `orders` into the [`OpenOrderAtSplit`] records carried by an
-/// [`EngineOutput::OpenOrdersAtSplit`] observable. Shared by the equity and held-option snapshot
-/// sites in `process_corporate_action` so both capture exactly the same fields — a split cancels
-/// nothing (a broker price-adjusts resting orders), it only reports them.
-fn snapshot_open_orders_at_split(
-    orders: &Orders<ExchangeIndex, InstrumentIndex>,
-) -> Vec<OpenOrderAtSplit> {
-    orders
-        .orders()
-        .map(|order| OpenOrderAtSplit {
-            cid: order.key.cid.clone(),
-            price_pre_split: order.price,
-            quantity_pre_split: order.quantity,
-        })
-        .collect()
-}
-
 impl<Clock, State, ExecutionTxs, Strategy, Risk> Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
     Clock: EngineClock,
@@ -1863,14 +1855,23 @@ pub enum EngineOutput<
         price_entry_average_post_split: Decimal,
     },
 
-    /// Observable snapshot of the resting orders an instrument had at the moment a split was
-    /// applied. The handler **does not** cancel or re-price them — a real broker price-adjusts
-    /// resting orders, so an engine-side cancel would diverge. The wrapper decides cancel-vs-keep
-    /// (and **must** cancel in backtest, or the mock exchange fills stale-priced orders).
+    /// The orders an instrument tracked when a split was applied, with the terms the engine
+    /// rescaled each to.
+    ///
+    /// The engine rescales its **view** of each order exactly (quantity and filled quantity × the
+    /// ratio, prices ÷ the ratio, no rounding) and takes the venue's next report of it whatever it
+    /// says, even with less filled (see "After a split" on
+    /// [`TrackedOrder`](crate::engine::state::order::TrackedOrder)). It sends **nothing**: a venue
+    /// adjusts resting orders or cancels them, by its own rule, so an engine-side cancel or amend
+    /// would act on a guess. The wrapper decides whether to cancel, keep or re-price each order.
+    ///
+    /// In backtest, the simulated venue does nothing on a split: it keeps each order on its old
+    /// terms and fills it against post-split prices. So the wrapper **must** cancel these orders
+    /// in backtest.
     OpenOrdersAtSplit {
-        /// Instrument whose resting orders are listed.
+        /// Instrument whose orders are listed.
         instrument: InstrumentKey,
-        /// The resting orders, captured at pre-split prices/quantities.
+        /// The orders, each with its terms before and after the split.
         orders: Vec<OpenOrderAtSplit>,
     },
 
@@ -1892,8 +1893,8 @@ pub enum EngineOutput<
     /// just the strike adjustment can read the first record and ignore the rest.
     ///
     /// The same standard adjustment **also** emits an [`EngineOutput::OpenOrdersAtSplit`] for the
-    /// adjusted option's own resting orders, if it has any (their premium is now stale-priced) —
-    /// observable, never cancelled, exactly as on the equity path. No [`EngineOutput::SplitRemainder`]
+    /// adjusted option's own resting orders, if it has any, rescaled as on the equity path —
+    /// observable, never cancelled. No [`EngineOutput::SplitRemainder`]
     /// accompanies it: a whole-number ratio applied to an integer contract count disposes no
     /// fractional sliver.
     OptionPositionAdjustedForSplit {
@@ -2158,22 +2159,33 @@ pub enum EngineOutput<
     OrderDeadline(OrderDeadlineOutput<ExchangeKey, InstrumentKey>),
 }
 
-/// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
+/// One order an instrument tracked when a split was applied, carried by an
+/// [`EngineOutput::OpenOrdersAtSplit`] observable, with its terms before and after the engine
+/// rescaled it.
+///
+/// `post_split` is `pre_split` with the quantity × the ratio and every price ÷ the ratio, exactly
+/// (see "After a split" on [`TrackedOrder`](crate::engine::state::order::TrackedOrder) for what
+/// is a price). It is the engine's view, not the venue's: the venue's next report of the order
+/// says how it adjusted the order, if it did, and the engine takes that.
 ///
 /// An order with an amend in flight at the split is captured at the values it rested at before
-/// the amend. The amend's new values are on the pre-split scale, and its answer commits whatever
-/// the venue confirms, so wait for that answer, or cancel the order, before re-pricing it for the
-/// split.
+/// the amend. The engine rescales the amend's new values too, but the venue answers the amend it
+/// was sent, on the old scale, so wait for that answer, or cancel the order, before re-pricing it
+/// for the split.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller; build one with
+/// [`OpenOrderAtSplit::new`].
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
+#[non_exhaustive]
 pub struct OpenOrderAtSplit {
-    /// Client order id of the resting order.
+    /// Client order id of the order.
     pub cid: ClientOrderId,
-    /// Limit price before the split (`None` for market/stop orders).
-    pub price_pre_split: Option<Decimal>,
-    /// Order quantity before the split.
-    pub quantity_pre_split: Decimal,
+    /// The order's terms before the split.
+    pub pre_split: OrderTerms,
+    /// The order's terms after the engine rescaled them for the split.
+    pub post_split: OrderTerms,
 }
 
 /// Reason a [`ContractExpiry`](crate::EngineEvent::ContractExpiry) was not settled, carried by
@@ -2315,9 +2327,9 @@ pub enum UnsupportedCorporateActionReason {
     /// (under `Floor`) or carried (under `Fractional`). **Not** self-healing on retry: the
     /// corrupted position must be reconciled before the action can succeed.
     PositionStateInvalid,
-    /// The split arithmetic would overflow `Decimal` for at least one affected position — an
-    /// extreme ratio or quantity driving a rescaled field past `Decimal::MAX`. Detected by the
-    /// read-only pre-validation pass, so **no** position was mutated. Indicates a corrupt or
+    /// The split arithmetic would overflow `Decimal` for at least one affected position, option
+    /// strike or tracked order — an extreme ratio, quantity or price driving a rescaled field past
+    /// `Decimal::MAX`. Detected by the read-only pre-validation pass, so **nothing** was mutated. Indicates a corrupt or
     /// adversarial feed rather than a transient condition.
     ArithmeticOverflow,
     /// The action's target is **not the unique split-eligible instrument** on its

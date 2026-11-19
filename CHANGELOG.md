@@ -545,6 +545,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: a split rescales the engine's view of the orders it tracks** (`rustrade`). On a
+  stock split, the engine kept each tracked order on its pre-split terms, so a strategy read an
+  order for 10 shares at 100 after a 2-for-1 split where the venue now held one for 20 at 50. A
+  reverse split was worse: the venue's next report showed less filled than the engine held, so
+  the engine refused it as stale and kept the old terms. Now `process_corporate_action` rescales
+  each order of the split equity, and each order of an option a standard split adjusts, exactly,
+  with no rounding: the quantity and the filled quantity × the ratio, and the limit price, every
+  trigger and activation price, a trailing stop-limit's stop price and limit offset, and an
+  absolute trailing offset ÷ the ratio. A percentage or basis-point offset is unchanged. An amend in flight
+  has its new values rescaled too. The venue's next report of each order replaces the rescaled
+  state whatever its time, even with less filled, and every term it states is taken
+  (`TrackedOrder::split_unreported` is `true` until then). A fill does not count, as it states no
+  terms. The engine still sends nothing on a split. `OpenOrderAtSplit` replaces
+  `price_pre_split` and `quantity_pre_split` with `pre_split` and `post_split`, each an
+  `OrderTerms`, so a stop order's trigger is listed too, and is now `#[non_exhaustive]` (build
+  one with `OpenOrderAtSplit::new`); an `OpenOrdersAtSplit` output serialized before this change
+  does not read back. A serialized `TrackedOrder` carries `split_unreported` while it is `true`,
+  and one without the field reads back with it `false`. The audit replica applies the same
+  rescale. A rescale that overflows `Decimal` rejects the whole action with
+  `ArithmeticOverflow`, as a position's does. The simulated venue still does nothing on a split,
+  so a backtest must still cancel the listed orders.
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
   (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had

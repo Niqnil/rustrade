@@ -3814,6 +3814,9 @@ fn test_corporate_action_replica_parity_floor_split() {
     );
     open_position_via_trade(&mut engine, 0, 3, Side::Buy, dec!(100), dec!(1), "dust");
 
+    // A resting order, half filled, which the split rescales in both.
+    engine.process(account_event_order_response(0, 4, Side::Buy, 1.0, 0.5));
+
     // Seed the replica from the exact pre-split state.
     let pre_split_state = engine.state.clone();
 
@@ -3883,6 +3886,17 @@ fn test_corporate_action_replica_parity_floor_split() {
     assert_eq!(survivor.price_entry_average, dec!(200));
     assert_eq!(survivor.quantity_abs_max, dec!(10.5));
     assert_eq!(survivor.pnl_unrealised, dec!(-1000));
+
+    // The resting order rescaled: quantity 1 × 0.5, filled 0.5 × 0.5.
+    let order = live_instrument
+        .orders
+        .get(&gen_cid(0))
+        .expect("still tracked");
+    assert_eq!(order.quantity, dec!(0.5));
+    assert_eq!(
+        order.state.open_meta().map(|open| open.filled_quantity),
+        Some(dec!(0.25))
+    );
 
     // Idempotency key recorded in both.
     assert!(
@@ -5122,6 +5136,8 @@ fn test_corporate_action_option_replica_parity_standard_split() {
     engine.process(market_event_trade(1, 0, dec!(1200)));
     engine.process(market_event_trade(1, 1, dec!(60_000)));
     open_option_position(&mut engine, dec!(2), dec!(1_000));
+    // A resting order on the option, half filled, which the split rescales in both.
+    engine.process(account_event_order_response(0, 2, Side::Buy, 1.0, 0.5));
 
     // Seed the replica from the exact pre-split state.
     let pre_split_state = engine.state.clone();
@@ -5181,6 +5197,14 @@ fn test_corporate_action_option_replica_parity_standard_split() {
     let position = option_live.position.positions.values().next().unwrap();
     assert_eq!(position.quantity_abs, dec!(4));
     assert_eq!(position.price_entry_average, dec!(500));
+
+    // The option's resting order rescaled: contracts 1 × 2, filled 0.5 × 2.
+    let order = option_live.orders.get(&gen_cid(0)).expect("still tracked");
+    assert_eq!(order.quantity, dec!(2));
+    assert_eq!(
+        order.state.open_meta().map(|open| open.filled_quantity),
+        Some(dec!(1))
+    );
 }
 
 /// Replica-parity for the **non-standard** option-split branch: a reverse (or fractional-forward)
@@ -6908,9 +6932,10 @@ fn test_contract_expiry_clears_pending_fills() {
 //   hedging routing-table prune on a floor-to-zero reverse split.
 // ---------------------------------------------------------------------------
 
-/// Equity/spot path: a resting order on the splitting instrument is surfaced via
-/// `OpenOrdersAtSplit` (and left in the book — a broker price-adjusts it, the engine never cancels).
-/// The option path already asserts this observable; this pins it on the equity leg too.
+/// Equity/spot path: a resting order on the splitting instrument is rescaled in the engine's view
+/// and surfaced via `OpenOrdersAtSplit` with its terms before and after (and left in the book — the
+/// venue adjusts or cancels it, the engine never cancels). The option path already asserts this
+/// observable; this pins it on the equity leg too.
 #[test]
 fn test_corporate_action_spot_split_surfaces_open_orders_at_split() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
@@ -6939,7 +6964,7 @@ fn test_corporate_action_spot_split_surfaces_open_orders_at_split() {
         _ => panic!("expected EngineAudit::Process"),
     };
 
-    // The resting order is surfaced for the equity instrument, carrying its pre-split terms.
+    // The resting order is surfaced for the equity instrument, with its terms before and after.
     let surfaced = outputs
         .iter()
         .find_map(|o| match o {
@@ -6952,23 +6977,23 @@ fn test_corporate_action_spot_split_surfaces_open_orders_at_split() {
         })
         .expect("equity split must surface the instrument's resting orders via OpenOrdersAtSplit");
     assert!(
-        surfaced
-            .iter()
-            .any(|order| order.cid == gen_cid(0) && order.quantity_pre_split == dec!(1)),
-        "OpenOrdersAtSplit must carry the resting order at its pre-split quantity"
+        surfaced.iter().any(|order| order.cid == gen_cid(0)
+            && order.pre_split.quantity == dec!(1)
+            && order.post_split.quantity == dec!(0.5)),
+        "OpenOrdersAtSplit must carry the resting order's quantity before and after the split"
     );
 
-    // The order is NOT cancelled — it still rests in the engine's order book post-split.
-    assert!(
-        engine
-            .state
-            .instruments
-            .instrument_index(&InstrumentIndex(0))
-            .orders
-            .0
-            .contains_key(&gen_cid(0)),
-        "the resting order must be left in place (surfaced, not cancelled)"
-    );
+    // The order is NOT cancelled — it still rests in the engine's order book post-split, rescaled,
+    // waiting for the venue's word on the split.
+    let tracked = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .orders
+        .tracked(&gen_cid(0))
+        .expect("the resting order must be left in place (surfaced, not cancelled)");
+    assert_eq!(tracked.order.quantity, dec!(0.5));
+    assert!(tracked.split_unreported());
 }
 
 /// Forward split (`ratio > 1`) on a populated spot position via the audit path: contracts scale up,
