@@ -18,7 +18,7 @@ use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
     error::OrderError,
-    exchange::mock::{SimulatedVenue, VenueOutcome},
+    exchange::mock::{CorporateActionResponse, SimulatedVenue, VenueOutcome},
     indexer::AccountEventIndexer,
     market::MarketObservation,
     order::{
@@ -33,6 +33,7 @@ use rustrade_execution::{
     },
 };
 use rustrade_instrument::{
+    corporate_action::CorporateActionKind,
     exchange::{ExchangeId, ExchangeIndex},
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
@@ -412,6 +413,20 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// account event at its instant, so the `Engine` has a fill stamped at the deadline before it
 /// decides what is left to cancel, and precedes market data, so the cancel it sends acts before a
 /// tick at that instant could fill the order. See `# An order's cancel_after`.
+///
+/// # A corporate action reaches the venues too
+/// A [`CorporateAction`](EngineEvent::CorporateAction) in the source is handed to every venue whose
+/// own exchange lists its instrument, with [`SimulatedVenue::apply_corporate_action`], before the
+/// `Engine` is shown it, as a market event is. On a stock split the venue cancels every order on
+/// the instrument and trades nothing on it until its next market event. What the venue caused
+/// reaches the `Engine` one `from_venue` leg later, so the `Engine` has already applied the split
+/// to its own state when the cancels arrive. The venue's balances, and options on the instrument,
+/// keep their pre-split terms: see the method's `# What it does not do yet`.
+///
+/// The split cancels only what the venue holds when the runner takes it from the source. An order
+/// the `Engine` sent before the split that reaches the venue after it, one `to_venue` leg later,
+/// arrives as a new order on its pre-split terms and is not cancelled, as at a live venue that
+/// receives it after its own cancel.
 ///
 /// `class` is compared inside the queue's own ordering, not only where the queue is weighed against
 /// the source. Comparing it at the peek alone would let the queue hand back a low-priority entry
@@ -1150,12 +1165,13 @@ where
 /// Folds one source event into per-instrument market state, hands it to every venue trading it,
 /// and schedules whatever resting orders it filled.
 ///
-/// Anything that is not a market data item is ignored, an account event or a command, except a
-/// reconnect. A reconnect carries no price, and is deliberately *not* treated as clearing the
-/// market: a gap in a feed does not mean the instrument stopped having a price, and a venue that
-/// forgot its market on every reconnect would refuse to match orders it should have matched. It
-/// does say that nothing more is arriving from its exchange, so each venue marks the instruments
-/// it trades whose market data comes from that exchange with
+/// A [`CorporateAction`](EngineEvent::CorporateAction) is handed to the venues too: see
+/// [`route_corporate_action`]. Anything else that is not a market data item is ignored, an account
+/// event or a command, except a reconnect. A reconnect carries no price, and is deliberately *not*
+/// treated as clearing the market: a gap in a feed does not mean the instrument stopped having a
+/// price, and a venue that forgot its market on every reconnect would refuse to match orders it
+/// should have matched. It does say that nothing more is arriving from its exchange, so each venue
+/// marks the instruments it trades whose market data comes from that exchange with
 /// [`SimulatedVenue::mark_market_stale`] at `time`, the instant the source carried it at. Only
 /// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) reads the mark.
 /// The end of the data needs no mark: nothing arrives after it, and
@@ -1199,6 +1215,26 @@ where
                     slot.venue.mark_market_stale(name, time);
                 }
             }
+            return Ok(Routed::Now);
+        }
+        EngineEvent::CorporateAction {
+            id,
+            instrument,
+            kind,
+            effective_time,
+            ..
+        } => {
+            route_corporate_action::<MarketKind>(
+                venues,
+                market,
+                pending,
+                seq,
+                wakeups,
+                id,
+                *instrument,
+                kind,
+                *effective_time,
+            )?;
             return Ok(Routed::Now);
         }
         _ => return Ok(Routed::Now),
@@ -1254,6 +1290,72 @@ where
     }
 
     Ok(routed)
+}
+
+/// Hands a corporate action to every venue whose own exchange lists `instrument`, with
+/// [`SimulatedVenue::apply_corporate_action`], and schedules what each caused, one `from_venue`
+/// leg after `effective_time`, as a tick-caused fill is.
+///
+/// The source event is shown to the `Engine` at once, and it ranks ahead of account deliverables at
+/// its instant, so the `Engine` applies the action to its own state before it sees what the venue
+/// did: an order the venue cancelled on a split arrives as a report of an order the `Engine` has
+/// already rescaled.
+///
+/// When any venue applies it, the market folded so far for `instrument` is dropped, so the next
+/// event starts a new fold rather than mixing post-split prices into pre-split ones.
+#[allow(clippy::too_many_arguments)] // The queue's parts, borrowed apart as `route_market` borrows them.
+fn route_corporate_action<MarketKind>(
+    venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
+    market: &mut FnvHashMap<InstrumentIndex, MarketKind::State>,
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    wakeups: &mut Wakeups,
+    id: &str,
+    instrument: InstrumentIndex,
+    kind: &CorporateActionKind,
+    effective_time: DateTime<Utc>,
+) -> Result<(), SimFault>
+where
+    MarketKind: VenueMarketUpdate,
+{
+    let mut applied = false;
+    for (exchange, slot) in venues.iter_mut() {
+        let Some(name) = slot
+            .indexer
+            .map
+            .find_own_instrument_name_exchange(instrument)
+        else {
+            continue;
+        };
+
+        // No clone: the name borrows `slot.indexer`, a field apart from `slot.venue`.
+        let outcome = slot
+            .venue
+            .apply_corporate_action(id, name, kind, effective_time);
+        applied |= outcome.response == CorporateActionResponse::Applied;
+
+        // The action moves the venue's clock, and cancelling an order can end a loan, so either
+        // can move its next deadline.
+        wakeups.arm(pending, seq, *exchange, &slot.venue);
+
+        if outcome.events.is_empty() {
+            continue;
+        }
+
+        let delivers = checked_offset(
+            effective_time,
+            slot.from_venue,
+            "what a corporate action caused arriving at the Engine",
+        )?;
+
+        schedule_events(pending, seq, *exchange, delivers, outcome.events);
+    }
+
+    if applied {
+        market.remove(&instrument);
+    }
+
+    Ok(())
 }
 
 /// Decide whether emitting another account deliverable would exceed the feedback budget.
@@ -2053,12 +2155,29 @@ mod tests {
         Timed::new(EngineEvent::ContractExpiry(instrument_key()), at(millis))
     }
 
+    /// A 2-for-1 split of the fixture instrument, effective at `millis`.
+    fn split(millis: i64) -> Timed<EngineEvent<DataKind>> {
+        Timed::new(
+            EngineEvent::CorporateAction {
+                id: "split".into(),
+                instrument: instrument_key(),
+                kind: rustrade_instrument::corporate_action::CorporateActionKind::StockSplit {
+                    ratio: rustrade_instrument::corporate_action::SplitRatio::new(dec!(2)).unwrap(),
+                },
+                policy: crate::SplitRoundingPolicy::Fractional,
+                effective_time: at(millis),
+            },
+            at(millis),
+        )
+    }
+
     /// A compact label for an emitted event, so a test asserts the *sequence* a run produces rather
     /// than restating each event's contents — which is what every ordering guarantee here is about.
     fn label(event: &EngineEvent<DataKind>) -> &'static str {
         match event {
             EngineEvent::Market(_) => "market",
             EngineEvent::ContractExpiry(_) => "aux",
+            EngineEvent::CorporateAction { .. } => "split",
             EngineEvent::Shutdown(Shutdown::AfterDrain) => "after_drain",
             EngineEvent::Shutdown(Shutdown::Immediate) => "shutdown",
             EngineEvent::Account(AccountStreamEvent::Item(event)) => match &event.kind {
@@ -2514,6 +2633,150 @@ mod tests {
             ],
             "the aux event at instant 10 leads the fill scheduled at instant 10"
         );
+    }
+
+    /// A split in the source reaches the venue, which cancels the order resting on the instrument.
+    /// The `Engine` is shown the split first, and the cancel one `from_venue` leg later.
+    #[tokio::test]
+    async fn a_split_cancels_the_venue_s_orders_after_the_engine_is_shown_it() {
+        let mut harness = Harness::new(
+            100,
+            vec![market(0, dec!(100)), split(200), market(400, dec!(50))],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(0));
+        let cid = harness.send_limit(dec!(90));
+
+        let events = harness.rest_events().await;
+
+        let labels = events.iter().map(label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "balance",
+                "order",
+                "split",
+                "balance",
+                "order",
+                "market",
+                "after_drain"
+            ],
+            "the open rests, then the split, then its cancel"
+        );
+        let EngineEvent::Account(AccountStreamEvent::Item(cancel)) = &events[4] else {
+            unreachable!("labelled an order above");
+        };
+        let AccountEventKind::OrderSnapshot(report) = &cancel.kind else {
+            unreachable!("labelled an order above");
+        };
+        assert_eq!(report.0.order.key.cid, cid);
+        let OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) = &report.0.order.state
+        else {
+            panic!("the split cancels the order: {:?}", report.0.order.state);
+        };
+        assert_eq!(cancelled.time_exchange, at(200), "stamped at the split");
+        assert_eq!(cancel.exchange, harness.exchange);
+        assert_eq!(
+            harness.venue_market().unwrap().split_at,
+            None,
+            "the market after the split ended the wait"
+        );
+    }
+
+    /// The venue trades nothing on the instrument between the split and its next market event.
+    #[tokio::test]
+    async fn after_a_split_the_venue_waits_for_the_instrument_s_next_market_event() {
+        let mut harness = Harness::new(0, vec![market(0, dec!(100)), split(10)]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        assert_eq!(harness.next().await, Some("split"));
+
+        assert_eq!(harness.venue_market().unwrap().split_at, Some(at(10)));
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert!(
+            matches!(
+                last_order_state(&events),
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "a market order is refused as unpriced: {events:#?}"
+        );
+    }
+
+    /// An L1 book at `millis`, quoting `bid` / `ask`.
+    ///
+    /// `millis` must be after 0: the fold keeps only a book newer than the one it holds, and the
+    /// empty book it starts with is stamped at the epoch, which is `at(0)`.
+    fn l1(millis: i64, bid: Decimal, ask: Decimal) -> Timed<EngineEvent<DataKind>> {
+        assert!(millis > 0, "a book at the epoch is not folded");
+        Timed::new(
+            EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+                time_exchange: at(millis),
+                time_received: at(millis),
+                exchange: EXCHANGE,
+                instrument: instrument_key(),
+                kind: DataKind::OrderBookL1(rustrade_data::subscription::book::OrderBookL1 {
+                    last_update_time: at(millis),
+                    best_bid: Some(rustrade_data::books::Level::new(bid, dec!(1))),
+                    best_ask: Some(rustrade_data::books::Level::new(ask, dec!(1))),
+                }),
+            })),
+            at(millis),
+        )
+    }
+
+    /// The book folded before a split does not survive it: a trade after the split is the venue's
+    /// whole market, with no pre-split bid or ask beside it.
+    #[tokio::test]
+    async fn the_market_folded_before_a_split_is_dropped() {
+        let mut harness = Harness::new(
+            0,
+            vec![l1(5, dec!(99), dec!(101)), split(10), market(20, dec!(50))],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        assert_eq!(
+            harness.venue_market().unwrap().snapshot.best_bid,
+            Some(dec!(99)),
+            "the pre-split book is folded"
+        );
+
+        let _ = harness.rest_events().await;
+
+        let market = harness.venue_market().unwrap();
+        assert_eq!(market.snapshot.last_price, Some(dec!(50)));
+        assert_eq!(market.snapshot.best_bid, None);
+        assert_eq!(market.snapshot.best_ask, None);
+    }
+
+    /// A split the venue does not apply keeps the folded market: here, the same split again, which
+    /// the venue has already applied.
+    #[tokio::test]
+    async fn a_split_the_venue_does_not_apply_keeps_the_folded_market() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                l1(5, dec!(99), dec!(101)),
+                split(10),
+                l1(20, dec!(49), dec!(51)),
+                split(30),
+                market(40, dec!(50)),
+            ],
+        );
+
+        let _ = harness.rest_events().await;
+
+        let market = harness.venue_market().unwrap();
+        assert_eq!(market.snapshot.last_price, Some(dec!(50)));
+        assert_eq!(
+            market.snapshot.best_bid,
+            Some(dec!(49)),
+            "the post-split book is kept"
+        );
+        assert_eq!(market.split_at, None, "the repeated split marked nothing");
     }
 
     /// Simulated latency moves a fill to a later instant, and the source is read up to it.

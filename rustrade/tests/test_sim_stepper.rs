@@ -1113,6 +1113,72 @@ fn a_corporate_action_effective_at_another_instant_is_refused() {
     );
 }
 
+/// The client order ids of the orders the `Engine` tracks on `instrument`.
+fn tracked<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Vec<ClientOrderId> {
+    engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .nth(instrument)
+        .map(|state| state.orders.0.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// A split reaches the venue as well as the `Engine`: the venue cancels the order resting on the
+/// split instrument, and the `Engine`, having rescaled its view of the order, takes the cancel and
+/// stops tracking it. The order on the other instrument is untouched on both sides.
+#[test]
+fn a_split_cancels_the_split_instrument_s_order_on_the_venue_and_in_the_engine() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(
+            &mut s.engine,
+            at(3),
+            [bar(BTC, 3, dec!(100)), bar(ETH, 3, dec!(50))],
+        )
+        .unwrap();
+    s.engine
+        .action(&limit_order(BTC, Side::Buy, dec!(1), dec!(95), "btc"));
+    s.engine
+        .action(&limit_order(ETH, Side::Buy, dec!(1), dec!(45), "eth"));
+    s.stepper.settle(&mut s.engine).unwrap();
+    assert_eq!(tracked(&s.engine, BTC), [ClientOrderId::new("btc")]);
+
+    let split = EngineEvent::CorporateAction {
+        id: "split".into(),
+        instrument: InstrumentIndex::new(BTC),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Fractional,
+        effective_time: at(4),
+    };
+    let audits = s.stepper.step(&mut s.engine, at(4), [split]).unwrap();
+
+    let cancelled = events(&audits)
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::OrderSnapshot(report),
+                ..
+            })) if matches!(
+                report.value().order.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ) =>
+            {
+                Some(report.value().order.key.cid.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled, [ClientOrderId::new("btc")]);
+    assert!(
+        tracked(&s.engine, BTC).is_empty(),
+        "the engine took the cancel"
+    );
+    assert_eq!(tracked(&s.engine, ETH), [ClientOrderId::new("eth")]);
+}
+
 #[test]
 fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() {
     let instruments = instruments();

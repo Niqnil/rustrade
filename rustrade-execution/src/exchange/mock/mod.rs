@@ -31,8 +31,9 @@ pub mod request;
 pub mod venue;
 
 pub use venue::{
-    AmendOutcome, CancelOutcome, ExternalChange, OpenOutcome, SimulatedVenue,
-    VenueInstrumentMarket, VenueOutcome,
+    AmendOutcome, CancelOutcome, CorporateActionOutcome, CorporateActionRefusal,
+    CorporateActionResponse, ExternalChange, OpenOutcome, SimulatedVenue, VenueInstrumentMarket,
+    VenueOutcome,
 };
 
 /// The clock a [`market-driven`](MockExchange::new_market_driven) [`MockExchange`] stamps
@@ -463,6 +464,20 @@ impl MockExchange {
                 Ok(events) => emit.respond(events, response_tx, Ok(())),
                 Err(error) => emit.respond(Vec::new(), response_tx, Err(error)),
             },
+            MockExchangeRequestKind::CorporateAction {
+                response_tx,
+                id,
+                instrument,
+                kind,
+            } => {
+                // At the instant the request is booked, which the caller times as the action's
+                // effective instant: a time of its own could move the venue's clock past it.
+                let now = self.venue.time_exchange();
+                let outcome = self
+                    .venue
+                    .apply_corporate_action(&id, &instrument, &kind, now);
+                emit.respond(outcome.events, response_tx, outcome.response);
+            }
             MockExchangeRequestKind::OpenOrder {
                 response_tx,
                 request,
@@ -2012,6 +2027,64 @@ mod tests {
         assert_eq!(report.0.order.price, Some(d("48000")));
         assert_eq!(report.0.reported, ReportedTerms::ALL);
         assert_eq!(response_rx.await.expect("the hook is answered"), Ok(()));
+        paper.stop().await;
+    }
+
+    /// A split sent to a paper venue cancels its resting order on the split instrument, reported
+    /// on the account stream ahead of the answer, and leaves a market order on it unpriced until
+    /// the instrument is observed again. A second send under the same id changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_venue_applies_a_split_it_is_sent() {
+        use crate::{
+            client::mock::request_corporate_action,
+            order::state::{InactiveOrderState, OrderState},
+        };
+        use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
+
+        let mut paper = Paper::start(spot_config("0", "100000", FeeModelConfig::default()));
+        paper.observe(priced("50000"));
+        let rest = limit_request("rest", Side::Buy, "1", "49000", gtc());
+        let _ = paper.open(rest.clone()).await;
+        assert!(matches!(
+            paper.next_event().await.kind,
+            AccountEventKind::BalanceSnapshot(_)
+        ));
+        async fn send(
+            request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+        ) -> Result<CorporateActionResponse, crate::error::UnindexedClientError> {
+            let split = CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(d("2")).unwrap(),
+            };
+            request_corporate_action(
+                request_tx,
+                EXCHANGE,
+                Utc::now(),
+                "split-1".into(),
+                instrument_name(),
+                split,
+            )
+            .await
+        }
+
+        let answer = send(&paper.request_tx).await;
+
+        let AccountEventKind::BalanceSnapshot(released) = paper.next_event().await.kind else {
+            panic!("the cancel releases the hold first");
+        };
+        assert_eq!(released.0.balance.free, d("100000"));
+        let AccountEventKind::OrderSnapshot(report) = paper.next_event().await.kind else {
+            panic!("the order is reported cancelled");
+        };
+        assert_eq!(report.0.order.key, rest.key);
+        assert!(matches!(
+            report.0.order.state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
+        assert_eq!(answer.unwrap(), CorporateActionResponse::Applied);
+        assert_eq!(
+            send(&paper.request_tx).await.unwrap(),
+            CorporateActionResponse::AlreadyApplied
+        );
         paper.stop().await;
     }
 

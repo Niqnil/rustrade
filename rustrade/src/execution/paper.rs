@@ -15,16 +15,18 @@ use futures::Stream;
 use rustrade_data::streams::{consumer::MarketStreamEvent, reconnect};
 use rustrade_execution::{
     borrow_capacity::BorrowCapacity,
-    client::mock::{request_borrow_capacity, request_checkpoint},
+    client::mock::{request_borrow_capacity, request_checkpoint, request_corporate_action},
     error::{ConnectivityError, UnindexedClientError},
-    exchange::mock::{MockExchangeClock, request::MockExchangeRequest},
+    exchange::mock::{CorporateActionResponse, MockExchangeClock, request::MockExchangeRequest},
     market::MarketObservation,
 };
 use rustrade_instrument::{
     Side,
+    corporate_action::CorporateActionKind,
     exchange::ExchangeId,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
+use smol_str::SmolStr;
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
@@ -407,6 +409,43 @@ impl PaperVenue {
             ));
         };
         request_checkpoint(&request_tx, self.exchange, (self.clock)()).await
+    }
+
+    /// Asks the venue to apply the corporate action `id` of `kind` to `instrument`, as the venue
+    /// that lists it would: see
+    /// [`SimulatedVenue::apply_corporate_action`](rustrade_execution::exchange::mock::SimulatedVenue::apply_corporate_action)
+    /// for what a stock split does to it, and what it does not do yet.
+    ///
+    /// The `Engine` does not pass a corporate action on to a paper venue: feed the same action to
+    /// both, this call when it takes effect and the
+    /// [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction) to the `Engine`. The
+    /// venue applies it when the request reaches it, ordered as a query is (see `# Ordering` on
+    /// this type), and stamps what it causes then. What it causes goes on its account stream
+    /// before this call answers with what it did.
+    ///
+    /// # Errors
+    /// [`ConnectivityError::ExchangeOffline`] once the venue has stopped, as for
+    /// [`fetch_borrow_capacity`](Self::fetch_borrow_capacity).
+    pub async fn apply_corporate_action(
+        &self,
+        id: SmolStr,
+        instrument: InstrumentNameExchange,
+        kind: CorporateActionKind,
+    ) -> Result<CorporateActionResponse, UnindexedClientError> {
+        let Some(request_tx) = self.request_tx.upgrade() else {
+            return Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(self.exchange),
+            ));
+        };
+        request_corporate_action(
+            &request_tx,
+            self.exchange,
+            (self.clock)(),
+            id,
+            instrument,
+            kind,
+        )
+        .await
     }
 }
 

@@ -32,6 +32,7 @@ use rustrade_instrument::{
     },
 };
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::{
     collections::{BTreeSet, HashSet},
     hash::Hash,
@@ -54,6 +55,8 @@ use thiserror::Error;
 ///   interest and holding costs.
 /// - The debt it last reported, whether a liquidation is under way or a margin call outstanding,
 ///   the prices over the borrow price window, and how far the slippage stream has drawn.
+/// - The id of every corporate action the venue applied, so a restored venue applies none of them
+///   again.
 ///
 /// # What it does not hold
 /// - **The configuration**, and the models set by builder methods (holding costs, margin interest,
@@ -113,6 +116,10 @@ pub struct SimulatedVenueSnapshot {
     borrow_prices: Vec<(InstrumentNameExchange, PriceWindow)>,
     slippage_draws: u64,
     checkpoint_sequence: u64,
+    /// Sorted. Left out when empty, and read as empty when absent, so a snapshot of a venue that
+    /// applied none reads and writes as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    corporate_actions_applied: Vec<SmolStr>,
 }
 
 impl SimulatedVenueSnapshot {
@@ -322,6 +329,12 @@ impl SimulatedVenue {
                 .collect(),
             slippage_draws: self.slippage.draws(),
             checkpoint_sequence: self.checkpoint_sequence,
+            corporate_actions_applied: self
+                .corporate_actions_applied
+                .iter()
+                .cloned()
+                .sorted_unstable()
+                .collect(),
         }
     }
 
@@ -517,6 +530,7 @@ impl SimulatedVenue {
             borrow_prices,
             slippage_draws,
             checkpoint_sequence,
+            corporate_actions_applied,
         } = snapshot;
 
         let mut venue = Self::assemble(
@@ -558,6 +572,7 @@ impl SimulatedVenue {
             .map_err(VenueRestoreError::SessionCalendar)?;
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
+        venue.corporate_actions_applied = corporate_actions_applied.into_iter().collect();
         venue.refresh_next_charge();
         venue.refresh_next_interest();
         venue.refresh_next_option_expiry();
