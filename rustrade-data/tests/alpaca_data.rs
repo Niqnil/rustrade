@@ -19,6 +19,8 @@
 //! 2. Environment variables set (see .env.template):
 //!    - ALPACA_API_KEY: API key
 //!    - ALPACA_SECRET_KEY: Secret key
+//!    - ALPACA_PAPER: `true` for paper keys. Absent means live, as in `AlpacaRestClient::from_env`,
+//!      so the option tests and the market-hours clock check refuse paper keys without it.
 //!
 //! # Running
 //!
@@ -35,10 +37,11 @@
 //!
 //! # Market Hours Note
 //!
-//! US equity market hours are 9:30 AM - 4:00 PM ET (9:30 PM - 4:00 AM SGT next day).
-//! The IEX feed only provides trade data during market hours. Tests that wait for
-//! trade events (`test_iex_*_receives_data`) may timeout outside market hours.
-//! Connection and subscription tests work anytime.
+//! US equity market hours are 9:30 AM - 4:00 PM ET. The IEX and SIP feeds carry trades and
+//! quotes only while the market trades, so the tests that wait for them
+//! (`test_iex_*_receives_data`, `test_sip_*_receives_data`) read Alpaca's clock first and fail at
+//! once, with the clock in the message, when the US regular session is closed. Connection and
+//! subscription tests work anytime.
 //!
 //! Crypto streams (BTC/USD, etc.) are available 24/7 and are the primary validation.
 //!
@@ -75,6 +78,40 @@ fn init_logging() {
                 .from_env_lossy(),
         )
         .try_init();
+}
+
+/// Panic unless Alpaca's clock says the US regular session is open.
+///
+/// Called before a test opens an equity feed, so a run outside the session fails at once instead
+/// of waiting out its timeout while it holds the feed's one connection. Reads the paper host when
+/// `ALPACA_PAPER` is `true` and the live host otherwise, as `AlpacaRestClient::from_env` does.
+async fn require_regular_session() {
+    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
+    let secret_key =
+        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
+    let paper = std::env::var("ALPACA_PAPER").is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+    let host = if paper {
+        "https://paper-api.alpaca.markets"
+    } else {
+        "https://api.alpaca.markets"
+    };
+    let clock: serde_json::Value = reqwest::Client::new()
+        .get(format!("{host}/v2/clock"))
+        .header("APCA-API-KEY-ID", api_key)
+        .header("APCA-API-SECRET-KEY", secret_key)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("Alpaca's clock is readable")
+        .json()
+        .await
+        .expect("Alpaca's clock is JSON");
+    assert_eq!(
+        clock["is_open"],
+        serde_json::Value::Bool(true),
+        "this test needs the US regular session open; Alpaca's clock: {clock}"
+    );
 }
 
 // ============================================================================
@@ -455,6 +492,7 @@ async fn test_crypto_trades_and_quotes_share_one_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_iex_trade_stream_connection() {
     init_logging();
 
@@ -482,6 +520,7 @@ async fn test_iex_trade_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_iex_quote_stream_connection() {
     init_logging();
 
@@ -509,6 +548,7 @@ async fn test_iex_quote_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_iex_multiple_symbols_subscription() {
     init_logging();
 
@@ -545,12 +585,14 @@ async fn test_iex_multiple_symbols_subscription() {
 
 /// Test receiving trade data from IEX.
 ///
-/// NOTE: This test may timeout outside US market hours (9:30 AM - 4:00 PM ET).
-/// The IEX feed only provides trade data during market hours.
+/// Needs the US regular session open, and fails at once when it is closed: the IEX feed carries
+/// trades only while the market trades.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_iex_trade_stream_receives_data() {
     init_logging();
+    require_regular_session().await;
 
     let streams = Streams::<PublicTrades>::builder()
         .subscribe(
@@ -571,7 +613,7 @@ async fn test_iex_trade_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
-    tracing::info!("Waiting for IEX trade data (may timeout outside market hours)...");
+    tracing::info!("Waiting for IEX trade data...");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
@@ -588,25 +630,24 @@ async fn test_iex_trade_stream_receives_data() {
             Ok(Some(_)) => continue,
             Ok(None) => panic!("Stream ended unexpectedly"),
             Err(_) => {
-                tracing::warn!("Timeout waiting for IEX data - may be outside market hours");
+                tracing::warn!("No IEX trade within 30 s; waiting on");
                 continue;
             }
         }
     }
 
-    panic!(
-        "No IEX trade events received within timeout. \
-         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
-    );
+    panic!("No IEX trade events received within 60 s, with the US regular session open");
 }
 
 /// Test receiving quote data from IEX.
 ///
-/// NOTE: This test may timeout outside US market hours.
+/// Needs the US regular session open, and fails at once when it is closed.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_iex_quote_stream_receives_data() {
     init_logging();
+    require_regular_session().await;
 
     let streams = Streams::<Quotes>::builder()
         .subscribe(
@@ -627,7 +668,7 @@ async fn test_iex_quote_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
-    tracing::info!("Waiting for IEX quote data (may timeout outside market hours)...");
+    tracing::info!("Waiting for IEX quote data...");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
@@ -644,16 +685,13 @@ async fn test_iex_quote_stream_receives_data() {
             Ok(Some(_)) => continue,
             Ok(None) => panic!("Stream ended unexpectedly"),
             Err(_) => {
-                tracing::warn!("Timeout waiting for IEX quote - may be outside market hours");
+                tracing::warn!("No IEX quote within 30 s; waiting on");
                 continue;
             }
         }
     }
 
-    panic!(
-        "No IEX quote events received within timeout. \
-         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
-    );
+    panic!("No IEX quote events received within 60 s, with the US regular session open");
 }
 
 // ============================================================================
@@ -665,6 +703,7 @@ async fn test_iex_quote_stream_receives_data() {
 /// NOTE: Requires SIP subscription. Will fail with auth error without subscription.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_sip_trade_stream_connection() {
     init_logging();
 
@@ -695,6 +734,7 @@ async fn test_sip_trade_stream_connection() {
 /// NOTE: Requires SIP subscription.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_sip_quote_stream_connection() {
     init_logging();
 
@@ -722,11 +762,14 @@ async fn test_sip_quote_stream_connection() {
 
 /// Test receiving trade data from SIP (consolidated tape).
 ///
-/// NOTE: Requires SIP subscription. May timeout outside US market hours.
+/// NOTE: Requires SIP subscription. Needs the US regular session open, and fails at once when it
+/// is closed.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_sip_trade_stream_receives_data() {
     init_logging();
+    require_regular_session().await;
 
     let streams = Streams::<PublicTrades>::builder()
         .subscribe(
@@ -764,25 +807,25 @@ async fn test_sip_trade_stream_receives_data() {
             Ok(Some(_)) => continue,
             Ok(None) => panic!("Stream ended unexpectedly"),
             Err(_) => {
-                tracing::warn!("Timeout waiting for SIP data - may be outside market hours");
+                tracing::warn!("No SIP trade within 30 s; waiting on");
                 continue;
             }
         }
     }
 
-    panic!(
-        "No SIP trade events received within timeout. \
-         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
-    );
+    panic!("No SIP trade events received within 60 s, with the US regular session open");
 }
 
 /// Test receiving quote data from SIP (consolidated NBBO).
 ///
-/// NOTE: Requires SIP subscription. May timeout outside US market hours.
+/// NOTE: Requires SIP subscription. Needs the US regular session open, and fails at once when it
+/// is closed.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_sip_quote_stream_receives_data() {
     init_logging();
+    require_regular_session().await;
 
     let streams = Streams::<Quotes>::builder()
         .subscribe(
@@ -820,16 +863,13 @@ async fn test_sip_quote_stream_receives_data() {
             Ok(Some(_)) => continue,
             Ok(None) => panic!("Stream ended unexpectedly"),
             Err(_) => {
-                tracing::warn!("Timeout waiting for SIP quote - may be outside market hours");
+                tracing::warn!("No SIP quote within 30 s; waiting on");
                 continue;
             }
         }
     }
 
-    panic!(
-        "No SIP quote events received within timeout. \
-         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
-    );
+    panic!("No SIP quote events received within 60 s, with the US regular session open");
 }
 
 // ============================================================================
