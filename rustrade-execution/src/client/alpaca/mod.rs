@@ -4329,9 +4329,9 @@ const REPLACE_HOPS: usize = 8;
 ///
 /// `None` when `asked` is not `replaced`, and, logged at `warn`, when an order on the chain is
 /// `replaced` but names no replacement, Alpaca does not know an order on the chain (404), or the
-/// chain is longer than the bound: the order asked about is then read as cancelled, as before. Also `None`, with the conversion's
-/// `warn`, for a final order this version cannot read, which then stays held and is asked about
-/// again. A read that fails fails the lookup.
+/// chain is longer than the bound: the order asked about is then read as cancelled, as before.
+/// Also `None`, with the conversion's `warn`, for a final order this version cannot read, which
+/// then stays held and is asked about again. A read that fails fails the lookup.
 async fn follow_replaces(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
@@ -13139,7 +13139,8 @@ mod tests {
 
         /// An order `replaced` that names no replacement, the order held or one further down its
         /// chain, leaves the order held reported as cancelled, not the order where the chain
-        /// breaks.
+        /// breaks. The case at the order held pins behaviour that predates following replaces
+        /// (only its `warn` is new, and not asserted); the case further down tells the two apart.
         #[tokio::test]
         async fn a_chain_that_names_no_replacement_leaves_the_order_held_cancelled() {
             for broken_at_held in [true, false] {

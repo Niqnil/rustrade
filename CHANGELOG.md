@@ -22,11 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observed for a partly filled order, and a replacement reporting less filled than the old order
   is logged at `warn`. `fetch_open_orders` returns orders without the link. An order replaced
   while the stream was disconnected is followed by the reconnect's check: a replacement listed
-  open in place of an order held is linked to it, and an order held that Alpaca reports `replaced` is read along
-  its `replaced_by` chain (`GET /v2/orders/{id}`, at most 8 replaces) to the order now standing
-  for it, which is reported live or ended and linked straight to the order held. A replacement
-  Alpaca does not know, an order replaced that names no replacement, or a longer chain leaves the
-  order held recovered as cancelled, with a warning. `fetch_ended_orders` still reports an order replaced as cancelled under its own key.
+  open in place of an order held is linked to it, and an order held that Alpaca reports
+  `replaced` is read along its `replaced_by` chain (`GET /v2/orders/{id}`, at most 8 replaces) to
+  the order now standing for it, which is reported live or ended and linked straight to the order
+  held. A replacement Alpaca does not know, an order replaced that names no replacement, or a
+  longer chain leaves the order held recovered as cancelled, with a warning.
+  `fetch_ended_orders` still reports an order replaced as cancelled under its own key.
 - **An instrument spec from loaded order rules** (`rustrade-execution`).
   `OrderRules::instrument_spec(unit)` describes the rules as an `InstrumentSpec`, and
   `BinanceSpot::load_specs` / `BinanceMargin::load_specs` load a set of symbols' rules from
