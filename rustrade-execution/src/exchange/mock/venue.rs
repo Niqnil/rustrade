@@ -984,6 +984,11 @@ impl SimulatedVenue {
 
     /// [`new`](Self::new), returning a configuration it cannot build a venue from as an error.
     ///
+    /// The asset spelling check reads only the configuration. A model added later, such as one
+    /// given to [`with_margin_interest`](Self::with_margin_interest), is passed the venue's own
+    /// asset names. A table of its own keyed by asset name, such as rates per asset, is not
+    /// checked: an entry spelled unlike the venue's never matches.
+    ///
     /// # Errors
     /// - [`VenueConfigError::AssetSpelledTwice`] if the instruments, `initial_state`'s balances,
     ///   the fee asset, the spot margin configuration or the fee model overrides spell one asset
@@ -1000,11 +1005,6 @@ impl SimulatedVenue {
     ///   [`SimulatedVenue`].
     /// - [`VenueConfigError::SessionCalendar`] if [`MockExecutionConfig::session_close`] cannot
     ///   place the close of a day limit order seeded in `initial_state`.
-    ///
-    /// The spelling check reads the configuration only. The models added afterwards, such as
-    /// [`with_margin_interest`](Self::with_margin_interest)'s, are given the venue's own asset names
-    /// when they are asked, so they cannot bring in another spelling, but one keyed internally by a
-    /// name the venue spells differently is not checked.
     pub fn try_new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
