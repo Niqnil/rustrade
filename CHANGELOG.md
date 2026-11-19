@@ -538,11 +538,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under one client order id onto another.
 - **Building the engine state logs each instrument without a quantity step** (`rustrade`).
   `EngineStateBuilder::try_build` (and `build`) checks every instrument's
-  `Instrument::try_quantity_step` once: an instrument whose spec gives no step (counted in the
-  quote or another asset, or an increment not above zero) is logged at `warn` with the reason,
-  naming the asset the spec counts in, since its positions and close orders are then not rounded
-  to a step; an instrument with no spec is logged at `debug`, as is normal when running without
-  specs.
+  `Instrument::try_quantity_step` once per build. An instrument whose spec gives no step (counted
+  in a unit other than the one a position is counted in, or an increment not above zero) is
+  logged at `warn` with the reason, naming the asset the spec counts in where it names one, since
+  neither a position left by a base-asset fee nor a close order is then rounded to a step. An
+  instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**

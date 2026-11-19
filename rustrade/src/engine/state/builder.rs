@@ -281,7 +281,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// non-positive quantity, targets a slot another seed already filled, or names a slot that
     /// does not fit the [`OmsMode`] — see [`PositionSeedError`].
     ///
-    /// Logs, once, each instrument without a quantity step (see
+    /// Logs, once per build, each instrument without a quantity step (see
     /// [`Instrument::try_quantity_step`]), whose positions and close orders are therefore not
     /// rounded to one: at WARN when the instrument's spec gives no step, at DEBUG when it has no
     /// spec, as when a backtest runs without specs.
@@ -1146,9 +1146,11 @@ mod tests {
     /// with the reason and the asset the spec counts in by name, and not about an instrument with
     /// a step or with no spec.
     ///
-    /// The DEBUG line for no spec is not asserted: every other test building a state with
-    /// spec-less instruments reaches that callsite, in parallel and with no subscriber, and
-    /// tracing's process-wide callsite cache may then hold it disabled for this thread too.
+    /// The capture is at WARN, so the DEBUG line for no spec is not asserted. It cannot be
+    /// reliably: with this test's subscriber the only one registered, tracing computes a newly
+    /// reached callsite's interest from the reaching thread's subscriber and caches it for every
+    /// thread. The other tests here build states with spec-less instruments in parallel and with
+    /// no subscriber, so the first of them to reach that callsite caches it as disabled.
     #[test]
     fn an_instrument_without_a_quantity_step_is_logged_once_at_build() {
         let instruments = IndexedInstruments::builder()
