@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::Serialize;
 
-/// Type that defines how to translate a Barter [`Subscription`] into a [`Bitmex`]
+/// Type that defines how to translate a [`Subscription`] into a [`Bitmex`]
 /// channel to be subscribed to.
 ///
 /// See docs: <https://www.bitmex.com/app/wsAPI>

@@ -124,7 +124,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
     }
 }
 
-/// Deserialize an [`OkxMessage`] "arg" field as a Barter [`SubscriptionId`].
+/// Deserialize an [`OkxMessage`] "arg" field as a [`SubscriptionId`].
 fn de_okx_message_arg_as_subscription_id<'de, D>(
     deserializer: D,
 ) -> Result<SubscriptionId, D::Error>

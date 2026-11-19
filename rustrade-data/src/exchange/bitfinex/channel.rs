@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::Serialize;
 
-/// Type that defines how to translate a Barter [`Subscription`] into a
+/// Type that defines how to translate a [`Subscription`] into a
 /// [`Bitfinex`] channel to be subscribed to.
 ///
 /// See docs: <https://docs.bitfinex.com/docs/ws-public>

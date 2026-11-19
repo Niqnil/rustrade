@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct IbkrSubscription<K> {
     /// Instrument key for MarketEvent output
     pub key: K,
-    /// Barter instrument name (must be registered in ContractRegistry)
+    /// Instrument name (must be registered in ContractRegistry)
     pub instrument: InstrumentNameExchange,
     /// Type of market data to subscribe to
     pub kind: IbkrSubscriptionKind,

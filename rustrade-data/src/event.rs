@@ -29,11 +29,11 @@ impl<InstrumentKey, T> FromIterator<Result<MarketEvent<InstrumentKey, T>, DataEr
     }
 }
 
-/// Normalised Barter [`MarketEvent<T>`](Self) wrapping the `T` data variant in metadata.
+/// Normalised [`MarketEvent<T>`](Self) wrapping the `T` data variant in metadata.
 ///
 /// Note: `T` can be an enum such as the [`DataKind`] if required.
 ///
-/// See [`crate::subscription`] for all existing Barter Market event variants.
+/// See [`crate::subscription`] for all existing market event variants.
 ///
 /// ### Examples
 /// - [`MarketEvent<PublicTrade>`](PublicTrade)
@@ -141,7 +141,7 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
     }
 }
 
-/// Available kinds of normalised Barter [`MarketEvent<T>`](MarketEvent).
+/// Available kinds of normalised [`MarketEvent<T>`](MarketEvent).
 ///
 /// ### Notes
 /// - [`Self`] is only used as the [`MarketEvent<DataKind>`](MarketEvent) `Output` when combining

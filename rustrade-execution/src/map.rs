@@ -11,7 +11,7 @@ use rustrade_integration::collection::FnvIndexSet;
 use smol_str::{SmolStr, StrExt};
 use tracing::{debug, warn};
 
-/// Indexed instrument map used to associate the internal Barter representation of instruments and
+/// Indexed instrument map used to associate the internal representation of instruments and
 /// assets with the [`ExecutionClient`](super::client::ExecutionClient) representation.
 ///
 /// Similarly, when the execution manager received an [`AccountEvent`](super::AccountEvent)

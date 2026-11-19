@@ -134,8 +134,8 @@ struct FtxBalance {
     total: f64,
 }
 
-/// See Barter-Execution for a comprehensive real-life example, as well as code you can use out of the
-/// box to execute trades on many exchanges.
+/// See `rustrade-execution` for a full real-life example, with code you can use as is to trade on
+/// several exchanges.
 #[tokio::main]
 async fn main() {
     // HMAC-SHA256 encoded account API secret used for signing private http requests

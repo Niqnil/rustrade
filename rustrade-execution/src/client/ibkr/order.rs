@@ -173,7 +173,7 @@ impl OrderContext {
 
 /// Bidirectional mapping between rustrade ClientOrderId and IB order IDs.
 ///
-/// IB uses `i32` order IDs from a sequence. Barter uses `ClientOrderId` (SmolStr).
+/// IB uses `i32` order IDs from a sequence. rustrade uses `ClientOrderId` (SmolStr).
 /// This map maintains the bidirectional relationship and stores order context
 /// for reconstructing full `Order` structs from `OrderStatus` callbacks.
 ///

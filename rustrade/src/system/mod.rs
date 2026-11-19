@@ -46,16 +46,16 @@ use tracing::error;
 /// [`UnknownOutcomeLookup::longest`]: crate::execution::unknown_outcome::UnknownOutcomeLookup::longest
 pub const AFTER_DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Provides a `SystemBuilder` for constructing a Barter trading system, and associated types.
+/// Provides a `SystemBuilder` for constructing a trading system, and associated types.
 pub mod builder;
 
-/// Provides a convenient `SystemConfig` used for defining a Barter trading system.
+/// Provides a convenient `SystemConfig` used for defining a trading system.
 pub mod config;
 
 /// The channel every event reaches a [`System`]'s `Engine` through, with an observable depth.
 pub mod feed;
 
-/// Initialised and running Barter trading system.
+/// Initialised and running trading system.
 ///
 /// Contains handles for the `Engine` and all auxillary system tasks.
 ///

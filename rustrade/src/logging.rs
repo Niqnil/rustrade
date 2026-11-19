@@ -1,7 +1,7 @@
 use crate::engine::audit::state_replica::AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Initialise default non-JSON `Barter` logging.
+/// Initialise default non-JSON logging.
 ///
 /// Note that this filters out duplicate logs produced by the `AuditManager` updating its replica
 /// `EngineState`.
@@ -17,7 +17,7 @@ pub fn init_logging() {
         .init()
 }
 
-/// Initialise default JSON `Barter` logging.
+/// Initialise default JSON logging.
 ///
 /// Note that this filters out duplicate logs produced by the `AuditManager` updating its replica
 /// `EngineState`.

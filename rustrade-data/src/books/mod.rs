@@ -42,7 +42,7 @@ pub struct OrderBookTimes {
     pub time_received: DateTime<Utc>,
 }
 
-/// Normalised Barter [`OrderBook`] snapshot.
+/// Normalised [`OrderBook`] snapshot.
 ///
 /// ### Equality
 /// `PartialEq`/`Eq` is derived over **all** fields, including the [`OrderBookTimes`]
@@ -239,7 +239,7 @@ impl OrderBook {
     }
 }
 
-/// Normalised Barter [`Level`]s for one `Side` of the [`OrderBook`].
+/// Normalised [`Level`]s for one `Side` of the [`OrderBook`].
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct OrderBookSide<Side> {
     #[serde(skip_serializing)]
@@ -380,7 +380,7 @@ impl Default for OrderBookSide<Asks> {
     }
 }
 
-/// Normalised Barter OrderBook [`Level`].
+/// Normalised OrderBook [`Level`].
 #[derive(Debug, Copy, Clone, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize)]
 pub struct Level {
     pub price: Decimal,

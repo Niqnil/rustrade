@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// 10,000 as a Decimal constant for basis point calculations.
 const BPS_FACTOR: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`Quote`]
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`Quote`]
 /// [`MarketEvent<T>`](crate::event::MarketEvent) events.
 ///
 /// Represents real-time best bid/ask quotes (NBBO for equities, top-of-book for crypto).
@@ -29,7 +29,7 @@ impl std::fmt::Display for Quotes {
     }
 }
 
-/// Normalised Barter [`Quote`] model representing best bid/ask.
+/// Normalised [`Quote`] model representing best bid/ask.
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
 pub struct Quote {
     pub bid_price: Decimal,

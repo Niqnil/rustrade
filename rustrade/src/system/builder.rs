@@ -67,9 +67,9 @@ pub enum AuditMode {
     Disabled,
 }
 
-/// Arguments required for building a full Barter trading system.
+/// Arguments required for building a full trading system.
 ///
-/// Contains all the required components to build and initialise a full Barter trading system,
+/// Contains all the required components to build and initialise a full trading system,
 /// including the `Engine` and all supporting infrastructure.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Constructor)]
 pub struct SystemArgs<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData> {
@@ -101,7 +101,7 @@ pub struct SystemArgs<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnIns
     pub instrument_data_init: FnInstrumentData,
 }
 
-/// Builder for constructing a full Barter trading system.
+/// Builder for constructing a full trading system.
 #[derive(Debug)]
 pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData> {
     args: SystemArgs<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>,

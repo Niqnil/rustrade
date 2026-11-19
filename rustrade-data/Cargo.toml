@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 documentation = "https://docs.rs/rustrade-data"
 readme = "README.md"
-description = "High performance & normalised WebSocket intergration for leading cryptocurrency exchanges - batteries included."
+description = "Normalised market data from exchanges and data providers: live WebSocket streams and history."
 
 # Every provider module (alpaca/databento/hyperliquid/ibkr/lse/massive) is feature-gated and
 # `default = []`, so a default-feature docs.rs build would document none of them.

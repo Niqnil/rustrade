@@ -60,8 +60,8 @@ impl Transformer for StatefulTransformer {
     }
 }
 
-/// See Barter-Data for a comprehensive real-life example, as well as code you can use out of the
-/// box to collect real-time public market data from many exchanges.
+/// See `rustrade-data` for a full real-life example, with code you can use as is to collect
+/// real-time public market data from several exchanges.
 #[tokio::main]
 async fn main() {
     // Establish Sink/Stream communication with desired WebSocket server

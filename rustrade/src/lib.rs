@@ -25,31 +25,37 @@
 // field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
 #![allow(clippy::redundant_field_names)]
 
-//! # Barter
-//! Barter core is a Rust framework for building high-performance live-trading, paper-trading and back-testing systems.
-//! * **Fast**: Written in native Rust. Minimal allocations. Data-oriented state management system with direct index lookups.
-//! * **Robust**: Strongly typed. Thread safe. Extensive test coverage.
-//! * **Customisable**: Plug and play Strategy and RiskManager components that facilitates most trading strategies (MarketMaking, StatArb, HFT, etc.).
-//! * **Scalable**: Multithreaded architecture with modular design. Leverages Tokio for I/O. Memory efficient data structures.
+//! # rustrade
+//! A Rust framework for live trading, paper trading and backtesting. The same
+//! [`Engine`](engine::Engine) and strategy run against live venues, a paper venue or a simulated
+//! one.
 //!
 //! ## Overview
-//! Barter core is a Rust framework for building professional grade live-trading, paper-trading and back-testing systems. The
-//! central Engine facilitates executing on many exchanges simultaneously, and offers the flexibility to run most types of
-//! trading strategies.  It allows turning algorithmic order generation on/off and can action Commands issued from external
-//! processes (eg/ CloseAllPositions, OpenOrders, CancelOrders, etc.)
+//! The [`Engine`](engine::Engine) processes market data, account events and commands from external
+//! processes, and can trade on many exchanges at once. Algorithmic order generation can be turned
+//! on and off while it runs, and external processes can issue commands such as closing all
+//! positions, opening orders or cancelling them.
 //!
-//! At a high-level, it provides a few major components:
-//! * `Engine` with plug and play `Strategy` and `RiskManager` components.
-//! * Centralised cache friendly `EngineState` management with O(1) constant lookups using indexed data structures.
-//! * `Strategy` interfaces for customising Engine behavior (AlgoStrategy, ClosePositionsStrategy,
-//!   OnDisconnectStrategy, CashFlowAttributionStrategy, etc.).
-//! * `RiskManager` interface for defining custom risk logic which checking generated algorithmic orders.
-//! * Event-driven system that allows for Commands to be issued from external processes (eg/ CloseAllPositions, OpenOrders, CancelOrders, etc.),
-//!   as well as turning algorithmic trading on/off.
-//! * Comprehensive statistics package that provides a summary of key performance metrics (PnL, Sharpe, Sortino, Drawdown, etc.).
+//! Its main components:
+//! * [`Engine`](engine::Engine), with plug-in [`strategy`] and [`RiskManager`](risk::RiskManager)
+//!   components.
+//! * [`EngineState`](engine::state::EngineState): the engine's view of balances, positions, orders
+//!   and market data, kept in indexed collections with constant-time lookups.
+//! * [`strategy`] interfaces for customising the engine's behaviour:
+//!   [`AlgoStrategy`](strategy::algo::AlgoStrategy),
+//!   [`ClosePositionsStrategy`](strategy::close_positions::ClosePositionsStrategy),
+//!   [`OnDisconnectStrategy`](strategy::on_disconnect::OnDisconnectStrategy),
+//!   [`CashFlowAttributionStrategy`](strategy::cash_flow_attribution::CashFlowAttributionStrategy)
+//!   and others.
+//! * [`RiskManager`](risk::RiskManager): checks the orders a strategy generates, and may refuse
+//!   them.
+//! * [`execution`]: routes the engine's requests to live venue clients from `rustrade-execution`,
+//!   or to a simulated venue for paper trading and backtests.
+//! * [`backtest`]: runs strategies over historical market data, one at a time or many at once.
+//! * [`statistic`]: performance summaries (PnL, Sharpe, Sortino, drawdown and others).
 //!
-//! ## Getting Started Via Engine Examples
-//! [See Engine Examples](https://github.com/Niqnil/rustrade/tree/feat/docs_tests_readmes_examples/rustrade/examples)
+//! ## Getting started
+//! See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples).
 //!
 //! ## Dependency security
 //! Your build resolves rustrade's dependencies itself, so the 7-day wait this repository applies to
@@ -113,14 +119,14 @@ pub use rustrade_instrument::corporate_action::{
 /// eg/ `Engine`, `run`, `process_with_audit`, etc.
 pub mod engine;
 
-/// Defines all possible errors in Barter core.
+/// Defines every error this crate returns.
 pub mod error;
 
 /// Components for initialising multi-exchange execution, routing `ExecutionRequest`s and other
 /// execution logic.
 pub mod execution;
 
-/// Provides default Barter core Tracing logging initialisers.
+/// Provides default `tracing` logging initialisers.
 pub mod logging;
 
 /// RiskManager interface for reviewing and optionally filtering algorithmic cancel and open
@@ -353,7 +359,7 @@ impl Sequence {
     }
 }
 
-/// Barter core test utilities.
+/// Test utilities.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test utilities: callers provide valid inputs
 pub mod test_utils {

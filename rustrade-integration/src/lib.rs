@@ -25,19 +25,22 @@
 // field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
 #![allow(clippy::redundant_field_names)]
 
-//! # Barter-Integration
-//! High-performance, low-level framework for composing flexible web integrations.
+//! # rustrade-integration
+//! A low-level framework for composing web integrations.
 //!
-//! Utilised by other Barter trading ecosystem crates to build robust financial execution integrations,
-//! primarily for public data collection & trade execution. It is:
-//! * **Low-Level**: Translates raw data streams communicated over the web into any desired data model using arbitrary data transformations.
-//! * **Flexible**: Compatible with any protocol (WebSocket, FIX, Http, etc.), any input/output model, and any user defined transformations.
+//! The other rustrade crates build their exchange integrations on it, for public market data and
+//! for order execution. It is:
+//! * **Low-level**: translates raw data streams received over the web into any data model, using
+//!   arbitrary transformations.
+//! * **Protocol-agnostic**: not tied to one protocol, input or output model, or transformation.
+//!   HTTP and WebSocket implementations are included.
 //!
-//! ## Core abstractions:
-//! - **RestClient** providing configurable signed Http communication between client & server.
-//! - **ExchangeStream** providing configurable communication over any asynchronous stream protocols (WebSocket, FIX, etc.).
+//! ## Core abstractions
+//! - **RestClient**: configurable, signed HTTP communication between client and server.
+//! - **ExchangeStream**: configurable communication over an asynchronous stream protocol, such as
+//!   WebSocket.
 //!
-//! Both core abstractions provide the robust glue you need to conveniently translate between server & client data models.
+//! Both translate between the server's data model and the client's.
 
 // Silence unused_crate_dependencies for dev-dependencies: each is used only by the tests or
 // examples of some features, so a test build with other features alone would report it.
@@ -49,7 +52,7 @@ use {
 
 use ::serde::{Deserialize, Serialize};
 
-/// All [`Error`](std::error::Error)s generated in Barter-Integration.
+/// All [`Error`](std::error::Error)s this crate generates.
 #[cfg(feature = "error")]
 pub mod error;
 

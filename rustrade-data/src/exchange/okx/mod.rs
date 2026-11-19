@@ -17,11 +17,11 @@ use serde_json::json;
 use std::time::Duration;
 use url::Url;
 
-/// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
+/// Defines the type that translates a [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
 pub mod channel;
 
-/// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
+/// Defines the type that translates a [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific market used for generating [`Connector::requests`].
 pub mod market;
 
