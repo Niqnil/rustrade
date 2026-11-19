@@ -825,6 +825,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The weekly Alpaca live tests run in the US regular session, one equity stream at a time**
+  (`rustrade-data` tests, CI). The IEX and SIP stream tests now run serially: Alpaca allows one
+  connection per data feed, and in parallel they failed with "connection limit exceeded". The tests
+  that wait for IEX or SIP trades and quotes read Alpaca's clock first and fail at once, with the
+  clock in the message, when the session is closed, instead of waiting out their timeout while
+  holding the feed's connection. The `Alpaca Weekly` workflow is scheduled before the open and
+  waits for it by Alpaca's clock, since its scheduled runs were starting after the close. It also
+  fails when the paper account is not flat after the tests.
 - **The engine keeps an order's venue order id when a report names the order by its client order
   id alone** (`rustrade`). A working report carrying `VenueOrderId::ClientAssigned` for an order
   the engine already held a venue id for replaced the held state whole, id included, whenever it
