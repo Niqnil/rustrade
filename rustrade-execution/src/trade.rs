@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side,
-    asset::QuoteAsset,
+    FeeAsset, Side,
+    asset::{QuoteAsset, SameAsset},
     instrument::{Instrument, kind::InstrumentKind, round_toward_zero_to_step},
 };
 use serde::{Deserialize, Serialize};
@@ -272,7 +272,9 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///   spot instrument, spot margin included. A derivative's position is counted in contracts,
     ///   and an inverse contract pays its fees in the settlement coin, so a fee there never
     ///   changes the quantity. A fee in quote or a third asset, such as BNB, and a fee of zero
-    ///   are not netted.
+    ///   are not netted. Which asset the fee is in is
+    ///   [`Underlying::classify`](rustrade_instrument::Underlying::classify): on unindexed keys, a
+    ///   fee reported as `BTC` against a base built as `btc` is in the base.
     /// - **A reduce-only move never grows or flips the position.** When
     ///   [`ReduceOnly::is_reduce_only`], a netted
     ///   move larger than the opposite position `held` is cut to land it flat, and one that does
@@ -324,10 +326,10 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
         reduce_only: ReduceOnly,
     ) -> Option<HoldingMove>
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
     {
         let base_fee = matches!(instrument.kind, InstrumentKind::Spot)
-            && self.fees.asset == instrument.underlying.base
+            && instrument.underlying.classify(&self.fees.asset) == FeeAsset::Base
             && !self.fees.fees.is_zero();
         let netted = signed(self.side, self.quantity.abs())
             - if base_fee {
@@ -781,7 +783,7 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use rustrade_instrument::{
-        asset::{Asset, name::AssetNameExchange},
+        asset::{Asset, AssetIndex, name::AssetNameExchange},
         exchange::ExchangeId,
         instrument::{
             kind::perpetual::PerpetualContract,
@@ -872,6 +874,16 @@ mod tests {
 
     /// A fill of `quantity` on `side`, charged `fee` in `fee_asset`.
     fn fill(side: Side, quantity: Decimal, fee_asset: &str, fee: Decimal) -> Trade<Asset, ()> {
+        fill_in(side, quantity, test_utils::asset(fee_asset), fee)
+    }
+
+    /// [`fill`] with its fee asset keyed as `AssetKey`.
+    fn fill_in<AssetKey>(
+        side: Side,
+        quantity: Decimal,
+        fee_asset: AssetKey,
+        fee: Decimal,
+    ) -> Trade<AssetKey, ()> {
         Trade::new(
             TradeId::new("t-1"),
             OrderId::new("o-1"),
@@ -882,7 +894,7 @@ mod tests {
             dec!(100),
             quantity,
             None,
-            AssetFees::new(test_utils::asset(fee_asset), fee, None),
+            AssetFees::new(fee_asset, fee, None),
         )
     }
 
@@ -941,6 +953,63 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// On unindexed keys, a fee spelled unlike the base in ASCII case (`BTC` against `btc`) is
+    /// in the base: it is netted and the position rounded to the step, exactly as on the indices
+    /// an indexed client resolves both names to.
+    #[test]
+    fn holding_move_nets_a_base_fee_spelled_in_another_case_as_the_index_does() {
+        let spot = btc_usdt(Some(dec!(0.01)));
+        let held = dec!(2);
+        let expected = moved(Side::Buy, dec!(0.99), dec!(0.009));
+
+        let indexed = spot
+            .clone()
+            .map_asset_key_with_lookup(|asset| {
+                Ok::<_, ()>(AssetIndex(usize::from(asset.name_exchange.name() != "btc")))
+            })
+            .unwrap();
+        let by_index = fill_in(Side::Buy, dec!(1), AssetIndex(0), dec!(0.001));
+        assert_eq!(
+            by_index.holding_move(&indexed, held, ReduceOnly::No),
+            expected
+        );
+
+        let by_name = spot
+            .clone()
+            .map_asset_key_with_lookup(|asset| Ok::<_, ()>(asset.name_exchange.clone()))
+            .unwrap();
+        for fee_asset in ["btc", "BTC", "Btc"] {
+            let trade = fill_in(
+                Side::Buy,
+                dec!(1),
+                AssetNameExchange::new(fee_asset),
+                dec!(0.001),
+            );
+            assert_eq!(
+                trade.holding_move(&by_name, held, ReduceOnly::No),
+                expected,
+                "AssetNameExchange {fee_asset}"
+            );
+            assert_eq!(
+                fill(Side::Buy, dec!(1), fee_asset, dec!(0.001)).holding_move(
+                    &spot,
+                    held,
+                    ReduceOnly::No
+                ),
+                expected,
+                "Asset {fee_asset}"
+            );
+        }
+
+        let bnb = fill_in(
+            Side::Buy,
+            dec!(1),
+            AssetNameExchange::new("BNB"),
+            dec!(0.001),
+        );
+        assert_eq!(bnb.holding_move(&by_name, held, ReduceOnly::No), None);
     }
 
     #[test]

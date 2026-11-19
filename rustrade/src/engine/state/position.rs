@@ -8,7 +8,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side,
-    asset::{AssetIndex, name::AssetNameInternal},
+    asset::{AssetIndex, SameAsset, name::AssetNameInternal},
     corporate_action::SplitRatio,
     instrument::{InstrumentIndex, name::InstrumentNameInternal},
 };
@@ -1320,7 +1320,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         time_exchange: DateTime<Utc>,
     ) -> CarryUpdate
     where
-        AssetKey: PartialEq + Debug,
+        AssetKey: SameAsset + Debug,
     {
         let held = match &slot {
             CarrySlot::Quote => self.carry,
@@ -1329,7 +1329,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 .carry_assets
                 .other
                 .iter()
-                .find_map(|(held_asset, held)| (held_asset == asset).then_some(*held))
+                .find_map(|(held_asset, held)| held_asset.is_same_asset(asset).then_some(*held))
                 .unwrap_or(Decimal::ZERO),
         };
         let Some(sum) = held.checked_add(amount) else {
@@ -1349,7 +1349,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                     .carry_assets
                     .other
                     .iter_mut()
-                    .find(|(held_asset, _)| *held_asset == asset)
+                    .find(|(held_asset, _)| held_asset.is_same_asset(&asset))
                 {
                     Some((_, held)) => *held = sum,
                     None => self.carry_assets.other.push((asset, sum)),

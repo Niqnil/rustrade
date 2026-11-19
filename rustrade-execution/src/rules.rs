@@ -1453,7 +1453,7 @@ mod tests {
 
     /// The spec of BTCUSDT-like rules with a lot step of `lot` and a market step of `market`,
     /// each `0` for off, counted in the base. Steps whose shared grid a `Decimal` holds.
-    fn spec_with_steps(lot: Decimal, market: Decimal) -> InstrumentSpec<&'static str> {
+    fn spec_with_steps<AssetKey>(lot: Decimal, market: Decimal) -> InstrumentSpec<AssetKey> {
         let rules = OrderRules::new(
             ValueRule::new(dec!(0.01), dec!(1000000), dec!(0.01)),
             ValueRule::new(dec!(0.001), dec!(100), lot),
@@ -1468,7 +1468,7 @@ mod tests {
 
     #[test]
     fn a_spec_takes_the_market_orders_quantity_grid_and_the_minimums() {
-        let spec = spec_with_steps(dec!(0.001), dec!(0));
+        let spec = spec_with_steps::<&str>(dec!(0.001), dec!(0));
         assert_eq!(
             spec,
             InstrumentSpec::new(
@@ -1478,7 +1478,7 @@ mod tests {
             )
         );
         // Both steps on: the grid they share, which a market order is rounded to.
-        let shared = spec_with_steps(dec!(0.05), dec!(0.02));
+        let shared = spec_with_steps::<&str>(dec!(0.05), dec!(0.02));
         assert_eq!(shared.quantity.increment, dec!(0.1));
         assert_eq!(
             rules_with_steps(dec!(0.05), dec!(0.02))
@@ -1487,7 +1487,9 @@ mod tests {
         );
         // The market step alone.
         assert_eq!(
-            spec_with_steps(dec!(0), dec!(0.02)).quantity.increment,
+            spec_with_steps::<&str>(dec!(0), dec!(0.02))
+                .quantity
+                .increment,
             dec!(0.02)
         );
     }
@@ -1550,13 +1552,16 @@ mod tests {
     /// spells its base.
     #[test]
     fn a_spec_gives_a_spot_instrument_its_quantity_step() {
-        use rustrade_instrument::{Underlying, exchange::ExchangeId, instrument::Instrument};
+        use rustrade_instrument::{
+            Underlying, asset::name::AssetNameExchange, exchange::ExchangeId,
+            instrument::Instrument,
+        };
 
         let instrument = Instrument::spot(
             ExchangeId::BinanceSpot,
             "binance_spot-btc_usdt",
             "BTCUSDT",
-            Underlying::new("BTC", "USDT"),
+            Underlying::<AssetNameExchange>::new("BTC", "USDT"),
             Some(spec_with_steps(dec!(0.05), dec!(0.02))),
         );
         assert_eq!(instrument.quantity_step(), Some(dec!(0.1)));

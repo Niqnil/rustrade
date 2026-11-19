@@ -537,10 +537,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had
   to name the base as `OrderQuantityUnits::Asset`, and on an unindexed instrument a name spelled
   unlike the base's (`BTC` and `btc`) made `Instrument::quantity_step` return `None` with no
-  error. `Asset` keeps its rule, and an instrument index registers no asset for `Base`.
+  error. `Asset` is compared with the base as the next entry says, and an instrument index
+  registers no asset for `Base`.
   `Instrument::try_quantity_step` returns the same step as `quantity_step`, or a
   `StepUnavailable` saying why there is none: `NoSpec`, `OtherUnit` naming the spec's unit, or
   `NotPositive` with the increment. A `match` on `OrderQuantityUnits` needs an arm for `Base`.
+- **Breaking: asset keys are compared as assets, not spellings** (`rustrade-instrument`,
+  `rustrade-execution`, `rustrade`, #986). On unindexed keys, `Trade::holding_move` missed a spot
+  fee the venue reported in the base spelled in another case (`BTC` against a base built as
+  `btc`): the fee was not netted and the position not rounded to the step, so a mirror of the
+  engine's positions overstated the account by the fee, with nothing reported. An indexed client
+  resolves both names to one `AssetIndex`, so the engine and such a mirror disagreed.
+  `Instrument::quantity_step` had the same flaw for an `OrderQuantityUnits::Asset` naming the
+  base. The new trait `asset::SameAsset` says whether two keys name one asset on one exchange: an
+  `AssetNameExchange`, and an `Asset` by its `name_exchange`, ignoring ASCII case, the rule the
+  instrument index enforces uniqueness under and an indexed client resolves names by; an
+  `AssetIndex` or `AssetNameInternal` by `==`. `holding_move`, `quantity_step`,
+  `try_quantity_step`, `Position::apply_carry` and the engine's instrument state now require
+  `AssetKey: SameAsset` instead of `PartialEq`, so a custom asset key type needs an
+  implementation. `PartialEq` on the key types stays exact. The new `Underlying::classify`
+  returns which asset of the pair a fee is in, `FeeAsset::Base`, `Quote` or `Other` (such as
+  BNB), by the same rule.
 - **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
   rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as
   an `OrderSnapshot` of a cancelled order with what it filled, instead of `OrderCancelled`, so a

@@ -1,6 +1,6 @@
 use crate::{
     Underlying,
-    asset::Asset,
+    asset::{Asset, SameAsset},
     instrument::{
         data_venue::DataVenue,
         kind::{
@@ -205,7 +205,7 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// Round a quantity to it with [`round_toward_zero_to_step`].
     pub fn quantity_step(&self) -> Option<Decimal>
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
     {
         self.step_or_reason().ok()
     }
@@ -216,8 +216,8 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// A position is counted in the base asset on [`InstrumentKind::Spot`], and in contracts on a
     /// derivative. The step is the [`InstrumentSpec`]'s quantity increment when the spec counts in
     /// that unit:
-    /// - On spot, [`OrderQuantityUnits::Base`], or [`OrderQuantityUnits::Asset`] whose key equals
-    ///   the base's.
+    /// - On spot, [`OrderQuantityUnits::Base`], or [`OrderQuantityUnits::Asset`] naming the base,
+    ///   compared with [`SameAsset`]: on an unindexed instrument, `btc` and `BTC` are one asset.
     /// - On a derivative, [`OrderQuantityUnits::Contract`]. A derivative whose contract is one unit
     ///   of its base (`contract_size` 1) accepts the base too, either way, since the two units are
     ///   then the same.
@@ -227,14 +227,13 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// - [`StepUnavailable::NoSpec`] when there is no spec.
     /// - [`StepUnavailable::OtherUnit`], naming the spec's unit, when it is
     ///   [`OrderQuantityUnits::Quote`], another asset, or a unit the kind does not count positions
-    ///   in. On an unindexed instrument an [`OrderQuantityUnits::Asset`] spelled unlike the base
-    ///   (`btc` and `BTC`) is another asset; [`OrderQuantityUnits::Base`] cannot be.
+    ///   in.
     /// - [`StepUnavailable::NotPositive`] when the increment is not above zero.
     ///
     /// Round a quantity to the step with [`round_toward_zero_to_step`].
     pub fn try_quantity_step(&self) -> Result<Decimal, StepUnavailable<AssetKey>>
     where
-        AssetKey: PartialEq + Clone,
+        AssetKey: SameAsset + Clone,
     {
         self.step_or_reason().map_err(|reason| match reason {
             Unavailable::NoSpec => StepUnavailable::NoSpec,
@@ -247,12 +246,12 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// that [`quantity_step`](Self::quantity_step) needs no `Clone`.
     fn step_or_reason(&self) -> Result<Decimal, Unavailable<'_, AssetKey>>
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
     {
         let quantity = &self.spec.as_ref().ok_or(Unavailable::NoSpec)?.quantity;
         let counts_in_base = |unit: &OrderQuantityUnits<AssetKey>| match unit {
             OrderQuantityUnits::Base => true,
-            OrderQuantityUnits::Asset(asset) => *asset == self.underlying.base,
+            OrderQuantityUnits::Asset(asset) => asset.is_same_asset(&self.underlying.base),
             OrderQuantityUnits::Contract | OrderQuantityUnits::Quote => false,
         };
         let counts_positions = match (&self.kind, &quantity.unit) {
@@ -651,21 +650,19 @@ mod tests {
         }
     }
 
-    /// `Base` names no asset, so the base's spelling cannot make it another one, where `Asset`
-    /// spelled unlike the base is another asset on an unindexed instrument.
+    /// On an unindexed instrument, a spec naming the base in another ASCII case (`aapl` and
+    /// `AAPL`) is still in the base, as an index would resolve both to one asset. `Base` names no
+    /// asset, so it is in the base whatever the spelling.
     #[test]
-    fn quantity_step_in_base_does_not_depend_on_the_base_s_spelling() {
-        let mut spot = with_quantity_spec(instrument(None), OrderQuantityUnits::Base, dec!(0.01));
-        spot.underlying.base = Asset::new_from_exchange("AAPL");
-        assert_eq!(spot.try_quantity_step(), Ok(dec!(0.01)));
-
+    fn quantity_step_in_the_base_ignores_the_base_s_ascii_case() {
         let named = OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
-        let mut spot = with_quantity_spec(instrument(None), named.clone(), dec!(0.01));
-        spot.underlying.base = Asset::new_from_exchange("AAPL");
-        assert_eq!(
-            spot.try_quantity_step(),
-            Err(StepUnavailable::OtherUnit(named))
-        );
+        for unit in [OrderQuantityUnits::Base, named] {
+            let mut spot = with_quantity_spec(instrument(None), unit.clone(), dec!(0.01));
+            spot.underlying.base = Asset::new_from_exchange("AAPL");
+
+            assert_eq!(spot.quantity_step(), Some(dec!(0.01)), "{unit:?}");
+            assert_eq!(spot.try_quantity_step(), Ok(dec!(0.01)), "{unit:?}");
+        }
     }
 
     #[test]

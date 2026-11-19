@@ -35,9 +35,10 @@ pub enum OrderQuantityUnits<AssetKey> {
     /// The named asset.
     ///
     /// Prefer [`Base`](Self::Base) for the instrument's own base asset: `Asset` holds a key of its
-    /// own, which must equal the instrument's base key to count in the base. On an unindexed
-    /// instrument the keys are names, so a spelling that differs from the base's (`btc` and `BTC`)
-    /// is another asset. An instrument index registers this asset alongside the instrument's own.
+    /// own, which must name the instrument's base, by
+    /// [`SameAsset`](crate::asset::SameAsset), to count in the base. On an unindexed instrument
+    /// the keys are names, compared ignoring ASCII case (`btc` and `BTC` are one asset). An
+    /// instrument index registers this asset alongside the instrument's own.
     Asset(AssetKey),
     /// Contracts of a derivative.
     Contract,
