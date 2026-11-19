@@ -424,7 +424,7 @@ pub struct AlpacaConfig {
     /// as [`OrderError::Connectivity`], whose outcome is unknown until the order is looked up. A
     /// caller that bounds a request itself, as an execution manager bounds orders and cancels with
     /// its own request timeout, gets the shorter of the two. Zero ends every request at once, so
-    /// each one fails with a timeout. Serialised as whole milliseconds, under
+    /// each one fails with a timeout. Deserialised from whole milliseconds, under
     /// `request_timeout_ms`.
     #[serde(
         rename = "request_timeout_ms",

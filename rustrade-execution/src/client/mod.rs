@@ -110,7 +110,8 @@ pub(crate) mod reconnect_budget;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod listed_order;
 
-// A config timeout serialised as whole milliseconds. Gated on the clients that use it.
+// A config timeout read (and for IBKR also written) as whole milliseconds. Gated on the clients
+// that use it.
 #[cfg(any(feature = "alpaca", feature = "ibkr"))]
 pub(crate) mod duration_millis;
 
