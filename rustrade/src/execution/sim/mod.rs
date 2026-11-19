@@ -2702,7 +2702,11 @@ mod tests {
     }
 
     /// An L1 book at `millis`, quoting `bid` / `ask`.
+    ///
+    /// `millis` must be after 0: the fold keeps only a book newer than the one it holds, and the
+    /// empty book it starts with is stamped at the epoch, which is `at(0)`.
     fn l1(millis: i64, bid: Decimal, ask: Decimal) -> Timed<EngineEvent<DataKind>> {
+        assert!(millis > 0, "a book at the epoch is not folded");
         Timed::new(
             EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
                 time_exchange: at(millis),
@@ -2725,7 +2729,14 @@ mod tests {
     async fn the_market_folded_before_a_split_is_dropped() {
         let mut harness = Harness::new(
             0,
-            vec![l1(0, dec!(99), dec!(101)), split(10), market(20, dec!(50))],
+            vec![l1(5, dec!(99), dec!(101)), split(10), market(20, dec!(50))],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        assert_eq!(
+            harness.venue_market().unwrap().snapshot.best_bid,
+            Some(dec!(99)),
+            "the pre-split book is folded"
         );
 
         let _ = harness.rest_events().await;
@@ -2743,7 +2754,7 @@ mod tests {
         let mut harness = Harness::new(
             0,
             vec![
-                l1(0, dec!(99), dec!(101)),
+                l1(5, dec!(99), dec!(101)),
                 split(10),
                 l1(20, dec!(49), dec!(51)),
                 split(30),
