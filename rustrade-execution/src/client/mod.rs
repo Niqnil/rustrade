@@ -836,7 +836,10 @@ where
     /// Fetch current balances for the specified assets.
     ///
     /// An empty `assets` slice is the "return all" sentinel: implementations must return
-    /// balances for every asset held. When non-empty, only the listed assets are returned.
+    /// balances for every asset held. When non-empty, only the listed assets are returned. An
+    /// asset is matched as [`SameAsset`](rustrade_instrument::asset::SameAsset) compares names,
+    /// ignoring ASCII case, so `btc` returns the balance a venue names `BTC`. Each balance is
+    /// named as the venue spells it.
     ///
     /// # Balance time
     ///

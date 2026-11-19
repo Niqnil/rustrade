@@ -1,7 +1,19 @@
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use rust_decimal::Decimal;
+use rustrade_instrument::asset::{SameAsset, name::AssetNameExchange};
 use serde::{Deserialize, Serialize};
+
+/// Whether a balance of `asset` is among those a read of `assets` asks for, as
+/// [`ExecutionClient::fetch_balances`](crate::client::ExecutionClient::fetch_balances) defines
+/// it: an empty `assets` asks for every asset, and names are compared with [`SameAsset`], so
+/// `btc` asks for a balance the venue names `BTC`.
+pub(crate) fn is_requested(assets: &[AssetNameExchange], asset: &AssetNameExchange) -> bool {
+    assets.is_empty()
+        || assets
+            .iter()
+            .any(|requested| requested.is_same_asset(asset))
+}
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
@@ -274,6 +286,20 @@ pub struct AssetBalanceUpdate<AssetKey> {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// An empty request asks for every asset; otherwise an asset is requested when one entry
+    /// names it, ignoring ASCII case.
+    #[test]
+    fn an_asset_is_requested_by_any_spelling_of_its_name() {
+        let btc = AssetNameExchange::new("BTC");
+        assert!(is_requested(&[], &btc));
+        assert!(is_requested(&[AssetNameExchange::new("btc")], &btc));
+        assert!(is_requested(
+            &[AssetNameExchange::new("eth"), AssetNameExchange::new("Btc")],
+            &btc
+        ));
+        assert!(!is_requested(&[AssetNameExchange::new("eth")], &btc));
+    }
 
     #[test]
     fn net_asset_cash_returns_total() {

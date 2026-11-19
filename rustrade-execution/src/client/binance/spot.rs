@@ -68,7 +68,7 @@ use crate::rules::{InstrumentSpecError, OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
+    balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate, is_requested},
     client::{
         ExecutionClient, OrderStatusClient,
         order_recovery::{
@@ -2767,38 +2767,14 @@ fn filter_and_convert_balances(
     assets: &[AssetNameExchange],
     time: chrono::DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    // Empty assets slice means "return all" — skip building the set entirely.
-    if assets.is_empty() {
-        return balances
-            .into_iter()
-            .filter_map(|b| convert_balance_entry(b, time))
-            .collect();
-    }
-    // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
-    // For larger slices, HashSet O(1) lookup amortizes the construction cost.
-    if assets.len() <= 16 {
-        return balances
-            .into_iter()
-            .filter_map(|b| {
-                let asset_name_str = b.asset.as_deref()?;
-                if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
-                    return None;
-                }
-                convert_balance_entry(b, time)
-            })
-            .collect();
-    }
-    use std::collections::HashSet;
-    let asset_set: HashSet<&str> = assets.iter().map(|a| a.name().as_str()).collect();
     balances
         .into_iter()
-        .filter_map(|b| {
-            let asset_name_str = b.asset.as_deref()?;
-            if !asset_set.contains(asset_name_str) {
-                return None;
-            }
-            convert_balance_entry(b, time)
+        .filter(|b| {
+            b.asset
+                .as_deref()
+                .is_some_and(|name| is_requested(assets, &AssetNameExchange::new(name)))
         })
+        .filter_map(|b| convert_balance_entry(b, time))
         .collect()
 }
 
@@ -3212,6 +3188,35 @@ mod tests {
     use crate::order::report::{OrderReport, Replaces, ReportedTerms, UnindexedOrderReport};
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use smol_str::SmolStr;
+
+    /// A balance read returns the assets asked for, in any spelling, under Binance's own.
+    #[test]
+    fn balances_are_filtered_by_asset_ignoring_case() {
+        let entry = |asset: &str| binance_sdk::spot::rest_api::GetAccountResponseBalancesInner {
+            asset: Some(asset.to_owned()),
+            free: Some("1".to_owned()),
+            locked: Some("0".to_owned()),
+        };
+        let names = |assets: &[AssetNameExchange]| {
+            filter_and_convert_balances(
+                vec![entry("BTC"), entry("USDT"), entry("ETH")],
+                assets,
+                Utc::now(),
+            )
+            .into_iter()
+            .map(|balance| balance.asset.name().to_string())
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(&[
+                AssetNameExchange::new("btc"),
+                AssetNameExchange::new("Usdt")
+            ]),
+            ["BTC", "USDT"]
+        );
+        assert_eq!(names(&[]), ["BTC", "USDT", "ETH"]);
+    }
 
     /// No WS-API session could be connected, so an open was never sent: the order was not
     /// placed. A cancel keeps the connectivity error, and a rate limit is a rejection for both.

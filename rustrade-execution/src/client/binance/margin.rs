@@ -92,7 +92,7 @@ use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     InstrumentBalanceSnapshot, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::{AssetBalance, Balance, is_requested},
     borrow_capacity::BorrowCapacity,
     client::{
         BorrowCapacityClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
@@ -3164,37 +3164,14 @@ fn filter_and_convert_margin_balances(
     assets: &[AssetNameExchange],
     time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    // Empty assets slice means "return all" — skip building the set entirely.
-    if assets.is_empty() {
-        return user_assets
-            .into_iter()
-            .filter_map(|b| convert_margin_balance_entry(b, time))
-            .collect();
-    }
-    // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
-    if assets.len() <= 16 {
-        return user_assets
-            .into_iter()
-            .filter_map(|b| {
-                let asset_name_str = b.asset.as_deref()?;
-                if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
-                    return None;
-                }
-                convert_margin_balance_entry(b, time)
-            })
-            .collect();
-    }
-    use std::collections::HashSet;
-    let asset_set: HashSet<&str> = assets.iter().map(|a| a.name().as_str()).collect();
     user_assets
         .into_iter()
-        .filter_map(|b| {
-            let asset_name_str = b.asset.as_deref()?;
-            if !asset_set.contains(asset_name_str) {
-                return None;
-            }
-            convert_margin_balance_entry(b, time)
+        .filter(|b| {
+            b.asset
+                .as_deref()
+                .is_some_and(|name| is_requested(assets, &AssetNameExchange::new(name)))
         })
+        .filter_map(|b| convert_margin_balance_entry(b, time))
         .collect()
 }
 
@@ -3828,6 +3805,38 @@ mod tests {
     use crate::client::binance::shared::convert_open_order;
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
+
+    /// A balance read returns the assets asked for, in any spelling, under Binance's own.
+    #[test]
+    fn margin_balances_are_filtered_by_asset_ignoring_case() {
+        let entry = |asset: &str| QueryCrossMarginAccountDetailsResponseUserAssetsInner {
+            asset: Some(asset.to_owned()),
+            free: Some("1".to_owned()),
+            locked: Some("0".to_owned()),
+            borrowed: Some("0".to_owned()),
+            interest: Some("0".to_owned()),
+            ..Default::default()
+        };
+        let names = |assets: &[AssetNameExchange]| {
+            filter_and_convert_margin_balances(
+                vec![entry("BTC"), entry("USDT"), entry("ETH")],
+                assets,
+                Utc::now(),
+            )
+            .into_iter()
+            .map(|balance| balance.asset.name().to_string())
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(&[
+                AssetNameExchange::new("btc"),
+                AssetNameExchange::new("Usdt")
+            ]),
+            ["BTC", "USDT"]
+        );
+        assert_eq!(names(&[]), ["BTC", "USDT", "ETH"]);
+    }
 
     #[test]
     fn margin_effect_default_is_no_side_effect() {

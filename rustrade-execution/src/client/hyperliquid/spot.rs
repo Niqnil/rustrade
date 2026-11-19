@@ -107,7 +107,7 @@ use crate::client::order_recovery::{
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
-    balance::AssetBalance,
+    balance::{AssetBalance, is_requested},
     client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
@@ -1013,7 +1013,7 @@ impl ExecutionClient for HyperliquidSpotClient {
 
     async fn fetch_balances(
         &self,
-        _assets: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
@@ -1025,7 +1025,9 @@ impl ExecutionClient for HyperliquidSpotClient {
             .await
             .map_err(map_sdk_error)?;
 
-        Ok(spot_balances(&token_balances.balances, sent).collect())
+        Ok(spot_balances(&token_balances.balances, sent)
+            .filter(|balance| is_requested(assets, &balance.asset))
+            .collect())
     }
 
     async fn fetch_open_orders(
@@ -1527,6 +1529,31 @@ mod tests {
                 known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
                 carried,
             }
+        }
+
+        /// A balance read returns only the tokens asked for, in any spelling, under
+        /// Hyperliquid's own.
+        #[tokio::test]
+        async fn spot_balances_are_filtered_by_asset_ignoring_case() {
+            let (server, info_client, spot_coins) = serve(serde_json::json!({"balances": [
+                {"coin": "USDC", "token": 0, "total": "10.0", "hold": "0.0", "entryNtl": "0.0"},
+                {"coin": "HYPE", "token": 150, "total": "2.0", "hold": "0.5", "entryNtl": "0.0"}
+            ]}))
+            .await;
+            let client =
+                spot_client(&server, info_client, spot_coins, CarriedFills::default()).await;
+
+            let balances = client
+                .fetch_balances(&[AssetNameExchange::new("hype")])
+                .await
+                .unwrap();
+            let [hype] = balances.as_slice() else {
+                panic!("expected one balance, got {balances:?}");
+            };
+            assert_eq!(hype.asset.name().as_str(), "HYPE");
+            assert_eq!(hype.balance.free, dec!(1.5));
+
+            assert_eq!(client.fetch_balances(&[]).await.unwrap().len(), 2);
         }
 
         /// Ended orders are read with `orderStatus`, with what a replacement carries added.

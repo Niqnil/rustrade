@@ -260,7 +260,7 @@ use crate::client::order_recovery::{
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::AssetBalance,
+    balance::{AssetBalance, is_requested},
     client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
@@ -1249,11 +1249,21 @@ impl ExecutionClient for HyperliquidClient {
     /// The collateral balances, read as [`account_snapshot`](ExecutionClient::account_snapshot)
     /// reads them: `userAbstraction` (weight 20), then either `spotClearinghouseState` or each
     /// DEX's `clearinghouseState` (weight 2 each).
+    ///
+    /// Only the balances of `assets` are returned, all when it is empty. The names depend on the
+    /// account mode: a per-DEX account names the default DEX's balance by its collateral (`USDC`)
+    /// and a HIP-3 DEX's as `{dex}:{collateral}` (`xyz:USDC`), so `USDC` asks for the default
+    /// DEX's alone; a unified or portfolio-margin account names each collateral token bare
+    /// (`USDC`, `USDH`), shared by every DEX margined in it, and has no `{dex}:` names.
     async fn fetch_balances(
         &self,
-        _assets: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        perp_account::fetch_balances(&self.info_client, self.wallet_h160(), &self.dexes).await
+        let mut balances =
+            perp_account::fetch_balances(&self.info_client, self.wallet_h160(), &self.dexes)
+                .await?;
+        balances.retain(|balance| is_requested(assets, &balance.asset));
+        Ok(balances)
     }
 
     /// Every open order on each DEX traded, with one `frontendOpenOrders` (weight 20) per DEX.
@@ -1813,6 +1823,43 @@ mod tests {
                 [ClientOrderId::new(CID)]
             );
         }
+    }
+
+    /// A balance read returns only the collateral asked for, in any spelling. A per-DEX account
+    /// names the default DEX's `USDC` and a HIP-3 DEX's `{dex}:{collateral}`; a unified account
+    /// names each collateral token bare.
+    #[tokio::test]
+    async fn balances_are_filtered_by_asset_ignoring_case() {
+        let names = |balances: Vec<AssetBalance<AssetNameExchange>>| {
+            let mut names = balances
+                .into_iter()
+                .map(|balance| balance.asset.name().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let usdc = AssetNameExchange::new("usdc");
+
+        let server = perp_account::tests::balance_server_answering_after(
+            "default",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let requested = [usdc.clone(), AssetNameExchange::new("XYZ:usdc")];
+        let balances = client.fetch_balances(&requested).await.unwrap();
+        assert_eq!(names(balances), ["USDC", "xyz:USDC"]);
+        let balances = client.fetch_balances(&[]).await.unwrap();
+        assert_eq!(names(balances), ["USDC", "flx:USDH", "xyz:USDC"]);
+
+        let server = perp_account::tests::balance_server_answering_after(
+            "unifiedAccount",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let balances = client.fetch_balances(&[usdc]).await.unwrap();
+        assert_eq!(names(balances), ["USDC"]);
     }
 
     /// A client trading `xyz` and `flx` against `server`, built without the network, that places
