@@ -3352,6 +3352,45 @@ mod tests {
         assert_eq!(loaded.price_exit, None);
     }
 
+    /// On unindexed keys a third asset spelled in another ASCII case (`BNB` and `bnb`) is one
+    /// asset, so its flows add up in one slot.
+    #[test]
+    fn test_apply_carry_adds_a_third_asset_in_any_ascii_case_to_one_slot() {
+        use rustrade_instrument::asset::name::AssetNameExchange;
+
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let opening = trade(base_time, Side::Buy, 100.0, 2.0, 0.0);
+        let opening = Trade::new(
+            opening.id,
+            opening.order_id,
+            opening.instrument,
+            opening.strategy,
+            opening.time_exchange,
+            opening.side,
+            opening.price,
+            opening.quantity,
+            None,
+            AssetFees::new(AssetNameExchange::new("usdt"), Decimal::ZERO, None),
+        );
+        let mut position = Position::from(&opening);
+
+        for (asset, amount, day) in [("BNB", dec!(-1), 1), ("bnb", dec!(-2), 2)] {
+            assert_eq!(
+                position.apply_carry(
+                    CarrySlot::Other(AssetNameExchange::new(asset)),
+                    amount,
+                    time_plus_days(base_time, day)
+                ),
+                CarryUpdate::Applied,
+                "{asset}"
+            );
+        }
+        assert_eq!(
+            position.carry_assets.other,
+            vec![(AssetNameExchange::new("BNB"), dec!(-3))]
+        );
+    }
+
     #[test]
     fn test_apply_carry_holds_last_good_on_overflow() {
         let base_time = DateTime::<Utc>::MIN_UTC;

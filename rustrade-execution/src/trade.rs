@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    FeeAsset, Side,
+    Side,
     asset::{QuoteAsset, SameAsset},
     instrument::{Instrument, kind::InstrumentKind, round_toward_zero_to_step},
 };
@@ -272,9 +272,9 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///   spot instrument, spot margin included. A derivative's position is counted in contracts,
     ///   and an inverse contract pays its fees in the settlement coin, so a fee there never
     ///   changes the quantity. A fee in quote or a third asset, such as BNB, and a fee of zero
-    ///   are not netted. Which asset the fee is in is
-    ///   [`Underlying::classify`](rustrade_instrument::Underlying::classify): on unindexed keys, a
-    ///   fee reported as `BTC` against a base built as `btc` is in the base.
+    ///   are not netted. The fee's asset is compared with the base by [`SameAsset`]: on unindexed
+    ///   keys, a fee reported as `BTC` against a base built as `btc` is in the base. On a pair whose
+    ///   base and quote are one asset, a fee in it is in the base and is netted.
     /// - **A reduce-only move never grows or flips the position.** When
     ///   [`ReduceOnly::is_reduce_only`], a netted
     ///   move larger than the opposite position `held` is cut to land it flat, and one that does
@@ -329,8 +329,8 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
         AssetKey: SameAsset,
     {
         let base_fee = matches!(instrument.kind, InstrumentKind::Spot)
-            && instrument.underlying.classify(&self.fees.asset) == FeeAsset::Base
-            && !self.fees.fees.is_zero();
+            && !self.fees.fees.is_zero()
+            && self.fees.asset.is_same_asset(&instrument.underlying.base);
         let netted = signed(self.side, self.quantity.abs())
             - if base_fee {
                 self.fees.fees
@@ -1010,6 +1010,21 @@ mod tests {
             dec!(0.001),
         );
         assert_eq!(bnb.holding_move(&by_name, held, ReduceOnly::No), None);
+    }
+
+    /// A pair whose base and quote are one asset: a fee in it left the base, so it is netted.
+    #[test]
+    fn holding_move_nets_a_fee_on_a_pair_whose_base_is_its_quote() {
+        let mut spot = btc_usdt(None);
+        spot.underlying.quote = test_utils::asset("BTC");
+        assert_eq!(
+            fill(Side::Buy, dec!(1), "btc", dec!(0.001)).holding_move(
+                &spot,
+                Decimal::ZERO,
+                ReduceOnly::No
+            ),
+            moved(Side::Buy, dec!(0.999), Decimal::ZERO)
+        );
     }
 
     #[test]

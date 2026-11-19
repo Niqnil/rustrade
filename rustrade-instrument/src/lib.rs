@@ -121,7 +121,9 @@ impl<AssetKey> Underlying<AssetKey> {
     /// [`FeeAsset::Base`], or [`FeeAsset::Other`] for a third asset, such as BNB. Compared with
     /// [`SameAsset`](asset::SameAsset), so on unindexed keys a fee spelled unlike the base or quote
     /// (`BTC` and `btc`) is still that asset. Quote is checked first, which matters only for a pair
-    /// whose base and quote are one asset.
+    /// whose base and quote are one asset: a fee in it is then [`FeeAsset::Quote`], already in
+    /// quote. A caller that asks only whether a fee left the base compares it with the base
+    /// directly by [`SameAsset`](asset::SameAsset).
     pub fn classify(&self, asset: &AssetKey) -> FeeAsset
     where
         AssetKey: asset::SameAsset,
@@ -139,8 +141,9 @@ impl<AssetKey> Underlying<AssetKey> {
 /// Which asset of an instrument's [`Underlying`] a fee was charged in: see
 /// [`Underlying::classify`].
 ///
-/// Closed by construction, `Other` being every asset that is neither, so it is exhaustive.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+/// Not `#[non_exhaustive]`: `Other` covers every asset that is neither base nor quote, so no
+/// variant can be added, and a `match` should name all three.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum FeeAsset {
     /// The base asset: the fee leaves the quantity a spot fill delivers, and is worth its quantity
     /// times the fill's price in quote.

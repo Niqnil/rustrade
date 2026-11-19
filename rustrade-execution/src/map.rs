@@ -260,6 +260,11 @@ impl ExecutionInstrumentMap {
 
 /// Key each name by its ASCII-lowercased form.
 ///
+/// For asset names this is the rule
+/// [`SameAsset`](rustrade_instrument::asset::SameAsset) states for unindexed keys. The two must
+/// stay one rule, so that comparing names agrees with comparing the indices they resolve to:
+/// change one only with the other.
+///
 /// A key two names share is left out, with a `warn!`, so a lookup by it misses rather than picks
 /// one of them. [`IndexedInstruments`] rejects such a pair on one exchange, so this guards only an
 /// invariant.

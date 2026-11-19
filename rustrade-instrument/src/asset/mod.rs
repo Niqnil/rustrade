@@ -118,6 +118,9 @@ impl Asset {
 ///
 /// # Contract
 /// - Only keys of one exchange are comparable. Across exchanges, one name can mean two assets.
+/// - The names compared are assumed to follow the index's uniqueness rule: no two distinct assets
+///   on the exchange differ only in ASCII case. A set built by hand that breaks it, such as
+///   `usd` and `USD` meant as two assets, is compared as one.
 /// - Folding is ASCII only: `é` and `É` are different assets, as they are to the index.
 /// - An implementation must be an equivalence relation, and must agree with `==` wherever `==`
 ///   holds.
@@ -128,6 +131,7 @@ pub trait SameAsset {
 
 /// An index names one asset: the same asset is the same index.
 impl SameAsset for AssetIndex {
+    #[inline]
     fn is_same_asset(&self, other: &Self) -> bool {
         self == other
     }
@@ -135,6 +139,7 @@ impl SameAsset for AssetIndex {
 
 /// The venue's spelling, compared ignoring ASCII case.
 impl SameAsset for AssetNameExchange {
+    #[inline]
     fn is_same_asset(&self, other: &Self) -> bool {
         self.name().eq_ignore_ascii_case(other.name())
     }
@@ -142,6 +147,7 @@ impl SameAsset for AssetNameExchange {
 
 /// Already lowercase, so `==` is the same asset.
 impl SameAsset for AssetNameInternal {
+    #[inline]
     fn is_same_asset(&self, other: &Self) -> bool {
         self == other
     }
@@ -151,6 +157,7 @@ impl SameAsset for AssetNameInternal {
 /// [`name_internal`](Asset::name_internal) is not consulted: a venue reports an asset, as a fee or
 /// a balance, by its exchange name, and that is what an indexed client resolves it by.
 impl SameAsset for Asset {
+    #[inline]
     fn is_same_asset(&self, other: &Self) -> bool {
         self.name_exchange.is_same_asset(&other.name_exchange)
     }
@@ -187,6 +194,7 @@ pub struct QuoteAsset;
 
 /// A marker names one asset, so every value is the same asset.
 impl SameAsset for BaseAsset {
+    #[inline]
     fn is_same_asset(&self, _: &Self) -> bool {
         true
     }
@@ -194,6 +202,7 @@ impl SameAsset for BaseAsset {
 
 /// A marker names one asset, so every value is the same asset.
 impl SameAsset for QuoteAsset {
+    #[inline]
     fn is_same_asset(&self, _: &Self) -> bool {
         true
     }
