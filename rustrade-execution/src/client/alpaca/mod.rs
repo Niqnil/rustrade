@@ -30,7 +30,9 @@
 //   before disconnect and the fill-recovery REST window
 // - Ended-order recovery: after the fills, each order held as live that one listing of the open
 //   orders no longer shows is looked up by client order id (GET /v2/orders:by_client_order_id),
-//   and how it ended is reported; a failed check is retried on a backoff while connected
+//   and how it ended is reported; a failed check is retried on a backoff while connected. An
+//   order replaced is followed to its replacement: listed in its place (linked by `replaces`), or
+//   read along `replaced_by` (GET /v2/orders/{id}, at most 8 reads)
 //
 // Known limitations:
 // - Order lifecycle events missed while disconnected are recovered only for orders the client
@@ -42,8 +44,8 @@
 //   settled instead by the terminal frame's own filled_qty, or by fetch_open_orders.
 // - A trade_bust or trade_correct sent while disconnected is not recovered: fill recovery reads
 //   FILL activities only.
-// - An order replaced while disconnected is recovered as cancelled, and its replacement is not
-//   linked to it (see `account_stream`'s "Orders Alpaca replaces").
+// - Fills of a replacement recovered before the check links it count towards the position, not
+//   the order (see `account_stream`'s "Orders that ended while disconnected").
 
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
@@ -53,8 +55,8 @@ use crate::{
     client::{
         BracketOrderClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
-            KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
-            UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
+            KnownLiveOrders, Listed, NoPendingFills, OpenListing, OrderLookup,
+            SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
         reconnect_budget::{BackoffLimits, ReconnectBudget},
         venue_clock::{HostMoment, VenueClock},
@@ -86,7 +88,7 @@ use crate::{
     trade::{AssetFees, TimeSource, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, Utc};
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
 use itertools::Itertools as _;
@@ -745,6 +747,9 @@ struct AlpacaOrderResponse {
     /// The order id of the order this one replaces, if it replaces one.
     #[serde(default)]
     replaces: Option<String>,
+    /// The order id of the order that replaced this one, once Alpaca has replaced it.
+    #[serde(default)]
+    replaced_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1783,10 +1788,26 @@ impl ExecutionClient for AlpacaClient {
     /// instrument when that list is empty. Alpaca's closed-order list filters on when an order was
     /// submitted, so such an order is found by asking about it, not by time.
     ///
-    /// **Known limitation:** an order replaced while the stream was disconnected is reported
-    /// ended, as cancelled, and its replacement is not reported linked to it (see "Orders Alpaca
-    /// replaces" below). A reader tracking the order sees it end, and its replacement, listed
-    /// later, as an order it did not place.
+    /// An order replaced while the stream was disconnected is followed to the order now standing
+    /// for it, which is reported as an [`AccountEventKind::OrderSnapshot`] under its own client
+    /// order id, linked to the order held ([`OrderReport::replaces`]: its order id and client
+    /// order id), live or ended:
+    ///
+    /// - **Listed.** A replacement the listing shows names only the order it replaced directly.
+    ///   When that is an order held, the replacement is reported linked to it, and the order held
+    ///   is not looked up. A replacement further down a chain of replaces is reached by the
+    ///   lookup instead.
+    /// - **Looked up.** An order held that the lookup finds `replaced` is followed along each
+    ///   `replaced_by` with `GET /v2/orders/{id}`, across any number of replaces up to 8, and the
+    ///   last order is linked straight to the order held, not to the order before it. A
+    ///   replacement Alpaca does not know (404), an order `replaced` that names no replacement,
+    ///   or a chain of more than 8 replaces leaves the order held reported ended as cancelled,
+    ///   logged at `warn`. A replacement this version cannot read leaves the order held, to be
+    ///   asked about again.
+    ///
+    /// Fills of a replacement that fill recovery reads before the check links it name an order
+    /// the reader does not yet know, so they count towards its position and not towards the
+    /// order until the link arrives.
     ///
     /// - **Which orders.** The client holds an order as live from the response to placing it,
     ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
@@ -1798,8 +1819,10 @@ impl ExecutionClient for AlpacaClient {
     ///   placed outside this client and never listed or reported to it is not covered.
     /// - **Cost.** One `GET /v2/orders?status=open` request listing every instrument with an
     ///   order held, then one `GET /v2/orders:by_client_order_id` for each held order the listing
-    ///   no longer shows, 8 at a time. These share the account's rate limit with orders, so after
-    ///   an outage in which many held orders ended, the check can hold orders back until the
+    ///   no longer shows, 8 at a time, and one `GET /v2/orders/{id}` for each replace followed.
+    ///   The reads along one chain of replaces are made one after another, and count towards the
+    ///   check's 30 s (see "Failures"). These share the account's rate limit with orders, so
+    ///   after an outage in which many held orders ended, the check can hold orders back until the
     ///   window resets (see [Rate limits](AlpacaClient#rate-limits)).
     /// - **Fills first.** The check starts once fill recovery has finished or given up, so an
     ///   order's recovered fills arrive before how it ended. It runs alongside the stream, which
@@ -1817,7 +1840,8 @@ impl ExecutionClient for AlpacaClient {
     ///   (404) stops being held, logged at `warn`; one still live, `done_for_day`, or in a state
     ///   this version cannot read stays held.
     ///
-    /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
+    /// The same lookup, without following replaces, is public as
+    /// [`OrderStatusClient::fetch_ended_orders`].
     ///
     /// # Orders Alpaca replaces
     ///
@@ -1859,10 +1883,11 @@ impl ExecutionClient for AlpacaClient {
     /// REST round trip, may not be reported: a read that finds it ended reports nothing, and its
     /// successor is then linked to an order the stream never reported.
     ///
-    /// A replace whose events arrive while the stream is disconnected is covered only as above.
-    /// So is a replace around a reconnect: the order check after a reconnect is not held back, so
-    /// if it asks about an order replaced while that order's end is held, it reports the order
-    /// ended before its replacement's first event, as for a replace while disconnected.
+    /// A replace whose events arrive while the stream is disconnected is covered by the reconnect's
+    /// check (see "Orders that ended while disconnected"). A replace around a reconnect can be
+    /// reported by both: the check is not held back, so it may follow a replace whose end the
+    /// stream is holding, and the stream then reports the replacement again, and the order
+    /// replaced ending after it.
     ///
     /// # Rejected orders
     ///
@@ -4208,7 +4233,9 @@ async fn recover_fills(
 // Ended-order recovery
 // ---------------------------------------------------------------------------
 
-/// Look the order under `key` up with `GET /v2/orders:by_client_order_id`.
+/// Look the order under `key` up with `GET /v2/orders:by_client_order_id`, for
+/// [`OrderStatusClient::fetch_ended_orders`]: how the order under that key ended, if it has. An
+/// order replaced is read as cancelled, not followed to its replacement.
 ///
 /// A 404 is [`OrderLookup::Unknown`], and so is an order on another symbol than the key's (ignoring
 /// case, as Alpaca's symbols are upper case).
@@ -4218,15 +4245,50 @@ async fn fetch_order_lookup(
     config: Arc<AlpacaConfig>,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
+    Ok(
+        match fetch_order_by_cid(&http, &rate_limiter, &config, &key).await? {
+            Some(order) => lookup_from_order(&order, &key),
+            None => OrderLookup::Unknown,
+        },
+    )
+}
+
+/// [`fetch_order_lookup`] for a reconnect's check, which follows an order Alpaca replaced: an order
+/// found `replaced` is followed along `replaced_by` (see [`follow_replaces`]) and answered as
+/// [`OrderLookup::Replaced`] by the order now standing for it.
+async fn fetch_order_lookup_following_replaces(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    key: UnindexedOrderKey,
+) -> Result<OrderLookup, UnindexedClientError> {
+    let Some(order) = fetch_order_by_cid(&http, &rate_limiter, &config, &key).await? else {
+        return Ok(OrderLookup::Unknown);
+    };
+    if let Some(found) = follow_replaces(&http, &rate_limiter, &config, &key, &order).await? {
+        return Ok(found);
+    }
+    Ok(lookup_from_order(&order, &key))
+}
+
+/// The order Alpaca holds under `key`'s client order id, read with
+/// `GET /v2/orders:by_client_order_id`. `None` for a 404, and, logged at `debug`, for an order on
+/// another symbol than the key's (ignoring case, as Alpaca's symbols are upper case).
+async fn fetch_order_by_cid(
+    http: &reqwest::Client,
+    rate_limiter: &RateLimitTracker,
+    config: &AlpacaConfig,
+    key: &UnindexedOrderKey,
+) -> Result<Option<AlpacaOrderResponse>, UnindexedClientError> {
     let url = format!("{}/v2/orders:by_client_order_id", config.rest_base_url());
     let cid = key.cid.0.as_str();
-    let found: Option<AlpacaOrderResponse> = rest_lookup_with_retry(&rate_limiter, || {
+    let found: Option<AlpacaOrderResponse> = rest_lookup_with_retry(rate_limiter, || {
         http.get(&url).query(&[("client_order_id", cid)])
     })
     .await?;
     let Some(order) = found else {
         debug!(instrument = %key.instrument, cid = %key.cid, "Alpaca does not know this order");
-        return Ok(OrderLookup::Unknown);
+        return Ok(None);
     };
     if !order
         .symbol
@@ -4238,34 +4300,158 @@ async fn fetch_order_lookup(
             symbol = %order.symbol,
             "Alpaca knows this client order id on another symbol"
         );
-        return Ok(OrderLookup::Unknown);
+        return Ok(None);
     }
-    Ok(
-        convert_ended_order(&order, &key).map_or(OrderLookup::NotEnded, |order| {
-            OrderLookup::Ended(Box::new(order))
-        }),
-    )
+    Ok(Some(order))
 }
 
-/// The client order ids one `GET /v2/orders?status=open` lists on `instruments`, for a
-/// reconnect's check of the orders held as live. A listing of 500 may be truncated, so it fails.
-async fn listed_open_cids(
+/// How the order `order`, found under `key`, ended, if it has.
+fn lookup_from_order(order: &AlpacaOrderResponse, key: &UnindexedOrderKey) -> OrderLookup {
+    convert_ended_order(order, key).map_or(OrderLookup::NotEnded, |order| {
+        OrderLookup::Ended(Box::new(order))
+    })
+}
+
+/// The most replaces [`follow_replaces`] follows from the order asked about. Each costs one read,
+/// and a chain longer than this, replaced again and again within one disconnect, is more likely a
+/// loop in what Alpaca reports than a real one.
+const REPLACE_HOPS: usize = 8;
+
+/// Follow `asked`, the order found under `key`, to the order now standing for it, if Alpaca
+/// replaced it: along each `replaced_by`, with `GET /v2/orders/{id}`, until an order that is not
+/// `replaced`, for at most [`REPLACE_HOPS`] reads.
+///
+/// That order, live or ended, is [`OrderLookup::Replaced`]: reported under its own client order
+/// id, with `key`'s instrument and strategy, and linked straight to the order asked about by its
+/// order id and `key`'s client order id, however many replaces lay between them. An order
+/// replaced again carries only its immediate predecessor, which the holder of `key` may never have
+/// seen.
+///
+/// `None` when `asked` is not `replaced`, and, logged at `warn`, when an order on the chain is
+/// `replaced` but names no replacement, Alpaca does not know an order on the chain (404), or the
+/// chain is longer than the bound: the order asked about is then read as cancelled, as before.
+/// Also `None`, with the conversion's `warn`, for a final order this version cannot read, which
+/// then stays held and is asked about again. A read that fails fails the lookup.
+async fn follow_replaces(
+    http: &reqwest::Client,
+    rate_limiter: &RateLimitTracker,
+    config: &AlpacaConfig,
+    key: &UnindexedOrderKey,
+    asked: &AlpacaOrderResponse,
+) -> Result<Option<OrderLookup>, UnindexedClientError> {
+    if asked.status.as_deref() != Some("replaced") {
+        return Ok(None);
+    }
+    let Some(mut next) = asked.replaced_by.clone() else {
+        warn_replacement_unnamed(key, asked, &asked.id);
+        return Ok(None);
+    };
+    for _ in 0..REPLACE_HOPS {
+        let url = format!("{}/v2/orders/{next}", config.rest_base_url());
+        let found: Option<AlpacaOrderResponse> =
+            rest_lookup_with_retry(rate_limiter, || http.get(&url)).await?;
+        let Some(order) = found else {
+            warn!(
+                instrument = %key.instrument,
+                cid = %key.cid,
+                order_id = %asked.id,
+                replacement_id = %next,
+                "Alpaca does not know an order replacing an order held as live - reporting the \
+                 order held as cancelled, without its replacement"
+            );
+            return Ok(None);
+        };
+        match (order.status.as_deref(), order.replaced_by.as_ref()) {
+            (Some("replaced"), Some(replaced_by)) => next = replaced_by.clone(),
+            (Some("replaced"), None) => {
+                warn_replacement_unnamed(key, asked, &order.id);
+                return Ok(None);
+            }
+            _ => return Ok(Some(replacement_lookup(&order, key, asked))),
+        }
+    }
+    warn!(
+        instrument = %key.instrument,
+        cid = %key.cid,
+        order_id = %asked.id,
+        hops = REPLACE_HOPS,
+        "Alpaca reports more replaces of an order held as live than are followed - reporting the \
+         order held as cancelled, without its replacement"
+    );
+    Ok(None)
+}
+
+/// Warn that `replaced`, an order on the chain from `asked`, the order held under `key`, is
+/// `replaced` but names no replacement, so the chain cannot be followed.
+fn warn_replacement_unnamed(key: &UnindexedOrderKey, asked: &AlpacaOrderResponse, replaced: &str) {
+    warn!(
+        instrument = %key.instrument,
+        cid = %key.cid,
+        order_id = %asked.id,
+        replaced_id = %replaced,
+        "Alpaca reports an order replaced without naming its replacement - reporting the order \
+         held as cancelled, without its replacement"
+    );
+}
+
+/// [`OrderLookup::Replaced`] by `order`, the order now standing for `asked`, which was found under
+/// `key` (see [`follow_replaces`]); [`OrderLookup::NotEnded`] for an order this version cannot
+/// read, which its conversion has warned of.
+fn replacement_lookup(
+    order: &AlpacaOrderResponse,
+    key: &UnindexedOrderKey,
+    asked: &AlpacaOrderResponse,
+) -> OrderLookup {
+    let renamed = UnindexedOrderKey {
+        cid: alpaca_cid(order.client_order_id.as_deref(), &order.id),
+        ..key.clone()
+    };
+    let report = if order.status.as_deref().is_some_and(order_status_is_live) {
+        convert_open_order(order).map(|mut listed| {
+            listed.order.key = renamed;
+            listed.into_report()
+        })
+    } else {
+        convert_ended_order(order, &renamed)
+            .map(|ended| OrderReport::state_only(ended.map_state(OrderState::Inactive)))
+    };
+    let Some(report) = report else {
+        return OrderLookup::NotEnded;
+    };
+    OrderLookup::Replaced(Box::new(report.with_replaces(
+        Replaces::new(OrderId(SmolStr::new(&asked.id))).with_cid(key.cid.clone()),
+    )))
+}
+
+/// The open orders one `GET /v2/orders?status=open` lists on `instruments`, for a reconnect's
+/// check of the orders held as live: as reports, each linked to the order it replaces, so the check
+/// follows a replacement listed in place of an order held. An order this version cannot represent
+/// is listed by its ids alone. A listing of 500 may be truncated, so it fails.
+async fn listed_open_orders(
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
     config: Arc<AlpacaConfig>,
     instruments: Vec<InstrumentNameExchange>,
-) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+) -> Result<Listed, UnindexedClientError> {
     let orders =
         fetch_raw_open_orders(&http, &rate_limiter, config.rest_base_url(), &instruments).await?;
-    Ok(orders
-        .iter()
-        .map(|order| alpaca_cid(order.client_order_id.as_deref(), &order.id))
-        .collect())
+    let mut listed = Listed::default();
+    for order in &orders {
+        match convert_representable_open_order(order) {
+            Some(open) => listed.extend([open.into_report()]),
+            None => listed.list_ids(
+                InstrumentNameExchange::new(&order.symbol),
+                alpaca_cid(order.client_order_id.as_deref(), &order.id),
+                OrderId(SmolStr::new(&order.id)),
+            ),
+        }
+    }
+    Ok(listed)
 }
 
 /// [`recover_ended_orders`] on Alpaca: one listing of every instrument due by
-/// [`listed_open_cids`], and lookups by [`fetch_order_lookup`]. Fill recovery has finished or been
-/// given up before it runs, so no fills are pending.
+/// [`listed_open_orders`], and lookups by [`fetch_order_lookup_following_replaces`]. Fill recovery
+/// has finished or been given up before it runs, so no fills are pending.
 async fn recover_alpaca_ended_orders(
     http: &reqwest::Client,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -4282,14 +4468,24 @@ async fn recover_alpaca_ended_orders(
         tx,
         OpenListing::Batched,
         |instruments| {
-            listed_open_cids(
+            listed_open_orders(
                 http.clone(),
                 rate_limiter.clone(),
                 config.clone(),
                 instruments,
             )
         },
-        |key, _| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
+        // Alpaca refuses a client order id any earlier order used, ended or not, so the order
+        // found under the key's client order id is the order held: its venue order id is not
+        // needed to tell them apart.
+        |key, _| {
+            fetch_order_lookup_following_replaces(
+                http.clone(),
+                rate_limiter.clone(),
+                config.clone(),
+                key,
+            )
+        },
     )
     .await;
 }
@@ -4389,8 +4585,8 @@ fn order_status_is_live(status: &str) -> bool {
 /// `filled` becomes [`InactiveOrderState::FullyFilled`] with the reported fill, or the whole
 /// `quantity` when that is unknown, and `filled_avg_price`; `canceled` becomes
 /// [`InactiveOrderState::Cancelled`], and so does `replaced`, as an order state names no
-/// replacement (a lookup of an order replaced does not follow it to its replacement, a known
-/// limitation); `expired` becomes [`InactiveOrderState::Expired`], each with
+/// replacement (a reconnect's check follows it to its replacement first, with
+/// [`follow_replaces`]); `expired` becomes [`InactiveOrderState::Expired`], each with
 /// what filled before, `None` when that is unknown; and `rejected` becomes
 /// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
 /// ([`convert_ended_order`]) and the response to placing one ([`placed_order_state`]).
@@ -6137,9 +6333,11 @@ impl OrderStatusClient for AlpacaClient {
     ///
     /// `filled` is reported as fully filled with `filled_avg_price`, `canceled` and `replaced` as
     /// cancelled, `expired` as expired and `rejected` as open failed. An order replaced is not
-    /// followed to its replacement, which has ids of its own: an
-    /// [`account_snapshot`](ExecutionClient::account_snapshot) lists the replacement linked to
-    /// it while it is open. `done_for_day` is not ended: Alpaca works the order again the next trading day.
+    /// followed to its replacement, which has ids of its own, as each order returned carries the
+    /// key it was asked for: an [`account_snapshot`](ExecutionClient::account_snapshot) lists the
+    /// replacement linked to it while it is open, and the reconnect's check of
+    /// [`account_stream`](ExecutionClient::account_stream) follows it. `done_for_day` is not
+    /// ended: Alpaca works the order again the next trading day.
     /// A 404, or an order on another symbol than the key's (ignoring case), is unknown.
     async fn fetch_ended_orders(
         &self,
@@ -7687,6 +7885,7 @@ mod tests {
             created_at: "2025-04-18T14:30:00Z".to_string(),
             updated_at: None,
             replaces: None,
+            replaced_by: None,
         };
         assert!(convert_open_order(&order).is_none());
     }
@@ -8144,6 +8343,7 @@ mod tests {
             created_at: "2025-04-18T14:30:00Z".to_string(),
             updated_at: None,
             replaces: None,
+            replaced_by: None,
         }
     }
 
@@ -12712,6 +12912,505 @@ mod tests {
                 );
             }
             assert_eq!(known.lock().instruments().len(), 2, "both still held");
+        }
+
+        // --- A reconnect's check follows an order Alpaca replaced while disconnected ---
+
+        /// `order_json` of `cid` with `status`, linked to the orders it replaces and that
+        /// replaced it, by order id.
+        fn chained_order_json(
+            cid: &str,
+            status: &str,
+            replaces: Option<&str>,
+            replaced_by: Option<&str>,
+        ) -> serde_json::Value {
+            let mut order = order_json(cid, "SPY", status, "0");
+            order["replaces"] = serde_json::json!(replaces.map(|cid| format!("id-{cid}")));
+            order["replaced_by"] = serde_json::json!(replaced_by.map(|cid| format!("id-{cid}")));
+            order
+        }
+
+        /// Log lines written by [`capture_warnings`]'s subscriber.
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl CapturedLog {
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+            }
+        }
+
+        /// Capture `WARN` and above on this thread until the guard drops. A `#[tokio::test]` runs
+        /// on one thread, so this sees every event of code it awaits inline.
+        fn capture_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+            let log = CapturedLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// Serve `order` as `GET /v2/orders/id-{cid}`, expecting `calls` reads.
+        async fn mount_read(server: &MockServer, cid: &str, order: ResponseTemplate, calls: u64) {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/orders/id-{cid}")))
+                .respond_with(order)
+                .expect(calls)
+                .mount(server)
+                .await;
+        }
+
+        /// Serve `orders` as the listing of open orders on SPY.
+        async fn mount_spy_listing(server: &MockServer, orders: serde_json::Value) {
+            use wiremock::matchers::query_param;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .and(query_param("status", "open"))
+                .and(query_param("symbols", "SPY"))
+                .respond_with(ok(orders))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        /// Run one reconnect check of the orders `known` holds, returning the reports it sent.
+        async fn check_once(
+            server: &MockServer,
+            known: &SharedKnownLiveOrders,
+        ) -> Vec<UnindexedOrderReport> {
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            recover_alpaca_ended_orders(
+                &reqwest::Client::new(),
+                &Arc::new(RateLimitTracker::new()),
+                &config,
+                known,
+                &mut unchecked,
+                &tx,
+            )
+            .await;
+            assert!(unchecked.is_empty(), "the check finished");
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| {
+                    let AccountEventKind::OrderSnapshot(
+                        rustrade_integration::collection::snapshot::Snapshot(report),
+                    ) = event.kind
+                    else {
+                        panic!("an order snapshot: {event:?}");
+                    };
+                    report
+                })
+                .collect()
+        }
+
+        /// An order replaced twice is followed along `replaced_by` to the order now live, which is
+        /// reported under its own client order id, on the key's instrument, and linked straight to
+        /// the order held, not to the order between them.
+        #[tokio::test]
+        async fn a_reconnect_check_follows_a_chain_of_replaces_to_the_live_order() {
+            let server = MockServer::start().await;
+            mount_spy_listing(&server, serde_json::json!([])).await;
+            mount_lookup(
+                &server,
+                "a",
+                ok(chained_order_json("a", "replaced", None, Some("b"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "b",
+                ok(chained_order_json("b", "replaced", Some("a"), Some("c"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "c",
+                ok(chained_order_json("c", "new", Some("b"), None)),
+                1,
+            )
+            .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(
+                (
+                    &report.order.key.instrument,
+                    report.order.key.cid.0.as_str()
+                ),
+                (&held.instrument, "c")
+            );
+            assert!(
+                matches!(&report.order.state, OrderState::Active(ActiveOrderState::Open(open))
+                    if open.id.assigned() == Some(&OrderId::new("id-c"))),
+                "{report:?}"
+            );
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("id-a")).with_cid(ClientOrderId::new("a")))
+            );
+            let known = known.lock();
+            assert!(!known.contains(&held.cid), "the order held moved");
+            assert!(
+                known.contains(&ClientOrderId::new("c")),
+                "to the replacement"
+            );
+        }
+
+        /// A replacement that has ended is reported ended, linked to the order held, which then
+        /// is held under no id.
+        #[tokio::test]
+        async fn a_reconnect_check_follows_a_replace_to_an_order_that_ended() {
+            let server = MockServer::start().await;
+            mount_spy_listing(&server, serde_json::json!([])).await;
+            mount_lookup(
+                &server,
+                "a",
+                ok(chained_order_json("a", "replaced", None, Some("b"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "b",
+                ok(chained_order_json("b", "filled", Some("a"), None)),
+                1,
+            )
+            .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(report.order.key.cid, ClientOrderId::new("b"));
+            assert!(
+                matches!(
+                    &report.order.state,
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(filled))
+                        if filled.id == OrderId::new("id-b")
+                ),
+                "{report:?}"
+            );
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("id-a")).with_cid(ClientOrderId::new("a")))
+            );
+            let known = known.lock();
+            assert!(!known.contains(&held.cid) && !known.contains(&ClientOrderId::new("b")));
+        }
+
+        /// A replacement Alpaca does not know leaves the order held reported as cancelled, as
+        /// before the check followed replaces.
+        #[tokio::test]
+        async fn a_replacement_alpaca_does_not_know_leaves_the_order_held_cancelled() {
+            let server = MockServer::start().await;
+            mount_spy_listing(&server, serde_json::json!([])).await;
+            mount_lookup(
+                &server,
+                "a",
+                ok(chained_order_json("a", "replaced", None, Some("b"))),
+                1,
+            )
+            .await;
+            mount_read(&server, "b", ResponseTemplate::new(404), 1).await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(
+                (&report.order.key.instrument, &report.order.key.cid),
+                (&held.instrument, &held.cid)
+            );
+            assert!(
+                matches!(
+                    &report.order.state,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(_))
+                ),
+                "{report:?}"
+            );
+            assert_eq!(report.replaces, None);
+            assert!(!known.lock().contains(&held.cid));
+        }
+
+        /// An order `replaced` that names no replacement, the order held or one further down its
+        /// chain, leaves the order held reported as cancelled, not the order where the chain
+        /// breaks, with a warning naming the order where it breaks. The report in the case at the
+        /// order held predates following replaces; the case further down tells the two apart.
+        #[tokio::test]
+        async fn a_chain_that_names_no_replacement_leaves_the_order_held_cancelled() {
+            for broken_at_held in [true, false] {
+                let server = MockServer::start().await;
+                mount_spy_listing(&server, serde_json::json!([])).await;
+                let held_order = if broken_at_held {
+                    chained_order_json("a", "replaced", None, None)
+                } else {
+                    chained_order_json("a", "replaced", None, Some("b"))
+                };
+                mount_lookup(&server, "a", ok(held_order), 1).await;
+                mount_read(
+                    &server,
+                    "b",
+                    ok(chained_order_json("b", "replaced", Some("a"), None)),
+                    u64::from(!broken_at_held),
+                )
+                .await;
+
+                let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+                let held = alpaca_key("SPY", "a");
+                hold(&known, &held);
+
+                let (log, guard) = capture_warnings();
+                let reported = check_once(&server, &known).await;
+                drop(guard);
+
+                let warnings = log.text();
+                let broken = if broken_at_held { "id-a" } else { "id-b" };
+                assert!(
+                    warnings.contains("replaced without naming its replacement")
+                        && warnings.contains(&format!("replaced_id={broken}")),
+                    "broken at held: {broken_at_held}: {warnings}"
+                );
+
+                let [report] = reported.as_slice() else {
+                    panic!("one report (broken at held: {broken_at_held}): {reported:?}");
+                };
+                assert_eq!(
+                    (&report.order.key.cid, report.replaces.as_ref()),
+                    (&held.cid, None),
+                    "broken at held: {broken_at_held}"
+                );
+                assert!(
+                    matches!(
+                        &report.order.state,
+                        OrderState::Inactive(InactiveOrderState::Cancelled(_))
+                    ),
+                    "{report:?}"
+                );
+            }
+        }
+
+        /// The last order of a chain listed open names only the order before it, which is not
+        /// held, so the order held is looked up and followed to it, and it is reported once,
+        /// linked straight to the order held.
+        #[tokio::test]
+        async fn a_chain_whose_last_order_is_listed_is_followed_by_the_lookup() {
+            let server = MockServer::start().await;
+            mount_spy_listing(
+                &server,
+                serde_json::json!([chained_order_json("c", "new", Some("b"), None)]),
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "a",
+                ok(chained_order_json("a", "replaced", None, Some("b"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "b",
+                ok(chained_order_json("b", "replaced", Some("a"), Some("c"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "c",
+                ok(chained_order_json("c", "new", Some("b"), None)),
+                1,
+            )
+            .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(report.order.key.cid, ClientOrderId::new("c"));
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("id-a")).with_cid(ClientOrderId::new("a")))
+            );
+            let known = known.lock();
+            assert!(!known.contains(&held.cid) && known.contains(&ClientOrderId::new("c")));
+        }
+
+        /// A chain longer than the bound is read no further, and the order held is reported as
+        /// cancelled.
+        #[tokio::test]
+        async fn a_chain_of_replaces_past_the_bound_leaves_the_order_held_cancelled() {
+            let server = MockServer::start().await;
+            mount_spy_listing(&server, serde_json::json!([])).await;
+            let cids: Vec<String> = (0..=REPLACE_HOPS + 1).map(|n| format!("r{n}")).collect();
+            mount_lookup(
+                &server,
+                &cids[0],
+                ok(chained_order_json(
+                    &cids[0],
+                    "replaced",
+                    None,
+                    Some(&cids[1]),
+                )),
+                1,
+            )
+            .await;
+            for (n, cid) in cids.iter().enumerate().skip(1) {
+                let read = u64::from(n <= REPLACE_HOPS);
+                let order = match cids.get(n + 1) {
+                    Some(next) => {
+                        chained_order_json(cid, "replaced", Some(&cids[n - 1]), Some(next))
+                    }
+                    None => chained_order_json(cid, "new", Some(&cids[n - 1]), None),
+                };
+                mount_read(&server, cid, ok(order), read).await;
+            }
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", &cids[0]);
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(
+                (&report.order.key.instrument, &report.order.key.cid),
+                (&held.instrument, &held.cid)
+            );
+            assert!(
+                matches!(
+                    &report.order.state,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(_))
+                ),
+                "{report:?}"
+            );
+        }
+
+        /// A listing that shows the replacement of an order held links it by the order id it
+        /// replaces, and the order held is not looked up.
+        #[tokio::test]
+        async fn a_listed_replacement_is_linked_to_the_order_held_without_a_lookup() {
+            let server = MockServer::start().await;
+            mount_spy_listing(
+                &server,
+                serde_json::json!([chained_order_json("b", "new", Some("a"), None)]),
+            )
+            .await;
+            mount_lookup(&server, "a", ResponseTemplate::new(500), 0).await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            let [report] = reported.as_slice() else {
+                panic!("one report: {reported:?}");
+            };
+            assert_eq!(report.order.key.cid, ClientOrderId::new("b"));
+            assert_eq!(
+                report.replaces,
+                Some(Replaces::new(OrderId::new("id-a")).with_cid(ClientOrderId::new("a")))
+            );
+            let known = known.lock();
+            assert!(!known.contains(&held.cid) && known.contains(&ClientOrderId::new("b")));
+        }
+
+        /// An open order the listing cannot represent still shows the order held under its
+        /// client order id, which is not looked up and stays held.
+        #[tokio::test]
+        async fn an_order_listed_in_a_form_not_read_still_shows_the_order_held() {
+            let server = MockServer::start().await;
+            let mut notional = order_json("a", "SPY", "new", "0");
+            notional["qty"] = serde_json::Value::Null;
+            mount_spy_listing(&server, serde_json::json!([notional])).await;
+            mount_lookup(&server, "a", ResponseTemplate::new(500), 0).await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let held = alpaca_key("SPY", "a");
+            hold(&known, &held);
+
+            let reported = check_once(&server, &known).await;
+
+            assert!(reported.is_empty(), "{reported:?}");
+            assert!(known.lock().contains(&held.cid));
+        }
+
+        /// `fetch_ended_orders` reads an order replaced as cancelled under the key asked about,
+        /// and does not follow it to its replacement.
+        #[tokio::test]
+        async fn fetch_ended_orders_does_not_follow_a_replace() {
+            let server = MockServer::start().await;
+            mount_lookup(
+                &server,
+                "a",
+                ok(chained_order_json("a", "replaced", None, Some("b"))),
+                1,
+            )
+            .await;
+            mount_read(
+                &server,
+                "b",
+                ok(chained_order_json("b", "new", Some("a"), None)),
+                0,
+            )
+            .await;
+
+            let ended = client_for(&server)
+                .fetch_ended_orders(&[alpaca_key("SPY", "a")])
+                .await
+                .unwrap();
+
+            let [order] = ended.as_slice() else {
+                panic!("one order: {ended:?}");
+            };
+            assert_eq!(order.key.cid, ClientOrderId::new("a"));
+            assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
         }
 
         #[tokio::test]
