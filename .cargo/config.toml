@@ -22,5 +22,7 @@ rustflags = [
 # `Cargo.lock` are unaffected, and `--locked` builds never resolve. To take a newer release on
 # purpose, after reviewing it:
 #   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>
+# and raise the requirement in Cargo.toml to it, or the next bare `cargo update` inside the
+# window downgrades it again (CONTRIBUTING.md has the transitive case).
 [registry]
 global-min-publish-age = "7 days"

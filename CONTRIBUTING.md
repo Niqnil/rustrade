@@ -19,7 +19,13 @@ Dependabot holds back its version updates for as long (security updates are not 
 malicious releases are found and yanked within hours. An exact (`=`) requirement on a release
 younger than 7 days makes `cargo update` fail with "is too new". To take such a release on
 purpose, review it, then run
-`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`.
+`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`, and
+raise the requirement in `Cargo.toml` to that version. Without the raised requirement, the next
+bare `cargo update` inside the 7 days quietly downgrades the crate again, printing only a
+"Downgrading" line. A transitive crate has no requirement to raise, so until its release ages,
+update other crates with `cargo update -p <crate>` rather than a bare `cargo update`, and check
+`Cargo.lock`'s diff for downgrades. CI's `cargo audit` flags a downgrade back to a version with a
+security advisory.
 
 **Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
 `.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
