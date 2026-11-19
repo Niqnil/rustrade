@@ -8,7 +8,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side,
-    asset::{AssetIndex, name::AssetNameInternal},
+    asset::{AssetIndex, SameAsset, name::AssetNameInternal},
     corporate_action::SplitRatio,
     instrument::{InstrumentIndex, name::InstrumentNameInternal},
 };
@@ -1320,7 +1320,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         time_exchange: DateTime<Utc>,
     ) -> CarryUpdate
     where
-        AssetKey: PartialEq + Debug,
+        AssetKey: SameAsset + Debug,
     {
         let held = match &slot {
             CarrySlot::Quote => self.carry,
@@ -1329,7 +1329,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 .carry_assets
                 .other
                 .iter()
-                .find_map(|(held_asset, held)| (held_asset == asset).then_some(*held))
+                .find_map(|(held_asset, held)| held_asset.is_same_asset(asset).then_some(*held))
                 .unwrap_or(Decimal::ZERO),
         };
         let Some(sum) = held.checked_add(amount) else {
@@ -1349,7 +1349,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                     .carry_assets
                     .other
                     .iter_mut()
-                    .find(|(held_asset, _)| *held_asset == asset)
+                    .find(|(held_asset, _)| held_asset.is_same_asset(&asset))
                 {
                     Some((_, held)) => *held = sum,
                     None => self.carry_assets.other.push((asset, sum)),
@@ -3350,6 +3350,45 @@ mod tests {
             serde_json::from_value(value).unwrap();
         assert!(loaded.carry_assets.is_empty());
         assert_eq!(loaded.price_exit, None);
+    }
+
+    /// On unindexed keys a third asset spelled in another ASCII case (`BNB` and `bnb`) is one
+    /// asset, so its flows add up in one slot.
+    #[test]
+    fn test_apply_carry_adds_a_third_asset_in_any_ascii_case_to_one_slot() {
+        use rustrade_instrument::asset::name::AssetNameExchange;
+
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let opening = trade(base_time, Side::Buy, 100.0, 2.0, 0.0);
+        let opening = Trade::new(
+            opening.id,
+            opening.order_id,
+            opening.instrument,
+            opening.strategy,
+            opening.time_exchange,
+            opening.side,
+            opening.price,
+            opening.quantity,
+            None,
+            AssetFees::new(AssetNameExchange::new("usdt"), Decimal::ZERO, None),
+        );
+        let mut position = Position::from(&opening);
+
+        for (asset, amount, day) in [("BNB", dec!(-1), 1), ("bnb", dec!(-2), 2)] {
+            assert_eq!(
+                position.apply_carry(
+                    CarrySlot::Other(AssetNameExchange::new(asset)),
+                    amount,
+                    time_plus_days(base_time, day)
+                ),
+                CarryUpdate::Applied,
+                "{asset}"
+            );
+        }
+        assert_eq!(
+            position.carry_assets.other,
+            vec![(AssetNameExchange::new("BNB"), dec!(-3))]
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Keyed, Side,
-    asset::{AssetIndex, name::AssetNameExchange},
+    asset::{AssetIndex, SameAsset, name::AssetNameExchange},
     corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
@@ -1079,7 +1079,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         exchange: &ExchangeKey,
     ) -> bool
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
         ExchangeKey: PartialEq,
     {
         matches!(&self.instrument.kind, InstrumentKind::Option(_))
@@ -1103,7 +1103,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         exchange: &ExchangeKey,
     ) -> bool
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
         ExchangeKey: PartialEq,
     {
         self.instrument.kind.is_split_eligible() && self.is_on_underlying(base, quote, exchange)
@@ -1118,11 +1118,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// BTC/USDC instruments.
     fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
         ExchangeKey: PartialEq,
     {
-        self.instrument.underlying.base == *base
-            && self.instrument.underlying.quote == *quote
+        self.instrument.underlying.base.is_same_asset(base)
+            && self.instrument.underlying.quote.is_same_asset(quote)
             && self.instrument.exchange == *exchange
     }
 
@@ -1142,7 +1142,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         exchange: &ExchangeKey,
     ) -> bool
     where
-        AssetKey: PartialEq,
+        AssetKey: SameAsset,
         ExchangeKey: PartialEq,
     {
         self.is_option_on_underlying(base, quote, exchange) && !self.position.positions.is_empty()
@@ -1183,7 +1183,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     where
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
     {
         let mut orders = OrderReportsApplied::default();
         for report in &snapshot.orders {
@@ -1522,7 +1522,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         ExchangeKey: Debug + Clone,
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         self.replay_order_snapshot(report, &[])
@@ -1537,7 +1537,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         ExchangeKey: Debug + Clone,
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         self.update_from_order_snapshot(Snapshot(&OrderReport::state_only(order.0.clone())))
@@ -1552,7 +1552,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
         ExchangeKey: Debug + Clone,
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         let order = Snapshot(&report.0.order);
@@ -1915,7 +1915,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// consumer that opens a new stream must drop the flows it has already passed on.
     pub fn update_from_cash_flow(&mut self, flow: &CashFlow<AssetKey, InstrumentKey>) -> CarryUpdate
     where
-        AssetKey: Debug + PartialEq + Clone,
+        AssetKey: Debug + SameAsset + Clone,
         InstrumentKey: Debug,
     {
         let history_start = self.position.time_history_start();
@@ -2075,9 +2075,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
-        let slot = if flow.asset == self.instrument.underlying.quote {
+        let slot = if flow.asset.is_same_asset(&self.instrument.underlying.quote) {
             CarrySlot::Quote
-        } else if flow.asset == self.instrument.underlying.base {
+        } else if flow.asset.is_same_asset(&self.instrument.underlying.base) {
             CarrySlot::Base
         } else {
             CarrySlot::Other(flow.asset.clone())
@@ -2155,7 +2155,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         Option<ReduceOnlyCapped<InstrumentKey>>,
     )>
     where
-        AssetKey: Clone + PartialEq,
+        AssetKey: Clone + SameAsset,
         InstrumentKey: Clone + Debug,
     {
         let held = self
@@ -2578,7 +2578,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         trade: &Trade<AssetKey, InstrumentKey>,
     ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         self.replay_trade(trade, &[])
@@ -2598,7 +2598,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         reduce_only_fills: &[(TradeId, ReduceOnly)],
     ) -> FillsApplied<AssetKey, InstrumentKey, ExchangeKey>
     where
-        AssetKey: Debug + Clone + PartialEq,
+        AssetKey: Debug + Clone + SameAsset,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         // Before routing, which can return early. Only a fill of origin `Order` is ever queued for

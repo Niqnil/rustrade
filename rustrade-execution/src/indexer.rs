@@ -25,6 +25,7 @@ use crate::{
 use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
+    FeeAsset,
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
     index::error::IndexError,
@@ -930,15 +931,11 @@ impl AccountEventIndexer {
 
         let fees = match self.map.find_asset_index(&fees.asset) {
             Ok(fee_asset) => {
-                let fees_quote = if fee_asset == underlying.quote {
-                    // Fee is in quote asset — no conversion needed
-                    Some(fees.fees)
-                } else if fee_asset == underlying.base {
-                    // Fee is in base asset — convert using trade price
-                    Some(fees.fees * trade_price)
-                } else {
-                    // Fee is in third-party asset (e.g., BNB) — needs external price
-                    None
+                let fees_quote = match underlying.classify(&fee_asset) {
+                    FeeAsset::Quote => Some(fees.fees),
+                    FeeAsset::Base => Some(fees.fees * trade_price),
+                    // A third asset (such as BNB) needs that asset's price, which a fill lacks.
+                    FeeAsset::Other => None,
                 };
                 AssetFees::new(fee_asset, fees.fees, fees_quote)
             }

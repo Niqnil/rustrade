@@ -260,6 +260,11 @@ impl ExecutionInstrumentMap {
 
 /// Key each name by its ASCII-lowercased form.
 ///
+/// For asset names this is the rule
+/// [`SameAsset`](rustrade_instrument::asset::SameAsset) states for unindexed keys. The two must
+/// stay one rule, so that comparing names agrees with comparing the indices they resolve to:
+/// change one only with the other.
+///
 /// A key two names share is left out, with a `warn!`, so a lookup by it misses rather than picks
 /// one of them. [`IndexedInstruments`] rejects such a pair on one exchange, so this guards only an
 /// invariant.
@@ -597,6 +602,25 @@ mod tests {
             kraken.find_asset_name_exchange(registered).unwrap().name(),
             "USDT"
         );
+    }
+
+    /// Two venue names resolve to one index exactly when `SameAsset` calls them one asset, so an
+    /// unindexed comparison agrees with comparing the indices.
+    #[test]
+    fn same_asset_agrees_with_the_index_a_name_resolves_to() {
+        use rustrade_instrument::asset::SameAsset;
+
+        let instruments = indexed_instruments();
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+        let names = ["USDT", "usdt", "UsDt", "USDC", "usdc"].map(AssetNameExchange::new);
+
+        for left in &names {
+            for right in &names {
+                let same_index = kraken.find_asset_index(left).unwrap()
+                    == kraken.find_asset_index(right).unwrap();
+                assert_eq!(left.is_same_asset(right), same_index, "{left} and {right}");
+            }
+        }
     }
 
     #[test]

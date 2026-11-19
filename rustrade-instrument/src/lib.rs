@@ -116,6 +116,42 @@ impl<AssetKey> Underlying<AssetKey> {
             quote: quote.into(),
         }
     }
+
+    /// Which asset of this pair `asset`, a fee's asset, is: [`FeeAsset::Quote`],
+    /// [`FeeAsset::Base`], or [`FeeAsset::Other`] for a third asset, such as BNB. Compared with
+    /// [`SameAsset`](asset::SameAsset), so on unindexed keys a fee spelled unlike the base or quote
+    /// (`BTC` and `btc`) is still that asset. Quote is checked first, which matters only for a pair
+    /// whose base and quote are one asset: a fee in it is then [`FeeAsset::Quote`], already in
+    /// quote. A caller that asks only whether a fee left the base compares it with the base
+    /// directly by [`SameAsset`](asset::SameAsset).
+    pub fn classify(&self, asset: &AssetKey) -> FeeAsset
+    where
+        AssetKey: asset::SameAsset,
+    {
+        if asset.is_same_asset(&self.quote) {
+            FeeAsset::Quote
+        } else if asset.is_same_asset(&self.base) {
+            FeeAsset::Base
+        } else {
+            FeeAsset::Other
+        }
+    }
+}
+
+/// Which asset of an instrument's [`Underlying`] a fee was charged in: see
+/// [`Underlying::classify`].
+///
+/// Not `#[non_exhaustive]`: `Other` covers every asset that is neither base nor quote, so no
+/// variant can be added, and a `match` should name all three.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum FeeAsset {
+    /// The base asset: the fee leaves the quantity a spot fill delivers, and is worth its quantity
+    /// times the fill's price in quote.
+    Base,
+    /// The quote asset: the fee is already in quote.
+    Quote,
+    /// A third asset, such as BNB: valuing the fee in quote needs that asset's price.
+    Other,
 }
 
 /// [`Side`] of a trade or position - Buy or Sell.
@@ -197,4 +233,42 @@ pub mod test_utils {
 
     #[cfg(feature = "test-utils")]
     pub mod logs;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asset::name::AssetNameExchange;
+
+    fn btc_usdt() -> Underlying<AssetNameExchange> {
+        Underlying::new("btc", "usdt")
+    }
+
+    #[test]
+    fn classify_names_the_side_of_the_pair_in_any_ascii_case() {
+        let pair = btc_usdt();
+        for (asset, expected) in [
+            ("btc", FeeAsset::Base),
+            ("BTC", FeeAsset::Base),
+            ("usdt", FeeAsset::Quote),
+            ("USDT", FeeAsset::Quote),
+            ("BNB", FeeAsset::Other),
+        ] {
+            assert_eq!(
+                pair.classify(&AssetNameExchange::new(asset)),
+                expected,
+                "{asset}"
+            );
+        }
+    }
+
+    /// Quote is checked first.
+    #[test]
+    fn classify_calls_an_asset_both_sides_are_the_quote() {
+        let pair = Underlying::new("usd", "USD");
+        assert_eq!(
+            pair.classify(&AssetNameExchange::new("usd")),
+            FeeAsset::Quote
+        );
+    }
 }
