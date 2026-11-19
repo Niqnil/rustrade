@@ -411,12 +411,14 @@ pub struct AlpacaConfig {
     /// Use paper trading endpoints instead of production.
     #[serde(default = "default_paper")]
     pub paper: bool,
-    /// How long a REST request may take, from connecting to the last byte of its answer, before
-    /// it fails with [`ConnectivityError::Timeout`]. [`DEFAULT_REQUEST_TIMEOUT`] by default.
+    /// How long one attempt at a REST request may take, from connecting to the last byte of its
+    /// answer, before it fails with [`ConnectivityError::Timeout`]. [`DEFAULT_REQUEST_TIMEOUT`]
+    /// by default.
     ///
     /// It bounds every REST request: orders, cancels, order lookups, listings and each page of
-    /// account activities. It bounds each attempt: a request Alpaca refuses for its rate limit
-    /// (429) is sent again after the wait, and the retry has the whole timeout again.
+    /// account activities. A request Alpaca refuses for its rate limit (429) is sent again after
+    /// the wait, and the retry has the whole timeout again. A request refused more than once can
+    /// therefore take longer than this in all, and the waits are not counted.
     ///
     /// An order or cancel that times out may have reached Alpaca and been acted on, so it fails
     /// as [`OrderError::Connectivity`], whose outcome is unknown until the order is looked up. A
