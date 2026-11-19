@@ -989,7 +989,10 @@ mod tests {
         asset::Asset,
         index::builder::IndexedInstrumentsBuilder,
         instrument::{
-            data_venue::DataVenue, kind::future::FutureContract, quote::InstrumentQuoteAsset,
+            data_venue::DataVenue,
+            kind::future::FutureContract,
+            quote::InstrumentQuoteAsset,
+            spec::{InstrumentSpecNotional, InstrumentSpecPrice},
         },
         test_utils::asset,
     };
@@ -1111,6 +1114,33 @@ mod tests {
             .get(&InstrumentNameExchange::from("spx500_usd"))
             .unwrap();
         assert_eq!(instrument.kind, InstrumentKind::Spot);
+    }
+
+    /// A spec in the instrument's own base stays so on the mock exchange's copy.
+    #[test]
+    fn mock_instruments_keep_a_spec_in_base() {
+        let instrument = Instrument::spot(
+            EXCHANGE,
+            "spx500_usd",
+            "spx500_usd",
+            Underlying::new(asset("spx500"), asset("usd")),
+            Some(InstrumentSpec::new(
+                InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.1), dec!(0.1)),
+                InstrumentSpecNotional::new(dec!(1)),
+            )),
+        );
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument)
+            .build();
+
+        let mocked = generate_mock_exchange_instruments(&instruments, EXCHANGE);
+
+        let spec = mocked
+            .get(&InstrumentNameExchange::from("spx500_usd"))
+            .and_then(|instrument| instrument.spec.as_ref())
+            .unwrap();
+        assert_eq!(spec.quantity.unit, OrderQuantityUnits::Base);
     }
 
     /// The projection's own assertion, reached here by calling it directly. Through
