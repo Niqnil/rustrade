@@ -586,7 +586,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// account event then outranks every later source event forever: simulated time never advances and
 /// the source is never drawn again. At most [`with_feedback_limit`](Self::with_feedback_limit)
 /// account deliverables are therefore emitted with no intervening source event or venue deadline,
-/// after which the run is abandoned with [`RustradeError::SimFeedbackLoop`], readable via [`error`](Self::error).
+/// after which the run is abandoned with [`RustradeError::SimFeedbackLoop`], readable via
+/// [`error`](Self::error).
 ///
 /// # Panics
 /// Panics if a venue reports an account event or response whose exchange, asset or instrument is

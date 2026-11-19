@@ -288,8 +288,8 @@ where
     }
 
     /// Set how many account events one call may deliver with no market event or venue deadline in
-    /// between before it fails with [`RustradeError::SimFeedbackLoop`]. Each call starts afresh. Defaults to
-    /// [`DEFAULT_FEEDBACK_LIMIT`]; see [`SimRunner::with_feedback_limit`].
+    /// between before it fails with [`RustradeError::SimFeedbackLoop`]. Each call starts afresh.
+    /// Defaults to [`DEFAULT_FEEDBACK_LIMIT`]; see [`SimRunner::with_feedback_limit`].
     ///
     /// [`SimRunner::with_feedback_limit`]: super::SimRunner::with_feedback_limit
     #[must_use]
