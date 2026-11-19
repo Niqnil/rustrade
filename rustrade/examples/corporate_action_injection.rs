@@ -231,10 +231,10 @@ fn live_injection_sketch(
 ///     contract identity, so the engine's ledger stays valid.
 ///
 /// For each adjusted option position it emits one `OptionPositionAdjustedForSplit`, and — exactly as
-/// for the equity — an `OpenOrdersAtSplit` listing that option's own resting orders: a real broker
-/// price-adjusts those resting orders, so the engine cancels nothing, but a backtest wrapper must
-/// cancel them itself or the mock exchange fills the now-stale-premium order against the post-split
-/// print.
+/// for the equity — an `OpenOrdersAtSplit` listing that option's own resting orders, which the
+/// engine rescales in its view (contracts × `ratio`, premium ÷ `ratio`). The engine cancels
+/// nothing, but a backtest wrapper must cancel them itself: the simulated venue keeps them on
+/// their old terms and would fill the now-stale-premium order against the post-split print.
 ///
 /// The event is constructed **identically** to the equity-only case — only the ratio's standard-ness
 /// and the presence of option positions on the underlying change what the engine emits. (The emitted

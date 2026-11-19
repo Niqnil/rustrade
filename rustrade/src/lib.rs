@@ -194,9 +194,11 @@ pub enum EngineEvent<
     /// explicit adjustment, used identically in backtest and live.
     ///
     /// The handler is idempotent, keyed on `id` alone (see below), and adjusts **every** open
-    /// position for `instrument` (one in netting mode, N in hedging mode). It does not mutate
-    /// resting orders — a real broker price-adjusts them, so cancelling engine-side would diverge;
-    /// the open orders are surfaced as an observable output instead.
+    /// position for `instrument` (one in netting mode, N in hedging mode). It cancels no resting
+    /// order and sends nothing: a venue adjusts or cancels resting orders by its own rule. It
+    /// rescales the engine's view of each tracked order exactly, takes the venue's next report of
+    /// each as the venue's word on the split, and lists the orders, with their terms before and
+    /// after, in an observable output.
     ///
     /// # Fields
     /// - `id`: a caller-assigned **unique** action identifier (e.g. `"AAPL-2026-06-20-split"`).

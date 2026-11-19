@@ -4,7 +4,10 @@ use crate::{
         state::{
             fee::FeeConversion,
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
-            order::{Orders, applied::OrderReportsApplied, manager::OrderManager},
+            order::{
+                Orders, applied::OrderReportsApplied, manager::OrderManager,
+                split::PreparedOrdersSplit,
+            },
             position::{
                 CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
                 PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
@@ -84,13 +87,17 @@ pub struct InstrumentStates<
 ///
 /// Splitting *prepare* (fallible arithmetic) from *commit* (infallible writes) makes the whole
 /// action atomic by construction: every `Decimal` overflow — including the option **strike**
-/// division — and every corrupted option-contract count is caught while building this plan, before
-/// any position or strike is touched, so a partially-applied split is impossible. Both the live
+/// division and every tracked order's rescale — and every corrupted option-contract count is caught
+/// while building this plan, before any position, strike or order is touched, so a
+/// partially-applied split is impossible. Both the live
 /// handler and the audit replica build the plan from the same single-sourced pass, so they reach the
 /// identical accept/reject decision and identical committed values.
 pub(crate) struct SplitPlan {
     /// Pre-computed rescale for every open position on the splitting equity, in position-map order.
     pub(crate) equity_positions: Vec<(PositionId, PreparedSplit)>,
+    /// Every order the splitting equity tracks, rescaled (see "After a split" on
+    /// [`TrackedOrder`](crate::engine::state::order::TrackedOrder)).
+    pub(crate) equity_orders: PreparedOrdersSplit<ExchangeIndex, InstrumentIndex>,
     /// One entry per registered option on the underlying (held OR unheld) for a **standard** split;
     /// empty for a non-standard split (which touches no option state).
     pub(crate) options: Vec<OptionSplitPlan>,
@@ -114,6 +121,8 @@ pub(crate) struct OptionSplitPlan {
     /// Pre-computed rescale for each held position on this option, in position-map order. Empty for
     /// an unheld option (the strike correction is its whole adjustment).
     pub(crate) positions: Vec<(PositionId, PreparedSplit)>,
+    /// Every order this option tracks, rescaled: contracts × ratio, premium ÷ ratio.
+    pub(crate) orders: PreparedOrdersSplit<ExchangeIndex, InstrumentIndex>,
 }
 
 impl<InstrumentData> InstrumentStates<InstrumentData> {
@@ -322,11 +331,18 @@ impl<InstrumentData> SplitEligibleTarget<'_, InstrumentData> {
             equity_positions.push((pos_id.clone(), prepared));
         }
 
+        // Equity orders: the engine's view of each is rescaled exactly, on every split.
+        let equity_orders = equity_state
+            .orders
+            .prepare_split(ratio)
+            .map_err(|SplitError::Overflow| UnsupportedCorporateActionReason::ArithmeticOverflow)?;
+
         // Non-standard splits leave all option state untouched (the handler only emits a signal),
         // so there is nothing further to pre-compute.
         if !adjust_options_in_place {
             return Ok(SplitPlan {
                 equity_positions,
+                equity_orders,
                 options: Vec::new(),
                 options_already_adjusted: Vec::new(),
             });
@@ -390,15 +406,26 @@ impl<InstrumentData> SplitEligibleTarget<'_, InstrumentData> {
                 positions.push((pos_id.clone(), prepared));
             }
 
+            // The option's orders rescale as its positions do: contracts × ratio, premium ÷ ratio.
+            let orders =
+                option_state
+                    .orders
+                    .prepare_split(ratio)
+                    .map_err(|SplitError::Overflow| {
+                        UnsupportedCorporateActionReason::ArithmeticOverflow
+                    })?;
+
             options.push(OptionSplitPlan {
                 key: option_state.key,
                 strike_post_split,
                 positions,
+                orders,
             });
         }
 
         Ok(SplitPlan {
             equity_positions,
+            equity_orders,
             options,
             options_already_adjusted,
         })
@@ -4725,8 +4752,8 @@ mod tests {
         rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
 
         // What the corporate-action split handler does to a position it floors to zero: prune the
-        // routing entry BY VALUE, leaving the resting order itself in place for the broker to
-        // price-adjust.
+        // routing entry BY VALUE, leaving the resting order itself in place for the venue to adjust
+        // or cancel.
         state.position_ids.retain(|_, mapped| *mapped != pos);
 
         // Retiring it now makes it a demotion candidate. The join must still fail.
