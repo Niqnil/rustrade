@@ -18,7 +18,10 @@ use rustrade_instrument::{
     asset::{AssetIndex, ExchangeAsset, name::AssetNameInternal},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
-    instrument::{Instrument, InstrumentIndex},
+    instrument::{
+        Instrument, InstrumentIndex,
+        spec::{OrderQuantityUnits, StepUnavailable},
+    },
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use tracing::{debug, warn};
@@ -277,6 +280,11 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// A seed is rejected if it names an instrument the builder was not given, has a
     /// non-positive quantity, targets a slot another seed already filled, or names a slot that
     /// does not fit the [`OmsMode`] — see [`PositionSeedError`].
+    ///
+    /// Logs, once per build, each instrument without a quantity step (see
+    /// [`Instrument::try_quantity_step`]), whose positions and close orders are therefore not
+    /// rounded to one: at WARN when the instrument's spec gives no step, at DEBUG when it has no
+    /// spec, as when a backtest runs without specs.
     pub fn try_build<InstrumentData>(
         self,
     ) -> Result<EngineState<GlobalData, InstrumentData>, PositionSeedError>
@@ -343,6 +351,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             )
             .collect();
 
+        log_unavailable_quantity_steps(instruments);
+
         // Kept for the restored positions below, which name their exchange by id.
         let indexed_instruments = instruments;
 
@@ -396,6 +406,44 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             assets,
             instruments,
         })
+    }
+}
+
+/// Log each instrument of `instruments` whose quantity step is unavailable: at WARN when it has a
+/// spec that gives none, since its rounding was meant and is now off, and at DEBUG when it has no
+/// spec at all, which is normal when running without specs.
+fn log_unavailable_quantity_steps(instruments: &IndexedInstruments) {
+    for Keyed {
+        value: instrument, ..
+    } in instruments.instruments()
+    {
+        let reason = match instrument.try_quantity_step() {
+            Ok(_) => continue,
+            Err(StepUnavailable::NoSpec) => {
+                debug!(
+                    instrument = %instrument.name_internal,
+                    "instrument has no InstrumentSpec: its positions and close orders are not \
+                     rounded to a quantity step"
+                );
+                continue;
+            }
+            Err(reason) => reason,
+        };
+        // The reason names an asset by its index alone: name it too.
+        let unit_asset = match &reason {
+            StepUnavailable::OtherUnit(OrderQuantityUnits::Asset(index)) => instruments
+                .find_asset(*index)
+                .ok()
+                .map(|asset| &asset.asset.name_internal),
+            _ => None,
+        };
+        warn!(
+            instrument = %instrument.name_internal,
+            %reason,
+            unit_asset = unit_asset.map(tracing::field::display),
+            "instrument's InstrumentSpec gives no quantity step: its positions and close orders \
+             are not rounded to one"
+        );
     }
 }
 
@@ -1040,5 +1088,129 @@ mod tests {
         let _: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
             .positions([long_seed("unknown", dec!(1))])
             .build();
+    }
+
+    /// A log written by [`capture_warnings`].
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Capture `WARN` and above on this thread until the guard drops.
+    fn capture_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (log, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// A spot instrument on BTC/USDT named `name`, with a spec counting quantities in `spec`'s
+    /// unit in steps of its decimal, or no spec for `None`.
+    fn spot_with_step(
+        name: &str,
+        spec: Option<(OrderQuantityUnits<Asset>, Decimal)>,
+    ) -> Instrument<ExchangeId, Asset> {
+        use rustrade_instrument::instrument::spec::{
+            InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
+        };
+        let spec = spec.map(|(unit, step)| {
+            InstrumentSpec::new(
+                InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+                InstrumentSpecQuantity::new(unit, step, step),
+                InstrumentSpecNotional::new(Decimal::ZERO),
+            )
+        });
+        Instrument::spot(
+            ExchangeId::BinanceSpot,
+            name,
+            name.to_uppercase(),
+            Underlying::new("btc", "usdt"),
+            spec,
+        )
+    }
+
+    /// Building the state warns once about each instrument whose spec gives no quantity step,
+    /// with the reason and the asset the spec counts in by name, and not about an instrument with
+    /// a step or with no spec.
+    ///
+    /// The capture is at WARN, so the DEBUG line for no spec is not asserted. It cannot be
+    /// reliably: with this test's subscriber the only one registered, tracing computes a newly
+    /// reached callsite's interest from the reaching thread's subscriber and caches it for every
+    /// thread. The other tests here build states with spec-less instruments in parallel and with
+    /// no subscriber, so the first of them to reach that callsite caches it as disabled.
+    #[test]
+    fn an_instrument_without_a_quantity_step_is_logged_once_at_build() {
+        let instruments = IndexedInstruments::builder()
+            .add_instrument(spot_with_step(
+                "stepped",
+                Some((OrderQuantityUnits::Base, dec!(0.01))),
+            ))
+            .add_instrument(spot_with_step(
+                "in_quote",
+                Some((OrderQuantityUnits::Quote, dec!(0.01))),
+            ))
+            .add_instrument(spot_with_step(
+                "in_eth",
+                Some((
+                    OrderQuantityUnits::Asset(Asset::new_from_exchange("eth")),
+                    dec!(0.01),
+                )),
+            ))
+            .add_instrument(spot_with_step(
+                "zero_step",
+                Some((OrderQuantityUnits::Base, Decimal::ZERO)),
+            ))
+            .add_instrument(spot_with_step("no_spec", None))
+            .build();
+
+        let (log, guard) = capture_warnings();
+        let _: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ()).build();
+        drop(guard);
+
+        let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        let lines_for = |name: &str| {
+            text.lines()
+                .filter(|line| {
+                    let field = format!("instrument={name}");
+                    line.split_whitespace().any(|token| token == field)
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let only_warning = |name: &str| {
+            let lines = lines_for(name);
+            assert_eq!(lines.len(), 1, "{name}: {text}");
+            lines.into_iter().next().unwrap()
+        };
+
+        assert!(lines_for("stepped").is_empty(), "{text}");
+
+        let in_quote = only_warning("in_quote");
+        assert!(in_quote.contains("Quote"), "{in_quote}");
+        assert!(!in_quote.contains("unit_asset"), "{in_quote}");
+
+        let in_eth = only_warning("in_eth");
+        assert!(in_eth.contains("unit_asset=eth"), "{in_eth}");
+
+        let zero_step = only_warning("zero_step");
+        assert!(
+            zero_step.contains("increment 0 is not above zero"),
+            "{zero_step}"
+        );
+
+        assert!(lines_for("no_spec").is_empty(), "{text}");
     }
 }
