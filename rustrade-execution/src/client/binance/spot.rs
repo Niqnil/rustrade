@@ -490,7 +490,9 @@ impl BinanceSpot {
     ///
     /// The spec names no asset, so it fits an instrument keyed by any `AssetKey`, indexed or not,
     /// and [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
-    /// reads its step however the instrument spells its base.
+    /// reads its step however the instrument spells its base. `AssetKey` is the asset key type of
+    /// the instruments the specs are for; name it (`load_specs::<AssetNameExchange>(..)`) where
+    /// it cannot be inferred.
     ///
     /// # Errors
     /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its

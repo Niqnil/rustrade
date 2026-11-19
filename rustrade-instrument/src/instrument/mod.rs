@@ -734,7 +734,7 @@ mod tests {
     /// A spec in another unit is reported as that, whatever its increment: the unit is checked
     /// first.
     #[test]
-    fn quantity_step_is_none_unless_the_increment_is_above_zero() {
+    fn quantity_step_needs_an_increment_above_zero_and_reports_the_unit_first() {
         for increment in [Decimal::ZERO, dec!(-0.01)] {
             let instrument =
                 with_quantity_spec(instrument(None), OrderQuantityUnits::Base, increment);

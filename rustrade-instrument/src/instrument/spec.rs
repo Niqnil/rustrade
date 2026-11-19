@@ -53,14 +53,18 @@ pub enum OrderQuantityUnits<AssetKey> {
 /// Why [`Instrument::try_quantity_step`](super::Instrument::try_quantity_step) has no step.
 ///
 /// It only reports: what to do about it, refuse to start or carry on unrounded, is the caller's.
+/// Non-exhaustive, so a later reason is not a breaking change.
 #[derive(
     Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error,
 )]
+#[non_exhaustive]
 pub enum StepUnavailable<AssetKey> {
     /// The instrument has no [`InstrumentSpec`].
     #[error("the instrument has no spec")]
     NoSpec,
-    /// The spec counts quantities in a unit other than the one a position is counted in.
+    /// The spec counts quantities in a unit other than the one a position is counted in. That
+    /// includes [`OrderQuantityUnits::Base`] on a derivative whose contract is not one unit of its
+    /// base, where a position is counted in contracts.
     #[error("the spec counts quantities in {0:?}, not in the unit a position is counted in")]
     OtherUnit(OrderQuantityUnits<AssetKey>),
     /// The spec's quantity increment is not above zero.

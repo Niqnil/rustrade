@@ -24,8 +24,9 @@
 //!   and a symbol with no rules is sent unchecked, with a warning. `load_rules` on each client
 //!   loads a set of symbols ahead of their first order, and `load_specs` loads them the same way
 //!   and returns each as an `InstrumentSpec` for the symbol's
-//!   [`Instrument`](rustrade_instrument::instrument::Instrument), counted in its base asset (see
-//!   [`OrderRules::instrument_spec`](crate::rules::OrderRules::instrument_spec)).
+//!   [`Instrument`](rustrade_instrument::instrument::Instrument), counted in
+//!   [`OrderQuantityUnits::Base`](rustrade_instrument::instrument::spec::OrderQuantityUnits::Base)
+//!   (see [`OrderRules::instrument_spec`](crate::rules::OrderRules::instrument_spec)).
 //! - **Margin** has no rules endpoint of its own, so [`BinanceMargin`] uses the pair's spot
 //!   rules, which a margin order obeys.
 //! - **Turning it off.** `pre_send_rules` on each config takes
