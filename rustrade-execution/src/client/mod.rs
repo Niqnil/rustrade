@@ -110,7 +110,8 @@ pub(crate) mod reconnect_budget;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod listed_order;
 
-// A config timeout serialised as whole milliseconds. Gated on the clients that use it.
+// A config timeout read (and for IBKR also written) as whole milliseconds. Gated on the clients
+// that use it.
 #[cfg(any(feature = "alpaca", feature = "ibkr"))]
 pub(crate) mod duration_millis;
 
@@ -122,6 +123,11 @@ pub(crate) mod log_excerpt;
 #[cfg(all(test, any(feature = "alpaca", feature = "binance")))]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 pub(crate) mod test_http;
+
+// A loopback address that refuses connections, for the transport-failure tests.
+#[cfg(all(test, any(feature = "alpaca", feature = "hyperliquid")))]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+pub(crate) mod test_refusing;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
