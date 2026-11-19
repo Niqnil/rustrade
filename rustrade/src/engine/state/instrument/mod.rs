@@ -6253,11 +6253,11 @@ mod tests {
         state
     }
 
-    /// The harness instrument, netting, with a base-asset step of 0.01.
+    /// The harness instrument, netting, with a step of 0.01 in its base.
     fn stepped_state() -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
         with_quantity_step(
             instrument_state(OmsMode::Netting),
-            OrderQuantityUnits::Asset,
+            |_| OrderQuantityUnits::Base,
             dec!(0.01),
         )
     }

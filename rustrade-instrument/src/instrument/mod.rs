@@ -10,7 +10,7 @@ use crate::{
         market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
         name::{InstrumentNameExchange, InstrumentNameInternal},
         quote::InstrumentQuoteAsset,
-        spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
+        spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits, StepUnavailable},
     },
 };
 use derive_more::{Constructor, Display};
@@ -199,31 +199,74 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// [`InstrumentSpec`]'s quantity increment, when the spec counts quantities in the unit a
     /// position is counted in. `None` otherwise.
     ///
-    /// A position is counted in the base asset on [`InstrumentKind::Spot`], and in contracts on a
-    /// derivative. So the spec's unit must be [`OrderQuantityUnits::Asset`] of the base asset on
-    /// spot, and [`OrderQuantityUnits::Contract`] on a derivative. A derivative whose contract is
-    /// one unit of its base (`contract_size` 1) accepts the base asset too, since the two units
-    /// are then the same. A step in [`OrderQuantityUnits::Quote`], in another asset, or not above
-    /// zero says nothing about a position's quantity, so it gives `None`, as no spec does.
+    /// [`try_quantity_step`](Self::try_quantity_step) gives the same step, or says why there is
+    /// none; this is it with the reason dropped.
     ///
     /// Round a quantity to it with [`round_toward_zero_to_step`].
     pub fn quantity_step(&self) -> Option<Decimal>
     where
         AssetKey: PartialEq,
     {
-        let quantity = &self.spec.as_ref()?.quantity;
-        let counts_positions = match (&self.kind, &quantity.unit) {
-            (InstrumentKind::Spot, OrderQuantityUnits::Asset(asset)) => {
-                *asset == self.underlying.base
-            }
-            (InstrumentKind::Spot, OrderQuantityUnits::Contract) => false,
-            (_, OrderQuantityUnits::Contract) => true,
-            (kind, OrderQuantityUnits::Asset(asset)) => {
-                kind.contract_size() == Decimal::ONE && *asset == self.underlying.base
-            }
-            (_, OrderQuantityUnits::Quote) => false,
+        self.step_or_reason().ok()
+    }
+
+    /// The step a position in this `Instrument`, and an order closing it, is sized in, or why
+    /// there is none.
+    ///
+    /// A position is counted in the base asset on [`InstrumentKind::Spot`], and in contracts on a
+    /// derivative. The step is the [`InstrumentSpec`]'s quantity increment when the spec counts in
+    /// that unit:
+    /// - On spot, [`OrderQuantityUnits::Base`], or [`OrderQuantityUnits::Asset`] whose key equals
+    ///   the base's.
+    /// - On a derivative, [`OrderQuantityUnits::Contract`]. A derivative whose contract is one unit
+    ///   of its base (`contract_size` 1) accepts the base too, either way, since the two units are
+    ///   then the same.
+    ///
+    /// # Errors
+    /// In the order they are checked:
+    /// - [`StepUnavailable::NoSpec`] when there is no spec.
+    /// - [`StepUnavailable::OtherUnit`], naming the spec's unit, when it is
+    ///   [`OrderQuantityUnits::Quote`], another asset, or a unit the kind does not count positions
+    ///   in. On an unindexed instrument an [`OrderQuantityUnits::Asset`] spelled unlike the base
+    ///   (`btc` and `BTC`) is another asset; [`OrderQuantityUnits::Base`] cannot be.
+    /// - [`StepUnavailable::NotPositive`] when the increment is not above zero.
+    ///
+    /// Round a quantity to the step with [`round_toward_zero_to_step`].
+    pub fn try_quantity_step(&self) -> Result<Decimal, StepUnavailable<AssetKey>>
+    where
+        AssetKey: PartialEq + Clone,
+    {
+        self.step_or_reason().map_err(|reason| match reason {
+            Unavailable::NoSpec => StepUnavailable::NoSpec,
+            Unavailable::OtherUnit(unit) => StepUnavailable::OtherUnit(unit.clone()),
+            Unavailable::NotPositive(step) => StepUnavailable::NotPositive(step),
+        })
+    }
+
+    /// [`try_quantity_step`](Self::try_quantity_step)'s rule, borrowing the unit it reports so
+    /// that [`quantity_step`](Self::quantity_step) needs no `Clone`.
+    fn step_or_reason(&self) -> Result<Decimal, Unavailable<'_, AssetKey>>
+    where
+        AssetKey: PartialEq,
+    {
+        let quantity = &self.spec.as_ref().ok_or(Unavailable::NoSpec)?.quantity;
+        let counts_in_base = |unit: &OrderQuantityUnits<AssetKey>| match unit {
+            OrderQuantityUnits::Base => true,
+            OrderQuantityUnits::Asset(asset) => *asset == self.underlying.base,
+            OrderQuantityUnits::Contract | OrderQuantityUnits::Quote => false,
         };
-        (counts_positions && quantity.increment > Decimal::ZERO).then_some(quantity.increment)
+        let counts_positions = match (&self.kind, &quantity.unit) {
+            (InstrumentKind::Spot, unit) => counts_in_base(unit),
+            (_, OrderQuantityUnits::Contract) => true,
+            (kind, unit) => kind.contract_size() == Decimal::ONE && counts_in_base(unit),
+        };
+        if !counts_positions {
+            return Err(Unavailable::OtherUnit(&quantity.unit));
+        }
+        if quantity.increment <= Decimal::ZERO {
+            return Err(Unavailable::NotPositive(quantity.increment));
+        }
+        Ok(quantity.increment)
     }
 
     /// Map this Instruments `ExchangeKey` to a new key, using the provided lookup closure.
@@ -333,6 +376,7 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
                     }
                     OrderQuantityUnits::Contract => OrderQuantityUnits::Contract,
                     OrderQuantityUnits::Quote => OrderQuantityUnits::Quote,
+                    OrderQuantityUnits::Base => OrderQuantityUnits::Base,
                 };
 
                 Some(InstrumentSpec {
@@ -361,6 +405,13 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
             data_venue,
         })
     }
+}
+
+/// [`StepUnavailable`] with the unit borrowed from the spec.
+enum Unavailable<'a, AssetKey> {
+    NoSpec,
+    OtherUnit(&'a OrderQuantityUnits<AssetKey>),
+    NotPositive(Decimal),
 }
 
 /// `quantity` rounded toward zero to a whole multiple of `step`, on either side of zero. A
@@ -592,18 +643,38 @@ mod tests {
     #[test]
     fn quantity_step_is_the_spot_increment_in_the_base_asset() {
         let aapl = Asset::new_from_exchange("aapl");
-        let spot = with_quantity_spec(
-            instrument(None),
-            OrderQuantityUnits::Asset(aapl),
-            dec!(0.01),
-        );
+        for unit in [OrderQuantityUnits::Base, OrderQuantityUnits::Asset(aapl)] {
+            let spot = with_quantity_spec(instrument(None), unit.clone(), dec!(0.01));
 
-        assert_eq!(spot.quantity_step(), Some(dec!(0.01)));
+            assert_eq!(spot.quantity_step(), Some(dec!(0.01)), "{unit:?}");
+            assert_eq!(spot.try_quantity_step(), Ok(dec!(0.01)), "{unit:?}");
+        }
+    }
+
+    /// `Base` names no asset, so the base's spelling cannot make it another one, where `Asset`
+    /// spelled unlike the base is another asset on an unindexed instrument.
+    #[test]
+    fn quantity_step_in_base_does_not_depend_on_the_base_s_spelling() {
+        let mut spot = with_quantity_spec(instrument(None), OrderQuantityUnits::Base, dec!(0.01));
+        spot.underlying.base = Asset::new_from_exchange("AAPL");
+        assert_eq!(spot.try_quantity_step(), Ok(dec!(0.01)));
+
+        let named = OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
+        let mut spot = with_quantity_spec(instrument(None), named.clone(), dec!(0.01));
+        spot.underlying.base = Asset::new_from_exchange("AAPL");
+        assert_eq!(
+            spot.try_quantity_step(),
+            Err(StepUnavailable::OtherUnit(named))
+        );
     }
 
     #[test]
     fn quantity_step_is_none_without_a_spec() {
         assert_eq!(instrument(None).quantity_step(), None);
+        assert_eq!(
+            instrument(None).try_quantity_step(),
+            Err(StepUnavailable::NoSpec)
+        );
     }
 
     #[test]
@@ -624,11 +695,21 @@ mod tests {
                 OrderQuantityUnits::Quote,
             ),
             ("perpetual of 100 in base", perpetual(dec!(100)), base()),
+            (
+                "perpetual of 100 in Base",
+                perpetual(dec!(100)),
+                OrderQuantityUnits::Base,
+            ),
         ];
 
         for (case, instrument, unit) in cases {
-            let instrument = with_quantity_spec(instrument, unit, dec!(0.01));
+            let instrument = with_quantity_spec(instrument, unit.clone(), dec!(0.01));
             assert_eq!(instrument.quantity_step(), None, "{case}");
+            assert_eq!(
+                instrument.try_quantity_step(),
+                Err(StepUnavailable::OtherUnit(unit)),
+                "{case}"
+            );
         }
     }
 
@@ -639,24 +720,73 @@ mod tests {
             OrderQuantityUnits::Contract,
             Decimal::ONE,
         );
-        let in_base = with_quantity_spec(
-            perpetual(Decimal::ONE),
-            OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl")),
-            dec!(0.001),
-        );
-
         assert_eq!(in_contracts.quantity_step(), Some(Decimal::ONE));
-        assert_eq!(in_base.quantity_step(), Some(dec!(0.001)));
+        assert_eq!(in_contracts.try_quantity_step(), Ok(Decimal::ONE));
+
+        let aapl = OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
+        for unit in [OrderQuantityUnits::Base, aapl] {
+            let in_base = with_quantity_spec(perpetual(Decimal::ONE), unit.clone(), dec!(0.001));
+            assert_eq!(in_base.quantity_step(), Some(dec!(0.001)), "{unit:?}");
+            assert_eq!(in_base.try_quantity_step(), Ok(dec!(0.001)), "{unit:?}");
+        }
+    }
+
+    /// A spec in another unit is reported as that, whatever its increment: the unit is checked
+    /// first.
+    #[test]
+    fn quantity_step_is_none_unless_the_increment_is_above_zero() {
+        for increment in [Decimal::ZERO, dec!(-0.01)] {
+            let instrument =
+                with_quantity_spec(instrument(None), OrderQuantityUnits::Base, increment);
+            assert_eq!(instrument.quantity_step(), None, "increment {increment}");
+            assert_eq!(
+                instrument.try_quantity_step(),
+                Err(StepUnavailable::NotPositive(increment)),
+                "increment {increment}"
+            );
+
+            let in_quote =
+                with_quantity_spec(instrument.clone(), OrderQuantityUnits::Quote, increment);
+            assert_eq!(
+                in_quote.try_quantity_step(),
+                Err(StepUnavailable::OtherUnit(OrderQuantityUnits::Quote)),
+                "increment {increment}"
+            );
+        }
     }
 
     #[test]
-    fn quantity_step_is_none_unless_the_increment_is_above_zero() {
-        let aapl = || OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
-
-        for increment in [Decimal::ZERO, dec!(-0.01)] {
-            let instrument = with_quantity_spec(instrument(None), aapl(), increment);
-            assert_eq!(instrument.quantity_step(), None, "increment {increment}");
+    fn step_unavailable_says_why() {
+        let cases = [
+            (
+                StepUnavailable::<Asset>::NoSpec,
+                "the instrument has no spec",
+            ),
+            (
+                StepUnavailable::OtherUnit(OrderQuantityUnits::Quote),
+                "the spec counts quantities in Quote, not in the unit a position is counted in",
+            ),
+            (
+                StepUnavailable::NotPositive(Decimal::ZERO),
+                "the spec's quantity increment 0 is not above zero",
+            ),
+        ];
+        for (reason, message) in cases {
+            assert_eq!(reason.to_string(), message);
         }
+    }
+
+    #[test]
+    fn mapping_the_asset_key_keeps_a_spec_in_base() {
+        let spot = with_quantity_spec(instrument(None), OrderQuantityUnits::Base, dec!(0.01));
+        let mapped = spot
+            .map_asset_key_with_lookup(|asset| Ok::<_, ()>(asset.name_internal.clone()))
+            .unwrap();
+
+        assert_eq!(
+            mapped.spec.map(|spec| spec.quantity.unit),
+            Some(OrderQuantityUnits::Base)
+        );
     }
 
     #[test]

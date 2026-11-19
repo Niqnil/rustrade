@@ -788,6 +788,7 @@ pub(crate) fn generate_mock_exchange_instruments(
                             }
                             OrderQuantityUnits::Contract => OrderQuantityUnits::Contract,
                             OrderQuantityUnits::Quote => OrderQuantityUnits::Quote,
+                            OrderQuantityUnits::Base => OrderQuantityUnits::Base,
                         };
 
                         Some(InstrumentSpec {

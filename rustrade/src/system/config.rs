@@ -138,6 +138,7 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                         }
                         OrderQuantityUnits::Contract => OrderQuantityUnits::Contract,
                         OrderQuantityUnits::Quote => OrderQuantityUnits::Quote,
+                        OrderQuantityUnits::Base => OrderQuantityUnits::Base,
                     },
                     min: spec.quantity.min,
                     increment: spec.quantity.increment,

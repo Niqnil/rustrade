@@ -292,14 +292,9 @@ mod tests {
             .into_iter()
             .zip(state.instruments.0.values_mut())
         {
-            let base = instrument_state.instrument.underlying.base;
             instrument_state.instrument.spec = Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(
-                    OrderQuantityUnits::Asset(base),
-                    dec!(0.01),
-                    dec!(0.01),
-                ),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.01), dec!(0.01)),
                 InstrumentSpecNotional::new(Decimal::ZERO),
             ));
             let mut position = long(held);

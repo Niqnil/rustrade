@@ -1103,11 +1103,7 @@ fn build_engine_with_deadlines(
             Underlying::new("btc", "usdt"),
             Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(
-                    OrderQuantityUnits::Quote,
-                    dec!(0.00001),
-                    dec!(0.00001),
-                ),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.00001), dec!(0.00001)),
                 InstrumentSpecNotional::new(dec!(5.0)),
             )),
         ))
@@ -1118,7 +1114,7 @@ fn build_engine_with_deadlines(
             Underlying::new("eth", "btc"),
             Some(InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.00001), dec!(0.00001)),
-                InstrumentSpecQuantity::new(OrderQuantityUnits::Quote, dec!(0.0001), dec!(0.0001)),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.0001), dec!(0.0001)),
                 InstrumentSpecNotional::new(dec!(0.0001)),
             )),
         ))

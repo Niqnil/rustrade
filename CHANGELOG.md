@@ -26,15 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderRules::instrument_spec(unit)` describes the rules as an `InstrumentSpec`, and
   `BinanceSpot::load_specs` / `BinanceMargin::load_specs` load a set of symbols' rules from
   `exchangeInfo` (holding them for the pre-send check, as `load_rules` does) and return each as a
-  spec counted in the symbol's base asset, named as Binance names it (`BTC`). The spec's quantity
-  step, which `Instrument::quantity_step` gives the engine to round a position to when a fill's fee
-  is taken from the base asset, is the grid a market order's quantity must sit on: the grid the
-  lot and market lot steps share, or the lot step where the market step is off. A position on it
-  can be closed by an order of any kind. The quantity minimum is the larger of the two, and the
-  price minimum and tick and the notional minimum carry over. When a `Decimal` cannot hold the
-  shared grid, the conversion fails with `InstrumentSpecError::QuantityGridOverflow` rather than
-  taking the finer step. A spec is a copy of the rules as loaded: a later reload of the rules does
-  not change it.
+  spec counted in `OrderQuantityUnits::Base`, for an instrument keyed by any asset type. The
+  spec's quantity step, which `Instrument::quantity_step` gives the engine to round a position to
+  when a fill's fee is taken from the base asset, is the grid a market order's quantity must sit
+  on: the grid the lot and market lot steps share, or the lot step where the market step is off.
+  A position on it can be closed by an order of any kind. The quantity minimum is the larger of
+  the two, and the price minimum and tick and the notional minimum carry over. When a `Decimal`
+  cannot hold the shared grid, the conversion fails with
+  `InstrumentSpecError::QuantityGridOverflow` rather than taking the finer step. A spec is a copy
+  of the rules as loaded: a later reload of the rules does not change it.
 - **Hyperliquid clients follow an order the venue replaces.** A modify gives an order a new venue
   id and restarts its size and fill. The account stream now reports the new order linked to the
   one it replaced (`OrderReport::replaces`), with the fill of the old order added back to its
@@ -532,6 +532,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under one client order id onto another.
 
 ### Changed
+- **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
+  (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
+  asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had
+  to name the base as `OrderQuantityUnits::Asset`, and on an unindexed instrument a name spelled
+  unlike the base's (`BTC` and `btc`) made `Instrument::quantity_step` return `None` with no
+  error. `Asset` keeps its rule, and an instrument index registers no asset for `Base`.
+  `Instrument::try_quantity_step` returns the same step as `quantity_step`, or a
+  `StepUnavailable` saying why there is none: `NoSpec`, `OtherUnit` naming the spec's unit, or
+  `NotPositive` with the increment. A `match` on `OrderQuantityUnits` needs an arm for `Base`.
 - **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
   rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as
   an `OrderSnapshot` of a cancelled order with what it filled, instead of `OrderCancelled`, so a

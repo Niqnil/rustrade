@@ -319,6 +319,10 @@ impl OrderRules {
 
     /// These rules as an [`InstrumentSpec`] whose quantity is counted in `unit`.
     ///
+    /// For rules that count an order's quantity in the instrument's own base asset, as on spot,
+    /// pass [`OrderQuantityUnits::Base`]: it names no asset, so the spec fits any `AssetKey` and
+    /// cannot disagree with the base an instrument gives it.
+    ///
     /// The spec has one quantity step where these rules have two, one for every order and one
     /// more for a market order. It takes the grid a market order's quantity must sit on, the one
     /// [`round_quantity_down`](Self::round_quantity_down) rounds a market order to: the grid
@@ -1448,7 +1452,7 @@ mod tests {
     }
 
     /// The spec of BTCUSDT-like rules with a lot step of `lot` and a market step of `market`,
-    /// each `0` for off, counted in BTC. Steps whose shared grid a `Decimal` holds.
+    /// each `0` for off, counted in the base. Steps whose shared grid a `Decimal` holds.
     fn spec_with_steps(lot: Decimal, market: Decimal) -> InstrumentSpec<&'static str> {
         let rules = OrderRules::new(
             ValueRule::new(dec!(0.01), dec!(1000000), dec!(0.01)),
@@ -1456,7 +1460,7 @@ mod tests {
             ValueRule::new(dec!(0), dec!(10), market),
             ValueRule::new(dec!(5), dec!(9000000), dec!(0)),
         );
-        match rules.instrument_spec(OrderQuantityUnits::Asset("btc")) {
+        match rules.instrument_spec(OrderQuantityUnits::Base) {
             Ok(spec) => spec,
             Err(error) => panic!("steps {lot} and {market}: {error}"),
         }
@@ -1469,11 +1473,7 @@ mod tests {
             spec,
             InstrumentSpec::new(
                 InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                InstrumentSpecQuantity::new(
-                    OrderQuantityUnits::Asset("btc"),
-                    dec!(0.001),
-                    dec!(0.001)
-                ),
+                InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.001), dec!(0.001)),
                 InstrumentSpecNotional::new(dec!(5)),
             )
         );
@@ -1546,7 +1546,8 @@ mod tests {
         );
     }
 
-    /// The spec's step is the one an instrument rounds positions to.
+    /// The spec's step is the one an instrument rounds positions to, however the instrument
+    /// spells its base.
     #[test]
     fn a_spec_gives_a_spot_instrument_its_quantity_step() {
         use rustrade_instrument::{Underlying, exchange::ExchangeId, instrument::Instrument};
@@ -1555,7 +1556,7 @@ mod tests {
             ExchangeId::BinanceSpot,
             "binance_spot-btc_usdt",
             "BTCUSDT",
-            Underlying::new("btc", "usdt"),
+            Underlying::new("BTC", "USDT"),
             Some(spec_with_steps(dec!(0.05), dec!(0.02))),
         );
         assert_eq!(instrument.quantity_step(), Some(dec!(0.1)));

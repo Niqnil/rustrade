@@ -657,35 +657,27 @@ impl BinanceMargin {
 
     /// Load the order rules of `instruments` from Binance now, as
     /// [`load_rules`](Self::load_rules) does, and return each instrument's as an
-    /// [`InstrumentSpec`] whose quantity is counted in the symbol's base asset, named as Binance
-    /// names it (`BTC`). The rules are the pair's spot rules, as
+    /// [`InstrumentSpec`] whose quantity is counted in
+    /// [`OrderQuantityUnits::Base`](rustrade_instrument::instrument::spec::OrderQuantityUnits::Base),
+    /// the instrument's own base asset. The rules are the pair's spot rules, as
     /// [`load_rules`](Self::load_rules) says.
     ///
     /// The spec's quantity step is the grid a market order's quantity sits on, which an order of
     /// any kind can close: see [`OrderRules::instrument_spec`]. It is a copy of the rules as
     /// loaded; the rules this client checks orders against are reloaded later, the spec is not.
     ///
-    /// The base asset's name must match the one the instrument's
-    /// [`Underlying`](rustrade_instrument::Underlying) gives its base, or
-    /// [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
-    /// reads no step from the spec. On an instrument keyed by [`AssetNameExchange`], the names
-    /// are compared as spelled, so a base spelled `btc` reads no step from a spec in `BTC`, with
-    /// no error. An instrument to be indexed takes the spec re-keyed to the asset it gives its
-    /// base, mapping the name as its underlying's are mapped; building the index from two names
-    /// of one exchange that differ only in case fails.
+    /// The spec names no asset, so it fits an instrument keyed by any `AssetKey`, indexed or not,
+    /// and [`Instrument::quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step)
+    /// reads its step however the instrument spells its base.
     ///
     /// # Errors
     /// As [`load_rules`](Self::load_rules). An instrument whose rules make no spec maps to its
-    /// [`InstrumentSpecError`]. One Binance lists without a base asset is left out, with a
-    /// warning.
-    pub async fn load_specs(
+    /// [`InstrumentSpecError`].
+    pub async fn load_specs<AssetKey>(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<
-        HashMap<
-            InstrumentNameExchange,
-            Result<InstrumentSpec<AssetNameExchange>, InstrumentSpecError>,
-        >,
+        HashMap<InstrumentNameExchange, Result<InstrumentSpec<AssetKey>, InstrumentSpecError>>,
         UnindexedClientError,
     > {
         self.rules.load_specs(instruments).await
@@ -7001,7 +6993,7 @@ mod tests {
         );
     }
 
-    /// `load_specs` returns each pair's spot rules as a spec counted in its base asset, and holds
+    /// `load_specs` returns each pair's spot rules as a spec counted in its base, and holds
     /// the rules, so the first order needs no load.
     #[tokio::test]
     async fn load_specs_returns_the_specs_and_the_first_order_reuses_the_rules() {
@@ -7019,18 +7011,16 @@ mod tests {
         let client = margin_client_at(&server, false);
         let btcusdt = InstrumentNameExchange::new("BTCUSDT");
 
-        let loaded = client.load_specs(std::slice::from_ref(&btcusdt)).await;
+        let loaded = client
+            .load_specs::<AssetNameExchange>(std::slice::from_ref(&btcusdt))
+            .await;
         assert_eq!(
             loaded,
             Ok(HashMap::from([(
                 btcusdt.clone(),
                 Ok(InstrumentSpec::new(
                     InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
-                    InstrumentSpecQuantity::new(
-                        OrderQuantityUnits::Asset(AssetNameExchange::new("BTC")),
-                        dec!(0.001),
-                        dec!(0.001),
-                    ),
+                    InstrumentSpecQuantity::new(OrderQuantityUnits::Base, dec!(0.001), dec!(0.001)),
                     InstrumentSpecNotional::new(dec!(5)),
                 )),
             )]))
