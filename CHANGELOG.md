@@ -918,6 +918,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     adopts the terms a report states (see Added, "The engine tracks an order on the terms the
     venue states").
 
+- **New dependency releases wait 7 days before this workspace takes them** (development and
+  CI only; dependents are unaffected). Malicious releases are usually found and yanked within
+  hours, so the wait keeps a short-lived one out.
+  - **Dependabot** holds back version updates for crates, GitHub Actions and the Rust toolchain
+    until a release is 7 days old. Patch updates outside the high-risk list merge without review
+    once CI passes, so this matters most for them.
+  - **Cargo** (`.cargo/config.toml`, Cargo 1.100+) resolves no crates.io release younger than 7
+    days, in `cargo update`, the weekly latest-deps job and Dependabot's own cargo runs. So a
+    crate's Dependabot security update waits until the fix is 7 days old (GitHub Actions and
+    toolchain security updates do not). An exact (`=`) requirement on a younger release makes
+    `cargo update` fail as "too new"; `CONTRIBUTING.md` gives the override.
+  - **For users:** the window does not reach a dependent's build, which resolves rustrade's
+    dependencies itself. The README's "Dependency Security" section and the `rustrade` crate docs
+    show how to set the same window in your own Cargo config.
+
 ### Fixed
 
 - **`fetch_balances` matches assets ignoring case, and Hyperliquid honours the filter**

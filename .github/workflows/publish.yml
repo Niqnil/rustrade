@@ -95,9 +95,17 @@ jobs:
       # The script publishes with `--no-verify`, so no build script or proc macro runs while the
       # token is set; the validate job, which has no token, builds and tests the tree. Dropping that
       # flag would hand the token to every dependency's build script.
+      #
+      # Packaging a crate resolves its dependencies, including the workspace crates this run
+      # published seconds earlier, from the crates.io index, where `.cargo/config.toml`'s 7-day
+      # minimum publish age refuses them as too new (checked with `cargo package` on Cargo 1.100).
+      # The override lifts it for this step only. Other dependencies stay as the committed
+      # `Cargo.lock` locks them: the validate job builds `--locked`, so a lock that does not cover
+      # every requirement fails there, before anything is published.
       - name: Publish crates
         run: ./.github/scripts/publish-crates.sh
         env:
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
           RELEASE_TAG: ${{ github.ref_name }}
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
