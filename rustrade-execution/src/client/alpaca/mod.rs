@@ -429,7 +429,7 @@ pub struct AlpacaConfig {
     #[serde(
         rename = "request_timeout_ms",
         default = "default_request_timeout",
-        with = "crate::client::duration_millis"
+        deserialize_with = "crate::client::duration_millis::deserialize"
     )]
     pub request_timeout: Duration,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
