@@ -50,7 +50,7 @@
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
     InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::{AssetBalance, Balance, is_requested},
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead},
     client::{
         BracketOrderClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
@@ -4712,12 +4712,13 @@ fn convert_account_to_balances(
     assets: &[AssetNameExchange],
     time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    if !assets.is_empty() && !assets.iter().any(is_usd) {
+    let usd = AssetNameExchange::new(USD);
+    if !is_requested(assets, &usd) {
         return Vec::new();
     }
 
     vec![AssetBalance::new(
-        AssetNameExchange::new(USD),
+        usd,
         Balance::new(
             account.cash,
             account.cash.min(account.non_marginable_buying_power),
@@ -4746,20 +4747,13 @@ fn convert_positions_to_balances(
         .iter()
         .filter(|p| is_crypto_position(p))
         .filter_map(|p| {
-            let base = crypto_position_asset(&p.symbol);
-
-            // Apply assets filter if specified.
-            if !assets.is_empty()
-                && !assets
-                    .iter()
-                    .any(|a| a.name().as_str().eq_ignore_ascii_case(base))
-            {
+            let asset_name = AssetNameExchange::new(crypto_position_asset(&p.symbol));
+            if !is_requested(assets, &asset_name) {
                 return None;
             }
 
             // total and free are in base currency units (e.g., BTC), not USD,
             // consistent with AssetBalance semantics for currency/crypto assets.
-            let asset_name = AssetNameExchange::new(base);
             Some(AssetBalance::new(
                 asset_name,
                 Balance::new(p.qty, p.qty_available),

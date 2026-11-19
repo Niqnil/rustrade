@@ -2,7 +2,7 @@
 
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::{AssetBalance, MarginDetails},
+    balance::{AssetBalance, MarginDetails, is_requested},
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
     client::mock::{AmendConfig, MockExecutionConfig, SessionCalendarConfig, TimeInForceRules},
@@ -4293,7 +4293,7 @@ impl SimulatedVenue {
         // Empty slice means "return all" (consistent with account_snapshot behavior).
         self.account
             .balances()
-            .filter(|balance| assets.is_empty() || assets.contains(&balance.asset))
+            .filter(|balance| is_requested(assets, &balance.asset))
             .cloned()
             .collect()
     }
@@ -8738,6 +8738,28 @@ mod tests {
 
     fn make_venue(btc: &str, usdt: &str) -> SimulatedVenue {
         make_venue_with_fee(btc, usdt, FeeModelConfig::default())
+    }
+
+    /// A balance read returns the assets asked for, in any spelling, under the configured one.
+    #[test]
+    fn balances_are_filtered_by_asset_ignoring_case() {
+        let venue = make_venue("1", "1000");
+        let names = |assets: &[AssetNameExchange]| {
+            let mut names = venue
+                .balances(assets)
+                .into_iter()
+                .map(|balance| balance.asset.name().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        assert_eq!(names(&[AssetNameExchange::new("usdt")]), ["USDT"]);
+        assert_eq!(
+            names(&[AssetNameExchange::new("eth")]),
+            Vec::<String>::new()
+        );
+        assert_eq!(names(&[]), ["BTC", "USDT"]);
     }
 
     fn make_venue_with_fee(btc: &str, usdt: &str, fee_model: FeeModelConfig) -> SimulatedVenue {

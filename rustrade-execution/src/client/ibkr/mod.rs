@@ -204,7 +204,7 @@ mod shortability;
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
-    balance::AssetBalance,
+    balance::{AssetBalance, is_requested},
     client::{
         BracketOrderClient, ClientInstrument, ExecutionClient, OrderStatusClient,
         dedup::new_dedup_cache,
@@ -3467,11 +3467,7 @@ impl ExecutionClient for IbkrClient {
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
         let client = self.client.clone();
-        let assets_filter: Option<HashSet<AssetNameExchange>> = if assets.is_empty() {
-            None
-        } else {
-            Some(assets.iter().cloned().collect())
-        };
+        let assets = assets.to_vec();
 
         tokio::task::spawn_blocking(move || {
             // The balances' time: the summary describes the account no earlier than this.
@@ -3489,9 +3485,7 @@ impl ExecutionClient for IbkrClient {
             )?
             .to_balances(sent);
 
-            if let Some(ref filter) = assets_filter {
-                balances.retain(|b| filter.contains(&b.asset));
-            }
+            balances.retain(|balance| is_requested(&assets, &balance.asset));
 
             Ok(balances)
         })
