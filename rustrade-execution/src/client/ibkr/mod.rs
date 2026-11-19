@@ -336,7 +336,7 @@ pub struct IbkrConfig {
     #[serde(
         rename = "shortability_timeout_ms",
         default = "default_shortability_timeout",
-        with = "duration_millis"
+        with = "crate::client::duration_millis"
     )]
     pub shortability_timeout: std::time::Duration,
 }
@@ -344,27 +344,6 @@ pub struct IbkrConfig {
 /// `#[serde(default = "…")]` takes a function, not a constant.
 fn default_shortability_timeout() -> std::time::Duration {
     DEFAULT_SHORTABILITY_TIMEOUT
-}
-
-/// A [`Duration`](std::time::Duration) as a whole number of milliseconds, so a config file
-/// writes `10000` rather than the `{ secs, nanos }` serde gives it by default.
-mod duration_millis {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub(super) fn serialize<S: Serializer>(
-        duration: &Duration,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        // Saturates rather than fails: no timeout needs more than u64::MAX milliseconds.
-        serializer.serialize_u64(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Duration, D::Error> {
-        u64::deserialize(deserializer).map(Duration::from_millis)
-    }
 }
 
 impl IbkrConfig {

@@ -110,6 +110,10 @@ pub(crate) mod reconnect_budget;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod listed_order;
 
+// A config timeout serialised as whole milliseconds. Gated on the clients that use it.
+#[cfg(any(feature = "alpaca", feature = "ibkr"))]
+pub(crate) mod duration_millis;
+
 // Excerpts of venue text for log lines. Gated on the clients that use it.
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod log_excerpt;
