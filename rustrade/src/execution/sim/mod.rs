@@ -423,6 +423,11 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// to its own state when the cancels arrive. The venue's balances, and options on the instrument,
 /// keep their pre-split terms: see the method's `# What it does not do yet`.
 ///
+/// The split cancels only what the venue holds when the runner takes it from the source. An order
+/// the `Engine` sent before the split that reaches the venue after it, one `to_venue` leg later,
+/// arrives as a new order on its pre-split terms and is not cancelled, as at a live venue that
+/// receives it after its own cancel.
+///
 /// `class` is compared inside the queue's own ordering, not only where the queue is weighed against
 /// the source. Comparing it at the peek alone would let the queue hand back a low-priority entry
 /// while a high-priority one sat behind it at the same instant.
@@ -1162,11 +1167,11 @@ where
 ///
 /// A [`CorporateAction`](EngineEvent::CorporateAction) is handed to the venues too: see
 /// [`route_corporate_action`]. Anything else that is not a market data item is ignored, an account
-/// event or a command, except a reconnect. A reconnect carries no price, and is deliberately *not* treated as clearing the
-/// market: a gap in a feed does not mean the instrument stopped having a price, and a venue that
-/// forgot its market on every reconnect would refuse to match orders it should have matched. It
-/// does say that nothing more is arriving from its exchange, so each venue marks the instruments
-/// it trades whose market data comes from that exchange with
+/// event or a command, except a reconnect. A reconnect carries no price, and is deliberately *not*
+/// treated as clearing the market: a gap in a feed does not mean the instrument stopped having a
+/// price, and a venue that forgot its market on every reconnect would refuse to match orders it
+/// should have matched. It does say that nothing more is arriving from its exchange, so each venue
+/// marks the instruments it trades whose market data comes from that exchange with
 /// [`SimulatedVenue::mark_market_stale`] at `time`, the instant the source carried it at. Only
 /// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) reads the mark.
 /// The end of the data needs no mark: nothing arrives after it, and
@@ -1323,10 +1328,10 @@ where
             continue;
         };
 
-        let name = name.clone();
+        // No clone: the name borrows `slot.indexer`, a field apart from `slot.venue`.
         let outcome = slot
             .venue
-            .apply_corporate_action(id, &name, kind, effective_time);
+            .apply_corporate_action(id, name, kind, effective_time);
         applied |= outcome.response == CorporateActionResponse::Applied;
 
         // The action moves the venue's clock, and cancelling an order can end a loan, so either

@@ -204,8 +204,12 @@ pub struct VenueInstrumentMarket {
     /// the next [`apply_market`](SimulatedVenue::apply_market) on the instrument, fresh or not.
     /// While it is set, [`snapshot`](Self::snapshot) still values what the account holds, but no
     /// order trades against it: on a [`MarketDriven`](VenueRegime::MarketDriven) venue a market
-    /// order is refused as unpriced, and a limit order, whether it arrives or is amended, rests
-    /// uncrossed, as on an instrument the venue was never fed.
+    /// order is refused as unpriced, under [`MarketOrderTiming::NextBar`] too, since its hold is
+    /// costed at this market. A limit order, whether it arrives or is amended, rests uncrossed, as
+    /// on an instrument the venue was never fed.
+    ///
+    /// Not part of the venue's [`snapshot`](SimulatedVenue::snapshot), which holds no market: a
+    /// restored venue prices nothing on any instrument until it is fed again.
     pub split_at: Option<DateTime<Utc>>,
 }
 

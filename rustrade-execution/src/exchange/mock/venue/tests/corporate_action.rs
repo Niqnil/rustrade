@@ -137,6 +137,28 @@ fn a_split_cancels_a_market_order_held_for_the_next_bar() {
     assert!(venue.account.orders().is_empty());
 }
 
+/// Under `NextBar` the venue still holds the pre-split bar, but a market order is not held for the
+/// next one: the hold is costed at the market, which a split leaves unpriced.
+#[test]
+fn after_a_split_a_market_order_is_refused_rather_than_held_for_the_next_bar() {
+    let mut venue = venue_holding(NextBarPrice::Open, "1000000");
+    assert!(apply_split(&mut venue, "split-1", 5).events.is_empty());
+    assert!(
+        venue.market(&instrument_name()).unwrap().bar.is_some(),
+        "the pre-split bar is kept"
+    );
+
+    let refused = venue.open_order(ioc_buy("after", "1"));
+
+    match &refused.response.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::OrderRejected(reason),
+        ))) => assert!(reason.contains("since a split"), "{reason}"),
+        other => panic!("expected the market order refused, got: {other:?}"),
+    }
+    assert!(venue.account.orders().is_empty());
+}
+
 #[test]
 fn after_a_split_the_market_values_holdings_but_trades_nothing_until_observed_again() {
     let mut venue = quoted_venue();
