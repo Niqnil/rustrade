@@ -834,6 +834,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for it by Alpaca's clock, since its scheduled runs were starting after the close. It also
   fails when the paper account is not flat after the tests, and when its test job is cancelled
   while waiting for the paper account.
+- **Alpaca REST requests time out** (`rustrade-execution`, `alpaca`, #979). The client's HTTP client
+  had no timeout, so a request on a connection that stopped answering without closing could wait
+  forever: a placement, cancel, order lookup, listing or page of account activities. Each attempt
+  is now bounded by `AlpacaConfig::request_timeout`, from connecting to the last byte of the
+  answer (10 seconds by default, `DEFAULT_REQUEST_TIMEOUT`; `request_timeout_ms` in a config
+  file; `AlpacaConfig::with_request_timeout`), with 5 seconds of it for the connection. A retry
+  after a rate-limit refusal has the whole timeout again, so a request refused more than once can
+  take longer in all. A request that runs out fails with
+  `ConnectivityError::Timeout`, where every transport failure was a `Socket` error before. An
+  order or cancel that times out may have reached Alpaca and been carried out, so it fails as
+  `OrderError::Connectivity`, whose outcome is unknown until the order is looked up.
 - **The engine keeps an order's venue order id when a report names the order by its client order
   id alone** (`rustrade`). A working report carrying `VenueOrderId::ClientAssigned` for an order
   the engine already held a venue id for replaced the held state whole, id included, whenever it
