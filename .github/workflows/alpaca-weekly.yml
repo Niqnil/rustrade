@@ -25,6 +25,7 @@ jobs:
   # at once when the next open is further away than the waiting left (a market holiday, or a run
   # that started after the close). A run dispatched during the session passes straight through;
   # one that waited for the open waits two minutes more, so an order placed next is not queued.
+  # Not when the open falls in the gap between the two jobs: each knows only what it saw.
   #
   # Outside the paper-account concurrency group: waiting must not hold the account from the other
   # runs.

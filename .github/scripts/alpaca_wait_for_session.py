@@ -7,8 +7,11 @@ Usage: alpaca_wait_for_session.py <budget minutes> [--horizon <minutes>] [--fina
 
 Returns once the session is open (exit 0). When this call saw the market closed first, it waits
 two minutes more, so an order placed next rests `new` rather than queued for the open; a call that
-finds the session already open returns at once. A GitHub-hosted job ends at 360 minutes, so a longer
-wait is split across chained jobs, each calling this with its own budget:
+finds the session already open returns at once. Each call knows only what it saw, so when the
+open falls between one chained job's budget running out and the next job's first read, the next
+job returns without the two minutes; the window is the gap between the jobs. A GitHub-hosted job
+ends at 360 minutes, so a longer wait is split across chained jobs, each calling this with its own
+budget:
 - When the budget runs out first, it exits 0 so the next job carries on; with --final it exits 1.
 - With --horizon, it exits 1 at once when the next open is further away than that many minutes
   (a market holiday, or a run that started after the close), instead of waiting out the budget.
