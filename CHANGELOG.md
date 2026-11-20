@@ -568,11 +568,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket to TWS/Gateway closing, TWS/Gateway losing its link to IB's servers (1100) or regaining
   it with its subscriptions lost (1101), or the `ibapi` client shutting down) the stream yields the
   new `DataError::ConnectionLost`, then `Event::Reconnecting`, then connects again and makes every
-  subscription anew; each failed attempt yields `DataError::ReinitFailed`. Before, a socket loss
-  ended the stream, and a 1101 left every subscription silent with nothing reported. The stream no
-  longer ends by itself, not even when every subscription has ended: drop it to stop it.
-  `disconnect` is removed (dropping closes the connection), and the per-connection stream is no
-  longer public. Every request passes a rate limiter shared by all of the stream's connections,
+  subscription anew; each failed attempt yields `DataError::ReinitFailed`. A link outage costs one
+  reconnect as it begins and one as it ends (a connection made during it is remade on the 1102
+  restore). Before, a socket loss ended the stream, and a 1101 left every subscription silent with
+  nothing reported. The stream no longer ends by itself, not even when every subscription has
+  ended (it stays open, silent): drop it to stop it. `disconnect` is removed (dropping closes the
+  connection, on a thread of its own, so the dropping task never blocks), and the per-connection
+  stream is no longer public. Every request passes a per-connection rate limiter,
   `IbkrStreamConfig::max_messages_per_second` (default 40; IB documents 50 per second for all
   clients of one gateway together), so resubscribing many lines does not exceed IB's message rate;
   a serialized configuration without it still loads. IB's link codes 1100, 1101 and 1102 are in
