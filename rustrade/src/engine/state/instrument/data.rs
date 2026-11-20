@@ -97,9 +97,9 @@ pub trait InstrumentDataState<
 /// # Which [`DataKind`]s update this state
 /// [`Trade`](DataKind::Trade), [`OrderBookL1`](DataKind::OrderBookL1) and
 /// [`Candle`](DataKind::Candle) are price inputs. [`OrderBook`](DataKind::OrderBook) (L2),
-/// [`Liquidation`](DataKind::Liquidation) and [`OptionGreeks`](DataKind::OptionGreeks) are
-/// deliberately ignored — see the [`Processor`] impl, where each exclusion is stated with its
-/// reason.
+/// [`Liquidation`](DataKind::Liquidation), [`OptionGreeks`](DataKind::OptionGreeks) and
+/// [`TradingStatus`](DataKind::TradingStatus) are deliberately ignored — see the [`Processor`]
+/// impl, where each exclusion is stated with its reason.
 ///
 /// Does not implement `Ord`/`PartialOrd`: `last_traded_price` holds a [`Timed`] value, whose
 /// whole-struct ordering is intentionally not provided (see [`Timed`] docs).
@@ -403,6 +403,12 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // Greeks are risk sensitivities, not a price, and belong in a dedicated option state
             // rather than a struct cloned per-instrument for every non-option user.
             DataKind::OptionGreeks(_) => {}
+            // A trading status says whether the price can be traded, not what it is. This simple
+            // state does not track it; a strategy that acts on halts keeps it itself.
+            DataKind::TradingStatus(_) => {}
+            // `DataKind` is `#[non_exhaustive]`: a kind added later carries no price this state
+            // reads until it is handled above.
+            _ => {}
         }
     }
 }
@@ -910,6 +916,21 @@ mod tests {
 
         assert_eq!(data.price(), Some(dec!(200)));
         assert_eq!(data.candle, None);
+    }
+
+    #[test]
+    fn a_trading_status_leaves_the_state_alone() {
+        use rustrade_data::subscription::trading_status::{TradingState, TradingStatus};
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(10), trade(dec!(200))));
+        let before = data.clone();
+
+        data.process(&event(
+            at(20),
+            DataKind::TradingStatus(TradingStatus::new(TradingState::Halted)),
+        ));
+
+        assert_eq!(data, before);
     }
 
     mod option {

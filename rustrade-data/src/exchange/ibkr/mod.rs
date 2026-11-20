@@ -39,7 +39,9 @@
 //!
 //! # Supported Data Types
 //!
-//! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription
+//! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription. The same
+//!   subscription reports halts as [`TradingStatus`] events (IB's Halted tick), on change only;
+//!   IB sends no reason beyond regulatory or volatility, and no Limit Up-Limit Down price bands
 //! - **Depth** ([`OrderBookEvent`]): L2 order book via `market_depth()` subscription
 //! - **Trades** ([`PublicTrade`]): Tick-by-tick trades via `tick_by_tick_all_last()` subscription
 //! - **Historical** ([`Candle`]): OHLCV bars via `historical::IbkrHistoricalData`
@@ -73,6 +75,7 @@
 //! [`OrderBookL1`]: crate::subscription::book::OrderBookL1
 //! [`OrderBookEvent`]: crate::subscription::book::OrderBookEvent
 //! [`PublicTrade`]: crate::subscription::trade::PublicTrade
+//! [`TradingStatus`]: crate::subscription::trading_status::TradingStatus
 //! [`Candle`]: crate::subscription::candle::Candle
 //! [`DataError::SubscriptionLimitReached`]: crate::error::DataError::SubscriptionLimitReached
 //! [`DataError::MarketDataNotAvailable`]: crate::error::DataError::MarketDataNotAvailable
@@ -92,6 +95,7 @@ pub mod greeks;
 pub mod historical;
 pub mod options;
 pub mod quotes;
+mod status;
 pub mod subscription;
 pub mod trades;
 
@@ -122,7 +126,10 @@ use ibapi::{
     Notice, RateLimiter, TRANSPORT_RECONNECT_CODE,
     client::blocking::Client,
     contracts::SecurityType,
-    market_data::{MarketDataType, realtime::MarketDepths},
+    market_data::{
+        MarketDataType,
+        realtime::{MarketDepths, TickTypes},
+    },
     subscriptions::SubscriptionItem,
 };
 use quotes::QuoteAggregator;
@@ -732,6 +739,7 @@ where
             };
 
             let mut aggregator = QuoteAggregator::new(&contract.security_type);
+            let mut statuses = status::StatusChanges::default();
 
             for item in sub.iter() {
                 let tick = match item {
@@ -746,6 +754,18 @@ where
                     }
                 };
                 let now = Utc::now();
+                if let TickTypes::Generic(generic) = &tick {
+                    if let Some(status) = statuses.change(generic) {
+                        // IB's tick carries no time of its own.
+                        if worker
+                            .send(now, now, DataKind::TradingStatus(status))
+                            .is_break()
+                        {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if let Some(l1) = aggregator.update(&tick, now) {
                     let time_exchange = l1.last_update_time;
                     if worker

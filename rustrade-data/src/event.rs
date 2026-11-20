@@ -7,6 +7,7 @@ use crate::{
         greeks::OptionGreeks,
         liquidation::Liquidation,
         trade::PublicTrade,
+        trading_status::TradingStatus,
     },
 };
 use chrono::{DateTime, Utc};
@@ -130,6 +131,13 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    pub fn as_trading_status(&self) -> Option<MarketEvent<&InstrumentKey, &TradingStatus>> {
+        match &self.kind {
+            DataKind::TradingStatus(status) => Some(self.as_event(status)),
+            _ => None,
+        }
+    }
+
     fn as_event<'a, K>(&'a self, kind: &'a K) -> MarketEvent<&'a InstrumentKey, &'a K> {
         MarketEvent {
             time_exchange: self.time_exchange,
@@ -152,6 +160,9 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
 ///   [`Subscription`](crate::subscription::Subscription)s directly, it is only used to
 ///   make ergonomic [`Streams`](crate::streams::Streams) containing many
 ///   [`MarketEvent<T>`](MarketEvent) kinds.
+/// - New kinds are added as venues publish them, so a `match` outside this crate needs a wildcard
+///   arm.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize, From)]
 pub enum DataKind {
     Trade(PublicTrade),
@@ -160,6 +171,7 @@ pub enum DataKind {
     Candle(Candle),
     Liquidation(Liquidation),
     OptionGreeks(OptionGreeks),
+    TradingStatus(TradingStatus),
 }
 
 impl DataKind {
@@ -171,6 +183,7 @@ impl DataKind {
             DataKind::Candle(_) => "candle",
             DataKind::Liquidation(_) => "liquidation",
             DataKind::OptionGreeks(_) => "option_greeks",
+            DataKind::TradingStatus(_) => "trading_status",
         }
     }
 }

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
+  `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
+  `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,
+  `Unknown`), an optional `HaltReason`, and the venue's own code. The IBKR stream's quote
+  subscriptions report IB's Halted tick this way, on change only, with no extra market data line:
+  -1 is `Unknown`, 0 `Trading`, 1 `Halted` (regulatory), 2 `Paused` (volatility), delayed data
+  included. IB documents 0 as sent only for a contract in a TWS watchlist, so a contract that
+  trades normally may report no status at all; IB sends no Limit Up-Limit Down price bands.
+
 - **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
   #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`
   string: `DataError::SubscriptionLimitReached` when the account's market data lines (IB code
@@ -584,6 +593,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IbkrStreamConfig::new(host, port, client_id)` (or `Default`) and the `with_*` methods rather
   than a struct literal; a serialized configuration without `market_data_type` still loads, as
   live. The security type decides which prices mean "no quote" (see Fixed).
+- **Breaking: `DataKind` is `#[non_exhaustive]`** (`rustrade-data`, #881). It gains
+  `TradingStatus` (see Added), and kinds will keep being added as venues publish them, so a `match`
+  on it outside `rustrade-data` needs a wildcard arm.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
@@ -1036,6 +1048,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
+- **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
+  IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
+  subscription passed on as a `PublicTrade` at price 0. It is now skipped.
 
 - **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB
   sends a price of -1 for a side it has no quote on, for example while the market is closed, and

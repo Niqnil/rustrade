@@ -167,7 +167,8 @@ impl VenueMarketUpdate for DataKind {
     /// previous close carried forward. One reporting neither is fresh, since some feeds (spot FX)
     /// report no volume at all, and an unknown volume is not a zero one.
     ///
-    /// L2 depth, liquidations and greeks are never fresh: the state prices from none of them.
+    /// L2 depth, liquidations, greeks and trading statuses are never fresh: the state prices from
+    /// none of them.
     fn fresh(state: &Self::State, event: &MarketEvent<InstrumentIndex, Self>) -> bool {
         match &event.kind {
             DataKind::Trade(_) => state.takes_trade(event.time_exchange),
@@ -177,7 +178,13 @@ impl VenueMarketUpdate for DataKind {
                     && candle.volume != Some(Decimal::ZERO)
                     && candle.trade_count != Some(0)
             }
-            DataKind::OrderBook(_) | DataKind::Liquidation(_) | DataKind::OptionGreeks(_) => false,
+            DataKind::OrderBook(_)
+            | DataKind::Liquidation(_)
+            | DataKind::OptionGreeks(_)
+            | DataKind::TradingStatus(_) => false,
+            // `DataKind` is `#[non_exhaustive]`: a kind added later prices nothing until it is
+            // handled above.
+            _ => false,
         }
     }
 }
@@ -360,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_liquidations_and_greeks_are_never_fresh() {
+    fn depth_liquidations_greeks_and_trading_statuses_are_never_fresh() {
         let mut state = DefaultInstrumentMarketData::default();
         let liquidation =
             DataKind::Liquidation(rustrade_data::subscription::liquidation::Liquidation {
@@ -382,6 +389,13 @@ mod tests {
         assert!(!fresh(
             &mut state,
             event(1, DataKind::OptionGreeks(Default::default()))
+        ));
+        let halted = rustrade_data::subscription::trading_status::TradingStatus::new(
+            rustrade_data::subscription::trading_status::TradingState::Halted,
+        );
+        assert!(!fresh(
+            &mut state,
+            event(1, DataKind::TradingStatus(halted))
         ));
     }
 
