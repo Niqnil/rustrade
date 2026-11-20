@@ -1684,16 +1684,16 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         // `ratio` is a `SplitRatio` (`> 0` by construction), so no runtime sign check is needed.
         let ratio = ratio.get();
 
-        // Scaled (unfloored) quantity on the new share scale.
+        // Scaled (unrounded) quantity on the new share scale.
         let scaled_quantity = self
             .quantity_abs
             .checked_mul(ratio)
             .ok_or(SplitError::Overflow)?;
         let quantity_abs = policy.round_shares(scaled_quantity);
 
-        // Post-split fractional shares disposed, in POST-split units (scaled minus floored).
-        // `scaled_quantity >= quantity_abs` (floor never increases it; equal under `Fractional`),
-        // so this subtraction is a value in `[0, 1)` and cannot overflow.
+        // Post-split fractional shares disposed, in POST-split units (scaled minus rounded).
+        // `round_shares` rounds toward zero, so `scaled_quantity >= quantity_abs` (equal under
+        // `Fractional`), and this subtraction is a value in `[0, 1)` and cannot overflow.
         let remainder = scaled_quantity - quantity_abs;
 
         // Notional-preserving per-share basis: old_avg / ratio, independent of rounding.
