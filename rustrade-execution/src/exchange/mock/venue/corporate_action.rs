@@ -564,12 +564,9 @@ impl SimulatedVenue {
             self.borrow_prices.insert(instrument.clone(), window);
         }
 
-        let positions_changed = options.iter().any(|option| option.position.is_some());
+        // A restated position is still open, so no holding-cost boundary moves.
         for option in options {
             self.commit_option_restatement(option, time_exchange);
-        }
-        if positions_changed {
-            self.refresh_next_charge();
         }
 
         for adjustment in adjust {
