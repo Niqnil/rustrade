@@ -11,7 +11,7 @@ use crate::{
             position::PositionSeed, trading::TradingState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{
         AccountStreamEvent,
         builder::{ExecutionBuildFutures, ExecutionBuilder},
@@ -182,7 +182,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// simulated time.
     ///
     /// # Errors
-    /// [`build`](Self::build) returns [`BarterError::InFlightDeadline`] if `exchange` has no
+    /// [`build`](Self::build) returns [`RustradeError::InFlightDeadline`] if `exchange` has no
     /// execution client in the system, or the deadline is zero.
     pub fn in_flight_deadline(mut self, exchange: ExchangeId, deadline: Option<Duration>) -> Self {
         self.in_flight_deadline_overrides.push((exchange, deadline));
@@ -257,7 +257,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// See [`EngineStateBuilder::positions`]. The engine built here uses
     /// [`OmsMode::Netting`](crate::engine::state::position::OmsMode::Netting), so a seed may name
     /// only the netting slot. An invalid seed makes [`Self::build`] return
-    /// [`BarterError::PositionSeed`]. Repeated calls append.
+    /// [`RustradeError::PositionSeed`]. Repeated calls append.
     pub fn positions<Iter>(mut self, positions: Iter) -> Self
     where
         Iter: IntoIterator<Item = PositionSeed>,
@@ -285,7 +285,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             Event,
             MarketStream,
         >,
-        BarterError,
+        RustradeError,
     >
     where
         Clock: EngineClock + Clone + Send + Sync + 'static,
@@ -494,7 +494,7 @@ where
     /// Initialise the system using the current tokio runtime.
     ///
     /// Spawns all necessary tasks and returns the running `System` instance.
-    pub async fn init(self) -> Result<System<Engine, Event>, BarterError> {
+    pub async fn init(self) -> Result<System<Engine, Event>, RustradeError> {
         self.init_internal(tokio::runtime::Handle::current()).await
     }
 
@@ -504,14 +504,14 @@ where
     pub async fn init_with_runtime(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<System<Engine, Event>, BarterError> {
+    ) -> Result<System<Engine, Event>, RustradeError> {
         self.init_internal(runtime).await
     }
 
     async fn init_internal(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<System<Engine, Event>, BarterError> {
+    ) -> Result<System<Engine, Event>, RustradeError> {
         let Self {
             mut engine,
             engine_feed_mode,
@@ -702,7 +702,7 @@ mod tests {
     }
 
     /// `SystemBuilder::positions` reaches the engine's starting state, and an invalid seed is
-    /// returned as [`BarterError::PositionSeed`] rather than panicking.
+    /// returned as [`RustradeError::PositionSeed`] rather than panicking.
     #[test]
     fn position_seeds_reach_the_engine_state_or_fail_the_build() {
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
@@ -734,7 +734,7 @@ mod tests {
             .expect("a zero-quantity seed must fail the build");
         assert_eq!(
             error,
-            BarterError::PositionSeed(PositionSeedError::NonPositiveQuantity {
+            RustradeError::PositionSeed(PositionSeedError::NonPositiveQuantity {
                 instrument: name,
                 quantity_abs: Decimal::ZERO,
             })
@@ -884,14 +884,14 @@ mod tests {
             .expect("an exchange without an execution client must fail the build");
         assert_eq!(
             error,
-            BarterError::InFlightDeadline(InFlightDeadlineError::NoExecution(DATA))
+            RustradeError::InFlightDeadline(InFlightDeadlineError::NoExecution(DATA))
         );
     }
 
     /// Asserts a failed build is an `ExecutionBuilder` error whose message contains `expected`.
-    fn assert_builder_error<T>(result: Result<T, BarterError>, expected: &str) {
+    fn assert_builder_error<T>(result: Result<T, RustradeError>, expected: &str) {
         match result {
-            Err(BarterError::ExecutionBuilder(message)) => {
+            Err(RustradeError::ExecutionBuilder(message)) => {
                 assert!(message.contains(expected), "{message}");
             }
             Err(other) => panic!("expected an ExecutionBuilder error, got {other}"),

@@ -38,7 +38,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{
         AccountStreamEvent,
         sim::{
@@ -1043,7 +1043,7 @@ fn finish_delivers_what_is_still_owed_and_ends_the_session() {
     assert!(s.stepper.has_ended());
     assert!(matches!(
         s.stepper.step(&mut s.engine, at(6), []),
-        Err(BarterError::SimStep(SimStepError::Finished))
+        Err(RustradeError::SimStep(SimStepError::Finished))
     ));
 }
 
@@ -1060,7 +1060,7 @@ fn an_error_ends_the_session_and_every_later_call_returns_it() {
         .unwrap_err();
     assert_eq!(
         not_later,
-        BarterError::SimStep(SimStepError::NotLater {
+        RustradeError::SimStep(SimStepError::NotLater {
             time: at(3),
             previous: at(3),
         })
@@ -1084,7 +1084,7 @@ fn the_first_step_may_open_the_session_but_no_step_may_go_back() {
         s.stepper
             .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
             .unwrap_err(),
-        BarterError::SimStep(SimStepError::NotLater {
+        RustradeError::SimStep(SimStepError::NotLater {
             time: at(3),
             previous: at(6),
         })
@@ -1106,7 +1106,7 @@ fn a_corporate_action_effective_at_another_instant_is_refused() {
 
     assert_eq!(
         s.stepper.step(&mut s.engine, at(3), [split]).unwrap_err(),
-        BarterError::SimStep(SimStepError::OffInstant {
+        RustradeError::SimStep(SimStepError::OffInstant {
             time: at(3),
             found: at(4),
         })
@@ -1216,7 +1216,7 @@ fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() 
             SimExecutionBuilder::new(&instruments)
                 .add_venue_with_start(config, SimVenueOptions::default(), usdt(dec!(1)))
                 .unwrap_err(),
-            BarterError::SimStart(SimStartError::InitialStateNotEmpty { exchange: EXCHANGE })
+            RustradeError::SimStart(SimStartError::InitialStateNotEmpty { exchange: EXCHANGE })
         );
     }
 }
@@ -1233,7 +1233,7 @@ fn an_event_stamped_at_another_instant_is_refused() {
                 [bar(BTC, 3, dec!(100)), bar(ETH, 4, dec!(50))]
             )
             .unwrap_err(),
-        BarterError::SimStep(SimStepError::OffInstant {
+        RustradeError::SimStep(SimStepError::OffInstant {
             time: at(3),
             found: at(4),
         })
@@ -1249,7 +1249,7 @@ fn an_engine_built_with_another_clock_is_refused() {
         s.stepper
             .step(&mut other.engine, at(3), [bar(BTC, 3, dec!(100))])
             .unwrap_err(),
-        BarterError::SimStep(SimStepError::WrongEngine)
+        RustradeError::SimStep(SimStepError::WrongEngine)
     );
 }
 
@@ -1571,7 +1571,10 @@ fn an_engine_not_seeded_with_the_venues_start_is_refused() {
         .unwrap_err();
 
     assert!(
-        matches!(error, BarterError::SimStep(SimStepError::StartMismatch(_))),
+        matches!(
+            error,
+            RustradeError::SimStep(SimStepError::StartMismatch(_))
+        ),
         "{error}"
     );
 }
@@ -1598,7 +1601,10 @@ fn an_engine_seeded_at_another_quantity_or_entry_is_refused() {
 
         let error = s.stepper.settle(&mut s.engine).unwrap_err();
         assert!(
-            matches!(error, BarterError::SimStep(SimStepError::StartMismatch(_))),
+            matches!(
+                error,
+                RustradeError::SimStep(SimStepError::StartMismatch(_))
+            ),
             "{error}"
         );
     }
@@ -1630,7 +1636,7 @@ fn a_venue_whose_opening_account_it_cannot_index_is_refused() {
     assert!(
         matches!(
             &error,
-            BarterError::SimStep(SimStepError::Misconfigured(reason))
+            RustradeError::SimStep(SimStepError::Misconfigured(reason))
                 if reason.starts_with("SimStepper venue produced an unindexable AccountEvent")
         ),
         "{error}"
@@ -1651,7 +1657,10 @@ fn a_terminal_audit_ends_the_session() {
         .unwrap_err();
 
     assert!(
-        matches!(error, BarterError::SimStep(SimStepError::EngineStopped(_))),
+        matches!(
+            error,
+            RustradeError::SimStep(SimStepError::EngineStopped(_))
+        ),
         "{error}"
     );
     assert!(s.stepper.has_ended());
@@ -1670,7 +1679,7 @@ fn shutting_the_engine_down_fails_the_next_call_without_delivering_it() {
         s.stepper
             .step(&mut s.engine, at(6), [bar(BTC, 6, dec!(110))])
             .unwrap_err(),
-        BarterError::SimStep(SimStepError::Finished)
+        RustradeError::SimStep(SimStepError::Finished)
     );
     assert_eq!(
         price(&s.engine, BTC),
@@ -1680,7 +1689,7 @@ fn shutting_the_engine_down_fails_the_next_call_without_delivering_it() {
     assert!(s.stepper.has_ended());
     assert_eq!(
         s.stepper.settle(&mut s.engine).unwrap_err(),
-        BarterError::SimStep(SimStepError::Finished)
+        RustradeError::SimStep(SimStepError::Finished)
     );
 
     // `settle` and `finish` observe it the same way.
@@ -1693,7 +1702,7 @@ fn shutting_the_engine_down_fails_the_next_call_without_delivering_it() {
         };
         assert_eq!(
             result.unwrap_err(),
-            BarterError::SimStep(SimStepError::Finished)
+            RustradeError::SimStep(SimStepError::Finished)
         );
     }
 }
@@ -1715,7 +1724,7 @@ fn a_shutdown_from_a_strategy_hook_fails_the_call_it_happens_in() {
         .unwrap_err();
 
     // The trading state update is auxiliary, so it goes first, and the bar after it is never shown.
-    assert_eq!(error, BarterError::SimStep(SimStepError::Finished));
+    assert_eq!(error, RustradeError::SimStep(SimStepError::Finished));
     assert_eq!(price(&s.engine, BTC), None);
     assert!(s.stepper.has_ended());
 }
@@ -1968,7 +1977,7 @@ fn each_call_starts_a_fresh_feedback_budget() {
     s.engine.action(&order(BTC, Side::Buy, dec!(1), "over"));
     let error = s.stepper.settle(&mut s.engine).unwrap_err();
     assert!(
-        matches!(error, BarterError::SimFeedbackLoop { limit, .. } if limit == per_order - 1),
+        matches!(error, RustradeError::SimFeedbackLoop { limit, .. } if limit == per_order - 1),
         "{error}"
     );
 }

@@ -8,7 +8,7 @@ pub mod forward_by;
 pub mod forward_clone_by;
 
 /// `Stream` extension trait.
-pub trait BarterStreamExt
+pub trait RustradeStreamExt
 where
     Self: Stream,
 {
@@ -72,4 +72,4 @@ where
     }
 }
 
-impl<S> BarterStreamExt for S where S: Stream {}
+impl<S> RustradeStreamExt for S where S: Stream {}

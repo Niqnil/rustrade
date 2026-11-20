@@ -3,7 +3,7 @@ use crate::{
         clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines,
         state::position::EngineCheckpoint,
     },
-    error::BarterError,
+    error::RustradeError,
     execution::{
         AccountStreamEvent, Execution,
         error::ExecutionError,
@@ -111,7 +111,7 @@ impl<'a> ExecutionBuilder<'a> {
     /// or with [`InFlightDeadlines::insert`] before [`Engine::new`](crate::engine::Engine::new).
     ///
     /// # Errors
-    /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
+    /// Returns [`RustradeError::ExecutionBuilder`] if any indexed instrument executed on
     /// `mocked_exchange` has an [`InstrumentKind`] other than `Spot`, `Cfd` or `Option`, per
     /// [`MockExecution::SUPPORTED_KINDS`]. `MockExchange` models no funding or futures contract
     /// chain, so a `Perpetual` or `Future` has no faithful projection. This is rejected
@@ -139,7 +139,7 @@ impl<'a> ExecutionBuilder<'a> {
         self,
         config: MockExecutionConfig,
         clock: Clock,
-    ) -> Result<Self, BarterError>
+    ) -> Result<Self, RustradeError>
     where
         Clock: EngineClock + Clone + Send + Sync + 'static,
     {
@@ -219,7 +219,7 @@ impl<'a> ExecutionBuilder<'a> {
     /// much the paper account can borrow.
     ///
     /// # Errors
-    /// Returns [`BarterError::ExecutionBuilder`] if:
+    /// Returns [`RustradeError::ExecutionBuilder`] if:
     /// - `config.market_order_timing` is [`MarketOrderTiming::NextBar`]. A backtest delivers the
     ///   fill a bar releases ahead of the bar itself, which a live feed shared with a running
     ///   `Engine` cannot do, so the venue would not behave as its backtest does.
@@ -241,7 +241,7 @@ impl<'a> ExecutionBuilder<'a> {
         options: PaperOptions,
         clock: Clock,
         feed: &PaperMarketFeed,
-    ) -> Result<Self, BarterError>
+    ) -> Result<Self, RustradeError>
     where
         Clock: EngineClock + Clone + Send + Sync + 'static,
     {
@@ -249,7 +249,7 @@ impl<'a> ExecutionBuilder<'a> {
 
         let exchange = config.mocked_exchange;
         if matches!(config.market_order_timing, MarketOrderTiming::NextBar(_)) {
-            return Err(BarterError::ExecutionBuilder(format!(
+            return Err(RustradeError::ExecutionBuilder(format!(
                 "paper venue {exchange} cannot use MarketOrderTiming::NextBar: a live feed cannot \
                  deliver a bar's fills ahead of the bar, as a backtest does"
             )));
@@ -261,7 +261,7 @@ impl<'a> ExecutionBuilder<'a> {
         } = options;
         if let Some(checkpoint) = &checkpoint {
             if checkpoint.version() != EngineCheckpoint::VERSION {
-                return Err(BarterError::ExecutionBuilder(format!(
+                return Err(RustradeError::ExecutionBuilder(format!(
                     "paper venue {exchange} given a checkpoint in format version {}; this release \
                      restores version {}",
                     checkpoint.version(),
@@ -269,14 +269,14 @@ impl<'a> ExecutionBuilder<'a> {
                 )));
             }
             if checkpoint.exchange() != exchange {
-                return Err(BarterError::ExecutionBuilder(format!(
+                return Err(RustradeError::ExecutionBuilder(format!(
                     "paper venue {exchange} given a checkpoint of {}",
                     checkpoint.exchange()
                 )));
             }
         }
         if account_stream_capacity == 0 {
-            return Err(BarterError::ExecutionBuilder(format!(
+            return Err(RustradeError::ExecutionBuilder(format!(
                 "paper venue {exchange} has an account_stream_capacity of zero"
             )));
         }
@@ -314,7 +314,7 @@ impl<'a> ExecutionBuilder<'a> {
                 checkpoint
                     .check_positions_agree(this.instruments)
                     .map_err(|error| {
-                        BarterError::ExecutionBuilder(format!(
+                        RustradeError::ExecutionBuilder(format!(
                             "paper venue {exchange} cannot be restored: {error}"
                         ))
                     })?;
@@ -344,7 +344,7 @@ impl<'a> ExecutionBuilder<'a> {
         self,
         config: Client::Config,
         request_timeout: Duration,
-    ) -> Result<Self, BarterError>
+    ) -> Result<Self, RustradeError>
     where
         Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
@@ -369,7 +369,7 @@ impl<'a> ExecutionBuilder<'a> {
         config: Client::Config,
         request_timeout: Duration,
         options: AccountStreamOptions,
-    ) -> Result<Self, BarterError>
+    ) -> Result<Self, RustradeError>
     where
         Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
@@ -395,7 +395,7 @@ impl<'a> ExecutionBuilder<'a> {
         request_timeout: Duration,
         in_flight_deadline: Option<Duration>,
         options: AccountStreamOptions,
-    ) -> Result<Self, BarterError>
+    ) -> Result<Self, RustradeError>
     where
         Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
@@ -415,7 +415,7 @@ impl<'a> ExecutionBuilder<'a> {
             .insert(exchange, (instrument_map.exchange.key, execution_tx))
             .is_some()
         {
-            return Err(BarterError::ExecutionBuilder(format!(
+            return Err(RustradeError::ExecutionBuilder(format!(
                 "ExecutionBuilder does not support duplicate mocked or paper ExecutionManagers: {exchange}"
             )));
         }
@@ -520,7 +520,7 @@ impl ExecutionBuild {
     /// - Spawns [`MockExchange`] runners tokio tasks.
     /// - Initialises all [`ExecutionManager`]s and their AccountStreams.
     /// - Returns the `MultiExchangeTxMap` and multi-exchange AccountStream.
-    pub async fn init(self) -> Result<Execution, BarterError> {
+    pub async fn init(self) -> Result<Execution, RustradeError> {
         self.init_internal(tokio::runtime::Handle::current()).await
     }
 
@@ -536,14 +536,14 @@ impl ExecutionBuild {
     pub async fn init_with_runtime(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<Execution, BarterError> {
+    ) -> Result<Execution, RustradeError> {
         self.init_internal(runtime).await
     }
 
     async fn init_internal(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<Execution, BarterError> {
+    ) -> Result<Execution, RustradeError> {
         let handles = self.futures.init_with_runtime(runtime).await?;
 
         Ok(Execution {
@@ -570,7 +570,7 @@ impl ExecutionBuildFutures {
     /// - Spawns [`MockExchange`] runner tokio tasks.
     /// - Initialises all [`ExecutionManager`]s and their AccountStreams.
     /// - Spawns tokio tasks to forward AccountStreams to multi-exchange AccountStream
-    pub async fn init(self) -> Result<ExecutionHandles, BarterError> {
+    pub async fn init(self) -> Result<ExecutionHandles, RustradeError> {
         self.init_internal(tokio::runtime::Handle::current()).await
     }
 
@@ -586,14 +586,14 @@ impl ExecutionBuildFutures {
     pub async fn init_with_runtime(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<ExecutionHandles, BarterError> {
+    ) -> Result<ExecutionHandles, RustradeError> {
         self.init_internal(runtime).await
     }
 
     async fn init_internal(
         self,
         runtime: tokio::runtime::Handle,
-    ) -> Result<ExecutionHandles, BarterError> {
+    ) -> Result<ExecutionHandles, RustradeError> {
         // Spawned first: the ExecutionManager build futures below connect to them.
         let mock_exchanges: Vec<_> = self
             .mock_exchange_run_futures
@@ -859,7 +859,7 @@ pub(crate) fn validate_supported_instrument_kinds(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
     supported: &[InstrumentKindDiscriminant],
-) -> Result<(), BarterError> {
+) -> Result<(), RustradeError> {
     // BTreeSet so a set with many offending instruments reports each distinct kind once, in a
     // deterministic order.
     let unsupported = instruments
@@ -874,7 +874,7 @@ pub(crate) fn validate_supported_instrument_kinds(
         return Ok(());
     }
 
-    Err(BarterError::ExecutionBuilder(format!(
+    Err(RustradeError::ExecutionBuilder(format!(
         "{exchange} execution client cannot trade instrument kind(s): {}. It supports: {}",
         join_kinds(unsupported.iter().copied()),
         join_kinds(supported.iter().copied()),
@@ -887,7 +887,7 @@ fn validate_client_config(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
     validate: impl FnOnce(&[ClientInstrument<'_>]) -> Result<(), String>,
-) -> Result<(), BarterError> {
+) -> Result<(), RustradeError> {
     let instruments = instruments
         .instruments()
         .iter()
@@ -898,7 +898,7 @@ fn validate_client_config(
         .collect::<Vec<_>>();
 
     validate(&instruments).map_err(|error| {
-        BarterError::ExecutionBuilder(format!(
+        RustradeError::ExecutionBuilder(format!(
             "{exchange} execution client config is invalid: {error}"
         ))
     })
@@ -922,7 +922,7 @@ fn paper_market(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
     feed: &PaperMarketFeed,
-) -> Result<BoxStream<'static, MarketFeedEvent>, BarterError> {
+) -> Result<BoxStream<'static, MarketFeedEvent>, RustradeError> {
     let map = generate_execution_instrument_map(instruments, exchange)?;
 
     let stream =
@@ -1191,7 +1191,7 @@ mod tests {
             panic!("a Future instrument is not backtestable on MockExchange")
         };
 
-        let BarterError::ExecutionBuilder(message) = error else {
+        let RustradeError::ExecutionBuilder(message) = error else {
             panic!("expected an ExecutionBuilder error, got {error:?}")
         };
         assert!(
@@ -1271,7 +1271,7 @@ mod tests {
         )
         .expect_err("both instruments are Futures on a spot-only client");
 
-        let BarterError::ExecutionBuilder(message) = error else {
+        let RustradeError::ExecutionBuilder(message) = error else {
             panic!("expected an ExecutionBuilder error, got {error:?}")
         };
         assert_eq!(
@@ -1319,7 +1319,7 @@ mod tests {
         })
         .unwrap_err();
 
-        let BarterError::ExecutionBuilder(message) = error else {
+        let RustradeError::ExecutionBuilder(message) = error else {
             panic!("expected an ExecutionBuilder error, got {error:?}")
         };
         assert!(message.contains(EXCHANGE.as_str()), "{message}");
@@ -1355,7 +1355,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(BarterError::Execution(ExecutionError::Config(_)))
+            Err(RustradeError::Execution(ExecutionError::Config(_)))
         ));
 
         // An abort takes effect when the runtime next reaches the task, so let it run.
@@ -1380,10 +1380,10 @@ mod tests {
         assert_eq!(options.reconnect, AccountStreamOptions::default().reconnect);
     }
 
-    /// The message of the [`BarterError::ExecutionBuilder`] `result` must be.
-    fn builder_error(result: Result<ExecutionBuilder<'_>, BarterError>) -> String {
+    /// The message of the [`RustradeError::ExecutionBuilder`] `result` must be.
+    fn builder_error(result: Result<ExecutionBuilder<'_>, RustradeError>) -> String {
         match result {
-            Err(BarterError::ExecutionBuilder(message)) => message,
+            Err(RustradeError::ExecutionBuilder(message)) => message,
             Err(error) => panic!("expected an ExecutionBuilder error, got {error:?}"),
             Ok(_) => panic!("expected the paper venue to be refused"),
         }

@@ -545,6 +545,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
+  `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
+  rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
+  with `rustrade::error::RustradeError`, and `rustrade_integration::stream::ext::BarterStreamExt`
+  with `rustrade_integration::stream::ext::RustradeStreamExt`. The variants, methods and serde
+  representation are unchanged.
 - **Breaking: a split rescales the engine's view of the orders it tracks** (`rustrade`). On a
   stock split, the engine kept each tracked order on its pre-split terms, so a strategy read an
   order for 10 shares at 100 after a 2-for-1 split where the venue now held one for 20 at 50. A
@@ -625,7 +631,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position with no entry price, an unsecured short option, a seeded day order the session close
   cannot place); those two still panic, with the error. `SimulatedVenue::from_snapshot` refuses
   the same with the new `VenueRestoreError::AssetSpelledTwice`. The backtest and paper trading
-  builders now return such a configuration as `BarterError::ExecutionBuilder` instead of
+  builders now return such a configuration as `RustradeError::ExecutionBuilder` instead of
   panicking.
 - **Breaking (`rustrade-execution`, `alpaca` feature): a replaced order, and a replacement Alpaca
   rejects, end as an order snapshot.** The account stream reports Alpaca's `replaced` event as

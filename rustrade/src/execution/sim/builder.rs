@@ -1,6 +1,6 @@
 use crate::{
     engine::{execution_tx::MultiExchangeTxMap, state::position::PositionSeed},
-    error::BarterError,
+    error::RustradeError,
     execution::{
         builder::{generate_mock_exchange_instruments, validate_supported_instrument_kinds},
         request::ExecutionRequest,
@@ -121,7 +121,7 @@ impl SimVenueOptions {
 /// configuration and its options build the same venue on both.
 ///
 /// # Errors
-/// [`BarterError::ExecutionBuilder`] if:
+/// [`RustradeError::ExecutionBuilder`] if:
 /// - `config` is refused by [`SimulatedVenue::try_new_market_driven`], for example because it
 ///   spells one asset two ways;
 /// - `options` carries a [`margin_interest`](SimVenueOptions::margin_interest) model while
@@ -139,7 +139,7 @@ pub(crate) fn market_driven_venue(
     options: SimVenueOptions,
     instruments: &IndexedInstruments,
     restore: Option<SimulatedVenueSnapshot>,
-) -> Result<SimulatedVenue, BarterError> {
+) -> Result<SimulatedVenue, RustradeError> {
     let SimVenueOptions {
         holding_costs,
         shortability,
@@ -151,7 +151,7 @@ pub(crate) fn market_driven_venue(
     let exchange = config.mocked_exchange;
 
     if margin_interest.is_some() && config.spot_margin.is_none() {
-        return Err(BarterError::ExecutionBuilder(format!(
+        return Err(RustradeError::ExecutionBuilder(format!(
             "simulated venue {exchange} has a margin interest model but no spot_margin: a cash \
              account takes no loans to charge"
         )));
@@ -174,20 +174,20 @@ pub(crate) fn market_driven_venue(
     let venue = match restore {
         None => {
             SimulatedVenue::try_new_market_driven(config, venue_instruments).map_err(|error| {
-                BarterError::ExecutionBuilder(format!(
+                RustradeError::ExecutionBuilder(format!(
                     "simulated venue {exchange} cannot be built: {error}"
                 ))
             })?
         }
         Some(snapshot) => {
             if snapshot.regime() != VenueRegime::MarketDriven {
-                return Err(BarterError::ExecutionBuilder(format!(
+                return Err(RustradeError::ExecutionBuilder(format!(
                     "simulated venue {exchange} cannot be restored from a snapshot of a \
                      request-priced venue"
                 )));
             }
             SimulatedVenue::from_snapshot(config, venue_instruments, snapshot).map_err(|error| {
-                BarterError::ExecutionBuilder(format!(
+                RustradeError::ExecutionBuilder(format!(
                     "simulated venue {exchange} cannot be restored: {error}"
                 ))
             })?
@@ -205,7 +205,7 @@ pub(crate) fn market_driven_venue(
     }
     if let Some(calendar) = session_calendar {
         venue = venue.with_session_calendar(calendar).map_err(|error| {
-            BarterError::ExecutionBuilder(format!(
+            RustradeError::ExecutionBuilder(format!(
                 "simulated venue {exchange} cannot place a seeded day order's session close: \
                  {error}"
             ))
@@ -255,7 +255,7 @@ impl<'a> SimExecutionBuilder<'a> {
     /// modelled.
     ///
     /// # Errors
-    /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on this
+    /// Returns [`RustradeError::ExecutionBuilder`] if any indexed instrument executed on this
     /// exchange has an [`InstrumentKind`] outside [`MockExecution::SUPPORTED_KINDS`], or if a
     /// configuration for this exchange has already been added. The kind check runs *before* the
     /// instrument projection below, which panics on a kind it cannot model — so an unbacktestable
@@ -268,7 +268,7 @@ impl<'a> SimExecutionBuilder<'a> {
     /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
     /// [`MockExecution::SUPPORTED_KINDS`]: rustrade_execution::client::ExecutionClient::SUPPORTED_KINDS
     /// [`SimRunner`]: crate::execution::sim::SimRunner
-    pub fn add_venue(self, config: MockExecutionConfig) -> Result<Self, BarterError> {
+    pub fn add_venue(self, config: MockExecutionConfig) -> Result<Self, RustradeError> {
         self.add_venue_with_options(config, SimVenueOptions::default())
     }
 
@@ -278,14 +278,14 @@ impl<'a> SimExecutionBuilder<'a> {
     /// Otherwise exactly [`add_venue`](Self::add_venue), whose latency, errors and panics apply.
     ///
     /// # Errors
-    /// Also returns [`BarterError::ExecutionBuilder`] if `options` carries a
+    /// Also returns [`RustradeError::ExecutionBuilder`] if `options` carries a
     /// [`margin_interest`](SimVenueOptions::margin_interest) model while `config` has no
     /// [`spot_margin`](MockExecutionConfig::spot_margin).
     pub fn add_venue_with_options(
         self,
         config: MockExecutionConfig,
         options: SimVenueOptions,
-    ) -> Result<Self, BarterError> {
+    ) -> Result<Self, RustradeError> {
         self.insert_venue(config, options, None)
     }
 
@@ -295,7 +295,7 @@ impl<'a> SimExecutionBuilder<'a> {
         config: MockExecutionConfig,
         options: SimVenueOptions,
         position_seeds: Option<Vec<PositionSeed>>,
-    ) -> Result<Self, BarterError> {
+    ) -> Result<Self, RustradeError> {
         let exchange = config.mocked_exchange;
 
         validate_supported_instrument_kinds(
@@ -318,7 +318,7 @@ impl<'a> SimExecutionBuilder<'a> {
             .insert(exchange, (index, execution_tx))
             .is_some()
         {
-            return Err(BarterError::ExecutionBuilder(format!(
+            return Err(RustradeError::ExecutionBuilder(format!(
                 "SimExecutionBuilder does not support duplicate simulated venues: {exchange}"
             )));
         }
@@ -350,7 +350,7 @@ impl<'a> SimExecutionBuilder<'a> {
     /// Otherwise exactly [`add_venue_with_options`](Self::add_venue_with_options).
     ///
     /// # Errors
-    /// Those of [`add_venue`](Self::add_venue), and [`BarterError::SimStart`] if `start` cannot
+    /// Those of [`add_venue`](Self::add_venue), and [`RustradeError::SimStart`] if `start` cannot
     /// be held by this venue — see [`SimStartError`],
     /// including when `config.initial_state` is not empty, since there would then be two
     /// starting states.
@@ -361,7 +361,7 @@ impl<'a> SimExecutionBuilder<'a> {
         mut config: MockExecutionConfig,
         options: SimVenueOptions,
         start: SimStart,
-    ) -> Result<Self, BarterError> {
+    ) -> Result<Self, RustradeError> {
         let exchange = config.mocked_exchange;
 
         if !config.initial_state.balances.is_empty() || !config.initial_state.instruments.is_empty()

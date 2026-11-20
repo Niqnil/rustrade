@@ -28,7 +28,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
-    error::BarterError,
+    error::RustradeError,
     execution::builder::{ExecutionBuild, ExecutionBuilder},
     risk::DefaultRiskManager,
     statistic::time::Daily,
@@ -523,7 +523,7 @@ async fn backtest_market_only(
     market_events: Arc<Vec<MarketStreamEvent<InstrumentIndex, DataKind>>>,
     args_dynamic: SeamDynamic,
     audit_mode: AuditMode,
-) -> Result<BacktestSummary<Daily>, BarterError> {
+) -> Result<BacktestSummary<Daily>, RustradeError> {
     let market_first = args_constant.market_data.time_first_event().await?;
     let raw_market = futures::stream::iter(
         (0..market_events.len()).map(move |index| market_events[index].clone()),
