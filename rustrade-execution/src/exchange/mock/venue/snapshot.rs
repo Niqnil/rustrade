@@ -56,7 +56,8 @@ use thiserror::Error;
 /// - The debt it last reported, whether a liquidation is under way or a margin call outstanding,
 ///   the prices over the borrow price window, and how far the slippage stream has drawn.
 /// - The id of every corporate action the venue applied, so a restored venue applies none of them
-///   again.
+///   again, and the strike each option a split restated took, which the restore gives the option
+///   in place of the strike it is constructed with.
 ///
 /// # What it does not hold
 /// - **The configuration**, and the models set by builder methods (holding costs, margin interest,
@@ -120,6 +121,10 @@ pub struct SimulatedVenueSnapshot {
     /// applied none reads and writes as it did before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     corporate_actions_applied: Vec<SmolStr>,
+    /// Sorted by instrument. Left out when empty, and read as empty when absent, as
+    /// `corporate_actions_applied` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    restated_strikes: Vec<(InstrumentNameExchange, Decimal)>,
 }
 
 impl SimulatedVenueSnapshot {
@@ -218,14 +223,19 @@ pub enum VenueRestoreError {
     #[error(transparent)]
     DuplicateOrder(#[from] DuplicateSeededOrder),
 
-    /// The snapshot lists one instrument twice among its positions, or among its borrow price
-    /// windows.
+    /// The snapshot lists one instrument twice among its positions, its borrow price windows, or
+    /// the strikes splits restated.
     #[error("venue snapshot lists {0} twice")]
     DuplicateInstrument(InstrumentNameExchange),
 
     /// The snapshot lists one asset twice among its balances, or among the debt it last reported.
     #[error("venue snapshot lists {0} twice")]
     DuplicateAsset(AssetNameExchange),
+
+    /// The snapshot records a strike a split restated for an instrument that is not an option.
+    /// A snapshot the venue wrote never does.
+    #[error("venue snapshot records a restated strike for {0}, which is not an option")]
+    RestatedStrikeOfNonOption(InstrumentNameExchange),
 
     /// The snapshot holds a short position in a cash-settled call, which nothing in a cash account
     /// secures, so the venue never holds one.
@@ -335,6 +345,12 @@ impl SimulatedVenue {
                 .cloned()
                 .sorted_unstable()
                 .collect(),
+            restated_strikes: self
+                .restated_strikes
+                .iter()
+                .map(|(option, strike)| (option.clone(), *strike))
+                .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
+                .collect(),
         }
     }
 
@@ -418,6 +434,8 @@ impl SimulatedVenue {
     ///   open orders, or among its cancelled, filled or expired ones.
     /// - [`VenueRestoreError::DuplicateInstrument`] or [`VenueRestoreError::DuplicateAsset`] if it
     ///   lists one instrument or asset twice in a list that holds each once.
+    /// - [`VenueRestoreError::RestatedStrikeOfNonOption`] if it records a restated strike for an
+    ///   instrument that is not an option.
     /// - [`VenueRestoreError::OptionShortUnsecurable`] if it holds a short cash-settled call.
     /// - [`VenueRestoreError::OptionCollateralNotHeld`] if its balances do not hold the collateral
     ///   its short options secure.
@@ -432,7 +450,10 @@ impl SimulatedVenue {
     /// snapshot is trusted input: one edited to claim a vast number of draws restores as slowly.
     pub fn from_snapshot(
         config: &MockExecutionConfig,
-        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        mut instruments: FnvHashMap<
+            InstrumentNameExchange,
+            Instrument<ExchangeId, AssetNameExchange>,
+        >,
         snapshot: SimulatedVenueSnapshot,
     ) -> Result<Self, VenueRestoreError> {
         if snapshot.version != SimulatedVenueSnapshot::VERSION {
@@ -472,6 +493,12 @@ impl SimulatedVenue {
                     .iter()
                     .map(|(instrument, _)| instrument),
             )
+            .chain(
+                snapshot
+                    .restated_strikes
+                    .iter()
+                    .map(|(instrument, _)| instrument),
+            )
             .find(|instrument| !instruments.contains_key(*instrument))
         {
             return Err(VenueRestoreError::UnknownInstrument(unknown.clone()));
@@ -479,8 +506,22 @@ impl SimulatedVenue {
         // Each list below becomes a map, which would keep one of two entries and drop the other.
         if let Some(repeat) = first_repeat(snapshot.positions.iter().map(|(name, _)| name))
             .or_else(|| first_repeat(snapshot.borrow_prices.iter().map(|(name, _)| name)))
+            .or_else(|| first_repeat(snapshot.restated_strikes.iter().map(|(name, _)| name)))
         {
             return Err(VenueRestoreError::DuplicateInstrument(repeat.clone()));
+        }
+        // Before anything reads a strike: the collateral check below, and the venue's own
+        // valuation and settlement once it runs.
+        for (option, strike) in &snapshot.restated_strikes {
+            let Some(listed) = instruments.get_mut(option) else {
+                unreachable!(
+                    "checked above that the venue lists {option}, which the snapshot names"
+                );
+            };
+            let InstrumentKind::Option(contract) = &mut listed.kind else {
+                return Err(VenueRestoreError::RestatedStrikeOfNonOption(option.clone()));
+            };
+            contract.strike = *strike;
         }
         if let Some(repeat) = first_repeat(snapshot.account.balance_assets())
             .or_else(|| first_repeat(snapshot.reported_debt.iter().map(|(asset, _)| asset)))
@@ -531,6 +572,7 @@ impl SimulatedVenue {
             slippage_draws,
             checkpoint_sequence,
             corporate_actions_applied,
+            restated_strikes,
         } = snapshot;
 
         let mut venue = Self::assemble(
@@ -573,6 +615,7 @@ impl SimulatedVenue {
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.corporate_actions_applied = corporate_actions_applied.into_iter().collect();
+        venue.restated_strikes = restated_strikes.into_iter().collect();
         venue.refresh_next_charge();
         venue.refresh_next_interest();
         venue.refresh_next_option_expiry();

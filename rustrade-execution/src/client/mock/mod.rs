@@ -663,8 +663,9 @@ impl AmendConfig {
 ///
 /// The default, [`SplitConfig::CANCEL`], cancels every order on a split of either kind.
 /// [`SplitConfig::ADJUST_FORWARD`] adjusts on a forward split and cancels on a reverse one, as
-/// US equity venues and brokers do under FINRA Rule 5330. Whatever the action, the venue rescales
-/// the account's holdings of the equity: see
+/// US equity venues and brokers do under FINRA Rule 5330. It does not apply to orders on options
+/// of the equity, which a split always cancels. Whatever the action, the venue rescales the
+/// account's holdings of the equity: see
 /// [`SimulatedVenue::apply_corporate_action`](crate::exchange::mock::SimulatedVenue::apply_corporate_action).
 ///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,

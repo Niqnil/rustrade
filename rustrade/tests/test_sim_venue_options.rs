@@ -22,9 +22,9 @@ use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::{
-    EngineEvent,
+    EngineEvent, SplitRoundingPolicy, Timed,
     backtest::{
-        BacktestArgsConstant, BacktestArgsDynamic, aux_events::NoAuxEvents, backtest,
+        BacktestArgsConstant, BacktestArgsDynamic, aux_events::AuxEventsInMemory, backtest,
         market_data::MarketDataInMemory, summary::BacktestResult,
     },
     engine::{
@@ -80,6 +80,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side, Underlying,
     asset::{AssetIndex, ExchangeAsset, name::AssetNameExchange, name::AssetNameInternal},
+    corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -354,6 +355,19 @@ async fn run_with(
     usd: Decimal,
     sell_out: Option<ExpirySellOut>,
 ) -> BacktestResult<Daily, BacktestState> {
+    run_split(kind, settlement, sell, spy_at_expiry, usd, sell_out, None).await
+}
+
+/// A run as [`run_with`]'s, with SPY split by `split`'s ratio at its instant when given.
+async fn run_split(
+    kind: OptionKind,
+    settlement: OptionSettlement,
+    sell: bool,
+    spy_at_expiry: Decimal,
+    usd: Decimal,
+    sell_out: Option<ExpirySellOut>,
+    split: Option<(DateTime<Utc>, Decimal)>,
+) -> BacktestResult<Daily, BacktestState> {
     let instruments = instruments_of(kind, settlement);
     let (spy, call) = (key(&instruments, "SPY"), key(&instruments, "SPY_C100"));
 
@@ -368,6 +382,25 @@ async fn run_with(
     market_events.push(trade("2025-03-25T21:00:00Z", spy, spy_at_expiry));
     let mut config = mock_config(vec![funded("usd", usd), funded("spy", Decimal::ZERO)]);
     config.expiry_sell_out = sell_out;
+    let aux_events = AuxEventsInMemory::new(Arc::new(
+        split
+            .into_iter()
+            .map(|(effective_time, ratio)| {
+                Timed::new(
+                    EngineEvent::CorporateAction {
+                        id: "spy-split".into(),
+                        instrument: spy,
+                        kind: CorporateActionKind::StockSplit {
+                            ratio: SplitRatio::new(ratio).unwrap(),
+                        },
+                        policy: SplitRoundingPolicy::Fractional,
+                        effective_time,
+                    },
+                    effective_time,
+                )
+            })
+            .collect(),
+    ));
 
     let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
@@ -384,7 +417,7 @@ async fn run_with(
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
         engine_state,
-        aux_events: NoAuxEvents,
+        aux_events,
     });
 
     backtest(
@@ -468,6 +501,35 @@ async fn a_backtest_exercised_call_ends_holding_the_underlying_bought_at_the_str
         FUNDING - dec!(150) - dec!(10_000)
     );
     assert_eq!(balance_end(&result, "spy").total, dec!(100));
+}
+
+/// SPY splits 2-for-1 at midnight, between the purchase and the expiry, and trades at 55 around
+/// the expiry. The venue and the engine both restate the call to two contracts struck at 50, so
+/// the venue exercises two contracts, buying 200 SPY at 50, and the engine's position closes on
+/// that settlement exactly, as it would without the split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_call_held_through_a_standard_split_is_exercised_on_its_restated_terms() {
+    let result = run_split(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        false,
+        dec!(55),
+        FUNDING,
+        None,
+        Some((ts("2025-03-25T00:00:00Z"), dec!(2))),
+    )
+    .await;
+
+    assert_eq!(
+        open_positions(&result),
+        [("SPY".to_string(), dec!(200), dec!(50))]
+    );
+    assert_eq!(option_pnl(&result), dec!(-150));
+    assert_eq!(
+        balance_end(&result, "usd").total,
+        FUNDING - dec!(150) - dec!(10_000)
+    );
+    assert_eq!(balance_end(&result, "spy").total, dec!(200));
 }
 
 /// With only 10,000 to start, the account left with 9,850 after the premium cannot pay the strike,

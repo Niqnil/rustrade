@@ -813,9 +813,12 @@ pub struct SimulatedVenue {
     /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
     /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
     slippage: Slippage,
-    /// Every instrument this venue trades, as constructed. Private, and never changed after
+    /// Every instrument this venue trades, as constructed. Private, and the set never changes after
     /// construction: [`spot_pairs`](Self::spot_pairs) indexes it, and resting orders were accepted
-    /// against it. Read through [`instruments`](Self::instruments).
+    /// against it. The one term that changes is an option's strike, which a standard split
+    /// restates after cancelling every order on the option (see
+    /// [`apply_corporate_action`](Self::apply_corporate_action)). Read through
+    /// [`instruments`](Self::instruments).
     instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     /// The spot instruments of [`instruments`](Self::instruments), by the two assets each pairs.
     /// What values an account and picks a liquidation's legs without scanning every instrument.
@@ -984,6 +987,10 @@ pub struct SimulatedVenue {
     /// The id of every corporate action this venue has applied, so that applying one again changes
     /// nothing. See [`apply_corporate_action`](Self::apply_corporate_action).
     corporate_actions_applied: FnvHashSet<SmolStr>,
+    /// The strike a split has given each option it restated, by option: what a
+    /// [`snapshot`](Self::snapshot) carries so that a restored venue trades the options on the
+    /// strikes this one does. Empty until a standard split restates an option.
+    restated_strikes: FnvHashMap<InstrumentNameExchange, Decimal>,
     /// What a split does to the open orders on its equity. Fixed at construction from
     /// [`MockExecutionConfig::split`].
     split: SplitConfig,
@@ -1186,6 +1193,7 @@ impl SimulatedVenue {
             sell_outs,
             next_sell_out: None,
             corporate_actions_applied: FnvHashSet::default(),
+            restated_strikes: FnvHashMap::default(),
             split: config.split,
         }
     }
@@ -1663,8 +1671,9 @@ impl SimulatedVenue {
     /// not list it.
     ///
     /// The amount is part of that asset's balance `total − free`, beside what open orders hold, and
-    /// is derived from the position, so it changes only as the short does. See the type's
-    /// `# How an option is accounted`.
+    /// is derived from the position, so it changes only as the short does, or as a standard split
+    /// restates the option (see [`apply_corporate_action`](Self::apply_corporate_action)). See the
+    /// type's `# How an option is accounted`.
     pub fn collateral_held(&self, instrument: &InstrumentNameExchange) -> Option<Collateral> {
         let position = self.positions.get(instrument)?;
         if !position.quantity.is_sign_negative() {
@@ -1677,11 +1686,20 @@ impl SimulatedVenue {
 
     /// Whether the account holds a position in the option `instrument`, or has an order on it.
     fn has_option_exposure(&self, instrument: &InstrumentNameExchange) -> bool {
-        self.positions.contains_key(instrument)
+        self.has_exposure_to_any(&[instrument])
+    }
+
+    /// Whether the account holds a position in, or has an order on, any of `options`, which are
+    /// sorted. One pass over the open orders, whatever the number of options.
+    fn has_exposure_to_any(&self, options: &[&InstrumentNameExchange]) -> bool {
+        debug_assert!(options.is_sorted(), "options are sorted");
+        options
+            .iter()
+            .any(|option| self.positions.contains_key(*option))
             || self
                 .account
                 .orders_open()
-                .any(|order| order.key.instrument == *instrument)
+                .any(|order| options.binary_search(&&order.key.instrument).is_ok())
     }
 
     /// Expires the option `instrument` at `expiry`: retires every order still working on it, then
@@ -4261,8 +4279,9 @@ impl SimulatedVenue {
         events
     }
 
-    /// Every instrument this venue trades, keyed by its exchange name, exactly as it was
-    /// constructed with.
+    /// Every instrument this venue trades, keyed by its exchange name, as it was constructed with,
+    /// except that an option's strike is the one the latest standard split of its underlying gave
+    /// it (see [`apply_corporate_action`](Self::apply_corporate_action)).
     ///
     /// Read only: the set of instruments is fixed for the venue's life. To trade a different set,
     /// construct a new venue.
