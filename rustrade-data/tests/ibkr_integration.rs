@@ -1489,8 +1489,10 @@ async fn test_option_greeks_stream() {
     // before opening the streaming connection.
     let option = aapl_call_option().await;
 
+    // The stream looks contracts up by name only, and the chain's contract carries no contract ID,
+    // which `register` requires.
     let registry = ContractRegistry::new();
-    registry.register("AAPL_CALL".into(), option).unwrap();
+    registry.register_by_name_only("AAPL_CALL".into(), option);
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {
