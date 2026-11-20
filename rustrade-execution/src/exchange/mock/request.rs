@@ -17,8 +17,11 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, corporate_action::CorporateActionKind,
-    exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    corporate_action::{CorporateActionKind, SplitRoundingPolicy},
+    exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
 };
 use smol_str::SmolStr;
 use tokio::sync::oneshot;
@@ -172,15 +175,16 @@ impl MockExchangeRequest {
         )
     }
 
-    /// A request to apply the corporate action `id` of `kind` to `instrument`: see
-    /// [`MockExchangeRequestKind::CorporateAction`]. What it causes goes to the account stream;
-    /// `response_tx` hears what the venue did with it.
+    /// A request to apply the corporate action `id` of `kind` to `instrument`, rounding as
+    /// `policy` says: see [`MockExchangeRequestKind::CorporateAction`]. What it causes goes to the
+    /// account stream; `response_tx` hears what the venue did with it.
     pub fn corporate_action(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<CorporateActionResponse>,
         id: SmolStr,
         instrument: InstrumentNameExchange,
         kind: CorporateActionKind,
+        policy: SplitRoundingPolicy,
     ) -> Self {
         Self::new(
             time_request,
@@ -189,6 +193,7 @@ impl MockExchangeRequest {
                 id,
                 instrument,
                 kind,
+                policy,
             },
         )
     }
@@ -275,6 +280,8 @@ pub enum MockExchangeRequestKind {
         id: SmolStr,
         instrument: InstrumentNameExchange,
         kind: CorporateActionKind,
+        /// How the broker rounds a share count the action leaves fractional.
+        policy: SplitRoundingPolicy,
     },
     OpenOrder {
         response_tx:

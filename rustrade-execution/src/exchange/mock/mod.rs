@@ -469,13 +469,14 @@ impl MockExchange {
                 id,
                 instrument,
                 kind,
+                policy,
             } => {
                 // At the instant the request is booked, which the caller times as the action's
                 // effective instant: a time of its own could move the venue's clock past it.
                 let now = self.venue.time_exchange();
-                let outcome = self
-                    .venue
-                    .apply_corporate_action(&id, &instrument, &kind, now);
+                let outcome =
+                    self.venue
+                        .apply_corporate_action(&id, &instrument, &kind, policy, now);
                 emit.respond(outcome.events, response_tx, outcome.response);
             }
             MockExchangeRequestKind::OpenOrder {
@@ -2039,7 +2040,9 @@ mod tests {
             client::mock::request_corporate_action,
             order::state::{InactiveOrderState, OrderState},
         };
-        use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
+        use rustrade_instrument::corporate_action::{
+            CorporateActionKind, SplitRatio, SplitRoundingPolicy,
+        };
 
         let mut paper = Paper::start(spot_config("0", "100000", FeeModelConfig::default()));
         paper.observe(priced("50000"));
@@ -2062,6 +2065,7 @@ mod tests {
                 "split-1".into(),
                 instrument_name(),
                 split,
+                SplitRoundingPolicy::Fractional,
             )
             .await
         }

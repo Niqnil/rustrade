@@ -391,6 +391,32 @@ impl AccountState {
             .filter(move |trade| trade.time_exchange >= time_since)
     }
 
+    /// What `asset`'s balance would be once each of `reservations` that holds it is released in
+    /// turn by [`release_reservation`](Self::release_reservation) with `auto_repay_at_cancel`,
+    /// changing nothing. `None` for an asset the account has never held.
+    ///
+    /// For a caller that must know what cancelling orders leaves before it decides to cancel them.
+    pub fn balance_after_releases<'a>(
+        &self,
+        asset: &AssetNameExchange,
+        reservations: impl IntoIterator<Item = &'a Reservation>,
+        auto_repay_at_cancel: bool,
+    ) -> Option<Balance> {
+        let mut balance = self.balances.get(asset)?.balance;
+        for reservation in reservations {
+            if reservation.asset != *asset {
+                continue;
+            }
+            // As `release`, then `repay_loan`, do it.
+            balance.free += reservation.amount;
+            if auto_repay_at_cancel && !reservation.loan().is_zero() {
+                let available = reservation.loan().min(balance.free);
+                repay(&mut balance, available);
+            }
+        }
+        Some(balance)
+    }
+
     pub fn balance_mut(
         &mut self,
         asset: &AssetNameExchange,
@@ -1743,5 +1769,61 @@ mod tests {
         account.repay_loan(&usd(), dec!(20), at);
         assert_eq!(account.loans_changed(), 1);
         assert_eq!(account.loans().count(), 0);
+    }
+
+    #[test]
+    fn balance_after_releases_predicts_releasing_each_reservation_in_turn() {
+        let held = |amount, borrowed, excess_borrowed| Reservation {
+            asset: usd(),
+            amount,
+            borrowed,
+            excess_borrowed,
+            effect: MarginEffect::Borrow,
+            unreported_interest: vec![],
+        };
+        // The second's loan is more than the first's repay leaves free, so the order counts.
+        let reservations = [
+            held(dec!(1), dec!(1), Decimal::ZERO),
+            held(dec!(1), dec!(1), dec!(2)),
+            Reservation {
+                asset: AssetNameExchange::new("eur"),
+                ..held(dec!(5), dec!(5), Decimal::ZERO)
+            },
+        ];
+        let at = Utc::now();
+        let account = || {
+            AccountState::new(
+                FnvHashMap::from_iter([(
+                    usd(),
+                    AssetBalance::new(
+                        usd(),
+                        Balance::new_margin(dec!(2), Decimal::ZERO, dec!(4), dec!(0.5)),
+                        at,
+                    ),
+                )]),
+                OpenOrders::default(),
+                FnvHashMap::default(),
+                vec![],
+            )
+        };
+
+        let mut predictions = vec![];
+        for auto_repay_at_cancel in [true, false] {
+            let predicted =
+                account().balance_after_releases(&usd(), &reservations, auto_repay_at_cancel);
+
+            let mut released = account();
+            for reservation in reservations.iter().filter(|held| held.asset == usd()) {
+                released.release_reservation(reservation, auto_repay_at_cancel, at);
+            }
+            assert_eq!(predicted, Some(usd_balance(&released)));
+            predictions.push(predicted);
+        }
+        assert_ne!(predictions[0], predictions[1], "only one of them repays");
+        assert_eq!(
+            account().balance_after_releases(&AssetNameExchange::new("eur"), &reservations, true),
+            None,
+            "an asset never held"
+        );
     }
 }

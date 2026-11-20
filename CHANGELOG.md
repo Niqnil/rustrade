@@ -580,16 +580,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each as an ended `Cancelled` order snapshot stamped at the split, which the engine takes in
   place of the rescaled order. Until the instrument's next market observation the venue trades
   nothing on it: a market order is refused as unpriced, and a limit order, arriving or amended,
-  rests uncrossed (`VenueInstrumentMarket::split_at`). The market it holds still values what the
-  account holds. An action id applied once is not applied again (`CorporateActionResponse`), and
-  the venue's snapshot keeps the ids. A backtest (`SimRunner`, `SimStepper`) hands each injected
-  `EngineEvent::CorporateAction` to the venues listing its instrument as well as to the engine,
-  and drops the market it folded for the instrument. A paper venue applies one sent with
-  `PaperVenue::apply_corporate_action`, and a `MockExchange` one sent as
-  `MockExchangeRequest::corporate_action`. A backtest with orders resting across a split now ends
-  them at the split. Not yet modelled: the venue keeps balances and loans of the split asset, and
-  options on it, on their pre-split terms, and has no rule to adjust orders instead of cancelling
-  them, so a wrapper must still cancel the orders an `OpenOrdersAtSplit` lists on an option.
+  rests uncrossed (`VenueInstrumentMarket::split_at`). The market it holds, restated, still values
+  what the account holds. An action id applied once is not applied again
+  (`CorporateActionResponse`), and the venue's snapshot keeps the ids. A backtest (`SimRunner`,
+  `SimStepper`) hands each injected `EngineEvent::CorporateAction` to the venues listing its
+  instrument as well as to the engine, and drops the market it folded for the instrument. A paper
+  venue applies one sent with `PaperVenue::apply_corporate_action`, and a `MockExchange` one sent
+  as `MockExchangeRequest::corporate_action`. A backtest with orders resting across a split now ends
+  them at the split, unless the venue is configured to adjust them (see the next entry). Not yet
+  modelled: options on the split asset keep their pre-split terms, so a wrapper must still cancel
+  the orders an `OpenOrdersAtSplit` lists on an option.
+- **A split restates the simulated venue's holdings, and can adjust its buy limits**
+  (`rustrade-execution`, `rustrade-instrument`, `rustrade`). On a stock split the simulated venue
+  now restates the account's balance of the split equity (`total`, `free`, and a loan's principal
+  and interest, multiplied by the ratio), and the market and borrow price window it values them
+  at (prices divided by the ratio, sizes multiplied). `SimulatedVenue::apply_corporate_action`,
+  `PaperVenue::apply_corporate_action`, `MockExchangeRequest::corporate_action` and
+  `request_corporate_action` take the action's `SplitRoundingPolicy`, which a backtest passes on
+  from the `EngineEvent::CorporateAction`, so the venue rounds as the engine does. Under `Floor`
+  the balance is rounded down to a whole share and the fraction is paid as cash in lieu into the
+  quote asset, at the held market's mid divided by the ratio (an approximation of the broker's
+  price), reported as a balance snapshot. The new `MockExecutionConfig::split` (`SplitConfig`, one
+  `SplitAction` for a forward split and one for a reverse) chooses what happens to the orders:
+  `Cancel`, the default, or `Adjust`, which adjusts each resting buy limit as FINRA Rule 5330 has
+  US brokers do (price divided by the ratio and rounded down to the tick, unfilled quantity
+  multiplied and rounded down to a whole share under `Floor`, then to the quantity step) and
+  cancels every other order. `SplitConfig::ADJUST_FORWARD` adjusts on a forward split and cancels
+  on a reverse one, as Rule 5330 does. An adjusted order keeps its venue order id and is reported
+  as an `Open` snapshot, which the engine takes in place of its own rescale; with no tick or step
+  and fractional shares the two agree exactly. One whose hold the account can no longer afford is
+  cancelled instead, with a warning. New `CorporateActionRefusal` reasons, each changing
+  nothing: `HeldByAnotherInstrument` (an order on another instrument holds the equity),
+  `FractionalShortUnderFloor` (under `Floor`, a loan or a holding below zero the split leaves
+  fractional), `NoPriceForCashInLieu` (cash in lieu to pay and no market to price it) and
+  `Overflow`. `SplitRoundingPolicy` moves to `rustrade_instrument::corporate_action`, still
+  re-exported at `rustrade::SplitRoundingPolicy` and
+  `rustrade::engine::state::position::SplitRoundingPolicy`, and gains
+  `SplitRoundingPolicy::round_shares`, with which the engine and the venue both round.
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
   (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had

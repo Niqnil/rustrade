@@ -22,7 +22,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side,
-    corporate_action::CorporateActionKind,
+    corporate_action::{CorporateActionKind, SplitRoundingPolicy},
     exchange::ExchangeId,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
@@ -411,8 +411,8 @@ impl PaperVenue {
         request_checkpoint(&request_tx, self.exchange, (self.clock)()).await
     }
 
-    /// Asks the venue to apply the corporate action `id` of `kind` to `instrument`, as the venue
-    /// that lists it would: see
+    /// Asks the venue to apply the corporate action `id` of `kind` to `instrument`, rounding a
+    /// share count it leaves fractional as `policy` says, as the venue that lists it would: see
     /// [`SimulatedVenue::apply_corporate_action`](rustrade_execution::exchange::mock::SimulatedVenue::apply_corporate_action)
     /// for what a stock split does to it, and what it does not do yet.
     ///
@@ -431,6 +431,7 @@ impl PaperVenue {
         id: SmolStr,
         instrument: InstrumentNameExchange,
         kind: CorporateActionKind,
+        policy: SplitRoundingPolicy,
     ) -> Result<CorporateActionResponse, UnindexedClientError> {
         let Some(request_tx) = self.request_tx.upgrade() else {
             return Err(UnindexedClientError::Connectivity(
@@ -444,6 +445,7 @@ impl PaperVenue {
             id,
             instrument,
             kind,
+            policy,
         )
         .await
     }

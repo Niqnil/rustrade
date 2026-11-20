@@ -42,25 +42,12 @@ pub enum OmsMode {
     Hedging,
 }
 
-/// Rounding policy applied to a [`Position`]'s share quantity when a stock split or reverse
-/// split produces a fractional resulting share count.
-///
-/// This is **broker policy, not arithmetic** — different brokers round differently — so there
-/// is intentionally **no `Default`**. The caller must choose explicitly.
-///
-/// `#[non_exhaustive]`: a future broker rounding mode (e.g. net-then-round across lots) can be
-/// added without breaking downstream exhaustive matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[non_exhaustive]
-pub enum SplitRoundingPolicy {
-    /// Whole-share brokers: floor `quantity_abs` to an integer share count. The disposed
-    /// fraction becomes cash-in-lieu, reported via [`SplitResult::remainder`] for the caller
-    /// to reconcile against the broker's CIL payment.
-    Floor,
-    /// Fractional-share brokers (e.g. Alpaca): keep the exact fractional share count. No
-    /// cash-in-lieu — [`SplitResult::remainder`] is always `0`.
-    Fractional,
-}
+/// How a broker rounds a share count a split leaves fractional. Defined in
+/// [`rustrade_instrument::corporate_action`] so a simulated venue applies the same policy as the
+/// engine; re-exported here, where the engine applies it. Under
+/// [`Floor`](SplitRoundingPolicy::Floor), the disposed fraction of a [`Position`] is reported via
+/// [`SplitResult::remainder`] for the caller to reconcile against the broker's cash in lieu.
+pub use rustrade_instrument::corporate_action::SplitRoundingPolicy;
 
 /// Outcome of [`Position::apply_split`].
 ///
@@ -1697,19 +1684,16 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         // `ratio` is a `SplitRatio` (`> 0` by construction), so no runtime sign check is needed.
         let ratio = ratio.get();
 
-        // Scaled (unfloored) quantity on the new share scale.
+        // Scaled (unrounded) quantity on the new share scale.
         let scaled_quantity = self
             .quantity_abs
             .checked_mul(ratio)
             .ok_or(SplitError::Overflow)?;
-        let quantity_abs = match policy {
-            SplitRoundingPolicy::Floor => scaled_quantity.floor(),
-            SplitRoundingPolicy::Fractional => scaled_quantity,
-        };
+        let quantity_abs = policy.round_shares(scaled_quantity);
 
-        // Post-split fractional shares disposed, in POST-split units (scaled minus floored).
-        // `scaled_quantity >= quantity_abs` (floor never increases it; equal under `Fractional`),
-        // so this subtraction is a value in `[0, 1)` and cannot overflow.
+        // Post-split fractional shares disposed, in POST-split units (scaled minus rounded).
+        // `round_shares` rounds toward zero, so `scaled_quantity >= quantity_abs` (equal under
+        // `Fractional`), and this subtraction is a value in `[0, 1)` and cannot overflow.
         let remainder = scaled_quantity - quantity_abs;
 
         // Notional-preserving per-share basis: old_avg / ratio, independent of rounding.

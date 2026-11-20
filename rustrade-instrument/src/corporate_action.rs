@@ -109,8 +109,8 @@ impl<'de> Deserialize<'de> for SplitRatio {
 /// This type carries **market facts only**. It deliberately contains no rounding policy, no
 /// account context, and no resolved timestamp: a data source emitting a split knows the ratio,
 /// not how a particular broker will round fractional shares or when a particular engine should
-/// stamp the adjustment. Those concerns live with the consumer (see the engine-side
-/// `SplitRoundingPolicy` and the `effective_time` resolved via [`split_effective_instant`]).
+/// stamp the adjustment. Those concerns live with the consumer (see [`SplitRoundingPolicy`] and
+/// the `effective_time` resolved via [`split_effective_instant`]).
 ///
 /// `#[non_exhaustive]`: further corporate actions (dividends, spin-offs, symbol changes, …) can
 /// be added without breaking downstream exhaustive matches.
@@ -226,6 +226,46 @@ impl CorporateActionKind {
     }
 }
 
+/// How a broker rounds a share count that a stock split or reverse split leaves fractional.
+///
+/// This is **broker policy, not arithmetic**: brokers round differently, so there is
+/// intentionally **no `Default`** and the caller must choose. It is not part of
+/// [`CorporateActionKind`], which carries market facts only: the holder declares it alongside the
+/// action, and every consumer of that action (an engine rescaling its positions, a simulated
+/// venue rescaling its balances and orders) applies the same one.
+///
+/// The rounding itself is [`round_shares`](Self::round_shares), so that every consumer rounds
+/// alike.
+///
+/// `#[non_exhaustive]`: a future broker rounding mode (e.g. net-then-round across lots) can be
+/// added without breaking downstream exhaustive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[non_exhaustive]
+pub enum SplitRoundingPolicy {
+    /// Whole-share brokers: round the scaled share count toward zero to a whole share. The
+    /// disposed fraction is paid out as cash in lieu.
+    Floor,
+    /// Fractional-share brokers (e.g. Alpaca): keep the exact fractional share count. No cash in
+    /// lieu.
+    Fractional,
+}
+
+impl SplitRoundingPolicy {
+    /// `shares`, a share count already multiplied by a split's ratio, as this policy keeps it:
+    /// rounded toward zero to a whole share under [`Floor`](Self::Floor), unchanged under
+    /// [`Fractional`](Self::Fractional).
+    ///
+    /// What it takes off, `shares - policy.round_shares(shares)`, is the fraction disposed of as
+    /// cash in lieu. It lies between zero and `shares`.
+    #[must_use]
+    pub fn round_shares(self, shares: Decimal) -> Decimal {
+        match self {
+            Self::Floor => shares.trunc(),
+            Self::Fractional => shares,
+        }
+    }
+}
+
 /// How the OCC adjusts listed **options** on an underlying that undergoes a stock split (OCC
 /// By-Laws Article VI, §11) — the classification returned by [`CorporateActionKind::split_kind`].
 ///
@@ -328,6 +368,25 @@ mod tests {
         assert_eq!(instant.time(), NaiveTime::MIN);
         assert_eq!(instant.naive_utc().year(), 2026);
         assert_eq!(instant.to_rfc3339(), "2026-06-22T00:00:00+00:00");
+    }
+
+    #[test]
+    fn floor_rounds_shares_toward_zero_and_fractional_keeps_them() {
+        use std::str::FromStr;
+        let d = |value: &str| Decimal::from_str(value).unwrap();
+        for (shares, floor) in [
+            ("2.5", "2"),
+            ("-2.5", "-2"),
+            ("3", "3"),
+            ("0.4", "0"),
+            ("0", "0"),
+        ] {
+            assert_eq!(SplitRoundingPolicy::Floor.round_shares(d(shares)), d(floor));
+            assert_eq!(
+                SplitRoundingPolicy::Fractional.round_shares(d(shares)),
+                d(shares)
+            );
+        }
     }
 
     /// Build a `StockSplit` from a raw ratio for assertions (panics on a non-positive ratio, which
