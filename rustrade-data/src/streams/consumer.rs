@@ -213,7 +213,7 @@ where
 /// Each initialised stream's items, ended early by a terminal error or by its silence timeout
 /// (which yields `SilenceTimeout`), then one `Reconnecting`. A failed attempt ends no stream, so
 /// it yields `ReinitFailed` and no further `Reconnecting`.
-fn market_stream_events<T>(
+pub(crate) fn market_stream_events<T>(
     attempts: BoxStream<'static, Result<BoxStream<'static, Result<T, DataError>>, DataError>>,
     options: MarketStreamOptions,
     stream_key: StreamKey,

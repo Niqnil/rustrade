@@ -3,6 +3,17 @@
 //! TWS/Gateway answers a request it refuses, and reports its own state, with a numbered message.
 //! These are the codes this workspace gives a meaning to; any other code is passed on as IB's text.
 
+/// TWS/Gateway has lost its connection to IB's servers. The API socket stays up, but no market
+/// data or order updates arrive until the link is restored.
+pub const LINK_LOST: i32 = 1100;
+
+/// TWS/Gateway is reconnected to IB's servers, and its market data subscriptions were lost: every
+/// subscription made before must be made again.
+pub const LINK_RESTORED_DATA_LOST: i32 = 1101;
+
+/// TWS/Gateway is reconnected to IB's servers, and its market data subscriptions were kept.
+pub const LINK_RESTORED_DATA_KEPT: i32 = 1102;
+
 /// A request would exceed the account's market data lines ("Max number of tickers has been
 /// reached").
 ///

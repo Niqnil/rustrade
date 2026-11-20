@@ -71,7 +71,12 @@ use ibapi::{
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistry,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    ibkr::{
+        ContractRegistry,
+        codes::{LINK_LOST, LINK_RESTORED_DATA_KEPT, LINK_RESTORED_DATA_LOST},
+    },
     instrument::name::InstrumentNameExchange,
 };
 use smol_str::SmolStr;
@@ -114,13 +119,6 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// the gap is given up and reported as [`AccountEventKind::FillRecoveryGaveUp`].
 const MAX_RECOVERY_FAILURES: u32 = 3;
 
-/// TWS has lost its connection to IB's servers. The API socket stays up.
-const CODE_LINK_LOST: i32 = 1100;
-/// TWS is reconnected to IB's servers; market data subscriptions were lost.
-const CODE_LINK_RESTORED_DATA_LOST: i32 = 1101;
-/// TWS is reconnected to IB's servers; market data subscriptions were kept.
-const CODE_LINK_RESTORED_DATA_KEPT: i32 = 1102;
-
 /// What a globally routed notice says about event delivery to this client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConnectivityNotice {
@@ -133,8 +131,8 @@ pub(super) enum ConnectivityNotice {
 /// Classify a notice code, or `None` for one that says nothing about event delivery.
 pub(super) fn classify_notice(code: i32) -> Option<ConnectivityNotice> {
     match code {
-        CODE_LINK_LOST => Some(ConnectivityNotice::Lost),
-        CODE_LINK_RESTORED_DATA_LOST | CODE_LINK_RESTORED_DATA_KEPT | TRANSPORT_RECONNECT_CODE => {
+        LINK_LOST => Some(ConnectivityNotice::Lost),
+        LINK_RESTORED_DATA_LOST | LINK_RESTORED_DATA_KEPT | TRANSPORT_RECONNECT_CODE => {
             Some(ConnectivityNotice::Restored)
         }
         _ => None,
@@ -1080,7 +1078,7 @@ mod tests {
         observe_notice(&mut tracker, &notice(2104));
         assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
-        observe_notice(&mut tracker, &notice(CODE_LINK_RESTORED_DATA_KEPT));
+        observe_notice(&mut tracker, &notice(LINK_RESTORED_DATA_KEPT));
         assert!(tracker.recovery_floor(true, VenueClock::new).is_some());
     }
 

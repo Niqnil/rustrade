@@ -44,8 +44,6 @@
 //! | `test_historical_connection` | Connect to IB for historical data |
 //! | `test_historical_from_shared_client` | Use shared ibapi client |
 //! | `test_market_stream_connection` | Initialize market stream |
-//! | `test_market_stream_disconnect_while_subscribing` | `disconnect` right after `init` ends the stream with no error |
-//! | `test_market_stream_disconnect_while_running` | `disconnect` of running subscriptions ends the stream with no error |
 //! | `test_market_stream_unregistered_contract` | Verify rejection for unknown contract |
 //! | `test_contract_resolution` | Resolve contract details |
 //!
@@ -65,6 +63,7 @@
 //! | `test_market_stream_quotes` | Stream L1 quotes |
 //! | `test_market_stream_multiple_subscriptions` | Stream multiple symbols |
 //! | `test_market_stream_option_quotes_delayed` | Stream delayed L1 quotes for many options at once (no OPRA needed) |
+//! | `test_market_stream_reconnects_after_the_socket_is_cut` | Cut the socket through a local proxy: the stream reports the loss, reconnects and quotes again (delayed data) |
 //! | `test_calculate_theoretical_greeks` | Calculate option Greeks (calculator, no data) |
 //! | `test_calculate_implied_volatility` | Calculate IV (calculator, no data) |
 //! | `test_fetch_option_chain` | Fetch option chain structure |
@@ -94,7 +93,7 @@ use ibapi::{
 };
 use rustrade_data::{
     error::DataError,
-    event::DataKind,
+    event::{DataKind, MarketEvent},
     exchange::ibkr::{
         IbkrMarketDataType, IbkrMarketStream, IbkrStreamConfig,
         historical::{
@@ -103,11 +102,12 @@ use rustrade_data::{
         },
         subscription::{IbkrSubscription, IbkrSubscriptionKind},
     },
+    streams::{consumer::MarketStreamOptions, reconnect::Event},
 };
-use rustrade_instrument::ibkr::ContractRegistry;
+use rustrade_instrument::{exchange::ExchangeId, ibkr::ContractRegistry};
 use serial_test::serial;
 use std::{sync::Arc, time::Duration};
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn init_logging() {
@@ -118,6 +118,27 @@ fn init_logging() {
                 .from_env_lossy(),
         )
         .try_init();
+}
+
+/// A market stream with the default options, its items unwrapped from their reconnection events.
+/// A reconnect fails the test: none of the tests reading it cuts the connection.
+async fn init_stream(
+    config: IbkrStreamConfig,
+    contracts: Arc<ContractRegistry>,
+    subscriptions: Vec<IbkrSubscription<String>>,
+) -> Result<impl Stream<Item = Result<MarketEvent<String, DataKind>, DataError>> + Unpin, DataError>
+{
+    let stream = IbkrMarketStream::init(
+        config,
+        contracts,
+        subscriptions,
+        MarketStreamOptions::default(),
+    )
+    .await?;
+    Ok(stream.map(|event| match event {
+        Event::Item(item) => item,
+        Event::Reconnecting(exchange) => panic!("unexpected reconnect of {exchange}"),
+    }))
 }
 
 fn test_port() -> u16 {
@@ -653,7 +674,7 @@ async fn test_market_stream_connection() {
         kind: IbkrSubscriptionKind::Quotes,
     }];
 
-    let result = IbkrMarketStream::init(config, registry, subscriptions);
+    let result = init_stream(config, registry, subscriptions).await;
 
     assert!(
         result.is_ok(),
@@ -662,103 +683,6 @@ async fn test_market_stream_connection() {
     );
 
     println!("Market stream initialized successfully");
-}
-
-fn disconnect_test_stream(client_id_offset: i32) -> IbkrMarketStream<String> {
-    let config = IbkrStreamConfig::new(
-        "127.0.0.1",
-        test_port(),
-        test_client_id_base() + client_id_offset,
-    );
-
-    // IDEALPRO forex quotes, because a paper account has them: it may lack the stock market data
-    // permissions, and then IB ends a stock subscription before the disconnect is tested. Outside
-    // forex hours no quotes flow, but the subscription still stays open.
-    let pairs = [("EUR.USD", "EUR", "USD"), ("GBP.USD", "GBP", "USD")];
-    let registry = ContractRegistry::new();
-    for (name, base, quote) in pairs {
-        registry.register_by_name_only(name.into(), Contract::forex(base, quote).build());
-    }
-    let registry = Arc::new(registry);
-
-    // Two workers, so the stream ends only once both have exited.
-    let subscriptions = pairs
-        .into_iter()
-        .map(|(name, _, _)| IbkrSubscription {
-            instrument: name.into(),
-            key: name.to_string(),
-            kind: IbkrSubscriptionKind::Quotes,
-        })
-        .collect();
-
-    IbkrMarketStream::init(config, registry, subscriptions).expect("stream init failed")
-}
-
-/// Read the stream to its end after `disconnect`, failing on any error item or if it never ends.
-async fn assert_ends_cleanly(stream: &mut IbkrMarketStream<String>) {
-    let drained = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut events = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(_) => events += 1,
-                Err(e) => panic!("error item after the caller's own disconnect: {e:?}"),
-            }
-        }
-        events
-    })
-    .await;
-    match drained {
-        Ok(events) => println!("Stream ended cleanly after disconnect ({events} events read)"),
-        Err(_) => panic!("stream did not end within 10s of disconnect"),
-    }
-}
-
-/// Tier 0: Connection Only (FREE)
-///
-/// `disconnect` right after `init`, while the workers may still be sending their subscriptions:
-/// `ibapi` refuses those with `ConnectionReset`, and the stream must still end with no error.
-#[serial]
-#[tokio::test]
-#[ignore]
-async fn test_market_stream_disconnect_while_subscribing() {
-    init_logging();
-
-    let mut stream = disconnect_test_stream(15);
-    stream.disconnect();
-    assert_ends_cleanly(&mut stream).await;
-}
-
-/// Tier 0: Connection Only (FREE)
-///
-/// `disconnect` once the subscriptions are running: `ibapi` ends them with `Shutdown`, and the
-/// stream must end with no error. Whatever arrives before the call, data or an error such as a
-/// missing market data permission, is read and set aside first.
-#[serial]
-#[tokio::test]
-#[ignore]
-async fn test_market_stream_disconnect_while_running() {
-    init_logging();
-
-    let mut stream = disconnect_test_stream(16);
-    let mut before = 0;
-    let ended_early = tokio::time::timeout(Duration::from_secs(3), async {
-        while let Some(item) = stream.next().await {
-            if let Err(e) = item {
-                println!("Before disconnect: {e:?}");
-            }
-            before += 1;
-        }
-    })
-    .await
-    .is_ok();
-    assert!(
-        !ended_early,
-        "every subscription ended before disconnect ({before} items), so nothing was left to test"
-    );
-    println!("{before} items before disconnect");
-
-    stream.disconnect();
-    assert_ends_cleanly(&mut stream).await;
 }
 
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
@@ -780,8 +704,9 @@ async fn test_market_stream_quotes() {
         kind: IbkrSubscriptionKind::Quotes,
     }];
 
-    let mut stream =
-        IbkrMarketStream::init(config, registry, subscriptions).expect("stream init failed");
+    let mut stream = init_stream(config, registry, subscriptions)
+        .await
+        .expect("stream init failed");
 
     println!("Waiting for quote events (10 second timeout)...");
     println!("Note: No quotes will arrive outside US market hours (9:30 AM - 4:00 PM ET)");
@@ -866,7 +791,8 @@ async fn test_market_stream_option_quotes_delayed() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 35)
         .with_market_data_type(IbkrMarketDataType::DelayedFrozen);
-    let mut stream = IbkrMarketStream::init(config, Arc::new(registry), subscriptions)
+    let mut stream = init_stream(config, Arc::new(registry), subscriptions)
+        .await
         .expect("stream init failed");
 
     let mut quotes: HashMap<String, usize> = HashMap::new();
@@ -893,7 +819,7 @@ async fn test_market_stream_option_quotes_delayed() {
         }
     })
     .await;
-    stream.disconnect();
+    drop(stream);
 
     println!(
         "{} of {lines} lines quoted; errors: {errors:?}",
@@ -915,7 +841,139 @@ async fn test_market_stream_option_quotes_delayed() {
         "only {} of {lines} lines quoted within 30 s",
         quotes.len()
     );
-    assert_ends_cleanly(&mut stream).await;
+}
+
+/// A TCP proxy on a free local port that forwards every connection to TWS/Gateway on
+/// `gateway_port`, and can cut every connection open through it at once.
+struct CuttableProxy {
+    port: u16,
+    cut: tokio::sync::watch::Sender<u64>,
+}
+
+impl CuttableProxy {
+    async fn start(gateway_port: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy bind");
+        let port = listener.local_addr().expect("proxy address").port();
+        let (cut, _) = tokio::sync::watch::channel(0_u64);
+        let cuts = cut.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                // A receiver made now has seen every cut so far, so only a later one ends this.
+                let mut cut = cuts.subscribe();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", gateway_port)).await
+                    else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = cut.changed() => println!("proxy: connection cut"),
+                    }
+                });
+            }
+        });
+        Self { port, cut }
+    }
+
+    /// Close every connection open through the proxy. New ones are still accepted.
+    fn cut(&self) {
+        self.cut.send_modify(|cuts| *cuts += 1);
+    }
+}
+
+/// Tier 0 (FREE: delayed-frozen data needs no market data subscription)
+///
+/// Streams AAPL quotes through a local proxy, cuts the socket once a quote has arrived, and
+/// requires the stream to report [`DataError::ConnectionLost`], then `Reconnecting`, then quote
+/// again on its own: a quote after the reconnect proves the subscription was made anew. Failed
+/// attempts in between (such as IB still holding the client ID) are allowed.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_market_stream_reconnects_after_the_socket_is_cut() {
+    init_logging();
+
+    let proxy = CuttableProxy::start(test_port()).await;
+    let config = IbkrStreamConfig::new("127.0.0.1", proxy.port, test_client_id_base() + 36)
+        .with_market_data_type(IbkrMarketDataType::DelayedFrozen);
+    let registry = ContractRegistry::new();
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    let subscriptions = vec![IbkrSubscription::quotes("AAPL".to_string(), "AAPL".into())];
+
+    let mut stream = IbkrMarketStream::init(
+        config,
+        Arc::new(registry),
+        subscriptions,
+        MarketStreamOptions::default(),
+    )
+    .await
+    .expect("stream init failed");
+    let is_quote = |event: &Event<ExchangeId, Result<MarketEvent<String, DataKind>, DataError>>| {
+        matches!(
+            event,
+            Event::Item(Ok(MarketEvent {
+                kind: DataKind::OrderBookL1(_),
+                ..
+            }))
+        )
+    };
+
+    let first = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = stream.next().await {
+            if is_quote(&event) {
+                return;
+            }
+            println!("before the cut: {event:?}");
+        }
+        panic!("the stream ended");
+    })
+    .await;
+    assert!(first.is_ok(), "no quote within 30 s before the cut");
+
+    proxy.cut();
+
+    let mut seen = Vec::new();
+    let after = tokio::time::timeout(Duration::from_secs(90), async {
+        while let Some(event) = stream.next().await {
+            let quote = is_quote(&event);
+            if !quote {
+                println!("after the cut: {event:?}");
+            }
+            let reconnected = seen
+                .iter()
+                .any(|seen| matches!(seen, Event::Reconnecting(ExchangeId::Ibkr)));
+            seen.push(event);
+            if quote && reconnected {
+                return;
+            }
+        }
+        panic!("the stream ended");
+    })
+    .await;
+    drop(stream);
+
+    let lost = seen
+        .iter()
+        .position(|event| matches!(event, Event::Item(Err(DataError::ConnectionLost { .. }))));
+    let reconnecting = seen
+        .iter()
+        .position(|event| matches!(event, Event::Reconnecting(ExchangeId::Ibkr)));
+    assert!(
+        after.is_ok(),
+        "no quote within 90 s after the cut: {seen:?}"
+    );
+    assert!(
+        matches!((lost, reconnecting), (Some(lost), Some(reconnecting)) if lost < reconnecting),
+        "expected ConnectionLost, then Reconnecting: {seen:?}"
+    );
+    let reconnects = seen
+        .iter()
+        .filter(|event| matches!(event, Event::Reconnecting(_)))
+        .count();
+    assert_eq!(reconnects, 1, "one reconnect per cut: {seen:?}");
 }
 
 /// Tier 2: L2 Market Depth (PAID — varies by exchange)
@@ -937,8 +995,9 @@ async fn test_market_stream_depth() {
         kind: IbkrSubscriptionKind::Depth { rows: 5 },
     }];
 
-    let mut stream =
-        IbkrMarketStream::init(config, registry, subscriptions).expect("stream init failed");
+    let mut stream = init_stream(config, registry, subscriptions)
+        .await
+        .expect("stream init failed");
 
     println!("Waiting for depth events (10 second timeout)...");
     println!("Note: Depth may not be available for all instruments or times");
@@ -990,7 +1049,7 @@ async fn test_market_stream_unregistered_contract() {
         kind: IbkrSubscriptionKind::Quotes,
     }];
 
-    let result = IbkrMarketStream::init(config, registry, subscriptions);
+    let result = init_stream(config, registry, subscriptions).await;
 
     // M-3: This test validates contract rejection, but connection errors also
     // cause is_err(). The test only confirms contract rejection when connected.
@@ -1029,7 +1088,7 @@ async fn test_market_stream_multiple_subscriptions() {
         },
     ];
 
-    let result = IbkrMarketStream::init(config, registry, subscriptions);
+    let result = init_stream(config, registry, subscriptions).await;
 
     assert!(
         result.is_ok(),
@@ -1430,8 +1489,10 @@ async fn test_option_greeks_stream() {
     // before opening the streaming connection.
     let option = aapl_call_option().await;
 
+    // The stream looks contracts up by name only, and the chain's contract carries no contract ID,
+    // which `register` requires.
     let registry = ContractRegistry::new();
-    registry.register("AAPL_CALL".into(), option).unwrap();
+    registry.register_by_name_only("AAPL_CALL".into(), option);
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {
@@ -1440,7 +1501,7 @@ async fn test_option_greeks_stream() {
         kind: IbkrSubscriptionKind::OptionGreeks,
     }];
 
-    let result = IbkrMarketStream::init(config, registry, subscriptions);
+    let result = init_stream(config, registry, subscriptions).await;
 
     match result {
         Ok(mut stream) => {

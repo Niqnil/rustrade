@@ -29,7 +29,7 @@ export decoding), `massive`, `sec-edgar` and `thetadata`.
 | **Okx** | `Okx` | Spot, Future, Perpetual, Option | PublicTrades |
 | **Hyperliquid** | `Hyperliquid::default()` | Perpetual | PublicTrades, OrderBooksL2 |
 | **HyperliquidSpot** | `HyperliquidSpot::default()` | Spot | PublicTrades, OrderBooksL2 |
-| **IBKR** | `IbkrMarketStream::init(config, contracts, subscriptions)` | Spot, Future, Option | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2, Candles, OptionGreeks |
+| **IBKR** | `IbkrMarketStream::init(config, contracts, subscriptions, options).await` | Spot, Future, Option | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2, Candles, OptionGreeks |
 | **AlpacaIex** | `AlpacaIex::default()`, with `AlpacaSubscriber` | Spot (Equities) | PublicTrades, Quotes, OrderBooksL1 |
 | **AlpacaSip** | `AlpacaSip::default()`, with `AlpacaSubscriber` | Spot (Equities) | PublicTrades, Quotes, OrderBooksL1 |
 | **AlpacaCrypto** | `AlpacaCrypto::default()`, with `AlpacaSubscriber` | Spot (Crypto) | PublicTrades, Quotes, OrderBooksL1 |

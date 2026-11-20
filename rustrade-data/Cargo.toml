@@ -68,7 +68,7 @@ temp-env = { workspace = true }
 serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection limit)
 wiremock = { workspace = true }  # For Massive/Alpaca REST pagination tests (mock next_url/page_token chains) and http.rs unit tests
 http = { workspace = true }  # Builds synthetic `reqwest::Response`s (via reqwest's `From<http::Response<_>>`) for socket-free transport tests; already in the tree via reqwest
-tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }  # `test-util` = paused-clock poll-timing tests
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util"] }  # `test-util` = paused-clock poll-timing tests; `io-util` = the IBKR live reconnect test's proxy
 tempfile = { workspace = true }  # Scratch directories for LSE export download/resume tests; already in the tree
 sha2 = { workspace = true }  # Computes the digest in synthetic LSE export job fixtures
 hex = { workspace = true }  # Encodes that digest as the provider does
