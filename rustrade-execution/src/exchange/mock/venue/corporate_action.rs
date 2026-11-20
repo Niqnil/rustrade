@@ -320,17 +320,13 @@ impl SimulatedVenue {
         let orders = self.account.orders();
 
         let options = self.options_on(instrument);
-        if option_split == OptionSplit::RefuseIfHeld
-            && options
-                .iter()
-                .any(|option| self.has_option_exposure(option))
-        {
+        if option_split == OptionSplit::RefuseIfHeld && self.has_exposure_to_any(&options) {
             return Err(CorporateActionRefusal::OptionExposureAtNonStandardSplit);
         }
         // Past that check, an order on an option of the equity remains only on a standard split,
         // which cancels it with the equity's own: neither counts as held elsewhere.
         let split_by_this = |order_instrument: &InstrumentNameExchange| {
-            order_instrument == instrument || options.contains(&order_instrument)
+            order_instrument == instrument || options.binary_search(&order_instrument).is_ok()
         };
 
         let held_elsewhere = orders
@@ -440,7 +436,11 @@ impl SimulatedVenue {
     }
 
     /// The options this venue lists on the equity `instrument`: those whose underlying is its
-    /// pair. Sorted by name, so the plan built from them does not depend on the map's order.
+    /// pair. Sorted by name, so the plan built from them does not depend on the map's order, and
+    /// so a lookup in them is a binary search.
+    ///
+    /// The underlying is compared by spelling. That selects what comparing each asset as the same
+    /// asset would, because the venue refuses, when built or restored, an asset spelled two ways.
     fn options_on(&self, instrument: &InstrumentNameExchange) -> Vec<&InstrumentNameExchange> {
         let underlying = &self.instruments[instrument].underlying;
         let mut options = self

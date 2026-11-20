@@ -1685,11 +1685,20 @@ impl SimulatedVenue {
 
     /// Whether the account holds a position in the option `instrument`, or has an order on it.
     fn has_option_exposure(&self, instrument: &InstrumentNameExchange) -> bool {
-        self.positions.contains_key(instrument)
+        self.has_exposure_to_any(&[instrument])
+    }
+
+    /// Whether the account holds a position in, or has an order on, any of `options`, which are
+    /// sorted. One pass over the open orders, whatever the number of options.
+    fn has_exposure_to_any(&self, options: &[&InstrumentNameExchange]) -> bool {
+        debug_assert!(options.is_sorted(), "options are sorted");
+        options
+            .iter()
+            .any(|option| self.positions.contains_key(*option))
             || self
                 .account
                 .orders_open()
-                .any(|order| order.key.instrument == *instrument)
+                .any(|order| options.binary_search(&&order.key.instrument).is_ok())
     }
 
     /// Expires the option `instrument` at `expiry`: retires every order still working on it, then
