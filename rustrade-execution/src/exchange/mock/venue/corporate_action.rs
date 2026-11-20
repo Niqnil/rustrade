@@ -166,9 +166,9 @@ impl SimulatedVenue {
     ///   is the same cash unless the exact division rounded the strike in its last decimal place.
     ///   The venue then holds or releases the difference in the quote asset, so the cash held
     ///   stays what the position calls for, reported as a balance snapshot of the quote asset
-    ///   after the restated holdings and cash in lieu. If the account has too little of it free,
-    ///   once the split's cancels and cash in lieu are counted, the action is refused with
-    ///   [`OptionCollateralShortfall`].
+    ///   after the restated holdings and cash in lieu, and before the adjusted orders' events.
+    ///   If the account has too little of it free, once the split's cancels and cash in lieu are
+    ///   counted, the action is refused with [`OptionCollateralShortfall`].
     /// - **[`NonStandard`](SplitAdjustmentKind::NonStandard)** (a reverse split, or a forward
     ///   split by a ratio that is not a whole number), or a kind this venue does not know:
     ///   refused with [`OptionExposureAtNonStandardSplit`] while the account holds a position in,

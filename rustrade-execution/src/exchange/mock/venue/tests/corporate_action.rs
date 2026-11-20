@@ -1186,10 +1186,32 @@ mod options_on_the_equity {
         assert_eq!(totals(&venue, usd()), (Decimal::ZERO, Decimal::ZERO));
     }
 
-    /// The quote cash the account holds apart from its free balance, with no order open.
+    /// The quote cash the account holds apart from its free balance.
     fn usd_held(venue: &SimulatedVenue) -> Decimal {
         let (total, free) = totals(venue, usd());
         total - free
+    }
+
+    /// The quote cash the account's open orders hold.
+    fn usd_held_by_orders(venue: &SimulatedVenue) -> Decimal {
+        venue
+            .account
+            .orders()
+            .entries()
+            .into_iter()
+            .filter_map(|entry| entry.resting.reservation)
+            .filter(|reservation| reservation.asset == usd())
+            .map(|reservation| reservation.amount)
+            .sum()
+    }
+
+    /// Asserts the quote cash held is exactly what the short put and the open orders hold.
+    fn assert_usd_held_is_collateral_and_orders(venue: &SimulatedVenue) {
+        let collateral = venue
+            .collateral_held(&option_name())
+            .expect("still short")
+            .amount;
+        assert_eq!(usd_held(venue), collateral + usd_held_by_orders(venue));
     }
 
     /// Sells a put at `STRIKE`, splits by `ratio`, and asserts the cash held is exactly what the
@@ -1311,6 +1333,35 @@ mod options_on_the_equity {
                 .map(|held| held.amount),
             Some(d("10000.000000000000000000000001"))
         );
+        assert_usd_held_is_collateral_and_orders(&venue);
+        // The adjusted bid's hold, 252 × (74.9999999999999999999999995 ÷ 126), rounds to 150, a
+        // step above what it held, and the put has taken the last free step: the account can no
+        // longer afford it, so it is cancelled as such an adjusted order is.
+        assert!(venue.orders_open(&[]).is_empty());
+        assert_eq!(
+            totals(&venue, usd()).1,
+            d("150") - d("0.000000000000000000000001")
+        );
+    }
+
+    #[test]
+    fn what_the_splits_cancels_release_counts_towards_a_short_puts_collateral() {
+        // Under the default configuration the split cancels the bid holding all the free cash,
+        // which frees it before the put's extra step is held.
+        let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+        let mut request = limit_request("spy-bid", Side::Buy, "3", "50", gtc());
+        request.key.instrument = spy_name();
+        assert!(venue.open_order(request).response.state.is_accepted());
+        assert_eq!(totals(&venue, usd()).1, Decimal::ZERO);
+
+        let outcome = split_spy(&mut venue, "split-1", "126", 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(cancelled_cids(&outcome.events), ["spy-bid"]);
+        assert_eq!(usd_held(&venue), d("10000.000000000000000000000001"));
+        assert_usd_held_is_collateral_and_orders(&venue);
     }
 
     #[test]
@@ -1335,6 +1386,7 @@ mod options_on_the_equity {
                 .map(|held| held.amount),
             Some(d("10000.000000000000000000000001"))
         );
+        assert_usd_held_is_collateral_and_orders(&venue);
         assert!(totals(&venue, usd()).1 > Decimal::ZERO);
     }
 
