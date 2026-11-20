@@ -13,6 +13,14 @@
 //!
 //! The value is kept as the status's venue code. IB documents 0 as sent only for a contract in a
 //! TWS watchlist, so a contract that trades normally may never report a status at all.
+//!
+//! [`TradingStatus`]: crate::subscription::trading_status::TradingStatus
+//! [`TradingState::Unknown`]: crate::subscription::trading_status::TradingState::Unknown
+//! [`TradingState::Trading`]: crate::subscription::trading_status::TradingState::Trading
+//! [`TradingState::Halted`]: crate::subscription::trading_status::TradingState::Halted
+//! [`TradingState::Paused`]: crate::subscription::trading_status::TradingState::Paused
+//! [`HaltReason::Regulatory`]: crate::subscription::trading_status::HaltReason::Regulatory
+//! [`HaltReason::Volatility`]: crate::subscription::trading_status::HaltReason::Volatility
 
 use crate::subscription::trading_status::{HaltReason, TradingState, TradingStatus};
 use ibapi::{contracts::tick_types::TickType, market_data::realtime::TickGeneric};

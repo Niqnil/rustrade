@@ -4,6 +4,8 @@
 //! or extreme volatility. While it does, orders sent to it rest unfilled or are refused, and its
 //! quotes stop being a price anyone can trade at. A [`TradingStatus`] reports each change the
 //! venue publishes.
+//!
+//! [`TradingStatus`]: crate::subscription::trading_status::TradingStatus
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
