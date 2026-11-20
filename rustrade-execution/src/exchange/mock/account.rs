@@ -391,11 +391,6 @@ impl AccountState {
             .filter(move |trade| trade.time_exchange >= time_since)
     }
 
-    /// `asset`'s balance, or `None` for an asset the account has never held.
-    pub fn balance(&self, asset: &AssetNameExchange) -> Option<&AssetBalance<AssetNameExchange>> {
-        self.balances.get(asset)
-    }
-
     /// What `asset`'s balance would be once each of `reservations` that holds it is released in
     /// turn by [`release_reservation`](Self::release_reservation) with `auto_repay_at_cancel`,
     /// changing nothing. `None` for an asset the account has never held.

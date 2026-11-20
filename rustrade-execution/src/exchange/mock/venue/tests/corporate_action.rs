@@ -918,3 +918,66 @@ fn a_split_is_refused_while_an_order_on_another_instrument_holds_the_equity() {
     assert!(refused.events.is_empty());
     assert_eq!(venue.account.free(&base()), d("9"));
 }
+
+#[test]
+fn a_cancelled_sell_s_loan_is_repaid_or_kept_as_the_venue_repays_at_cancel_then_restated() {
+    for (auto_repay, expected, why) in [
+        (
+            true,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            "the cancel repays the borrowed BTC, leaving nothing to restate",
+        ),
+        (
+            false,
+            Balance::new_margin(d("2"), d("2"), d("2"), Decimal::ZERO),
+            "the released BTC and its loan both stay, then double",
+        ),
+    ] {
+        let config = spot_config("0", "100000", FeeModelConfig::default()).with_spot_margin(
+            SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
+                .unwrap()
+                .with_auto_repay_at_cancel(auto_repay),
+        );
+        let mut venue = venue_with(&config, spot_instruments());
+        rest(&mut venue, "ask", Side::Sell, "1", "50000");
+
+        let outcome = apply(&mut venue, "2", SplitRoundingPolicy::Fractional, 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(cancelled_cids(&outcome.events), ["ask"]);
+        let restated = outcome
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::BalanceSnapshot(snapshot) if snapshot.0.asset == base() => {
+                    Some(snapshot.0.balance)
+                }
+                _ => None,
+            });
+        assert_eq!(restated, Some(expected), "{why}");
+    }
+}
+
+#[test]
+fn a_split_restates_the_borrow_price_window() {
+    let config = spot_config("10", "1000000", FeeModelConfig::default()).with_spot_margin(
+        SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
+            .unwrap()
+            .with_borrow_price_window(TimeDelta::hours(1))
+            .unwrap(),
+    );
+    let mut venue = venue_with(&config, spot_instruments());
+    assert_eq!(
+        venue.borrow_prices[&instrument_name()].low(time(0)),
+        Some(d("49050")),
+        "the quote's mid is recorded"
+    );
+
+    let outcome = apply(&mut venue, "2", SplitRoundingPolicy::Fractional, 5);
+
+    assert_eq!(outcome.response, CorporateActionResponse::Applied);
+    let window = &venue.borrow_prices[&instrument_name()];
+    assert_eq!(window.low(time(0)), Some(d("24525")));
+    assert_eq!(window.high(time(0)), Some(d("24525")));
+}
