@@ -66,6 +66,22 @@ impl PriceWindow {
         }
     }
 
+    /// This window with every price divided by `ratio`, as a split of `ratio` restates it, or
+    /// `None` if a price does not fit a [`Decimal`]. `ratio` is positive, so each queue keeps its
+    /// order.
+    pub(super) fn rescaled(&self, ratio: Decimal) -> Option<Self> {
+        let rescale = |queue: &VecDeque<(DateTime<Utc>, Decimal)>| {
+            queue
+                .iter()
+                .map(|(time, price)| price.checked_div(ratio).map(|price| (*time, price)))
+                .collect::<Option<VecDeque<_>>>()
+        };
+        Some(Self {
+            lows: rescale(&self.lows)?,
+            highs: rescale(&self.highs)?,
+        })
+    }
+
     /// The lowest price recorded at or after `since`, or `None` if none was.
     pub(super) fn low(&self, since: DateTime<Utc>) -> Option<Decimal> {
         first_since(&self.lows, since)
@@ -104,6 +120,23 @@ mod tests {
 
     fn d(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn a_rescaled_window_divides_every_price_and_keeps_its_instants() {
+        let mut window = PriceWindow::default();
+        window.record(at(10), d("90"), d("110"), at(0));
+        window.record(at(20), d("95"), d("105"), at(0));
+
+        let rescaled = window.rescaled(d("2")).unwrap();
+
+        assert_eq!(rescaled.low(at(0)), Some(d("45")));
+        assert_eq!(rescaled.high(at(0)), Some(d("55")));
+        assert_eq!(rescaled.low(at(11)), Some(d("47.5")));
+        assert_eq!(rescaled.high(at(11)), Some(d("52.5")));
+        assert_eq!(rescaled.low(at(21)), None);
+        // 110 divided by 1e-28 does not fit a `Decimal`.
+        assert_eq!(window.rescaled(d("0.0000000000000000000000000001")), None);
     }
 
     #[test]

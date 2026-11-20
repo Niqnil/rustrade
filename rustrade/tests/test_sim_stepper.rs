@@ -67,7 +67,7 @@ use rustrade_execution::{
     PeriodicMarginInterest, SpotMarginConfig,
     balance::{AssetBalance, Balance, MarginDetails},
     cash_flow::{CashFlow, CashFlowKind},
-    client::mock::MockExecutionConfig,
+    client::mock::{MockExecutionConfig, SplitConfig},
     fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{DayCount, RateSeries},
     order::{
@@ -1177,6 +1177,101 @@ fn a_split_cancels_the_split_instrument_s_order_on_the_venue_and_in_the_engine()
         "the engine took the cancel"
     );
     assert_eq!(tracked(&s.engine, ETH), [ClientOrderId::new("eth")]);
+}
+
+/// With the venue adjusting buy limits on a forward split, and no tick, no quantity step and
+/// fractional shares to round to, the venue's adjustment of a resting buy limit is exactly the
+/// `Engine`'s own rescale of it: the `Engine` takes the venue's report with no term diverging.
+#[test]
+fn a_buy_limit_the_venue_adjusts_on_a_split_matches_the_engine_s_rescale_of_it() {
+    let mut s = session_configured(
+        config(0).with_split(SplitConfig::ADJUST_FORWARD),
+        usdt(dec!(10_000)),
+        None,
+        DefaultStrategy::default(),
+    );
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine
+        .action(&limit_order(BTC, Side::Buy, dec!(1.5), dec!(95), "btc"));
+    s.stepper.settle(&mut s.engine).unwrap();
+
+    let split = EngineEvent::CorporateAction {
+        id: "split".into(),
+        instrument: InstrumentIndex::new(BTC),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Fractional,
+        effective_time: at(4),
+    };
+    let audits = s.stepper.step(&mut s.engine, at(4), [split]).unwrap();
+
+    let outputs = audits
+        .iter()
+        .filter_map(|audit| match audit {
+            EngineAudit::Process(process) => Some(process.outputs.iter()),
+            EngineAudit::FeedEnded => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    let rescaled = outputs
+        .iter()
+        .find_map(|output| match output {
+            rustrade::engine::EngineOutput::OpenOrdersAtSplit { orders, .. } => Some(orders),
+            _ => None,
+        })
+        .expect("the Engine rescales the order");
+    assert_eq!(rescaled.len(), 1);
+    let engine = &rescaled[0].post_split;
+    let venue = events(&audits)
+        .into_iter()
+        .find_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::OrderSnapshot(report),
+                ..
+            })) if matches!(report.value().order.state, OrderState::Active(_)) => {
+                Some(&report.value().order)
+            }
+            _ => None,
+        })
+        .expect("the venue reports the adjusted order");
+
+    assert_eq!(
+        (venue.price, venue.quantity, venue.kind, venue.time_in_force),
+        (
+            engine.price,
+            engine.quantity,
+            engine.kind,
+            engine.time_in_force
+        )
+    );
+    assert_eq!((engine.price, engine.quantity), (Some(dec!(47.5)), dec!(3)));
+    assert!(
+        !outputs.iter().any(|output| matches!(
+            output,
+            rustrade::engine::EngineOutput::OrderTermsDiverged(_)
+        )),
+        "{outputs:#?}"
+    );
+    let tracked = s
+        .engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .nth(BTC)
+        .and_then(|state| state.orders.0.get(&ClientOrderId::new("btc")))
+        .expect("still tracked")
+        .clone();
+    assert!(
+        !tracked.split_unreported(),
+        "the Engine took the venue's report"
+    );
+    assert_eq!(
+        (tracked.order.price, tracked.order.quantity),
+        (Some(dec!(47.5)), dec!(3))
+    );
 }
 
 #[test]

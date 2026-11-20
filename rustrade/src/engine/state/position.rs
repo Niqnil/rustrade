@@ -42,25 +42,12 @@ pub enum OmsMode {
     Hedging,
 }
 
-/// Rounding policy applied to a [`Position`]'s share quantity when a stock split or reverse
-/// split produces a fractional resulting share count.
-///
-/// This is **broker policy, not arithmetic** — different brokers round differently — so there
-/// is intentionally **no `Default`**. The caller must choose explicitly.
-///
-/// `#[non_exhaustive]`: a future broker rounding mode (e.g. net-then-round across lots) can be
-/// added without breaking downstream exhaustive matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[non_exhaustive]
-pub enum SplitRoundingPolicy {
-    /// Whole-share brokers: floor `quantity_abs` to an integer share count. The disposed
-    /// fraction becomes cash-in-lieu, reported via [`SplitResult::remainder`] for the caller
-    /// to reconcile against the broker's CIL payment.
-    Floor,
-    /// Fractional-share brokers (e.g. Alpaca): keep the exact fractional share count. No
-    /// cash-in-lieu — [`SplitResult::remainder`] is always `0`.
-    Fractional,
-}
+/// How a broker rounds a share count a split leaves fractional. Defined in
+/// [`rustrade_instrument::corporate_action`] so a simulated venue applies the same policy as the
+/// engine; re-exported here, where the engine applies it. Under
+/// [`Floor`](SplitRoundingPolicy::Floor), the disposed fraction of a [`Position`] is reported via
+/// [`SplitResult::remainder`] for the caller to reconcile against the broker's cash in lieu.
+pub use rustrade_instrument::corporate_action::SplitRoundingPolicy;
 
 /// Outcome of [`Position::apply_split`].
 ///

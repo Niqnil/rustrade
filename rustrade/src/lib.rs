@@ -232,7 +232,8 @@ pub enum EngineEvent<
     /// - `policy`: how to round a fractional resulting **equity** share count
     ///   ([`SplitRoundingPolicy`]) — broker-specific, no default. Governs the **equity** leg only;
     ///   option contract counts are whole integers and are never floored, so a standard option
-    ///   adjustment is exact regardless of this `policy`.
+    ///   adjustment is exact regardless of this `policy`. A simulated venue the event is routed to
+    ///   rounds its balances and adjusted orders by the same `policy`.
     /// - `effective_time`: the resolved instant the adjustment takes effect. In backtest the
     ///   [`HistoricalClock`](engine::clock::HistoricalClock) advances to this instant so the
     ///   adjustment is stamped and ordered exactly (no look-ahead); in live it is honest metadata.

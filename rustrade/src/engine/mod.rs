@@ -1824,8 +1824,9 @@ pub enum EngineOutput<
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
     /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**
-    /// (`position_id` attributes it in hedging mode). The library writes no balances — the
-    /// wrapper reconciles this against the broker's CIL payment.
+    /// (`position_id` attributes it in hedging mode). The engine writes no balances — the
+    /// wrapper reconciles this against the broker's CIL payment, which a simulated venue reports
+    /// as a balance snapshot of the quote asset.
     ///
     /// `quantity_fractional_disposed × price_entry_average_post_split` is the cost basis of the
     /// disposed sliver; both fields share the post-split era (Decimal arithmetic, no ratio).
@@ -1865,9 +1866,10 @@ pub enum EngineOutput<
     /// adjusts resting orders or cancels them, by its own rule, so an engine-side cancel or amend
     /// would act on a guess. The wrapper decides whether to cancel, keep or re-price each order.
     ///
-    /// In backtest, the simulated venue cancels every order on the split equity itself (see
+    /// In backtest, the simulated venue cancels or adjusts each order on the split equity itself,
+    /// by its configured rule (see
     /// [`SimulatedVenue::apply_corporate_action`](rustrade_execution::exchange::mock::SimulatedVenue::apply_corporate_action)),
-    /// and its cancel of each follows this output. It leaves orders on options of the equity on
+    /// and its report of each follows this output. It leaves orders on options of the equity on
     /// their old terms, and would fill them against post-split prices, so the wrapper **must**
     /// cancel those in backtest.
     OpenOrdersAtSplit {

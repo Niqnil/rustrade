@@ -33,7 +33,7 @@ use rustrade_execution::{
     },
 };
 use rustrade_instrument::{
-    corporate_action::CorporateActionKind,
+    corporate_action::{CorporateActionKind, SplitRoundingPolicy},
     exchange::{ExchangeId, ExchangeIndex},
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
@@ -417,16 +417,18 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// # A corporate action reaches the venues too
 /// A [`CorporateAction`](EngineEvent::CorporateAction) in the source is handed to every venue whose
 /// own exchange lists its instrument, with [`SimulatedVenue::apply_corporate_action`], before the
-/// `Engine` is shown it, as a market event is. On a stock split the venue cancels every order on
-/// the instrument and trades nothing on it until its next market event. What the venue caused
-/// reaches the `Engine` one `from_venue` leg later, so the `Engine` has already applied the split
-/// to its own state when the cancels arrive. The venue's balances, and options on the instrument,
-/// keep their pre-split terms: see the method's `# What it does not do yet`.
+/// `Engine` is shown it, as a market event is, with the event's rounding `policy`. On a stock split
+/// the venue cancels or adjusts the orders on the instrument, by its
+/// [`MockExecutionConfig::split`](rustrade_execution::client::mock::MockExecutionConfig::split)
+/// rule, restates the account's holding of it, and trades nothing on it until its next market
+/// event. What the venue caused reaches the `Engine` one `from_venue` leg later, so the `Engine`
+/// has already applied the split to its own state when the venue's reports arrive. Options on the
+/// instrument keep their pre-split terms: see the method's `# What it does not do yet`.
 ///
-/// The split cancels only what the venue holds when the runner takes it from the source. An order
+/// The split acts only on what the venue holds when the runner takes it from the source. An order
 /// the `Engine` sent before the split that reaches the venue after it, one `to_venue` leg later,
-/// arrives as a new order on its pre-split terms and is not cancelled, as at a live venue that
-/// receives it after its own cancel.
+/// arrives as a new order on its pre-split terms and is neither cancelled nor adjusted, as at a
+/// live venue that receives it after its own adjustment.
 ///
 /// `class` is compared inside the queue's own ordering, not only where the queue is weighed against
 /// the source. Comparing it at the peek alone would let the queue hand back a low-priority entry
@@ -1222,8 +1224,8 @@ where
             id,
             instrument,
             kind,
+            policy,
             effective_time,
-            ..
         } => {
             route_corporate_action::<MarketKind>(
                 venues,
@@ -1234,6 +1236,7 @@ where
                 id,
                 *instrument,
                 kind,
+                *policy,
                 *effective_time,
             )?;
             return Ok(Routed::Now);
@@ -1294,8 +1297,8 @@ where
 }
 
 /// Hands a corporate action to every venue whose own exchange lists `instrument`, with
-/// [`SimulatedVenue::apply_corporate_action`], and schedules what each caused, one `from_venue`
-/// leg after `effective_time`, as a tick-caused fill is.
+/// [`SimulatedVenue::apply_corporate_action`] under the event's `policy`, and schedules what each
+/// caused, one `from_venue` leg after `effective_time`, as a tick-caused fill is.
 ///
 /// The source event is shown to the `Engine` at once, and it ranks ahead of account deliverables at
 /// its instant, so the `Engine` applies the action to its own state before it sees what the venue
@@ -1314,6 +1317,7 @@ fn route_corporate_action<MarketKind>(
     id: &str,
     instrument: InstrumentIndex,
     kind: &CorporateActionKind,
+    policy: SplitRoundingPolicy,
     effective_time: DateTime<Utc>,
 ) -> Result<(), SimFault>
 where
@@ -1332,7 +1336,7 @@ where
         // No clone: the name borrows `slot.indexer`, a field apart from `slot.venue`.
         let outcome = slot
             .venue
-            .apply_corporate_action(id, name, kind, effective_time);
+            .apply_corporate_action(id, name, kind, policy, effective_time);
         applied |= outcome.response == CorporateActionResponse::Applied;
 
         // The action moves the venue's clock, and cancelling an order can end a loan, so either
@@ -2660,10 +2664,11 @@ mod tests {
                 "split",
                 "balance",
                 "order",
+                "balance",
                 "market",
                 "after_drain"
             ],
-            "the open rests, then the split, then its cancel"
+            "the open rests, then the split, then its cancel, then the holding restated"
         );
         let EngineEvent::Account(AccountStreamEvent::Item(cancel)) = &events[4] else {
             unreachable!("labelled an order above");

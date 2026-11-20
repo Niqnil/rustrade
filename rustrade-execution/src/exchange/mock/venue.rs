@@ -5,7 +5,9 @@ use crate::{
     balance::{AssetBalance, MarginDetails, is_requested},
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
-    client::mock::{AmendConfig, MockExecutionConfig, SessionCalendarConfig, TimeInForceRules},
+    client::mock::{
+        AmendConfig, MockExecutionConfig, SessionCalendarConfig, SplitConfig, TimeInForceRules,
+    },
     error::{
         AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError, UnindexedApiError,
         UnindexedOrderError,
@@ -202,11 +204,12 @@ pub struct VenueInstrumentMarket {
     ///
     /// Set by [`apply_corporate_action`](SimulatedVenue::apply_corporate_action), and cleared by
     /// the next [`apply_market`](SimulatedVenue::apply_market) on the instrument, fresh or not.
-    /// While it is set, [`snapshot`](Self::snapshot) still values what the account holds, but no
-    /// order trades against it: on a [`MarketDriven`](VenueRegime::MarketDriven) venue a market
-    /// order is refused as unpriced, under [`MarketOrderTiming::NextBar`] too, since its hold is
-    /// costed at this market. A limit order, whether it arrives or is amended, rests uncrossed, as
-    /// on an instrument the venue was never fed.
+    /// While it is set, [`snapshot`](Self::snapshot), restated by the split, still values what the
+    /// account holds, but no order trades against it: on a
+    /// [`MarketDriven`](VenueRegime::MarketDriven) venue a market order is refused as unpriced,
+    /// under [`MarketOrderTiming::NextBar`] too, since its hold is costed at this market. A limit
+    /// order, whether it arrives or is amended, rests uncrossed, as on an instrument the venue was
+    /// never fed.
     ///
     /// Not part of the venue's [`snapshot`](SimulatedVenue::snapshot), which holds no market: a
     /// restored venue prices nothing on any instrument until it is fed again.
@@ -981,6 +984,9 @@ pub struct SimulatedVenue {
     /// The id of every corporate action this venue has applied, so that applying one again changes
     /// nothing. See [`apply_corporate_action`](Self::apply_corporate_action).
     corporate_actions_applied: FnvHashSet<SmolStr>,
+    /// What a split does to the open orders on its equity. Fixed at construction from
+    /// [`MockExecutionConfig::split`].
+    split: SplitConfig,
 }
 
 impl SimulatedVenue {
@@ -1180,6 +1186,7 @@ impl SimulatedVenue {
             sell_outs,
             next_sell_out: None,
             corporate_actions_applied: FnvHashSet::default(),
+            split: config.split,
         }
     }
 
@@ -4188,9 +4195,19 @@ impl SimulatedVenue {
             .map(|order| order.key.cid.clone())
             .collect::<Vec<ClientOrderId>>();
         open.sort_unstable();
+        self.cancel_each(open, time_exchange, events);
+    }
 
-        for cid in open {
-            // Collected from the book with nothing in between, so this always finds it.
+    /// Cancels each order of `cids` the venue holds, in that order, releasing what each held, and
+    /// reports each as [`cancel_unfilled`](Self::cancel_unfilled) does.
+    fn cancel_each(
+        &mut self,
+        cids: Vec<ClientOrderId>,
+        time_exchange: DateTime<Utc>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) {
+        for cid in cids {
+            // Each caller collects them from the book with nothing in between, so this finds each.
             if let Some(resting) = self.account.remove_order(&cid) {
                 let released = resting
                     .reservation
@@ -8468,6 +8485,7 @@ impl<'a> ShortSale<'a> {
 }
 
 /// Why [`Reentry::Refused`] refused an order.
+#[derive(Debug)]
 enum Refusal {
     /// It is post-only, and the market crosses it.
     PostOnly,

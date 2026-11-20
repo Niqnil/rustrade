@@ -32,7 +32,7 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     calendar::{DailyClose, SessionCalendar},
-    corporate_action::CorporateActionKind,
+    corporate_action::{CorporateActionKind, SplitRoundingPolicy},
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
@@ -206,6 +206,12 @@ pub struct MockExecutionConfig {
     /// [`spot_margin`](Self::spot_margin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_sell_out: Option<ExpirySellOut>,
+    /// What a stock split does to the mock exchange's open orders on the split equity: cancelled,
+    /// or adjusted. See [`SplitConfig`].
+    ///
+    /// Defaults to [`SplitConfig::CANCEL`]: every order on the equity is cancelled.
+    #[serde(default)]
+    pub split: SplitConfig,
 }
 
 impl MockExecutionConfig {
@@ -238,6 +244,7 @@ impl MockExecutionConfig {
             session_close: None,
             fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
+            split: SplitConfig::default(),
         }
     }
 
@@ -370,6 +377,12 @@ impl MockExecutionConfig {
             expiry_sell_out: Some(expiry_sell_out),
             ..self
         }
+    }
+
+    /// This config with its [`split`](Self::split) rule set to `split`.
+    #[must_use]
+    pub fn with_split(self, split: SplitConfig) -> Self {
+        Self { split, ..self }
     }
 }
 
@@ -641,6 +654,99 @@ impl AmendConfig {
             .with_keeps_id(!self.reassign_id)
             .with_priority(AmendPriority::KeptOnQuantityDecrease)
     }
+}
+
+/// What a simulated venue does with its open orders on an equity that splits, and so what
+/// [`MockExecutionConfig::split`] sets. One [`SplitAction`] for a forward split (a ratio of one or
+/// more) and one for a reverse split (a ratio below one).
+///
+/// The default, [`SplitConfig::CANCEL`], cancels every order on a split of either kind.
+/// [`SplitConfig::ADJUST_FORWARD`] adjusts on a forward split and cancels on a reverse one, as
+/// US equity venues and brokers do under FINRA Rule 5330. Whatever the action, the venue rescales
+/// the account's holdings of the equity: see
+/// [`SimulatedVenue::apply_corporate_action`](crate::exchange::mock::SimulatedVenue::apply_corporate_action).
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
+/// start from a constant and the `with_*` methods. A field missing from a serialized config takes
+/// its value from `CANCEL`.
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SplitConfig {
+    /// What a split with a ratio of one or more does to the open orders on its equity.
+    pub forward: SplitAction,
+    /// What a split with a ratio below one does to the open orders on its equity.
+    pub reverse: SplitAction,
+}
+
+impl Default for SplitConfig {
+    /// [`SplitConfig::CANCEL`].
+    fn default() -> Self {
+        Self::CANCEL
+    }
+}
+
+impl SplitConfig {
+    /// Every order on the equity is cancelled, on a split of either kind.
+    pub const CANCEL: Self = Self {
+        forward: SplitAction::Cancel,
+        reverse: SplitAction::Cancel,
+    };
+
+    /// Buy limit orders are adjusted on a forward split, and every order is cancelled on a reverse
+    /// split, as FINRA Rule 5330 has US brokers do.
+    pub const ADJUST_FORWARD: Self = Self {
+        forward: SplitAction::Adjust,
+        reverse: SplitAction::Cancel,
+    };
+
+    /// With [`forward`](Self::forward): what a forward split does to the orders.
+    #[must_use]
+    pub fn with_forward(self, forward: SplitAction) -> Self {
+        Self { forward, ..self }
+    }
+
+    /// With [`reverse`](Self::reverse): what a reverse split does to the orders.
+    #[must_use]
+    pub fn with_reverse(self, reverse: SplitAction) -> Self {
+        Self { reverse, ..self }
+    }
+
+    /// The action for a split of `ratio`: [`reverse`](Self::reverse) below one, else
+    /// [`forward`](Self::forward).
+    pub fn action(&self, ratio: rust_decimal::Decimal) -> SplitAction {
+        if ratio < rust_decimal::Decimal::ONE {
+            self.reverse
+        } else {
+            self.forward
+        }
+    }
+}
+
+/// What a simulated venue does with the open orders on an equity that splits: see
+/// [`SplitConfig`].
+///
+/// `#[non_exhaustive]`, so an action can be added without breaking a caller.
+#[non_exhaustive]
+#[derive(
+    Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAction {
+    /// Every order on the equity, resting or held, is cancelled, releasing what it held.
+    #[default]
+    Cancel,
+    /// Each resting buy limit order is adjusted to the split, as FINRA Rule 5330 has US brokers
+    /// adjust one, and every other order is cancelled: a sell limit order, and a market order
+    /// held for a later bar or a fresh market.
+    ///
+    /// The limit price is divided by the ratio and rounded down to the instrument's tick size. The
+    /// unfilled quantity is multiplied by the ratio and rounded down as the action's
+    /// [`SplitRoundingPolicy`] says, to a whole share under `Floor`, and then to the instrument's
+    /// quantity step. What has filled is multiplied by the ratio exactly. With no tick size or
+    /// step, the price or quantity is exact. An order whose price or unfilled quantity rounds to
+    /// zero is cancelled instead.
+    Adjust,
 }
 
 #[derive(Debug, Constructor)]
@@ -1141,7 +1247,8 @@ pub async fn request_checkpoint(
 }
 
 /// Asks the [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx` to apply
-/// the corporate action `id` of `kind` to `instrument`, with the request stamped `time_request`.
+/// the corporate action `id` of `kind` to `instrument`, rounding a share count it leaves
+/// fractional as `policy` says, with the request stamped `time_request`.
 ///
 /// The exchange applies it when the request reaches it, as
 /// [`SimulatedVenue::apply_corporate_action`](crate::exchange::mock::venue::SimulatedVenue::apply_corporate_action)
@@ -1158,6 +1265,7 @@ pub async fn request_corporate_action(
     id: SmolStr,
     instrument: InstrumentNameExchange,
     kind: CorporateActionKind,
+    policy: SplitRoundingPolicy,
 ) -> Result<CorporateActionResponse, UnindexedClientError> {
     let offline =
         || UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(mocked_exchange));
@@ -1169,6 +1277,7 @@ pub async fn request_corporate_action(
             id,
             instrument,
             kind,
+            policy,
         ))
         .map_err(|_| offline())?;
     response_rx.await.map_err(|_| offline())
@@ -1181,6 +1290,44 @@ mod tests {
     use crate::{AccountEventKind, balance::Balance};
     use rust_decimal::Decimal;
     use rustrade_integration::collection::snapshot::Snapshot;
+
+    #[test]
+    fn a_split_config_takes_its_reverse_action_below_a_ratio_of_one_and_its_forward_one_otherwise()
+    {
+        let config = SplitConfig::CANCEL.with_forward(SplitAction::Adjust);
+        assert_eq!(config.action(Decimal::new(5, 1)), SplitAction::Cancel);
+        assert_eq!(config.action(Decimal::ONE), SplitAction::Adjust);
+        assert_eq!(config.action(Decimal::TWO), SplitAction::Adjust);
+        assert_eq!(
+            SplitConfig::ADJUST_FORWARD.with_reverse(SplitAction::Adjust),
+            SplitConfig {
+                forward: SplitAction::Adjust,
+                reverse: SplitAction::Adjust,
+            }
+        );
+        assert_eq!(SplitConfig::default(), SplitConfig::CANCEL);
+    }
+
+    #[test]
+    fn a_stored_config_without_a_split_rule_cancels_and_a_partial_rule_takes_cancel_for_the_rest() {
+        let config = MockExecutionConfig::new(
+            ExchangeId::Simulated,
+            UnindexedAccountSnapshot {
+                exchange: ExchangeId::Simulated,
+                balances: vec![],
+                instruments: vec![],
+            },
+            0,
+        );
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("split");
+        let read: MockExecutionConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(read.split, SplitConfig::CANCEL);
+
+        json["split"] = serde_json::json!({ "forward": "adjust" });
+        let read: MockExecutionConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.split, SplitConfig::ADJUST_FORWARD);
+    }
 
     #[test]
     fn an_amend_config_declares_what_it_allows_and_never_a_trigger() {

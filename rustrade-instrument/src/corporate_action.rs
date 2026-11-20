@@ -109,8 +109,8 @@ impl<'de> Deserialize<'de> for SplitRatio {
 /// This type carries **market facts only**. It deliberately contains no rounding policy, no
 /// account context, and no resolved timestamp: a data source emitting a split knows the ratio,
 /// not how a particular broker will round fractional shares or when a particular engine should
-/// stamp the adjustment. Those concerns live with the consumer (see the engine-side
-/// `SplitRoundingPolicy` and the `effective_time` resolved via [`split_effective_instant`]).
+/// stamp the adjustment. Those concerns live with the consumer (see [`SplitRoundingPolicy`] and
+/// the `effective_time` resolved via [`split_effective_instant`]).
 ///
 /// `#[non_exhaustive]`: further corporate actions (dividends, spin-offs, symbol changes, …) can
 /// be added without breaking downstream exhaustive matches.
@@ -224,6 +224,27 @@ impl CorporateActionKind {
             }
         }
     }
+}
+
+/// How a broker rounds a share count that a stock split or reverse split leaves fractional.
+///
+/// This is **broker policy, not arithmetic**: brokers round differently, so there is
+/// intentionally **no `Default`** and the caller must choose. It is not part of
+/// [`CorporateActionKind`], which carries market facts only: the holder declares it alongside the
+/// action, and every consumer of that action (an engine rescaling its positions, a simulated
+/// venue rescaling its balances and orders) applies the same one.
+///
+/// Not `#[non_exhaustive]`: every consumer must decide what a policy does to its own state, so
+/// a future broker rounding mode (e.g. net-then-round across lots) is a breaking change that makes
+/// each match handle it, rather than a wildcard arm guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SplitRoundingPolicy {
+    /// Whole-share brokers: floor the scaled share count to an integer. The disposed fraction is
+    /// paid out as cash in lieu.
+    Floor,
+    /// Fractional-share brokers (e.g. Alpaca): keep the exact fractional share count. No cash in
+    /// lieu.
+    Fractional,
 }
 
 /// How the OCC adjusts listed **options** on an underlying that undergoes a stock split (OCC

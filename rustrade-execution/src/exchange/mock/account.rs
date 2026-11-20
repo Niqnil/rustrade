@@ -391,6 +391,37 @@ impl AccountState {
             .filter(move |trade| trade.time_exchange >= time_since)
     }
 
+    /// `asset`'s balance, or `None` for an asset the account has never held.
+    pub fn balance(&self, asset: &AssetNameExchange) -> Option<&AssetBalance<AssetNameExchange>> {
+        self.balances.get(asset)
+    }
+
+    /// What `asset`'s balance would be once each of `reservations` that holds it is released in
+    /// turn by [`release_reservation`](Self::release_reservation) with `auto_repay_at_cancel`,
+    /// changing nothing. `None` for an asset the account has never held.
+    ///
+    /// For a caller that must know what cancelling orders leaves before it decides to cancel them.
+    pub fn balance_after_releases<'a>(
+        &self,
+        asset: &AssetNameExchange,
+        reservations: impl IntoIterator<Item = &'a Reservation>,
+        auto_repay_at_cancel: bool,
+    ) -> Option<Balance> {
+        let mut balance = self.balances.get(asset)?.balance;
+        for reservation in reservations {
+            if reservation.asset != *asset {
+                continue;
+            }
+            // As `release`, then `repay_loan`, do it.
+            balance.free += reservation.amount;
+            if auto_repay_at_cancel && !reservation.loan().is_zero() {
+                let available = reservation.loan().min(balance.free);
+                repay(&mut balance, available);
+            }
+        }
+        Some(balance)
+    }
+
     pub fn balance_mut(
         &mut self,
         asset: &AssetNameExchange,
