@@ -5,7 +5,7 @@ use rustrade_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`PublicTrade`]
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`PublicTrade`]
 /// [`MarketEvent<T>`](crate::event::MarketEvent) events.
 #[derive(
     Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, DeSubKind, SerSubKind,
@@ -26,7 +26,7 @@ impl std::fmt::Display for PublicTrades {
     }
 }
 
-/// Normalised Barter [`PublicTrade`] model.
+/// Normalised [`PublicTrade`] model.
 ///
 /// Uses [`SmolStr`] for `id` to avoid heap allocation for typical trade IDs
 /// (up to 23 bytes on 64-bit systems are stored inline). Exceptions that

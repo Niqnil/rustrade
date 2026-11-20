@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 documentation = "https://docs.rs/rustrade"
 readme = "README.md"
-description = "Framework for building high-performance live-trading, paper-trading and back-testing systems"
+description = "Framework for building live-trading, paper-trading and backtesting systems"
 
 [features]
 # Forward provider market-data features so the corporate-action *sourcing* example can drive a real

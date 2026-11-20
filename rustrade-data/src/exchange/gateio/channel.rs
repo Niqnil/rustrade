@@ -6,7 +6,7 @@ use crate::{
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use serde::Serialize;
 
-/// Type that defines how to translate a Barter [`Subscription`] into a
+/// Type that defines how to translate a [`Subscription`] into a
 /// [`Gateio`](super::Gateio) channel to be subscribed to.
 ///
 /// See docs: <https://www.okx.com/docs-v5/en/#websocket-api-public-channel>

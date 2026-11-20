@@ -8,7 +8,7 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, StrExt, format_smolstr};
 
-/// Type that defines how to translate a Barter [`Subscription`] into a [`Bybit`]
+/// Type that defines how to translate a [`Subscription`] into a [`Bybit`]
 /// market that can be subscribed to.
 ///
 /// See docs: <https://bybit-exchange.github.io/docs/v5/ws/connect>

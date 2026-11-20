@@ -18,7 +18,7 @@ use std::{fmt::Debug, future::Future};
 use tracing::debug;
 
 /// [`SubscriptionMapper`] implementations defining how to map a
-/// collection of Barter [`Subscription`]s into exchange specific [`SubscriptionMeta`].
+/// collection of [`Subscription`]s into exchange specific [`SubscriptionMeta`].
 pub mod mapper;
 
 /// [`SubscriptionValidator`] implementations defining how to

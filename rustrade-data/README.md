@@ -6,8 +6,8 @@ Integration library for streaming public market data from exchanges and data pro
 
 Binance, Bitfinex, Bitmex, Bybit, Coinbase, Gate.io, Kraken and OKX are always available. The other
 exchanges and the data providers are each behind a Cargo feature, none enabled by default:
-`alpaca`, `databento`, `hyperliquid`, `ibkr`, `lse` (`lse-parquet` adds Parquet export decoding),
-`massive` and `thetadata`.
+`alpaca`, `alpha-vantage`, `databento`, `hyperliquid`, `ibkr`, `lse` (`lse-parquet` adds Parquet
+export decoding), `massive`, `sec-edgar` and `thetadata`.
 
 | Exchange | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|

@@ -8,7 +8,7 @@ use fnv::FnvHashMap;
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
 
-/// Defines how to map a collection of Barter [`Subscription`]s into exchange specific
+/// Defines how to map a collection of [`Subscription`]s into exchange specific
 /// [`SubscriptionMeta`], containing subscription payloads that are sent to the exchange.
 pub trait SubscriptionMapper {
     fn map<Exchange, Instrument, Kind>(
@@ -45,17 +45,17 @@ impl SubscriptionMapper for WebSocketSubMapper {
             Default::default(),
         ));
 
-        // Map Barter Subscriptions to exchange specific subscriptions
+        // Map Subscriptions to exchange specific subscriptions
         let exchange_subs = subscriptions
             .iter()
             .map(|subscription| {
-                // Translate Barter Subscription to exchange specific subscription
+                // Translate Subscription to exchange specific subscription
                 let exchange_sub = ExchangeSub::new(subscription);
 
                 // Determine the SubscriptionId associated with this exchange specific subscription
                 let subscription_id = exchange_sub.id();
 
-                // Use ExchangeSub SubscriptionId as the manager to this Barter Subscription
+                // Use ExchangeSub SubscriptionId as the manager to this Subscription
                 instrument_map
                     .0
                     .insert(subscription_id, subscription.instrument.key().clone());

@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::str::FromStr;
 use thiserror::Error;
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`Candle`]
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`Candle`]
 /// [`MarketEvent<T>`](crate::event::MarketEvent) events.
 ///
 /// The [`interval`](Self::interval) is intrinsic to a candle subscription — it is
@@ -1003,7 +1003,7 @@ mod tests {
     }
 }
 
-/// Normalised Barter OHLCV [`Candle`] model.
+/// Normalised OHLCV [`Candle`] model.
 ///
 /// # `close_time` contract
 ///

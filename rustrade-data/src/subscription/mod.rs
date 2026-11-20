@@ -16,22 +16,22 @@ use serde::{Deserialize, Serialize};
 use smol_str::{ToSmolStr, format_smolstr};
 use std::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-/// OrderBook [`SubscriptionKind`]s and the associated Barter output data models.
+/// OrderBook [`SubscriptionKind`]s and the associated output data models.
 pub mod book;
 
-/// Candle [`SubscriptionKind`] and the associated Barter output data model.
+/// Candle [`SubscriptionKind`] and the associated output data model.
 pub mod candle;
 
 /// Option Greeks data model for options analytics.
 pub mod greeks;
 
-/// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
+/// Liquidation [`SubscriptionKind`] and the associated output data model.
 pub mod liquidation;
 
-/// Quote [`SubscriptionKind`] and the associated Barter output data model.
+/// Quote [`SubscriptionKind`] and the associated output data model.
 pub mod quote;
 
-/// Public trade [`SubscriptionKind`] and the associated Barter output data model.
+/// Public trade [`SubscriptionKind`] and the associated output data model.
 pub mod trade;
 
 /// Defines kind of a [`Subscription`], and the output [`Self::Event`] that it yields.
@@ -43,7 +43,7 @@ where
     fn as_str(&self) -> &'static str;
 }
 
-/// Barter [`Subscription`] used to subscribe to a [`SubscriptionKind`] for a particular exchange
+/// [`Subscription`] used to subscribe to a [`SubscriptionKind`] for a particular exchange
 /// [`MarketDataInstrument`].
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct Subscription<Exchange = ExchangeId, Inst = MarketDataInstrument, Kind = SubKind> {
@@ -394,12 +394,12 @@ pub fn exchange_supports_instrument_kind_sub_kind(
     }
 }
 
-/// Metadata generated from a collection of Barter [`Subscription`]s, including the exchange
+/// Metadata generated from a collection of [`Subscription`]s, including the exchange
 /// specific subscription payloads that are sent to the exchange.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct SubscriptionMeta<InstrumentKey> {
     /// `HashMap` containing the mapping between a [`SubscriptionId`] and
-    /// it's associated Barter [`MarketDataInstrument`].
+    /// its associated [`MarketDataInstrument`].
     pub instrument_map: Map<InstrumentKey>,
     /// Collection of [`WsMessage`]s containing exchange specific subscription payloads to be sent.
     pub ws_subscriptions: Vec<WsMessage>,
@@ -408,7 +408,7 @@ pub struct SubscriptionMeta<InstrumentKey> {
 /// New type`HashMap` that maps a [`SubscriptionId`] to some associated type `T`.
 ///
 /// Used by [`ExchangeTransformer`](crate::transformer::ExchangeTransformer)s to identify the
-/// Barter [`MarketDataInstrument`] associated with incoming exchange messages.
+/// [`MarketDataInstrument`] associated with incoming exchange messages.
 #[derive(Clone, Eq, PartialEq, Debug, Deserialize, Serialize)]
 pub struct Map<T>(pub FnvHashMap<SubscriptionId, T>);
 

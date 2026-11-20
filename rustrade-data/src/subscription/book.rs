@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use rustrade_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`OrderBookL1`]
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`OrderBookL1`]
 /// market events.
 ///
 /// Level 1 refers to the best non-aggregated bid and ask [`Level`] on each side of the
@@ -29,7 +29,7 @@ impl std::fmt::Display for OrderBooksL1 {
     }
 }
 
-/// Normalised Barter [`OrderBookL1`] snapshot containing the latest best bid and ask.
+/// Normalised [`OrderBookL1`] snapshot containing the latest best bid and ask.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
 )]
@@ -97,7 +97,7 @@ impl OrderBookL1 {
     }
 }
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields L2
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields L2
 /// [`OrderBookEvent`] market events
 ///
 /// Level 2 refers to an [`OrderBook`] with orders at each price level aggregated.
@@ -119,7 +119,7 @@ impl std::fmt::Display for OrderBooksL2 {
     }
 }
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields
 /// L3 [`OrderBookEvent`] market events.
 ///
 /// Level 3 refers to the non-aggregated [`OrderBook`]. This is a direct replication of the exchange

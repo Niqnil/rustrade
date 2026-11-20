@@ -25,16 +25,23 @@
 // field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
 #![allow(clippy::redundant_field_names)]
 
-//! # Barter-Execution
-//! Stream private account data from financial venues, and execute (live or mock) orders. Also provides
-//! a feature rich MockExchange and MockExecutionClient to assist with backtesting and paper-trading.
+//! # rustrade-execution
+//! Stream private account data from trading venues and execute orders, live or simulated.
 //!
-//! **It is:**
-//! * **Easy**: ExecutionClient trait provides a unified and simple language for interacting with exchanges.
-//! * **Normalised**: Allow your strategy to communicate with every real or MockExchange using the same interface.
-//! * **Extensible**: Barter-Execution is highly extensible, making it easy to contribute by adding new exchange integrations!
+//! * **One interface**: the [`ExecutionClient`](client::ExecutionClient) trait covers orders,
+//!   balances, positions and the account stream on every venue, so a strategy talks to a live
+//!   venue and to the simulated one in the same way.
+//! * **Simulated venue**: [`MockExchange`](exchange::mock::MockExchange) and
+//!   [`MockExecution`](client::mock::MockExecution) stand in for a live venue in backtests and
+//!   paper trading.
+//! * **Extensible**: a new venue implements [`ExecutionClient`](client::ExecutionClient).
 //!
-//! See `README.md` for more information and examples.
+//! ## Venues
+//! Each live venue client is behind its own Cargo feature, none enabled by default: `alpaca`,
+//! `binance`, `hyperliquid` and `ibkr`.
+//!
+//! See the [README](https://github.com/Niqnil/rustrade/blob/main/rustrade-execution/README.md)
+//! for each venue's coverage.
 
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]

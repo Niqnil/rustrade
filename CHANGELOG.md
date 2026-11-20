@@ -932,6 +932,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **For users:** the window does not reach a dependent's build, which resolves rustrade's
     dependencies itself. The README's "Dependency Security" section and the `rustrade` crate docs
     show how to set the same window in your own Cargo config.
+- **Crate documentation describes rustrade** (all crates; documentation only). The crate-level
+  docs of `rustrade`, `rustrade-data`, `rustrade-execution`, `rustrade-instrument` and
+  `rustrade-integration` are rewritten to describe what each crate does today, and doc comments
+  no longer use the name of the project rustrade was forked from. The `rustrade` docs link to the
+  examples on `main` (the old link pointed to a branch that no longer exists), and the
+  `rustrade-data` docs and README now list the `alpha-vantage` and `sec-edgar` features too. The
+  `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
 

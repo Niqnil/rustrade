@@ -25,7 +25,7 @@ use smol_str::format_smolstr;
 /// ```
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize)]
 pub struct ExchangeSub<Channel, Market> {
-    /// Type that defines how to translate a Barter [`Subscription`] into an exchange specific
+    /// Type that defines how to translate a [`Subscription`] into an exchange specific
     /// channel to be subscribed to.
     ///
     /// ### Examples
@@ -33,7 +33,7 @@ pub struct ExchangeSub<Channel, Market> {
     /// - [`KrakenChannel("trade")`](super::kraken::channel::KrakenChannel)
     pub channel: Channel,
 
-    /// Type that defines how to translate a Barter [`Subscription`] into an exchange specific
+    /// Type that defines how to translate a [`Subscription`] into an exchange specific
     /// market that can be subscribed to.
     ///
     /// ### Examples
@@ -61,7 +61,7 @@ where
     Channel: AsRef<str>,
     Market: AsRef<str>,
 {
-    /// Construct a new exchange specific [`Self`] with the Barter [`Subscription`] provided.
+    /// Construct a new exchange specific [`Self`] with the [`Subscription`] provided.
     pub fn new<Exchange, Instrument, Kind>(sub: &Subscription<Exchange, Instrument, Kind>) -> Self
     where
         Subscription<Exchange, Instrument, Kind>: Identifier<Channel> + Identifier<Market>,

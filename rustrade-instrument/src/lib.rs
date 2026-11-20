@@ -25,11 +25,13 @@
 // field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
 #![allow(clippy::redundant_field_names)]
 
-//! # Barter-Instrument
-//! Barter-Instrument contains core Exchange, Instrument and Asset data structures and associated utilities.
+//! # rustrade-instrument
+//! The exchange, instrument and asset data structures shared by the rustrade crates, the indexes
+//! that map them to compact keys, and related utilities such as trading calendars and corporate
+//! actions.
 //!
 //! ## Examples
-//! For a comprehensive collection of examples, see the Barter core Engine /examples directory.
+//! See the [`rustrade` examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples).
 
 use derive_more::Constructor;
 use serde::{Deserialize, Serialize};

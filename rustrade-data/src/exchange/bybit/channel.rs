@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 
-/// Type that defines how to translate a Barter [`Subscription`] into a [`Bybit`]
+/// Type that defines how to translate a [`Subscription`] into a [`Bybit`]
 /// channel to be subscribed to.
 ///
 /// See docs: <https://bybit-exchange.github.io/docs/v5/ws/connect>

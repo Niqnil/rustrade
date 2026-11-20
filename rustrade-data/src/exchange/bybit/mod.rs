@@ -23,7 +23,7 @@ use tokio::time;
 use trade::BybitTrade;
 use url::Url;
 
-/// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
+/// Defines the type that translates a [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
 pub mod channel;
 
@@ -31,7 +31,7 @@ pub mod channel;
 /// [`BybitFuturesUsd`](futures::BybitPerpetualsUsd).
 pub mod futures;
 
-/// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
+/// Defines the type that translates a [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific market used for generating [`Connector::requests`].
 pub mod market;
 

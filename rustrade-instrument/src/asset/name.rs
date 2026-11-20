@@ -3,7 +3,7 @@ use serde::Serialize;
 use smol_str::{SmolStr, StrExt};
 use std::borrow::Borrow;
 
-/// Barter lowercase `SmolStr` representation for an [`Asset`](super::Asset) - not unique across
+/// Lowercase `SmolStr` representation for an [`Asset`](super::Asset) - not unique across
 /// exchanges.
 ///
 /// This may or may not be different from an execution's representation.

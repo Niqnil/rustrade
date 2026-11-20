@@ -6,7 +6,7 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, StrExt, format_smolstr};
 
-/// Type that defines how to translate a Barter [`Subscription`] into a [`Binance`]
+/// Type that defines how to translate a [`Subscription`] into a [`Binance`]
 /// market that can be subscribed to.
 ///
 /// See docs: <https://binance-docs.github.io/apidocs/spot/en/#websocket-market-streams>

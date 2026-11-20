@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 pub mod stateless;
 
 /// Defines how to construct a [`Transformer`] used by [`MarketStream`](super::MarketStream)s to
-/// translate exchange specific types to normalised Barter types.
+/// translate exchange specific types to normalised types.
 pub trait ExchangeTransformer<Exchange, InstrumentKey, Kind>
 where
     Self: Transformer<Output = MarketEvent<InstrumentKey, Kind::Event>, Error = DataError> + Sized,

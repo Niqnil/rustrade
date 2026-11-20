@@ -4,7 +4,7 @@ use serde::Serialize;
 use smol_str::{SmolStr, StrExt, format_smolstr};
 use std::borrow::Borrow;
 
-/// Barter lowercase `SmolStr` representation for an [`Instrument`](super::Instrument) - unique
+/// Lowercase `SmolStr` representation for an [`Instrument`](super::Instrument) - unique
 /// across all exchanges.
 ///
 /// Note: Binance btc_usdt spot is not considered the same instrument as Bitfinex btc_usdt spot.
