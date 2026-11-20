@@ -30,6 +30,9 @@ const NO_QUOTE_PRICE: f64 = -1.0;
 /// not know), only -1 with a size of 0 or no size does; any other price, negative or not, is
 /// quoted.
 ///
+/// A no-quote price on a side never quoted is emitted too, so on a closed market the first book
+/// can have neither side: it says IB has no quote, not that the book is malformed.
+///
 /// # Event Rate
 ///
 /// Emits on every relevant tick, even if values are unchanged from the previous

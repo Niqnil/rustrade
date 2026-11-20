@@ -273,13 +273,14 @@ where
     /// # Errors
     ///
     /// Returns error if:
-    /// - Connection to IB fails, or IB refuses the configured market data type
+    /// - Connection to IB fails, or the configured market data type cannot be sent
     /// - No subscriptions could be activated (all contracts missing from registry)
     ///
-    /// A subscription IB refuses after this returns ends with an error item on the stream instead:
-    /// [`DataError::SubscriptionLimitReached`] when the account's market data lines or depth
-    /// requests are all in use, [`DataError::MarketDataNotAvailable`] when the account has no
-    /// market data for the instrument, and [`DataError::Socket`] otherwise.
+    /// IB does not answer the market data type itself; what the account may receive shows per
+    /// subscription. A subscription IB refuses after this returns ends with an error item on the
+    /// stream instead: [`DataError::SubscriptionLimitReached`] when the account's market data
+    /// lines or depth requests are all in use, [`DataError::MarketDataNotAvailable`] when the
+    /// account has no market data for the instrument, and [`DataError::Socket`] otherwise.
     pub fn init(
         config: IbkrStreamConfig,
         contracts: Arc<ContractRegistry>,
