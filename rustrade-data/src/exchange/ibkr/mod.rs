@@ -744,7 +744,7 @@ pub(crate) fn decimal_from_f64(value: f64) -> Option<Decimal> {
 
 #[cfg(test)]
 // Test code: a panic is the failure report.
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
