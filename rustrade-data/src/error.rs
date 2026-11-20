@@ -156,6 +156,21 @@ pub enum DataError {
     #[error("no market event received for {threshold:?}, so the stream is reconnecting")]
     SilenceTimeout { threshold: Duration },
 
+    /// The stream's connection to the venue was lost, so every subscription on it ended, and the
+    /// stream will re-initialise.
+    ///
+    /// Yielded once per loss, immediately before the stream's
+    /// [`Reconnecting`](crate::streams::reconnect::Event::Reconnecting), by a stream that sees the
+    /// loss itself rather than only its connection closing. `reason` says what was lost, in the
+    /// venue's words where it gave any. On IBKR: the socket to TWS/Gateway, or TWS/Gateway's own
+    /// link to IB's servers (codes 1100, 1101). The stream re-initialises as after any other end;
+    /// giving up is the caller's decision.
+    #[error("{exchange} connection lost, so the stream is reconnecting: {reason}")]
+    ConnectionLost {
+        exchange: ExchangeId,
+        reason: String,
+    },
+
     /// A one-shot request, named by `operation`, got no complete answer within the time set for
     /// it, so it was given up.
     ///
@@ -300,6 +315,15 @@ mod tests {
                 // has already ended itself, and re-initialises without being terminated.
                 input: DataError::SilenceTimeout {
                     threshold: Duration::from_secs(5),
+                },
+                expected: false,
+            },
+            TestCase {
+                // TC4: not terminal w/ DataError::ConnectionLost — as SilenceTimeout, the stream
+                // that yields it ends itself after it.
+                input: DataError::ConnectionLost {
+                    exchange: ExchangeId::Ibkr,
+                    reason: "socket closed".to_owned(),
                 },
                 expected: false,
             },

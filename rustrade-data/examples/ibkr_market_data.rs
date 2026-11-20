@@ -4,6 +4,8 @@
 //!
 //! Demonstrates streaming market data from Interactive Brokers:
 //! - Quotes (OrderBookL1) for best bid/ask
+//! - Reconnection: the stream reports a lost connection, then reconnects and resubscribes by
+//!   itself
 //!
 //! # Trades Subscription
 //!
@@ -28,9 +30,12 @@
 
 use futures_util::StreamExt;
 use ibapi::contracts::Contract;
-use rustrade_data::exchange::ibkr::{
-    IbkrMarketStream, IbkrStreamConfig,
-    subscription::{IbkrSubscription, IbkrSubscriptionKind},
+use rustrade_data::{
+    exchange::ibkr::{
+        IbkrMarketStream, IbkrStreamConfig,
+        subscription::{IbkrSubscription, IbkrSubscriptionKind},
+    },
+    streams::{consumer::MarketStreamOptions, reconnect::Event},
 };
 use rustrade_instrument::ibkr::ContractRegistry;
 use std::sync::Arc;
@@ -62,8 +67,16 @@ async fn main() {
 
     info!("Connecting to IB Gateway...");
 
-    // Initialize the market data stream
-    let mut stream = match IbkrMarketStream::init(config, registry, subscriptions) {
+    // Initialize the market data stream. The default options reconnect with the library's
+    // backoff and set no silence timeout.
+    let mut stream = match IbkrMarketStream::init(
+        config,
+        registry,
+        subscriptions,
+        MarketStreamOptions::default(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect: {e}");
@@ -74,18 +87,14 @@ async fn main() {
 
     info!("Connected! Streaming market data for AAPL...");
     info!("Press Ctrl+C to stop");
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(event) => {
-                info!("{event:?}");
-            }
-            Err(e) => {
-                warn!("Stream error: {e}");
-            }
+    // The stream never ends by itself: it reconnects after a lost connection.
+    while let Some(event) = stream.next().await {
+        match event {
+            Event::Item(Ok(event)) => info!("{event:?}"),
+            Event::Item(Err(e)) => warn!("Stream error: {e}"),
+            Event::Reconnecting(exchange) => warn!("{exchange} reconnecting"),
         }
     }
-
-    info!("Stream ended");
 }
 
 fn init_logging() {

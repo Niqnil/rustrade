@@ -33,7 +33,9 @@
 //!
 //! Unlike WebSocket-based exchanges, IB uses TCP sockets with a blocking API.
 //! This module implements [`Stream`](futures::Stream) directly rather than using the [`Connector`]
-//! trait designed for WebSocket exchanges.
+//! trait designed for WebSocket exchanges. [`IbkrMarketStream`] still reconnects as the other
+//! venues' market streams do: it yields the same [`reconnect::Event`]s, and takes the same
+//! [`MarketStreamOptions`].
 //!
 //! # Supported Data Types
 //!
@@ -57,7 +59,10 @@
 //!   [`IbkrStreamConfig::with_market_data_type`]
 //! - **Trade side**: IB doesn't provide trade side; defaults to `Side::Buy`
 //! - **Blocking API**: Uses `std::thread::spawn` for long-lived subscriptions
-//! - **No auto-reconnect**: Caller responsibility per library philosophy
+//! - **Reconnection**: a lost connection (the socket to TWS/Gateway, or TWS/Gateway's link to IB,
+//!   codes 1100 and 1101) is reported as [`DataError::ConnectionLost`]; the stream then connects
+//!   again and makes every subscription anew, paced by
+//!   [`IbkrStreamConfig::max_messages_per_second`]. See [`IbkrMarketStream`]
 //!
 //! # See Also
 //!
@@ -72,6 +77,11 @@
 //! [`DataError::SubscriptionLimitReached`]: crate::error::DataError::SubscriptionLimitReached
 //! [`DataError::MarketDataNotAvailable`]: crate::error::DataError::MarketDataNotAvailable
 //! [`IbkrStreamConfig::with_market_data_type`]: crate::exchange::ibkr::IbkrStreamConfig::with_market_data_type
+//! [`IbkrStreamConfig::max_messages_per_second`]: crate::exchange::ibkr::IbkrStreamConfig::max_messages_per_second
+//! [`DataError::ConnectionLost`]: crate::error::DataError::ConnectionLost
+//! [`IbkrMarketStream`]: crate::exchange::ibkr::IbkrMarketStream
+//! [`reconnect::Event`]: crate::streams::reconnect::Event
+//! [`MarketStreamOptions`]: crate::streams::consumer::MarketStreamOptions
 
 pub mod depth;
 // `flex` is private: its public surface is re-exported flat below (matching the `massive`
@@ -93,12 +103,20 @@ pub use flex::{
 use crate::{
     error::DataError,
     event::{DataKind, MarketEvent},
+    streams::{
+        consumer::{MarketStreamOptions, MarketStreamResult, StreamKey, market_stream_events},
+        reconnect::{self, stream::init_reconnecting_stream},
+    },
 };
 use chrono::{DateTime, Utc};
 use depth::DepthAggregator;
+use futures::{
+    Stream, StreamExt,
+    stream::{self, BoxStream},
+};
 use greeks::GreeksAggregator;
 use ibapi::{
-    Notice,
+    Notice, RateLimiter, TRANSPORT_RECONNECT_CODE,
     client::blocking::Client,
     contracts::SecurityType,
     market_data::{MarketDataType, realtime::MarketDepths},
@@ -113,6 +131,7 @@ use rustrade_instrument::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    num::NonZeroU32,
     ops::ControlFlow,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
@@ -180,6 +199,26 @@ pub struct IbkrStreamConfig {
     /// when they arrived, not when the venue quoted or traded.
     #[serde(default)]
     pub market_data_type: IbkrMarketDataType,
+    /// The most messages the stream sends to TWS/Gateway in any one second, counting every
+    /// subscription request, on the first connection and on each reconnect. Default
+    /// [`DEFAULT_MAX_MESSAGES_PER_SECOND`].
+    ///
+    /// IB documents 50 messages per second, counted across every client connected to one
+    /// TWS/Gateway together, and answers the excess with error 100, which can end the session.
+    /// The default leaves room for another client, such as an execution client, on the same
+    /// gateway. A request over the limit waits; none is dropped.
+    #[serde(default = "default_max_messages_per_second")]
+    pub max_messages_per_second: NonZeroU32,
+}
+
+/// The default [`IbkrStreamConfig::max_messages_per_second`]: 40.
+pub const DEFAULT_MAX_MESSAGES_PER_SECOND: NonZeroU32 = match NonZeroU32::new(40) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
+fn default_max_messages_per_second() -> NonZeroU32 {
+    DEFAULT_MAX_MESSAGES_PER_SECOND
 }
 
 impl IbkrStreamConfig {
@@ -190,12 +229,20 @@ impl IbkrStreamConfig {
             port,
             client_id,
             market_data_type: IbkrMarketDataType::default(),
+            max_messages_per_second: DEFAULT_MAX_MESSAGES_PER_SECOND,
         }
     }
 
     /// Ask IB for `market_data_type` rather than live data.
     pub fn with_market_data_type(mut self, market_data_type: IbkrMarketDataType) -> Self {
         self.market_data_type = market_data_type;
+        self
+    }
+
+    /// Send at most `max_messages_per_second` messages to TWS/Gateway in any one second; see
+    /// [`max_messages_per_second`](Self::max_messages_per_second).
+    pub fn with_max_messages_per_second(mut self, max_messages_per_second: NonZeroU32) -> Self {
+        self.max_messages_per_second = max_messages_per_second;
         self
     }
 }
@@ -206,51 +253,74 @@ impl Default for IbkrStreamConfig {
     }
 }
 
-/// Market data stream from Interactive Brokers.
+/// Market data stream from Interactive Brokers, which reconnects and resubscribes by itself.
 ///
-/// Wraps an `mpsc::UnboundedReceiver` that receives events from background
-/// worker threads running ibapi subscriptions.
+/// Built with [`init`](Self::init). It yields [`MarketStreamResult`]s:
+/// - `Event::Item(Ok(event))` for each market event.
+/// - `Event::Item(Err(error))` for a subscription that ended while the connection stays up: see
+///   [`init`](Self::init)'s refusals, which end only their own line.
+/// - `Event::Item(Err(`[`DataError::ConnectionLost`]`))` when the connection is lost, then
+///   `Event::Reconnecting(ExchangeId::Ibkr)`. The stream then connects again with the reconnect
+///   backoff in its [`MarketStreamOptions`] and makes every subscription again. Each failed attempt
+///   yields `Event::Item(Err(`[`DataError::ReinitFailed`]`))`.
 ///
-/// # Thread Architecture
+/// It never ends by itself: drop it to stop it, which closes the connection.
 ///
-/// - One worker thread is spawned per subscription during `init()`
-/// - Worker threads are detached (their `JoinHandle`s are not stored)
-/// - Worker threads terminate when:
-///   - The channel closes (this stream is dropped)
-///   - The IB subscription ends (disconnect or server-side cancel)
-/// - The stream ends once every worker has exited. A worker ended by an error first sends it as
-///   a terminal `DataError::Socket`, except when [`disconnect`](Self::disconnect) ended it.
+/// # What counts as a lost connection
 ///
-/// # Memory Usage
+/// - The socket to TWS/Gateway closing, whether `ibapi` would reconnect it or not. Every
+///   subscription on a socket ends with it, so the stream connects anew rather than waiting for
+///   `ibapi`'s own reconnect.
+/// - TWS/Gateway losing its link to IB's servers (code 1100), or regaining it with its market data
+///   subscriptions lost (1101). A link that comes back with the subscriptions kept (1102) needs
+///   nothing, but by then the stream has already reconnected on the 1100 before it.
+/// - The `ibapi` client shutting down without this stream asking.
 ///
-/// The internal channel is **unbounded**. If the consumer processes events
-/// slower than IB produces them, memory usage will grow without limit. This
-/// design prioritizes data completeness over memory safety — a slow consumer
-/// causes heap growth rather than dropped events. Callers should ensure
-/// adequate processing capacity.
+/// # After a reconnect
 ///
-/// # Panic Handling
+/// - **Every subscription is made again**, including one refused before: a line past the cap may
+///   fit now, and one IB has no data for is refused again, as a new error item.
+/// - **Books and quotes start empty.** A quote or depth book is rebuilt from what IB sends on the
+///   new subscription, so the first event after a reconnect does not carry a side over from before.
+/// - **The client ID is reused.** IB Gateway frees it only once it has processed the old
+///   connection's close, so the first attempt may be refused (IB code 326) and yield
+///   `ReinitFailed` before a later one succeeds.
+/// - **The market data type** of the [`IbkrStreamConfig`] is asked for again on each connection.
 ///
-/// Worker threads are wrapped in `catch_unwind`. If a worker panics, a terminal
-/// `DataError::Socket` is sent to the stream describing the panic. The channel
-/// remains open for other subscriptions. No automatic recovery or reconnection.
-#[derive(Debug)]
+/// # Pacing
+///
+/// Every request the stream sends, initial and after each reconnect, passes one rate limiter
+/// ([`IbkrStreamConfig::max_messages_per_second`]), shared by all of the stream's connections, so
+/// resubscribing hundreds of lines does not exceed IB's message rate (error 100, which can end the
+/// session). IB counts that rate across every client of one TWS/Gateway together; this limiter
+/// counts only this stream's messages.
+///
+/// # Thread architecture
+///
+/// Each connection runs one thread per subscription and one watching the connection's global
+/// notices. They are detached, and end when the connection closes. The stream's events pass
+/// through an **unbounded** channel per connection: a consumer slower than IB grows the heap
+/// rather than dropping events.
+///
+/// # Panic handling
+///
+/// A subscription thread that panics ends its subscription with a [`DataError::Socket`] naming it;
+/// the stream's other subscriptions continue.
 pub struct IbkrMarketStream<K> {
-    rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
-    client: Arc<Client>,
-    /// Set by [`disconnect`](Self::disconnect) before it closes the connection, so that a worker
-    /// can tell the caller's own close from a shutdown `ibapi` or TWS/Gateway caused: `ibapi`
-    /// reports both alike, as `Error::Shutdown` to a running subscription and as
-    /// `Error::ConnectionReset` to one still being sent. Once it is set, any error that ends a
-    /// worker is taken for the caller's close, even one `ibapi` raised on its own just before.
-    closing: Arc<AtomicBool>,
+    inner: BoxStream<'static, MarketStreamResult<K, DataKind>>,
+}
+
+impl<K> std::fmt::Debug for IbkrMarketStream<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IbkrMarketStream").finish_non_exhaustive()
+    }
 }
 
 impl<K> futures::Stream for IbkrMarketStream<K> {
-    type Item = Result<MarketEvent<K, DataKind>, DataError>;
+    type Item = MarketStreamResult<K, DataKind>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_recv(cx)
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -258,7 +328,8 @@ impl<K> IbkrMarketStream<K>
 where
     K: Clone + Send + 'static,
 {
-    /// Initialize a market data stream with the given subscriptions.
+    /// Connect to TWS/Gateway and make `subscriptions`, returning the stream once the first
+    /// connection is up.
     ///
     /// # Arguments
     ///
@@ -267,41 +338,188 @@ where
     ///   contracts up by name only, and IB resolves each contract description on request, so
     ///   contracts registered with
     ///   [`register_by_name_only`](rustrade_instrument::ibkr::ContractRegistry::register_by_name_only)
-    ///   need not be resolved first.
+    ///   need not be resolved first. It is read again on each reconnect.
     /// * `subscriptions` - List of subscriptions to activate
+    /// * `options` - How the stream reconnects, and whether it is ended when it stays silent; see
+    ///   [`MarketStreamOptions`]. A silence timeout counts the market events of all subscriptions
+    ///   together, so set it longer than the quietest market the stream carries is ever silent.
     ///
     /// # Errors
     ///
-    /// Returns error if:
-    /// - Connection to IB fails, or the configured market data type cannot be sent
-    /// - No subscriptions could be activated (all contracts missing from registry)
+    /// The first connection's error:
+    /// - [`DataError::SubscriptionsEmpty`] if `subscriptions` is empty.
+    /// - [`DataError::Socket`] if the connection to IB fails, the configured market data type
+    ///   cannot be sent, or no subscription could be activated (every contract missing from the
+    ///   registry).
+    /// - [`DataError::ConnectionLost`] if TWS/Gateway reported during the handshake that it has no
+    ///   link to IB's servers (1100).
+    ///
+    /// A failed reconnect is not returned: the stream yields it, as above, and tries again.
     ///
     /// IB does not answer the market data type itself; what the account may receive shows per
-    /// subscription. A subscription IB refuses after this returns ends with an error item on the
-    /// stream instead: [`DataError::SubscriptionLimitReached`] when the account's market data
-    /// lines or depth requests are all in use, [`DataError::MarketDataNotAvailable`] when the
-    /// account has no market data for the instrument, and [`DataError::Socket`] otherwise.
-    pub fn init(
+    /// subscription. A subscription IB refuses ends with an error item on the stream instead:
+    /// [`DataError::SubscriptionLimitReached`] when the account's market data lines or depth
+    /// requests are all in use, [`DataError::MarketDataNotAvailable`] when the account has no
+    /// market data for the instrument, and [`DataError::Socket`] otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime: the blocking connection is made on tokio's blocking thread pool.
+    pub async fn init(
         config: IbkrStreamConfig,
         contracts: Arc<ContractRegistry>,
+        subscriptions: Vec<IbkrSubscription<K>>,
+        options: MarketStreamOptions,
+    ) -> Result<Self, DataError> {
+        if subscriptions.is_empty() {
+            return Err(DataError::SubscriptionsEmpty);
+        }
+        let limiter = RateLimiter::per_second(config.max_messages_per_second.get());
+        info!(
+            ?options,
+            subscriptions = subscriptions.len(),
+            "IbkrMarketStream with auto reconnect initialising"
+        );
+
+        let attempts = init_reconnecting_stream(move || {
+            let config = config.clone();
+            let contracts = contracts.clone();
+            let subscriptions = subscriptions.clone();
+            let limiter = limiter.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    Connection::open(&config, limiter, &contracts, subscriptions)
+                })
+                .await
+                .map_err(|e| DataError::Socket(format!("IB connect task: {e}")))?
+                .map(StreamExt::boxed)
+            }
+        })
+        .await?
+        .boxed();
+
+        Ok(Self {
+            inner: reconnecting_events(attempts, options),
+        })
+    }
+}
+
+/// The events a consumer receives from a stream's connection attempts: each connection's items up
+/// to and including a [`DataError::ConnectionLost`], then the shared reconnect handling
+/// ([`market_stream_events`]).
+fn reconnecting_events<T>(
+    attempts: BoxStream<'static, Result<BoxStream<'static, Result<T, DataError>>, DataError>>,
+    options: MarketStreamOptions,
+) -> BoxStream<'static, reconnect::Event<ExchangeId, Result<T, DataError>>>
+where
+    T: Send + 'static,
+{
+    let exchange = ExchangeId::Ibkr;
+    let attempts = attempts
+        .map(|attempt| attempt.map(|connection| end_after_connection_lost(connection).boxed()))
+        .boxed();
+    market_stream_events(
+        attempts,
+        options,
+        StreamKey::new_general("market_stream", exchange),
+        exchange,
+    )
+    .boxed()
+}
+
+/// `connection`'s items, ending after the first [`DataError::ConnectionLost`] without polling it
+/// again, and dropping it then, which closes its connection.
+///
+/// Every subscription of a lost connection may report the loss, and a link loss leaves the others
+/// silent rather than ended, so the first report is the end.
+fn end_after_connection_lost<St, T>(connection: St) -> impl Stream<Item = Result<T, DataError>>
+where
+    St: Stream<Item = Result<T, DataError>> + Unpin,
+{
+    stream::unfold(Some(connection), |connection| async move {
+        let mut connection = connection?;
+        let item = connection.next().await?;
+        let lost = matches!(item, Err(DataError::ConnectionLost { .. }));
+        Some((item, (!lost).then_some(connection)))
+    })
+}
+
+/// One connection to TWS/Gateway with its subscriptions: the inner piece of [`IbkrMarketStream`],
+/// which opens a new one after each loss.
+///
+/// Its items are each subscription's events and errors, and a [`DataError::ConnectionLost`] when
+/// the connection is lost. It ends once every worker and the notice watcher have exited, and the
+/// watcher exits only after reporting a loss or when the client shuts down: a connection whose
+/// subscriptions have all ended stays open, silent.
+struct Connection<K> {
+    rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
+    client: Arc<Client>,
+    /// Set by [`close`](Self::close) before it closes the connection, so that a worker or the
+    /// watcher can tell this stream's own close from a shutdown `ibapi` or TWS/Gateway caused:
+    /// `ibapi` reports both alike, as `Error::Shutdown` to a running subscription and as
+    /// `Error::ConnectionReset` to one still being sent. Once it is set, nothing more is reported.
+    closing: Arc<AtomicBool>,
+}
+
+impl<K> futures::Stream for Connection<K> {
+    type Item = Result<MarketEvent<K, DataKind>, DataError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+impl<K> Connection<K>
+where
+    K: Clone + Send + 'static,
+{
+    /// Connect as `config` says and start a worker per subscription, plus the notice watcher.
+    ///
+    /// Blocks for the handshake.
+    fn open(
+        config: &IbkrStreamConfig,
+        limiter: RateLimiter,
+        contracts: &ContractRegistry,
         subscriptions: Vec<IbkrSubscription<K>>,
     ) -> Result<Self, DataError> {
         let url = format!("{}:{}", config.host, config.port);
         info!(%url, client_id = config.client_id, "Connecting to IB for market data");
 
-        let client = Client::connect(&url, config.client_id)
+        let (client, notices) = Client::builder()
+            .address(&url)
+            .client_id(config.client_id)
+            .rate_limiter(limiter)
+            .connect_with_notice_stream()
             .map_err(|e| DataError::Socket(format!("IB connect: {e}")))?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Built before anything else can fail, so that its `Drop` closes the client on every
+        // early return below.
+        let connection = Self {
+            rx,
+            client: Arc::new(client),
+            closing: Arc::new(AtomicBool::new(false)),
+        };
+
+        if let Some(lost) = link_lost_at_handshake(std::iter::from_fn(|| notices.try_next())) {
+            return Err(lost);
+        }
 
         // Live is what IB sends when nothing was asked for, so only another type is requested.
         if config.market_data_type != IbkrMarketDataType::Live {
-            client
+            connection
+                .client
                 .switch_market_data_type(config.market_data_type.into())
                 .map_err(|e| DataError::Socket(format!("IB market data type: {e}")))?;
         }
 
-        let client = Arc::new(client);
-        let closing = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let watcher = NoticeWatcher {
+            tx: tx.clone(),
+            closing: connection.closing.clone(),
+        };
+        std::thread::Builder::new()
+            .name("ibkr-notices".to_owned())
+            .spawn(move || watcher.watch(notices.iter()))
+            .map_err(|e| DataError::Socket(format!("Failed to spawn IB notice thread: {e}")))?;
 
         let mut active_subscriptions = 0;
 
@@ -323,23 +541,22 @@ where
                 instrument: sub.instrument.clone(),
                 key: sub.key.clone(),
                 tx: tx.clone(),
-                closing: closing.clone(),
+                closing: connection.closing.clone(),
             };
+            let client = connection.client.clone();
             let spawn_result = match sub.kind {
                 IbkrSubscriptionKind::Quotes => {
-                    Self::run_quotes_subscription(client.clone(), contract, worker("quotes"))
+                    Self::run_quotes_subscription(client, contract, worker("quotes"))
                 }
                 IbkrSubscriptionKind::Depth { rows } => {
-                    Self::run_depth_subscription(client.clone(), contract, rows, worker("depth"))
+                    Self::run_depth_subscription(client, contract, rows, worker("depth"))
                 }
                 IbkrSubscriptionKind::Trades => {
-                    Self::run_trades_subscription(client.clone(), contract, worker("trades"))
+                    Self::run_trades_subscription(client, contract, worker("trades"))
                 }
-                IbkrSubscriptionKind::OptionGreeks => Self::run_option_greeks_subscription(
-                    client.clone(),
-                    contract,
-                    worker("option Greeks"),
-                ),
+                IbkrSubscriptionKind::OptionGreeks => {
+                    Self::run_option_greeks_subscription(client, contract, worker("option Greeks"))
+                }
             };
 
             match spawn_result {
@@ -356,11 +573,7 @@ where
             ));
         }
 
-        Ok(Self {
-            rx,
-            client,
-            closing,
-        })
+        Ok(connection)
     }
 
     fn run_quotes_subscription(
@@ -545,31 +758,95 @@ where
     }
 }
 
-impl<K> IbkrMarketStream<K> {
-    /// Disconnect from IB Gateway.
-    ///
-    /// Closes the connection to IB Gateway, which ends every worker's subscription at once. The
-    /// stream then ends (`None`) once every worker has exited, with no error item for the close:
-    /// a close the caller asked for is not a failure. A shutdown `ibapi` or TWS/Gateway causes
-    /// instead, such as reconnection given up or the API session ended, still reaches the stream
-    /// as one terminal [`DataError::Socket`] per subscription; one that comes just before this
-    /// call, but reaches a worker only after it, ends that worker quietly too. IB Gateway frees the
-    /// client ID once it has processed the close, which can take a moment. Dropping the stream
-    /// disconnects too.
-    ///
-    /// This is idempotent — calling it multiple times is safe.
-    pub fn disconnect(&self) {
-        debug!("Disconnecting IbkrMarketStream");
+impl<K> Connection<K> {
+    /// Close the connection, which ends every worker's subscription and the notice watcher, with
+    /// nothing reported for it. IB Gateway frees the client ID once it has processed the close,
+    /// which can take a moment. Idempotent.
+    fn close(&self) {
+        debug!("Closing IB market data connection");
         self.closing.store(true, Ordering::Release);
         self.client.disconnect();
     }
 }
 
-impl<K> Drop for IbkrMarketStream<K> {
+impl<K> Drop for Connection<K> {
     fn drop(&mut self) {
-        debug!("Dropping IbkrMarketStream, disconnecting client");
-        self.disconnect();
+        self.close();
     }
+}
+
+/// Watches one connection's global notices (those with no request ID), and reports the
+/// connection lost when a notice says so, or when the notices end because the client shut down.
+struct NoticeWatcher<K> {
+    tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+    /// The connection's close flag; see [`Connection::close`].
+    closing: Arc<AtomicBool>,
+}
+
+impl<K> NoticeWatcher<K> {
+    /// Read `notices` until one reports the connection lost ([`link_loss`]) or they end, and
+    /// report the loss either way, unless the connection's own close ended them.
+    fn watch(self, notices: impl IntoIterator<Item = Notice>) {
+        for notice in notices {
+            if let Some(reason) = link_loss(&notice) {
+                self.report_lost(reason);
+                return;
+            }
+            info!(code = notice.code, message = %notice.message, "IB notice");
+        }
+        self.report_lost("the IB client shut down".to_owned());
+    }
+
+    fn report_lost(&self, reason: String) {
+        if self.closing.load(Ordering::Acquire) {
+            debug!(%reason, "IB notices ended by the connection's own close");
+            return;
+        }
+        warn!(%reason, "IB market data connection lost");
+        let _ = self.tx.send(Err(DataError::ConnectionLost {
+            exchange: ExchangeId::Ibkr,
+            reason,
+        }));
+    }
+}
+
+/// Why `notice` ends the connection, if it does: TWS/Gateway lost its link to IB's servers
+/// (1100), or regained it with its market data subscriptions lost (1101), or `ibapi` reconnected
+/// the socket itself, which ends every subscription on it.
+fn link_loss(notice: &Notice) -> Option<String> {
+    let what = match notice.code {
+        codes::LINK_LOST => "TWS/Gateway lost its link to IB's servers",
+        codes::LINK_RESTORED_DATA_LOST => {
+            "TWS/Gateway regained its link to IB's servers but lost its market data subscriptions"
+        }
+        TRANSPORT_RECONNECT_CODE => {
+            "ibapi reconnected the socket to TWS/Gateway, which ended every subscription"
+        }
+        _ => return None,
+    };
+    Some(format!("{what} ({} {})", notice.code, notice.message))
+}
+
+/// The [`DataError::ConnectionLost`] for a connection whose handshake brought a notice that
+/// TWS/Gateway has no link to IB's servers (1100), if one did. Every handshake notice is logged.
+///
+/// Failing the attempt, rather than starting a connection that would end at once, lets the
+/// reconnect backoff grow while the link is down.
+fn link_lost_at_handshake(notices: impl IntoIterator<Item = Notice>) -> Option<DataError> {
+    let mut lost = None;
+    for notice in notices {
+        info!(code = notice.code, message = %notice.message, "IB notice at connect");
+        if notice.code == codes::LINK_LOST && lost.is_none() {
+            lost = Some(DataError::ConnectionLost {
+                exchange: ExchangeId::Ibkr,
+                reason: format!(
+                    "TWS/Gateway has no link to IB's servers ({} {})",
+                    notice.code, notice.message
+                ),
+            });
+        }
+    }
+    lost
 }
 
 /// One subscription's worker: the line it serves, and how it reaches the stream.
@@ -582,7 +859,7 @@ struct Worker<K> {
     /// The key the caller gave the subscription, put on each event.
     key: K,
     tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
-    /// The stream's close flag; see [`IbkrMarketStream::disconnect`].
+    /// The connection's close flag; see [`Connection::close`].
     closing: Arc<AtomicBool>,
 }
 
@@ -641,23 +918,30 @@ where
         }
     }
 
-    /// End the worker on `error`: log it, and send it to the stream as the worker's terminal error
-    /// ([`subscription_error`]).
+    /// End the worker on `error`: log it, and send it to the stream as the worker's terminal error,
+    /// [`DataError::ConnectionLost`] when the error says the connection is gone
+    /// ([`ends_connection`]), else the subscription's own ([`subscription_error`]).
     ///
-    /// Once `closing` is set, the stream's own [`disconnect`](IbkrMarketStream::disconnect) has
-    /// begun, and any error is logged at debug and nothing is sent: `ibapi` reports that close as
-    /// more than one error, depending on how far the worker got, and the caller is ending the
-    /// stream anyway.
+    /// Once `closing` is set, the connection's own [`close`](Connection::close) has begun, and any
+    /// error is logged at debug and nothing is sent: `ibapi` reports that close as more than one
+    /// error, depending on how far the worker got, and the stream is ending the connection anyway.
     fn fail(&self, error: ibapi::Error) {
         let stage = self.stage;
         if self.closing.load(Ordering::Acquire) {
-            debug!(instrument = %self.instrument, error = %error, "{stage} subscription ended by disconnect");
+            debug!(instrument = %self.instrument, error = %error, "{stage} subscription ended by the connection's close");
             return;
         }
-        error!(instrument = %self.instrument, error = %error, "{stage} subscription failed");
-        let _ = self
-            .tx
-            .send(Err(subscription_error(stage, &self.instrument, error)));
+        let item = if ends_connection(&error) {
+            warn!(instrument = %self.instrument, error = %error, "{stage} subscription ended by a lost connection");
+            DataError::ConnectionLost {
+                exchange: ExchangeId::Ibkr,
+                reason: format!("{stage} subscription {}: {error}", self.instrument),
+            }
+        } else {
+            error!(instrument = %self.instrument, error = %error, "{stage} subscription failed");
+            subscription_error(stage, &self.instrument, error)
+        };
+        let _ = self.tx.send(Err(item));
     }
 
     /// Act on a notice IB sent for this subscription without ending it: `Break` after sending a
@@ -679,6 +963,16 @@ where
         );
         ControlFlow::Continue(())
     }
+}
+
+/// Whether `error` says the connection itself is gone, rather than one subscription refused: the
+/// socket closed (whether `ibapi` would reconnect it or not), or the client shut down.
+fn ends_connection(error: &ibapi::Error) -> bool {
+    error.is_connection_lost()
+        || matches!(
+            error,
+            ibapi::Error::Shutdown | ibapi::Error::ConnectionFailed
+        )
 }
 
 /// The stream error for an `ibapi` error that ended the `stage` subscription to `instrument`: the
@@ -790,30 +1084,268 @@ mod tests {
     }
 
     #[test]
-    fn a_shutdown_the_caller_did_not_ask_for_reaches_the_stream() {
+    fn a_shutdown_the_stream_did_not_ask_for_reports_the_connection_lost() {
         assert_eq!(
             worker_error_sent(false, ibapi::Error::Shutdown),
-            Some(DataError::Socket(format!(
-                "quotes subscription AAPL: {}",
-                ibapi::Error::Shutdown
-            )))
+            Some(DataError::ConnectionLost {
+                exchange: ExchangeId::Ibkr,
+                reason: format!("quotes subscription AAPL: {}", ibapi::Error::Shutdown),
+            })
         );
     }
 
     #[test]
-    fn a_connection_reset_the_caller_did_not_ask_for_reaches_the_stream() {
-        assert!(worker_error_sent(false, ibapi::Error::ConnectionReset).is_some());
+    fn a_closed_socket_reports_the_connection_lost() {
+        for error in [
+            ibapi::Error::ConnectionReset,
+            ibapi::Error::ConnectionFailed,
+            ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let shown = error.to_string();
+            assert!(
+                matches!(
+                    worker_error_sent(false, error),
+                    Some(DataError::ConnectionLost { .. })
+                ),
+                "{shown}"
+            );
+        }
     }
 
     #[test]
-    fn the_callers_own_disconnect_ends_a_running_worker_without_an_error_item() {
+    fn the_connections_own_close_ends_a_running_worker_without_an_error_item() {
         assert_eq!(worker_error_sent(true, ibapi::Error::Shutdown), None);
     }
 
     #[test]
-    fn the_callers_own_disconnect_ends_a_subscribing_worker_without_an_error_item() {
+    fn the_connections_own_close_ends_a_subscribing_worker_without_an_error_item() {
         // `ibapi` refuses a subscription sent after the close began with `ConnectionReset`.
         assert_eq!(worker_error_sent(true, ibapi::Error::ConnectionReset), None);
+    }
+
+    fn global_notice(code: i32, message: &str) -> Notice {
+        Notice {
+            request_id: None,
+            ..notice(code, message)
+        }
+    }
+
+    /// What a watcher sends when it reads `notices`, with the connection closing or not.
+    fn watched(closing: bool, notices: Vec<Notice>) -> Vec<DataError> {
+        let (tx, mut rx) =
+            mpsc::unbounded_channel::<Result<MarketEvent<(), DataKind>, DataError>>();
+        NoticeWatcher {
+            tx,
+            closing: Arc::new(AtomicBool::new(closing)),
+        }
+        .watch(notices);
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|item| item.expect_err("a watcher sends only errors"))
+            .collect()
+    }
+
+    #[test]
+    fn the_link_notices_that_lose_market_data_end_the_connection() {
+        for (code, says) in [
+            (1100, "lost its link"),
+            (1101, "lost its market data subscriptions"),
+            (TRANSPORT_RECONNECT_CODE, "ended every subscription"),
+        ] {
+            let reason = link_loss(&global_notice(code, "IB says")).expect("a link loss");
+            assert!(reason.contains(says), "{code}: {reason}");
+            assert!(reason.contains(&format!("({code} IB says)")), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_link_restored_with_data_kept_or_a_farm_notice_ends_nothing() {
+        for code in [1102, 2104, 2106, 2158, 2103] {
+            assert_eq!(link_loss(&global_notice(code, "farm")), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_watcher_reports_the_first_link_loss_once_and_stops_reading() {
+        let sent = watched(
+            false,
+            vec![
+                global_notice(2104, "Market data farm connection is OK"),
+                global_notice(1101, "Connectivity restored - data lost"),
+                global_notice(1100, "Connectivity lost"),
+            ],
+        );
+
+        let [DataError::ConnectionLost { exchange, reason }] = sent.as_slice() else {
+            panic!("expected one connection loss, got {sent:?}");
+        };
+        assert_eq!(*exchange, ExchangeId::Ibkr);
+        assert!(reason.contains("1101"), "{reason}");
+    }
+
+    #[test]
+    fn notices_ending_without_a_loss_mean_the_client_shut_down() {
+        let sent = watched(false, vec![global_notice(2104, "farm OK")]);
+
+        assert_eq!(
+            sent,
+            [DataError::ConnectionLost {
+                exchange: ExchangeId::Ibkr,
+                reason: "the IB client shut down".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_watcher_reports_nothing_once_the_connection_is_closing() {
+        assert_eq!(watched(true, vec![global_notice(1100, "lost")]), []);
+        assert_eq!(watched(true, vec![]), []);
+    }
+
+    #[test]
+    fn a_handshake_saying_the_link_is_down_fails_the_attempt() {
+        let lost = link_lost_at_handshake([
+            global_notice(2104, "farm OK"),
+            global_notice(1100, "Connectivity between IB and TWS has been lost"),
+        ]);
+
+        let Some(DataError::ConnectionLost { reason, .. }) = lost else {
+            panic!("expected a connection loss, got {lost:?}");
+        };
+        assert!(reason.contains("1100"), "{reason}");
+    }
+
+    #[test]
+    fn a_handshake_with_only_farm_notices_succeeds() {
+        assert_eq!(
+            link_lost_at_handshake([global_notice(2104, "OK"), global_notice(2106, "OK")]),
+            None
+        );
+        assert_eq!(link_lost_at_handshake([]), None);
+    }
+
+    type Item = Result<u8, DataError>;
+
+    fn lost() -> Item {
+        Err(DataError::ConnectionLost {
+            exchange: ExchangeId::Ibkr,
+            reason: "socket closed".to_owned(),
+        })
+    }
+
+    fn limit() -> Item {
+        Err(DataError::SubscriptionLimitReached {
+            exchange: ExchangeId::Ibkr,
+            instrument: InstrumentNameExchange::new("AAPL"),
+            code: 101,
+            message: "Max number of tickers".to_owned(),
+        })
+    }
+
+    /// A connection yielding `items`, then nothing, without ending: as a lost connection whose
+    /// other workers stay silent.
+    fn connection(items: Vec<Item>) -> BoxStream<'static, Item> {
+        stream::iter(items).chain(stream::pending()).boxed()
+    }
+
+    /// The first `count` items of `stream`, failing the test if they have not all arrived within
+    /// a day of tokio's (paused) clock.
+    async fn first<T>(stream: impl Stream<Item = T>, count: usize) -> Vec<T> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(86_400),
+            stream.take(count).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the stream stalled")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_ends_after_its_first_loss_without_waiting_for_more() {
+        let items = end_after_connection_lost(connection(vec![Ok(1), limit(), lost(), Ok(2)]));
+
+        let collected = tokio::time::timeout(
+            std::time::Duration::from_secs(86_400),
+            items.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("a lost connection ends");
+
+        assert_eq!(collected, [Ok(1), limit(), lost()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_connection_is_reported_then_reopened_and_a_line_refusal_is_not() {
+        const POLICY: crate::streams::reconnect::stream::ReconnectionBackoffPolicy =
+            crate::streams::reconnect::stream::ReconnectionBackoffPolicy {
+                backoff_ms_initial: 1,
+                backoff_multiplier: 2,
+                backoff_ms_max: 10,
+            };
+        let refused = DataError::Socket("IB connect: connection refused".to_owned());
+        let attempts = stream::iter([
+            Ok(connection(vec![Ok(1), limit(), lost(), Ok(99)])),
+            Err(refused.clone()),
+            Ok(connection(vec![Ok(2)])),
+        ])
+        .chain(stream::pending())
+        .boxed();
+
+        let events = first(
+            reconnecting_events(
+                attempts,
+                MarketStreamOptions::default().with_reconnect(POLICY),
+            ),
+            6,
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            [
+                reconnect::Event::Item(Ok(1)),
+                reconnect::Event::Item(limit()),
+                reconnect::Event::Item(lost()),
+                reconnect::Event::Reconnecting(ExchangeId::Ibkr),
+                reconnect::Event::Item(Err(DataError::ReinitFailed {
+                    attempt: 1,
+                    error: Box::new(refused),
+                })),
+                reconnect::Event::Item(Ok(2)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_market_stream_yields_its_reconnecting_events_and_names_itself() {
+        let inner = stream::iter([
+            reconnect::Event::Reconnecting(ExchangeId::Ibkr),
+            reconnect::Event::Item(Err(DataError::SubscriptionsEmpty)),
+        ]);
+        let stream = IbkrMarketStream::<()> {
+            inner: inner.boxed(),
+        };
+
+        assert_eq!(format!("{stream:?}"), "IbkrMarketStream { .. }");
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(
+            events,
+            [
+                reconnect::Event::Reconnecting(ExchangeId::Ibkr),
+                reconnect::Event::Item(Err(DataError::SubscriptionsEmpty)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_subscriptions_is_refused_before_connecting() {
+        let result = IbkrMarketStream::<()>::init(
+            IbkrStreamConfig::default(),
+            Arc::new(ContractRegistry::new()),
+            vec![],
+            MarketStreamOptions::default(),
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(DataError::SubscriptionsEmpty));
     }
 
     #[test]
@@ -975,6 +1507,7 @@ mod tests {
 
         let delayed = config.with_market_data_type(IbkrMarketDataType::Delayed);
         assert_eq!(delayed.market_data_type, IbkrMarketDataType::Delayed);
+        assert_eq!(delayed.max_messages_per_second.get(), 40);
         assert_eq!(
             (delayed.host.as_str(), delayed.port, delayed.client_id),
             ("127.0.0.1", 4002, 7)
@@ -986,6 +1519,31 @@ mod tests {
         let config: IbkrStreamConfig =
             serde_json::from_str(r#"{"host":"127.0.0.1","port":4002,"client_id":7}"#).unwrap();
         assert_eq!(config.market_data_type, IbkrMarketDataType::Live);
+        assert_eq!(
+            config.max_messages_per_second,
+            DEFAULT_MAX_MESSAGES_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn a_configuration_sets_its_message_rate() {
+        let rate = NonZeroU32::new(25).unwrap();
+        let config = IbkrStreamConfig::default().with_max_messages_per_second(rate);
+        assert_eq!(config.max_messages_per_second, rate);
+
+        let loaded: IbkrStreamConfig = serde_json::from_str(
+            r#"{"host":"h","port":1,"client_id":2,"max_messages_per_second":25}"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.max_messages_per_second, rate);
+    }
+
+    #[test]
+    fn a_configuration_with_no_message_rate_is_refused() {
+        let zero = serde_json::from_str::<IbkrStreamConfig>(
+            r#"{"host":"h","port":1,"client_id":2,"max_messages_per_second":0}"#,
+        );
+        assert!(zero.is_err());
     }
 
     #[test]
