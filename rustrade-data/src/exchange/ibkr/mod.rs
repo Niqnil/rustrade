@@ -105,7 +105,10 @@ use crate::{
     event::{DataKind, MarketEvent},
     streams::{
         consumer::{MarketStreamOptions, MarketStreamResult, StreamKey, market_stream_events},
-        reconnect::{self, stream::init_reconnecting_stream},
+        reconnect::{
+            self,
+            stream::{ReconnectionBackoffPolicy, init_reconnecting_stream},
+        },
     },
 };
 use chrono::{DateTime, Utc};
@@ -277,9 +280,7 @@ impl Default for IbkrStreamConfig {
 ///   subscriptions lost (1101).
 /// - TWS/Gateway regaining the link with its subscriptions kept (1102), when the connection made
 ///   its subscriptions while the link was down (it reconnected on the 1100): those are made again
-///   once the link is back. A 1102 ends nothing otherwise, and a further 1100 while the link is
-///   already down ends nothing, so a link outage costs one reconnect when it begins and one when
-///   it ends.
+///   once the link is back. A 1102 ends nothing otherwise.
 /// - The `ibapi` client shutting down without this stream asking.
 ///
 /// Events a lost connection had queued after it reported the loss are dropped with it.
@@ -292,7 +293,12 @@ impl Default for IbkrStreamConfig {
 ///   new subscription, so the first event after a reconnect does not carry a side over from before.
 /// - **The client ID is reused.** The old connection's close finishes before the new one connects,
 ///   but IB Gateway may take a moment longer to free the ID, so an attempt may be refused (IB code
-///   326) and yield `ReinitFailed` before a later one succeeds.
+///   326) and yield `ReinitFailed` before a later one succeeds. The same holds for a new stream
+///   made with the client ID of one just dropped, which does not wait for the old close at all.
+/// - **A connection that ends soon after opening delays the next.** One that ends within 30
+///   seconds of opening, such as one TWS/Gateway accepts and then ends at once, makes the next
+///   attempt wait one more step of the reconnect backoff for each such end in a row, since a
+///   connection that opens otherwise resets the backoff.
 /// - **The market data type** of the [`IbkrStreamConfig`] is asked for again on each connection.
 ///
 /// # Pacing
@@ -384,6 +390,7 @@ where
             return Err(DataError::SubscriptionsEmpty);
         }
         let shared = Shared::default();
+        let backoff = options.reconnect.clone();
         info!(
             ?options,
             subscriptions = subscriptions.len(),
@@ -395,7 +402,15 @@ where
             let contracts = contracts.clone();
             let subscriptions = subscriptions.clone();
             let shared = shared.clone();
+            let delay = shared.quick_ends.lock().delay(&backoff);
             async move {
+                if !delay.is_zero() {
+                    debug!(
+                        ?delay,
+                        "IB connection ended soon after opening; waiting to reconnect"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
                 tokio::task::spawn_blocking(move || {
                     Connection::open(&config, &shared, &contracts, subscriptions)
                 })
@@ -468,9 +483,12 @@ struct Connection<K> {
     /// `ibapi` reports both alike, as `Error::Shutdown` to a running subscription and as
     /// `Error::ConnectionReset` to one still being sent. Once it is set, nothing more is reported.
     closing: Arc<AtomicBool>,
-    /// Where [`close`](Self::close) leaves the close running, for the stream's next connection to
-    /// wait for.
-    pending_close: PendingClose,
+    /// What the stream's connections share: where [`close`](Self::close) leaves the close
+    /// running, and how long connections last.
+    shared: Shared,
+    /// When `open` handed the connection out; `None` while it is still being opened, so that a
+    /// failed open is not counted as a connection that ended.
+    opened_at: Option<std::time::Instant>,
 }
 
 /// What a stream's connections share, one after another.
@@ -480,6 +498,48 @@ struct Shared {
     /// stream's connections read said: see [`link_notice`].
     link_down: Arc<AtomicBool>,
     pending_close: PendingClose,
+    quick_ends: Arc<parking_lot::Mutex<QuickEnds>>,
+}
+
+/// A connection that ends sooner than this after it opened counts as a quick end; see
+/// [`QuickEnds`].
+const QUICK_END: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many of a stream's connections in a row ended within [`QUICK_END`] of opening.
+///
+/// The shared reconnect handling resets its backoff whenever a connection opens, so a connection
+/// that TWS/Gateway accepts and then ends at once (an 1100 sent to each new connection while the
+/// link is down, say) would otherwise be remade with no wait, again and again. Each quick end in a
+/// row delays the next attempt by one more step of the reconnect backoff.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QuickEnds(u32);
+
+impl QuickEnds {
+    /// Count a connection that ended after `lived`.
+    fn record(&mut self, lived: std::time::Duration) {
+        self.0 = if lived < QUICK_END {
+            self.0.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// The wait before the next attempt: none after a connection that lasted, else the backoff
+    /// `policy` gives the attempt after as many failures as there were quick ends.
+    fn delay(self, policy: &ReconnectionBackoffPolicy) -> std::time::Duration {
+        let Some(steps) = self.0.checked_sub(1) else {
+            return std::time::Duration::ZERO;
+        };
+        let multiplier = u64::from(policy.backoff_multiplier);
+        let mut millis = policy.backoff_ms_initial;
+        for _ in 0..steps {
+            if millis >= policy.backoff_ms_max {
+                break;
+            }
+            millis = millis.saturating_mul(multiplier);
+        }
+        std::time::Duration::from_millis(millis.min(policy.backoff_ms_max))
+    }
 }
 
 /// The close of a stream's last connection, which runs on a thread of its own, since
@@ -491,28 +551,33 @@ struct PendingClose(Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>>
 
 impl PendingClose {
     /// Run `close` on a new thread, after any close started before it. If no thread can be
-    /// started, `close` runs here instead.
+    /// started, the earlier closes and `close` run here instead, blocking the caller.
     fn start(&self, close: impl FnOnce() + Send + 'static) {
         let mut pending = self.0.lock();
         let earlier = pending.take();
-        let close = std::sync::Arc::new(parking_lot::Mutex::new(Some(close)));
-        let on_thread = close.clone();
+        let job = move || {
+            if let Some(earlier) = earlier {
+                let _ = earlier.join();
+            }
+            close();
+        };
+        // Shared with the thread, so that the job is still here to run if the spawn fails.
+        let job = Arc::new(parking_lot::Mutex::new(Some(job)));
+        let on_thread = job.clone();
         let spawned = std::thread::Builder::new()
             .name("ibkr-close".to_owned())
             .spawn(move || {
-                if let Some(earlier) = earlier {
-                    let _ = earlier.join();
-                }
-                if let Some(close) = on_thread.lock().take() {
-                    close();
+                if let Some(job) = on_thread.lock().take() {
+                    job();
                 }
             });
         match spawned {
             Ok(handle) => *pending = Some(handle),
             Err(error) => {
-                warn!(%error, "Failed to spawn the IB close thread; closing here");
-                if let Some(close) = close.lock().take() {
-                    close();
+                drop(pending);
+                warn!(%error, "Failed to spawn the IB close thread; closing on this one");
+                if let Some(job) = job.lock().take() {
+                    job();
                 }
             }
         }
@@ -569,7 +634,8 @@ where
             rx,
             client: Arc::new(client),
             closing: Arc::new(AtomicBool::new(false)),
-            pending_close: shared.pending_close.clone(),
+            shared: shared.clone(),
+            opened_at: None,
         };
 
         // Live is what IB sends when nothing was asked for, so only another type is requested.
@@ -649,6 +715,8 @@ where
             ));
         }
 
+        let mut connection = connection;
+        connection.opened_at = Some(std::time::Instant::now());
         Ok(connection)
     }
 
@@ -843,12 +911,15 @@ impl<K> Connection<K> {
         // Set here, not on the close thread, so that no worker reports the close as a failure.
         self.closing.store(true, Ordering::Release);
         let client = self.client.clone();
-        self.pending_close.start(move || client.disconnect());
+        self.shared.pending_close.start(move || client.disconnect());
     }
 }
 
 impl<K> Drop for Connection<K> {
     fn drop(&mut self) {
+        if let Some(opened_at) = self.opened_at {
+            self.shared.quick_ends.lock().record(opened_at.elapsed());
+        }
         self.close();
     }
 }
@@ -870,6 +941,10 @@ impl<K> NoticeWatcher<K> {
     /// loss either way, unless the connection's own close ended them.
     fn watch(self, notices: impl IntoIterator<Item = Notice>) {
         for notice in notices {
+            // A closing connection's notices change nothing: the next connection may be open.
+            if self.closing.load(Ordering::Acquire) {
+                return;
+            }
             info!(code = notice.code, message = %notice.message, "IB notice");
             if let Some(reason) = link_notice(&notice, &self.link_down, self.down_at_open) {
                 self.report_lost(reason);
@@ -896,9 +971,8 @@ impl<K> NoticeWatcher<K> {
 /// of whether TWS/Gateway's link to IB's servers is down. `down_at_open` says whether it was down
 /// when this connection made its subscriptions.
 ///
-/// - 1100 (link lost) ends the connection, unless the link was already down: TWS/Gateway may say
-///   so again to a connection made during the outage, and reconnecting on that would loop until
-///   the link is back.
+/// - 1100 (link lost) ends it. Should TWS/Gateway say so again to each connection made during the
+///   outage, [`QuickEnds`] spaces the reconnects out.
 /// - 1101 (restored, subscriptions lost) ends it.
 /// - 1102 (restored, subscriptions kept) ends it only if its subscriptions were made while the
 ///   link was down, so that they are made again with the link up.
@@ -906,9 +980,7 @@ impl<K> NoticeWatcher<K> {
 fn link_notice(notice: &Notice, link_down: &AtomicBool, down_at_open: bool) -> Option<String> {
     let what = match notice.code {
         codes::LINK_LOST => {
-            if link_down.swap(true, Ordering::AcqRel) {
-                return None;
-            }
+            link_down.store(true, Ordering::Release);
             "TWS/Gateway lost its link to IB's servers"
         }
         codes::LINK_RESTORED_DATA_LOST => {
@@ -1246,20 +1318,16 @@ mod tests {
     }
 
     #[test]
-    fn a_link_loss_ends_the_connection_once_until_the_link_is_back() {
-        let (ends, down) = link_after(1100, false, false);
-        let reason = ends.expect("the first 1100 ends the connection");
-        assert!(
-            reason.contains("lost its link") && reason.contains("(1100 IB says)"),
-            "{reason}"
-        );
-        assert!(down);
-
-        assert_eq!(
-            link_after(1100, true, true),
-            (None, true),
-            "an 1100 while the link is down already"
-        );
+    fn a_link_loss_ends_the_connection_and_marks_the_link_down() {
+        for (down_before, down_at_open) in [(false, false), (true, true)] {
+            let (ends, down) = link_after(1100, down_before, down_at_open);
+            let reason = ends.expect("an 1100 ends the connection");
+            assert!(
+                reason.contains("lost its link") && reason.contains("(1100 IB says)"),
+                "{reason}"
+            );
+            assert!(down);
+        }
     }
 
     #[test]
@@ -1318,46 +1386,70 @@ mod tests {
     }
 
     #[test]
-    fn a_link_outage_costs_one_reconnect_as_it_begins_and_one_as_it_ends() {
+    fn a_connection_made_during_a_link_outage_is_remade_when_the_link_is_back() {
         let link_down = Arc::new(AtomicBool::new(false));
-        let lost = |sent: &[DataError], code: &str| matches!(sent, [DataError::ConnectionLost { reason, .. }] if reason.contains(code));
+        let lost = |sent: &[DataError], says: &str| matches!(sent, [DataError::ConnectionLost { reason, .. }] if reason.contains(says));
 
         // The first connection: the link goes down.
         let first = watched_with(false, &link_down, vec![global_notice(1100, "lost")]);
         assert!(lost(&first, "1100"), "{first:?}");
 
-        // The next connection, made during the outage: told again, it carries on, and the restore
-        // ends it so that its subscriptions are made again with the link up.
-        let second = watched_with(
-            false,
-            &link_down,
-            vec![
-                global_notice(1100, "lost"),
-                global_notice(1102, "maintained"),
-            ],
-        );
+        // The next, made during the outage: the restore ends it, so that its subscriptions are
+        // made again with the link up.
+        let second = watched_with(false, &link_down, vec![global_notice(1102, "maintained")]);
         assert!(lost(&second, "1102"), "{second:?}");
 
-        // The connection after the restore is not ended by a 1102.
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<Result<MarketEvent<(), DataKind>, DataError>>();
-        let third = NoticeWatcher {
-            tx,
-            closing: Arc::new(AtomicBool::new(false)),
-            link_down: link_down.clone(),
-            down_at_open: link_down.load(Ordering::Acquire),
-        };
-        assert!(!third.down_at_open);
-        assert_eq!(
-            link_notice(
-                &global_notice(1102, "maintained"),
-                &third.link_down,
-                third.down_at_open
-            ),
-            None
-        );
-        drop(third);
-        assert!(rx.try_recv().is_err());
+        // The one after: a 1102 ends nothing, so only the notices ending report a loss.
+        let third = watched_with(false, &link_down, vec![global_notice(1102, "maintained")]);
+        assert!(lost(&third, "shut down"), "{third:?}");
+    }
+
+    #[test]
+    fn a_closing_connections_notices_leave_the_link_state_alone() {
+        let link_down = Arc::new(AtomicBool::new(true));
+
+        let sent = watched_with(true, &link_down, vec![global_notice(1102, "maintained")]);
+
+        assert_eq!(sent, []);
+        assert!(link_down.load(Ordering::Acquire));
+    }
+
+    const BACKOFF: ReconnectionBackoffPolicy = ReconnectionBackoffPolicy {
+        backoff_ms_initial: 100,
+        backoff_multiplier: 2,
+        backoff_ms_max: 1_000,
+    };
+
+    #[test]
+    fn a_connection_that_lasted_delays_nothing() {
+        let mut ends = QuickEnds::default();
+        assert_eq!(ends.delay(&BACKOFF), std::time::Duration::ZERO);
+
+        ends.record(QUICK_END);
+        assert_eq!(ends.delay(&BACKOFF), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn quick_ends_in_a_row_step_through_the_backoff_up_to_its_cap() {
+        let mut ends = QuickEnds::default();
+        let mut delays = Vec::new();
+        for _ in 0..6 {
+            ends.record(QUICK_END - std::time::Duration::from_millis(1));
+            delays.push(ends.delay(&BACKOFF).as_millis());
+        }
+
+        assert_eq!(delays, [100, 200, 400, 800, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn a_connection_that_lasted_resets_the_quick_ends() {
+        let mut ends = QuickEnds::default();
+        ends.record(std::time::Duration::ZERO);
+        ends.record(std::time::Duration::ZERO);
+
+        ends.record(QUICK_END);
+
+        assert_eq!(ends, QuickEnds::default());
     }
 
     #[test]
@@ -1383,15 +1475,17 @@ mod tests {
     fn a_close_runs_off_the_callers_thread_and_the_next_connection_waits_for_it() {
         let pending = PendingClose::default();
         let (started, release) = std::sync::mpsc::channel::<()>();
+        let (hold, held) = std::sync::mpsc::channel::<()>();
         let done = Arc::new(AtomicBool::new(false));
+        let off_caller = Arc::new(AtomicBool::new(false));
         let caller = std::thread::current().id();
 
-        let on_close = done.clone();
+        let (on_close, on_other_thread) = (done.clone(), off_caller.clone());
         pending.start(move || {
-            assert_ne!(std::thread::current().id(), caller);
-            // Held until the test releases it, so `start` is seen to return before it ends.
+            on_other_thread.store(std::thread::current().id() != caller, Ordering::Release);
             let _ = started.send(());
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Held until the test lets it go, so `start` is seen to return before it ends.
+            let _ = held.recv();
             on_close.store(true, Ordering::Release);
         });
         release.recv().expect("the close started");
@@ -1399,12 +1493,18 @@ mod tests {
             !done.load(Ordering::Acquire),
             "start returned before the close finished"
         );
+        hold.send(()).unwrap();
 
         pending.wait();
         assert!(
             done.load(Ordering::Acquire),
             "wait returns once the close has finished"
         );
+        assert!(
+            off_caller.load(Ordering::Acquire),
+            "the close ran off the caller's thread"
+        );
+        pending.wait();
     }
 
     #[test]

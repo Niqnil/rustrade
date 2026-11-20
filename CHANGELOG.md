@@ -568,9 +568,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket to TWS/Gateway closing, TWS/Gateway losing its link to IB's servers (1100) or regaining
   it with its subscriptions lost (1101), or the `ibapi` client shutting down) the stream yields the
   new `DataError::ConnectionLost`, then `Event::Reconnecting`, then connects again and makes every
-  subscription anew; each failed attempt yields `DataError::ReinitFailed`. A link outage costs one
-  reconnect as it begins and one as it ends (a connection made during it is remade on the 1102
-  restore). Before, a socket loss ended the stream, and a 1101 left every subscription silent with
+  subscription anew; each failed attempt yields `DataError::ReinitFailed`. A connection made during
+  a link outage is remade on the 1102 restore, and connections that end soon after opening space
+  their reconnects out with the backoff. Before, a socket loss ended the stream, and a 1101 left every subscription silent with
   nothing reported. The stream no longer ends by itself, not even when every subscription has
   ended (it stays open, silent): drop it to stop it. `disconnect` is removed (dropping closes the
   connection, on a thread of its own, so the dropping task never blocks), and the per-connection
