@@ -1,7 +1,9 @@
 #[cfg(feature = "databento")]
 use crate::exchange::databento::DatabentoErrorKind;
 use crate::subscription::{SubKind, candle::CandleInterval};
-use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
+use rustrade_instrument::{
+    exchange::ExchangeId, index::error::IndexError, instrument::name::InstrumentNameExchange,
+};
 use rustrade_integration::{
     error::SocketError,
     subscription::{SubscriptionId, display_subscription_ids},
@@ -165,6 +167,39 @@ pub enum DataError {
     /// have answered later: retrying is the caller's decision.
     #[error("{operation} got no complete answer in time")]
     RequestTimeout { operation: String },
+
+    /// The venue refused the subscription to `instrument` because a cap on concurrent
+    /// subscriptions is reached.
+    ///
+    /// `code` and `message` are the venue's own. Only that subscription ends; the stream's other
+    /// subscriptions continue. The cap frees only when another subscription is cancelled, possibly
+    /// one held outside this stream: on IBKR, market data lines (code 101) and depth requests
+    /// (code 309) are shared by every session and API connection of the username, and the venue
+    /// offers no way to read how many are free. Freeing one and subscribing again is the caller's
+    /// decision.
+    #[error("{exchange} refused {instrument}: subscription limit reached ({code} {message})")]
+    SubscriptionLimitReached {
+        exchange: ExchangeId,
+        instrument: InstrumentNameExchange,
+        code: i32,
+        message: String,
+    },
+
+    /// The venue will not send market data for `instrument` to this account: it lacks the
+    /// subscription, or another session has precedence.
+    ///
+    /// `code` and `message` are the venue's own. Only that subscription ends; the stream's other
+    /// subscriptions continue. On IBKR: 354 (not subscribed), 10089 (the subscription does not
+    /// extend to the API), 10168 (not subscribed, and delayed data is not enabled) and 10197 (a
+    /// competing live session). An account without the live subscription may still get delayed
+    /// data, by asking for it on the stream's configuration.
+    #[error("{exchange} has no market data for {instrument} on this account ({code} {message})")]
+    MarketDataNotAvailable {
+        exchange: ExchangeId,
+        instrument: InstrumentNameExchange,
+        code: i32,
+        message: String,
+    },
 }
 
 impl DataError {

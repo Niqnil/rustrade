@@ -26,7 +26,7 @@ use ibapi::{
     subscriptions::SubscriptionItem,
 };
 use rust_decimal::Decimal;
-use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use rustrade_instrument::{ibkr::codes, instrument::name::InstrumentNameExchange};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -46,18 +46,6 @@ pub const DEFAULT_SHORTABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// scale from, the grace is a small margin for a tick 89 that trails tick 46 rather than a
 /// measured bound.
 const SHORTABLE_SHARES_GRACE: Duration = Duration::from_secs(2);
-
-/// IB's error code for a request that would exceed the account's market data lines ("Max number
-/// of tickers has been reached"). The lines are a cap on concurrent subscriptions, shared by every
-/// TWS session and API client on the account, and one frees only when a subscription is
-/// cancelled: this is not IB's rate limit, which is code 100.
-const MAX_TICKERS_CODE: i32 = 101;
-
-/// IB's notices that the account may not have the stock's market data, after which no tick comes:
-/// 354 (not subscribed), 10089 (the subscription does not extend to the API) and 10168 (not
-/// subscribed, and delayed data is not enabled). They end the read at once rather than waiting
-/// out the timeout. 10167, delayed data shown in place of live, is not one: the ticks follow it.
-const NO_MARKET_DATA_CODES: [i32; 3] = [354, 10089, 10168];
 
 impl ShortabilityClient for IbkrClient {
     /// Reads IB's shortability ticks with a streaming market data request for generic tick 236,
@@ -158,7 +146,7 @@ fn instrument_invalid(instrument: &InstrumentNameExchange, reason: &str) -> Unin
 /// What an `ibapi` error answering the shortability request means for the caller.
 fn request_error(instrument: &InstrumentNameExchange, e: ibapi::Error) -> UnindexedClientError {
     match e {
-        ibapi::Error::Notice(notice) if notice.code == MAX_TICKERS_CODE => {
+        ibapi::Error::Notice(notice) if notice.code == codes::MAX_TICKERS => {
             UnindexedClientError::Api(ApiError::CapacityExceeded(format!(
                 "{instrument}: {} {}",
                 notice.code, notice.message
@@ -277,11 +265,11 @@ fn read_shortability_ticks(
                     deadline = deadline.min(Instant::now() + grace);
                 }
             }
-            Some(Ok(SubscriptionItem::Notice(notice))) if notice.code == MAX_TICKERS_CODE => {
+            Some(Ok(SubscriptionItem::Notice(notice))) if notice.code == codes::MAX_TICKERS => {
                 return Err(ibapi::Error::Notice(notice));
             }
             Some(Ok(SubscriptionItem::Notice(notice)))
-                if NO_MARKET_DATA_CODES.contains(&notice.code) =>
+                if codes::MARKET_DATA_NOT_SUBSCRIBED_CODES.contains(&notice.code) =>
             {
                 debug!(%notice, "IBKR shortability request has no market data");
                 ticks.notices.push(notice);
