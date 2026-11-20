@@ -608,14 +608,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancels every other order. `SplitConfig::ADJUST_FORWARD` adjusts on a forward split and cancels
   on a reverse one, as Rule 5330 does. An adjusted order keeps its venue order id and is reported
   as an `Open` snapshot, which the engine takes in place of its own rescale; with no tick or step
-  and fractional shares the two agree exactly. New `CorporateActionRefusal` reasons, each changing
+  and fractional shares the two agree exactly. One whose hold the account can no longer afford is
+  cancelled instead, with a warning. New `CorporateActionRefusal` reasons, each changing
   nothing: `HeldByAnotherInstrument` (an order on another instrument holds the equity),
   `FractionalShortUnderFloor` (under `Floor`, a loan or a holding below zero the split leaves
   fractional), `NoPriceForCashInLieu` (cash in lieu to pay and no market to price it) and
   `Overflow`. `SplitRoundingPolicy` moves to `rustrade_instrument::corporate_action`, still
   re-exported at `rustrade::SplitRoundingPolicy` and
-  `rustrade::engine::state::position::SplitRoundingPolicy`, and is no longer `#[non_exhaustive]`,
-  so a new policy makes each match handle it.
+  `rustrade::engine::state::position::SplitRoundingPolicy`, and gains
+  `SplitRoundingPolicy::round_shares`, with which the engine and the venue both round.
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
   (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had

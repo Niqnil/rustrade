@@ -74,7 +74,9 @@ pub enum CorporateActionRefusal {
     /// Under [`SplitRoundingPolicy::Floor`], the split leaves a fractional share to pay out as
     /// cash in lieu, and the venue holds no market for the equity to price it at. Feed the venue
     /// a market for it with [`apply_market`](SimulatedVenue::apply_market), then apply the action
-    /// again.
+    /// again. A [`RequestPriced`](super::VenueRegime::RequestPriced) venue is fed
+    /// no market, so it applies such a split only under
+    /// [`Fractional`](SplitRoundingPolicy::Fractional), or for a holding the split leaves whole.
     NoPriceForCashInLieu,
     /// A holding or a price the split restates does not fit a [`Decimal`].
     Overflow,
@@ -94,7 +96,7 @@ impl SimulatedVenue {
     ///   [`Adjust`](SplitAction::Adjust), a resting buy limit order is adjusted. A cancel is
     ///   reported as for a client's cancel: `[balance, cash flow.., order]`, the order an ended
     ///   [`Cancelled`](crate::order::state::Cancelled) snapshot stamped at the split, or `[order]`
-    ///   alone for one that held nothing. Cancels come first, by client order id.
+    ///   alone for one that held nothing. These cancels come first, by client order id.
     /// - **Holdings:** the balance of the equity, with what the account owes of it, is restated:
     ///   `total`, `free`, the loan's principal and its interest are each multiplied by `ratio`.
     ///   Under [`SplitRoundingPolicy::Floor`], `total` is then rounded down to a whole share, and
@@ -112,15 +114,17 @@ impl SimulatedVenue {
     ///   the venue was never fed.
     /// - **Adjusted orders:** each buy limit order the action adjusts takes the terms
     ///   [`SplitAction::Adjust`] describes, and the venue recommits its hold for them, releasing
-    ///   what the smaller hold no longer needs, as an amend does. It is reported as an amend is:
+    ///   what the new hold no longer needs, as an amend does. It is reported as an amend is:
     ///   the restated balances, then the order's [`Open`] snapshot stamped at the split, with its
     ///   venue order id kept. The adjusted orders keep their order among themselves, best price
     ///   first, but go behind any order that later joins their price, as if they had arrived at
     ///   the split. An order seeded through
     ///   [`MockExecutionConfig::initial_state`](crate::client::mock::MockExecutionConfig::initial_state)
     ///   holds nothing, so only its terms change. One whose hold the account can no longer afford
-    ///   (a fee schedule raised since it rested, or a free balance charged below zero) is
-    ///   cancelled instead, with a warning.
+    ///   (a fee schedule raised since it rested, a free balance charged below zero, or on a
+    ///   reverse split the venue adjusts, a hold that grew) is cancelled instead, with a warning,
+    ///   reported in its turn among the adjusted orders. That cancel releases only the quote
+    ///   asset the buy order held, so it leaves the restated holding as it is.
     ///
     /// # What it does not do yet
     /// - **Options on `instrument` are untouched:** their strikes, positions and orders keep their
@@ -271,6 +275,15 @@ impl SimulatedVenue {
         let base = &traded.underlying.base;
         let orders = self.account.orders();
 
+        let held_elsewhere = orders
+            .iter()
+            .filter(|order| order.key.instrument != *instrument)
+            .filter_map(|order| orders.resting_order(&order.key.cid)?.reservation.as_ref())
+            .any(|reservation| reservation.asset == *base);
+        if held_elsewhere {
+            return Err(CorporateActionRefusal::HeldByAnotherInstrument);
+        }
+
         let adjust = match self.split.action(ratio) {
             SplitAction::Cancel => Vec::new(),
             SplitAction::Adjust => {
@@ -298,15 +311,6 @@ impl SimulatedVenue {
             .cloned()
             .collect::<Vec<_>>();
         cancel.sort_unstable();
-
-        let held_elsewhere = orders
-            .iter()
-            .filter(|order| order.key.instrument != *instrument)
-            .filter_map(|order| orders.resting_order(&order.key.cid)?.reservation.as_ref())
-            .any(|reservation| reservation.asset == *base);
-        if held_elsewhere {
-            return Err(CorporateActionRefusal::HeldByAnotherInstrument);
-        }
 
         let holding = match self.account.balance_after_releases(
             base,
@@ -368,7 +372,9 @@ impl SimulatedVenue {
     }
 
     /// Makes every change `plan` holds to `instrument`, pushing what each reports onto `events`:
-    /// the second of the split's two phases, which cannot refuse. See
+    /// the second of the split's two phases, which cannot refuse the action. Its one outcome the
+    /// plan does not hold is an adjusted order cancelled because its hold cannot be recommitted:
+    /// see [`adjust_for_split`](Self::adjust_for_split). See
     /// [`apply_corporate_action`](Self::apply_corporate_action) for the order it reports in.
     fn commit_split(
         &mut self,
@@ -587,11 +593,7 @@ fn split_adjustment(
         .state
         .quantity_remaining(order.quantity)
         .checked_mul(ratio)?;
-    let unfilled = match policy {
-        SplitRoundingPolicy::Floor => unfilled.floor(),
-        SplitRoundingPolicy::Fractional => unfilled,
-    };
-    let unfilled = round_toward_zero_to_step(unfilled, step);
+    let unfilled = round_toward_zero_to_step(policy.round_shares(unfilled), step);
     if price <= Decimal::ZERO || unfilled <= Decimal::ZERO {
         return None;
     }
@@ -628,17 +630,14 @@ fn restate_holding(
     let free = scale(balance.free)?;
     // A carry accrued in the equity is counted in shares too.
     let accrued = balance.accrued.map(scale).transpose()?;
-    let remainder = match policy {
-        SplitRoundingPolicy::Fractional => Decimal::ZERO,
-        SplitRoundingPolicy::Floor => {
-            let borrowed = margin.map_or(Decimal::ZERO, |margin| margin.borrowed);
-            let short = total < Decimal::ZERO;
-            if !borrowed.fract().is_zero() || (short && !total.fract().is_zero()) {
-                return Err(CorporateActionRefusal::FractionalShortUnderFloor);
-            }
-            total - total.floor()
-        }
-    };
+    // Rounding a loan or a holding below zero would need a rule for who pays or is paid for the
+    // fraction, which the venue does not model yet.
+    let borrowed = margin.map_or(Decimal::ZERO, |margin| margin.borrowed);
+    let rounds = |shares: Decimal| policy.round_shares(shares) != shares;
+    if rounds(borrowed) || (total < Decimal::ZERO && rounds(total)) {
+        return Err(CorporateActionRefusal::FractionalShortUnderFloor);
+    }
+    let remainder = total - policy.round_shares(total);
     Ok((
         Balance {
             total: total - remainder,

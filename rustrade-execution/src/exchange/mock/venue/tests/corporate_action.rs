@@ -981,3 +981,33 @@ fn a_split_restates_the_borrow_price_window() {
     assert_eq!(window.low(time(0)), Some(d("24525")));
     assert_eq!(window.high(time(0)), Some(d("24525")));
 }
+
+#[test]
+fn a_split_whose_restated_holding_overflows_is_refused_and_changes_nothing() {
+    let huge = Decimal::MAX / d("2");
+    let config = config_from_balances(
+        vec![funded(base(), huge), funded(quote(), d("1000000"))],
+        maker_taker_fee(),
+    )
+    .with_split(SplitConfig::ADJUST_FORWARD);
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+
+    let refused = apply(&mut venue, "3", SplitRoundingPolicy::Fractional, 5);
+
+    assert_eq!(
+        refused.response,
+        CorporateActionResponse::Refused(CorporateActionRefusal::Overflow)
+    );
+    assert!(refused.events.is_empty());
+    assert_eq!(venue.account.free(&base()), huge);
+    // Not recorded: the same id applies once the ratio fits.
+    let applied = venue.apply_corporate_action(
+        "split-1",
+        &instrument_name(),
+        &split("1"),
+        SplitRoundingPolicy::Fractional,
+        time(6),
+    );
+    assert_eq!(applied.response, CorporateActionResponse::Applied);
+}

@@ -1689,10 +1689,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             .quantity_abs
             .checked_mul(ratio)
             .ok_or(SplitError::Overflow)?;
-        let quantity_abs = match policy {
-            SplitRoundingPolicy::Floor => scaled_quantity.floor(),
-            SplitRoundingPolicy::Fractional => scaled_quantity,
-        };
+        let quantity_abs = policy.round_shares(scaled_quantity);
 
         // Post-split fractional shares disposed, in POST-split units (scaled minus floored).
         // `scaled_quantity >= quantity_abs` (floor never increases it; equal under `Fractional`),

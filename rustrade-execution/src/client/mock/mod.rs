@@ -28,6 +28,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::{StreamExt, stream::BoxStream};
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
@@ -714,8 +715,8 @@ impl SplitConfig {
 
     /// The action for a split of `ratio`: [`reverse`](Self::reverse) below one, else
     /// [`forward`](Self::forward).
-    pub fn action(&self, ratio: rust_decimal::Decimal) -> SplitAction {
-        if ratio < rust_decimal::Decimal::ONE {
+    pub fn action(self, ratio: Decimal) -> SplitAction {
+        if ratio < Decimal::ONE {
             self.reverse
         } else {
             self.forward
