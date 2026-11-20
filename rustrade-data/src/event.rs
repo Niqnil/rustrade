@@ -283,3 +283,51 @@ impl<InstrumentKey> From<MarketEvent<InstrumentKey, Liquidation>>
         value.map_kind(Liquidation::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscription::trading_status::TradingState;
+
+    fn event(kind: DataKind) -> MarketEvent<u8, DataKind> {
+        MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MIN_UTC,
+            exchange: ExchangeId::Ibkr,
+            instrument: 7,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_trading_status_event_reads_as_one_and_nothing_else() {
+        let status = TradingStatus::new(TradingState::Halted);
+        let event = event(DataKind::TradingStatus(status.clone()));
+
+        let read = event.as_trading_status();
+
+        assert_eq!(
+            read.map(|read| (read.instrument, read.kind)),
+            Some((&7, &status))
+        );
+        assert!(event.as_option_greeks().is_none());
+    }
+
+    #[test]
+    fn another_kind_is_not_a_trading_status() {
+        let event = event(DataKind::OptionGreeks(OptionGreeks::default()));
+
+        assert!(event.as_trading_status().is_none());
+    }
+
+    #[test]
+    fn kind_names() {
+        let names = [
+            DataKind::OptionGreeks(OptionGreeks::default()),
+            DataKind::TradingStatus(TradingStatus::new(TradingState::Trading)),
+        ]
+        .map(|kind| kind.kind_name().to_owned());
+
+        assert_eq!(names, ["option_greeks", "trading_status"]);
+    }
+}
