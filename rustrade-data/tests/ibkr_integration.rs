@@ -64,6 +64,7 @@
 //! | `test_historical_ticks_with_time_range` | Fetch ticks with specific time range |
 //! | `test_market_stream_quotes` | Stream L1 quotes |
 //! | `test_market_stream_multiple_subscriptions` | Stream multiple symbols |
+//! | `test_market_stream_option_quotes_delayed` | Stream delayed L1 quotes for many options at once (no OPRA needed) |
 //! | `test_calculate_theoretical_greeks` | Calculate option Greeks (calculator, no data) |
 //! | `test_calculate_implied_volatility` | Calculate IV (calculator, no data) |
 //! | `test_fetch_option_chain` | Fetch option chain structure |
@@ -95,7 +96,7 @@ use rustrade_data::{
     error::DataError,
     event::DataKind,
     exchange::ibkr::{
-        IbkrMarketStream, IbkrStreamConfig,
+        IbkrMarketDataType, IbkrMarketStream, IbkrStreamConfig,
         historical::{
             HistoricalRequest, HistoricalTickRequest, IbkrHistoricalData, IbkrHistoricalDataConfig,
             ToDuration,
@@ -640,11 +641,7 @@ async fn test_historical_ticks_with_time_range() {
 async fn test_market_stream_connection() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 10,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 10);
 
     let registry = ContractRegistry::new();
     registry.register_by_name_only("AAPL".into(), aapl_contract());
@@ -668,11 +665,11 @@ async fn test_market_stream_connection() {
 }
 
 fn disconnect_test_stream(client_id_offset: i32) -> IbkrMarketStream<String> {
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + client_id_offset,
-    };
+    let config = IbkrStreamConfig::new(
+        "127.0.0.1",
+        test_port(),
+        test_client_id_base() + client_id_offset,
+    );
 
     // IDEALPRO forex quotes, because a paper account has them: it may lack the stock market data
     // permissions, and then IB ends a stock subscription before the disconnect is tested. Outside
@@ -771,11 +768,7 @@ async fn test_market_stream_disconnect_while_running() {
 async fn test_market_stream_quotes() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 11,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 11);
 
     let registry = ContractRegistry::new();
     registry.register_by_name_only("AAPL".into(), aapl_contract());
@@ -830,6 +823,101 @@ async fn test_market_stream_quotes() {
     }
 }
 
+/// Tier 1: delayed option L1 quotes on many lines at once (FREE: delayed data needs no OPRA
+/// subscription).
+///
+/// Streams `IBKR_OPTION_LINES` (default 40) AAPL calls around the money on one expiration with
+/// delayed-frozen data, so it runs outside US market hours too (the last delayed quotes from the
+/// close). Every line must stay unrefused (a paper account gets no market data while the same
+/// user is logged in to a live session elsewhere, which fails it as `MarketDataNotAvailable`
+/// 10197), most lines must quote, and no quoted price may be negative: IB's "no quote" price of
+/// -1 must withdraw the side instead.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_market_stream_option_quotes_delayed() {
+    use std::collections::HashMap;
+
+    init_logging();
+
+    let lines: usize = std::env::var("IBKR_OPTION_LINES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(40);
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let resolver =
+        IbkrHistoricalData::connect(&url, test_client_id_base() + 34).expect("connection failed");
+    let calls = resolve_aapl_calls_near_the_money(&resolver, lines).await;
+    resolver.disconnect();
+
+    let registry = ContractRegistry::new();
+    let subscriptions: Vec<_> = calls
+        .into_iter()
+        .map(|call| {
+            let name = format!(
+                "AAPL {} {}C",
+                call.last_trade_date_or_contract_month, call.strike
+            );
+            registry.register_by_name_only(name.as_str().into(), call);
+            IbkrSubscription::quotes(name.clone(), name.as_str().into())
+        })
+        .collect();
+
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 35)
+        .with_market_data_type(IbkrMarketDataType::DelayedFrozen);
+    let mut stream = IbkrMarketStream::init(config, Arc::new(registry), subscriptions)
+        .expect("stream init failed");
+
+    let mut quotes: HashMap<String, usize> = HashMap::new();
+    let mut errors = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => {
+                    let DataKind::OrderBookL1(l1) = &event.kind else {
+                        continue;
+                    };
+                    for level in l1.best_bid.iter().chain(l1.best_ask.iter()) {
+                        assert!(
+                            level.price >= rust_decimal::Decimal::ZERO,
+                            "{}: quoted at {}",
+                            event.instrument,
+                            level.price
+                        );
+                    }
+                    *quotes.entry(event.instrument).or_default() += 1;
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+    })
+    .await;
+    stream.disconnect();
+
+    println!(
+        "{} of {lines} lines quoted; errors: {errors:?}",
+        quotes.len()
+    );
+    let refusals: Vec<_> = errors
+        .iter()
+        .filter(|error| {
+            matches!(
+                error,
+                DataError::SubscriptionLimitReached { .. }
+                    | DataError::MarketDataNotAvailable { .. }
+            )
+        })
+        .collect();
+    assert!(refusals.is_empty(), "lines refused: {refusals:?}");
+    assert!(
+        quotes.len() * 2 >= lines,
+        "only {} of {lines} lines quoted within 30 s",
+        quotes.len()
+    );
+    assert_ends_cleanly(&mut stream).await;
+}
+
 /// Tier 2: L2 Market Depth (PAID — varies by exchange)
 #[serial]
 #[tokio::test]
@@ -837,11 +925,7 @@ async fn test_market_stream_quotes() {
 async fn test_market_stream_depth() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 12,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 12);
 
     let registry = ContractRegistry::new();
     registry.register_by_name_only("AAPL".into(), aapl_contract());
@@ -896,11 +980,7 @@ async fn test_market_stream_depth() {
 async fn test_market_stream_unregistered_contract() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 13,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 13);
 
     let registry = Arc::new(ContractRegistry::new());
 
@@ -929,11 +1009,7 @@ async fn test_market_stream_unregistered_contract() {
 async fn test_market_stream_multiple_subscriptions() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 14,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 14);
 
     let registry = ContractRegistry::new();
     registry.register_by_name_only("AAPL".into(), aapl_contract());
@@ -1069,6 +1145,18 @@ const AAPL_UNDERLYING_CONID: i32 = 265598;
 /// strike from the live chain keeps the option-calculator tests valid over time
 /// with no manual upkeep, and only uses values IBKR itself reports as listed.
 async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
+    resolve_aapl_calls_near_the_money(client, 1)
+        .await
+        .pop()
+        .expect("one AAPL call")
+}
+
+/// Resolve `count` listed AAPL calls on one expiration, at the strikes nearest the median strike
+/// (about at the money). See [`resolve_aapl_call_option`] for how the series is chosen.
+async fn resolve_aapl_calls_near_the_money(
+    client: &IbkrHistoricalData,
+    count: usize,
+) -> Vec<Contract> {
     use chrono::{Datelike, Duration as ChronoDuration, Utc};
     use rust_decimal::prelude::ToPrimitive;
 
@@ -1102,22 +1190,33 @@ async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
         .copied()
         .expect("a future AAPL option expiration in the chain");
 
-    // Median strike ≈ at-the-money and is guaranteed to be a listed strike for
-    // this series, so the (expiration, strike) pair resolves to a real contract.
+    // The median strike ≈ at-the-money; take the `count` strikes around it. A strike listed in
+    // the chain's parameters may still be missing from this expiration, so a test using many
+    // tolerates a few that resolve to nothing.
     let mut strikes = chain.strikes.clone();
     strikes.sort();
-    let strike = strikes[strikes.len() / 2]
-        .to_f64()
-        .expect("strike Decimal converts to f64");
+    assert!(
+        count <= strikes.len(),
+        "{count} calls asked, {} strikes listed",
+        strikes.len()
+    );
+    let first = (strikes.len() / 2)
+        .saturating_sub(count / 2)
+        .min(strikes.len() - count);
 
-    Contract::call("AAPL")
-        .strike(strike)
-        .expires_on(
-            expiration.year() as u16,
-            expiration.month() as u8,
-            expiration.day() as u8,
-        )
-        .build()
+    strikes[first..first + count]
+        .iter()
+        .map(|strike| {
+            Contract::call("AAPL")
+                .strike(strike.to_f64().expect("strike Decimal converts to f64"))
+                .expires_on(
+                    expiration.year() as u16,
+                    expiration.month() as u8,
+                    expiration.day() as u8,
+                )
+                .build()
+        })
+        .collect()
 }
 
 /// Shared AAPL call option, resolved from the live chain exactly once per run.
@@ -1325,11 +1424,7 @@ async fn test_fetch_option_chain() {
 async fn test_option_greeks_stream() {
     init_logging();
 
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: test_port(),
-        client_id: test_client_id_base() + 33,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 33);
 
     // Resolve a currently-listed option from the shared once-per-run cache
     // before opening the streaming connection.

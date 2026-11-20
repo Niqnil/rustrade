@@ -41,11 +41,7 @@ async fn main() {
     init_logging();
 
     // Configuration for IB Gateway paper trading
-    let config = IbkrStreamConfig {
-        host: "127.0.0.1".to_string(),
-        port: 4002, // Gateway paper; use 7497 for TWS paper
-        client_id: 100,
-    };
+    let config = IbkrStreamConfig::new("127.0.0.1", 4002, 100); // Gateway paper; use 7497 for TWS paper
 
     // Build contract registry with instruments we want to subscribe to
     let registry = ContractRegistry::new();

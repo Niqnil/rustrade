@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
+  #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`
+  string: `DataError::SubscriptionLimitReached` when the account's market data lines (IB code
+  101) or depth requests (309) are all in use, and `DataError::MarketDataNotAvailable` when the
+  account has no market data for the instrument (354, 10089, 10168) or a competing live session
+  has precedence (10197). Both carry the exchange, the instrument, and IB's code and message; only
+  that subscription ends, and the stream's other subscriptions continue. IB offers no way to read
+  how many lines are free, and its cap is shared by TWS and every API connection on the username,
+  so no count is offered. `IbkrStreamConfig::with_market_data_type` asks IB for frozen, delayed or
+  delayed-frozen data (`IbkrMarketDataType`), so an account without a live subscription, such as
+  OPRA for US options, can stream delayed quotes; delayed events carry no mark that they are
+  delayed. Errors and logs now name a subscription by its instrument rather than the contract's
+  symbol, which is the same for every option on an underlying. IB's message codes the workspace
+  acts on are in `rustrade_instrument::ibkr::codes`.
+
 - **The Alpaca client follows an order Alpaca replaces.** Alpaca carries out a replace as a new
   order under a new order id and client order id. Every live report of the replacement, on the
   account stream and in `account_snapshot`'s open orders, is now linked to the order it replaces
@@ -545,6 +560,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `IbkrStreamConfig` is `#[non_exhaustive]`, and `QuoteAggregator::new` takes the
+  instrument's security type** (`rustrade-data`, #877). Build the configuration with
+  `IbkrStreamConfig::new(host, port, client_id)` (or `Default`) and the `with_*` methods rather
+  than a struct literal; a serialized configuration without `market_data_type` still loads, as
+  live. The security type decides which prices mean "no quote" (see Fixed).
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
@@ -997,6 +1017,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
+- **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB
+  sends a price of -1 for a side it has no quote on, for example while the market is closed, and
+  the IBKR stream's `OrderBookL1` carried it as a level at -1. The side is now withdrawn (`None`,
+  with its size) and the book is emitted, so a consumer sees the side go. For an instrument whose
+  price cannot be negative (stocks, options, futures options, warrants, bonds, funds, currencies,
+  crypto) any negative price withdraws the side; for one whose price can be (futures, spreads,
+  indices, commodities, CFDs), only -1 with a size of 0 or no size does.
 
 - **`fetch_balances` matches assets ignoring case, and Hyperliquid honours the filter**
   (`rustrade-execution`, #996). The Binance spot, Binance margin and IBKR clients and the
