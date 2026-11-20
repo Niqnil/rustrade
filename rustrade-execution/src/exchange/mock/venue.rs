@@ -1671,8 +1671,9 @@ impl SimulatedVenue {
     /// not list it.
     ///
     /// The amount is part of that asset's balance `total − free`, beside what open orders hold, and
-    /// is derived from the position, so it changes only as the short does. See the type's
-    /// `# How an option is accounted`.
+    /// is derived from the position, so it changes only as the short does, or as a standard split
+    /// restates the option (see [`apply_corporate_action`](Self::apply_corporate_action)). See the
+    /// type's `# How an option is accounted`.
     pub fn collateral_held(&self, instrument: &InstrumentNameExchange) -> Option<Collateral> {
         let position = self.positions.get(instrument)?;
         if !position.quantity.is_sign_negative() {

@@ -26,7 +26,11 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
     corporate_action::{CorporateActionKind, SplitAdjustmentKind, SplitRatio, SplitRoundingPolicy},
-    instrument::{kind::InstrumentKind, name::InstrumentNameExchange, round_toward_zero_to_step},
+    instrument::{
+        kind::{InstrumentKind, option::OptionKind},
+        name::InstrumentNameExchange,
+        round_toward_zero_to_step,
+    },
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::SmolStr;
@@ -87,6 +91,12 @@ pub enum CorporateActionRefusal {
     /// new symbol, closing only. The venue does not model that. Close the positions and cancel
     /// the orders, then apply the action again.
     OptionExposureAtNonStandardSplit,
+    /// A [standard](SplitAdjustmentKind::Standard) split restates a short put the account holds,
+    /// and the collateral its restated strike and position call for exceeds what it holds by more
+    /// than the account has free of the quote asset. Dividing the strike exactly can round the
+    /// collateral up by a step of the last decimal place. Free some of the quote asset, then
+    /// apply the action again.
+    OptionCollateralShortfall,
 }
 
 impl SimulatedVenue {
@@ -143,14 +153,22 @@ impl SimulatedVenue {
     ///   option is adjusted as listed options are. Its strike is divided by `ratio`, with its
     ///   contract size unchanged. The account's position in it is multiplied by `ratio`, and the
     ///   position's entry price divided by it. The market the venue holds for it is restated and
-    ///   trades nothing until observed again, as the equity's is. The collateral a short holds
-    ///   follows from the restated position and strike: a put holds the same cash, and a call the
-    ///   restated shares. The strike is divided exactly. A clearing house rounds an adjusted
-    ///   strike to an increment of its own, which the venue does not model. The venue reports no
-    ///   event for these changes, as it reports none for a position: an engine applying the same
-    ///   action restates its own positions in the options, and a consumer keeping positions
-    ///   without one applies the same restatement. The restated strikes are part of the venue's
-    ///   [`snapshot`](Self::snapshot), and [`instruments`](Self::instruments) reports them.
+    ///   trades nothing until observed again, as the equity's is. The strike is divided exactly.
+    ///   A clearing house rounds an adjusted strike to an increment of its own, which the venue
+    ///   does not model. The venue reports no event for these changes, as it reports none for a
+    ///   position: an engine applying the same action restates its own positions in the options,
+    ///   and a consumer keeping positions without one applies the same restatement. The restated
+    ///   strikes are part of the venue's [`snapshot`](Self::snapshot), and
+    ///   [`instruments`](Self::instruments) reports them.
+    ///
+    ///   The collateral a short holds follows from the restated position and strike. A call holds
+    ///   the restated shares. A put holds the restated strike times the restated contracts, which
+    ///   is the same cash unless the exact division rounded the strike in its last decimal place.
+    ///   The venue then holds or releases the difference in the quote asset, so the cash held
+    ///   stays what the position calls for, reported as a balance snapshot of the quote asset
+    ///   after the restated holdings and cash in lieu. If the account has too little of it free,
+    ///   once the split's cancels and cash in lieu are counted, the action is refused with
+    ///   [`OptionCollateralShortfall`].
     /// - **[`NonStandard`](SplitAdjustmentKind::NonStandard)** (a reverse split, or a forward
     ///   split by a ratio that is not a whole number), or a kind this venue does not know:
     ///   refused with [`OptionExposureAtNonStandardSplit`] while the account holds a position in,
@@ -160,6 +178,7 @@ impl SimulatedVenue {
     ///   order on one later trades it on its old terms. Stop trading them at the split.
     ///
     /// [`OptionExposureAtNonStandardSplit`]: CorporateActionRefusal::OptionExposureAtNonStandardSplit
+    /// [`OptionCollateralShortfall`]: CorporateActionRefusal::OptionCollateralShortfall
     ///
     /// # What it does not do yet
     /// - **No minimum price or size:** an adjusted order is rounded to the tick and the quantity
@@ -286,6 +305,9 @@ impl SimulatedVenue {
             CorporateActionRefusal::OptionExposureAtNonStandardSplit => {
                 "a non-standard split would change what the account's options on the equity \
                  deliver"
+            }
+            CorporateActionRefusal::OptionCollateralShortfall => {
+                "a restated short put calls for more collateral than the account has free"
             }
         };
         warn!(
@@ -424,6 +446,33 @@ impl SimulatedVenue {
             OptionSplit::RefuseIfHeld => Vec::new(),
         };
 
+        let put_collateral = options.iter().try_fold(Decimal::ZERO, |change, option| {
+            self.put_collateral_change(option)
+                .and_then(|more| change.checked_add(more))
+                .ok_or(CorporateActionRefusal::Overflow)
+        })?;
+        if put_collateral > Decimal::ZERO {
+            // Held after the cancels release what they held and cash in lieu is paid, as the
+            // commit does it.
+            let quote = &traded.underlying.quote;
+            let free = self
+                .account
+                .balance_after_releases(
+                    quote,
+                    cancel
+                        .iter()
+                        .filter_map(|cid| orders.resting_order(cid)?.reservation.as_ref()),
+                    self.repays_at_cancel(),
+                )
+                .map_or(Decimal::ZERO, |balance| balance.free)
+                + cash_in_lieu
+                    .as_ref()
+                    .map_or(Decimal::ZERO, |paid| paid.amount);
+            if free < put_collateral {
+                return Err(CorporateActionRefusal::OptionCollateralShortfall);
+            }
+        }
+
         Ok(SplitPlan {
             cancel,
             adjust,
@@ -432,7 +481,39 @@ impl SimulatedVenue {
             market,
             borrow_prices,
             options,
+            put_collateral,
         })
+    }
+
+    /// How much more quote the short put `restatement` restates must hold: what its restated
+    /// strike and position call for, less what it holds now. Zero for anything else. `None` on
+    /// overflow.
+    fn put_collateral_change(&self, restatement: &OptionRestatement) -> Option<Decimal> {
+        let InstrumentKind::Option(contract) = &self.instruments[&restatement.option].kind else {
+            unreachable!("options_on lists only options");
+        };
+        let short = restatement
+            .position
+            .filter(|position| position.quantity.is_sign_negative());
+        let (OptionKind::Put, Some(position)) = (contract.kind, short) else {
+            return Some(Decimal::ZERO);
+        };
+        let Some(held) = self.collateral_held(&restatement.option) else {
+            unreachable!(
+                "the account is short {}, which holds collateral",
+                restatement.option
+            );
+        };
+        // The product `InstrumentTerms::short_collateral` takes, so what the venue holds is what
+        // the restated position derives, to the last decimal place.
+        let units = position
+            .quantity
+            .abs()
+            .checked_mul(contract.contract_size)?;
+        restatement
+            .strike
+            .checked_mul(units)?
+            .checked_sub(held.amount)
     }
 
     /// The options this venue lists on the equity `instrument`: those whose underlying is its
@@ -518,6 +599,7 @@ impl SimulatedVenue {
             market,
             borrow_prices,
             options,
+            put_collateral,
         } = plan;
 
         self.cancel_each(cancel, time_exchange, events);
@@ -567,6 +649,19 @@ impl SimulatedVenue {
         // A restated position is still open, so no holding-cost boundary moves.
         for option in options {
             self.commit_option_restatement(option, time_exchange);
+        }
+        if !put_collateral.is_zero() {
+            let quote = self.instruments[instrument].underlying.quote.clone();
+            let balance = match put_collateral.is_sign_positive() {
+                true => match self.account.reserve(&quote, put_collateral, time_exchange) {
+                    Ok(balance) => balance,
+                    Err(_) => unreachable!("plan_split checked {quote}'s free balance holds it"),
+                },
+                false => self
+                    .account
+                    .release(&quote, put_collateral.abs(), time_exchange),
+            };
+            events.push(self.build_account_event(Snapshot(balance)));
         }
 
         for adjustment in adjust {
@@ -723,6 +818,9 @@ struct SplitPlan {
     /// The options on the equity, restated: every one the venue lists on a standard split, by
     /// name, and none on any other.
     options: Vec<OptionRestatement>,
+    /// How much more quote the restated short puts hold, negative for less: the rounding of
+    /// their exactly divided strikes.
+    put_collateral: Decimal,
 }
 
 /// What a split does to the options on its equity, by its kind.

@@ -627,7 +627,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is divided by the ratio, exactly, with the contract size unchanged; the account's position in
   it is multiplied by the ratio and its entry price divided by it; and the market held for it is
   restated and trades nothing until observed again, as the equity's is. Short collateral follows:
-  a put holds the same cash, a call the restated shares. `SimulatedVenue::instruments` reports the
+  a call holds the restated shares, and a put the restated strike times the restated contracts.
+  Where the exact division rounds the strike in its last decimal place, the venue holds or
+  releases the difference in the quote asset and reports the balance, or refuses the split with
+  the new `CorporateActionRefusal::OptionCollateralShortfall` if too little of it is free.
+  `SimulatedVenue::instruments` reports the
   restated strikes, and the venue's snapshot carries them, so a restore gives the options their
   restated strikes (new `VenueRestoreError::RestatedStrikeOfNonOption` for a snapshot that names
   something else). A non-standard split (a reverse split, or a ratio that is not a whole number)

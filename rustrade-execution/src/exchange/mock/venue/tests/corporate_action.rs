@@ -1186,6 +1186,158 @@ mod options_on_the_equity {
         assert_eq!(totals(&venue, usd()), (Decimal::ZERO, Decimal::ZERO));
     }
 
+    /// The quote cash the account holds apart from its free balance, with no order open.
+    fn usd_held(venue: &SimulatedVenue) -> Decimal {
+        let (total, free) = totals(venue, usd());
+        total - free
+    }
+
+    /// Sells a put at `STRIKE`, splits by `ratio`, and asserts the cash held is exactly what the
+    /// restated position calls for, as a balance event reported, and that the venue restores
+    /// from its snapshot and releases all of it when the short is bought back.
+    fn assert_put_collateral_reconciled(ratio: &str, rounded: &str) {
+        let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+        assert_eq!(usd_held(&venue), d("10000"));
+
+        let outcome = split_spy(&mut venue, "split-1", ratio, 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        let required = venue
+            .collateral_held(&option_name())
+            .expect("still short")
+            .amount;
+        assert_eq!(required, d(rounded), "the exact division rounds the strike");
+        assert_eq!(
+            usd_held(&venue),
+            required,
+            "held is what the position calls for"
+        );
+        let reported = outcome
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::BalanceSnapshot(balance) if balance.value().asset == usd() => {
+                    Some(balance.value().balance)
+                }
+                _ => None,
+            })
+            .expect("the quote balance is reported");
+        assert_eq!(reported.total - reported.free, required);
+
+        let restored = SimulatedVenue::from_snapshot(
+            &option_config("10000", FeeModelConfig::default()),
+            driven_instruments(OptionKind::Put, OptionSettlement::Physical),
+            venue.snapshot(),
+        );
+        assert!(restored.is_ok(), "{:?}", restored.err());
+
+        feed(&mut venue, "1", "0.01", time(6));
+        buy(&mut venue, ratio);
+        assert_eq!(option_position(&venue), None);
+        assert_eq!(usd_held(&venue), Decimal::ZERO, "every cent released");
+    }
+
+    #[test]
+    fn a_standard_split_holds_more_cash_for_a_short_put_whose_restated_collateral_rounds_up() {
+        assert_put_collateral_reconciled("126", "10000.000000000000000000000001");
+    }
+
+    #[test]
+    fn a_standard_split_releases_cash_from_a_short_put_whose_restated_collateral_rounds_down() {
+        assert_put_collateral_reconciled("122", "9999.999999999999999999999999");
+    }
+
+    #[test]
+    fn a_standard_split_is_refused_when_a_short_put_calls_for_more_cash_than_is_free() {
+        let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |config| {
+            *config = config.clone().with_split(SplitConfig::ADJUST_FORWARD);
+        });
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+        // A buy the split adjusts rather than cancels keeps holding all the free cash.
+        let mut request = limit_request("spy-bid", Side::Buy, "3", "50", gtc());
+        request.key.instrument = spy_name();
+        assert!(venue.open_order(request).response.state.is_accepted());
+        assert_eq!(totals(&venue, usd()).1, Decimal::ZERO);
+
+        assert_refused_unchanged(
+            &mut venue,
+            "split-1",
+            "126",
+            5,
+            CorporateActionRefusal::OptionCollateralShortfall,
+        );
+
+        // At a ratio whose strike divides exactly, nothing more is needed.
+        let applied = split_spy(&mut venue, "split-1", "2", 6);
+        assert_eq!(applied.response, CorporateActionResponse::Applied);
+        assert_eq!(
+            usd_held(&venue),
+            d("10150"),
+            "the put's 10000 and the bid's 150"
+        );
+    }
+
+    /// A venue short one put at `STRIKE`, holding `spy` shares, whose free cash a buy of the
+    /// equity the split adjusts holds down to `free`.
+    fn short_put_with_free_cash(spy: &str, bid_quantity: &str, bid_price: &str) -> SimulatedVenue {
+        let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |config| {
+            funds("10000", spy)(config);
+            *config = config.clone().with_split(SplitConfig::ADJUST_FORWARD);
+        });
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+        let mut request = limit_request("spy-bid", Side::Buy, bid_quantity, bid_price, gtc());
+        request.key.instrument = spy_name();
+        assert!(venue.open_order(request).response.state.is_accepted());
+        venue
+    }
+
+    #[test]
+    fn a_short_put_may_take_the_last_of_the_free_cash_at_a_split() {
+        // 150 of premium, less 2 × 74.9999999999999999999999995 held by the bid.
+        let mut venue = short_put_with_free_cash("0", "2", "74.9999999999999999999999995");
+        assert_eq!(totals(&venue, usd()).1, d("0.000000000000000000000001"));
+
+        let outcome = split_spy(&mut venue, "split-1", "126", 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(
+            venue
+                .collateral_held(&option_name())
+                .map(|held| held.amount),
+            Some(d("10000.000000000000000000000001"))
+        );
+    }
+
+    #[test]
+    fn cash_in_lieu_paid_at_the_split_counts_towards_a_short_puts_collateral() {
+        let mut venue = short_put_with_free_cash("0.001", "3", "50");
+        assert_eq!(totals(&venue, usd()).1, Decimal::ZERO);
+
+        // 0.126 of a share floored away, paid at 100 ÷ 126: about 0.1 of cash, which holds the
+        // put's extra step.
+        let outcome = venue.apply_corporate_action(
+            "split-1",
+            &spy_name(),
+            &split("126"),
+            SplitRoundingPolicy::Floor,
+            time(5),
+        );
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(
+            venue
+                .collateral_held(&option_name())
+                .map(|held| held.amount),
+            Some(d("10000.000000000000000000000001"))
+        );
+        assert!(totals(&venue, usd()).1 > Decimal::ZERO);
+    }
+
     #[test]
     fn a_split_cancels_every_order_on_an_option_on_its_equity() {
         let mut venue = driven_venue(
