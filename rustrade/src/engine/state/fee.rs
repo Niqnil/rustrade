@@ -2,6 +2,7 @@ use crate::engine::state::instrument::{InstrumentStates, data::InstrumentDataSta
 use rust_decimal::Decimal;
 use rustrade_execution::trade::{Trade, TradeId};
 use rustrade_instrument::{
+    FeeAsset,
     asset::AssetIndex,
     instrument::{InstrumentIndex, kind::InstrumentKind},
 };
@@ -151,8 +152,7 @@ where
             .instrument_index(&trade.instrument)
             .instrument
             .underlying;
-        if fee.fees_quote.is_some() || fee.asset == underlying.base || fee.asset == underlying.quote
-        {
+        if fee.fees_quote.is_some() || underlying.classify(&fee.asset) != FeeAsset::Other {
             return None;
         }
 
