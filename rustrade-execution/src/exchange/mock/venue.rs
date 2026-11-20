@@ -813,9 +813,12 @@ pub struct SimulatedVenue {
     /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
     /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
     slippage: Slippage,
-    /// Every instrument this venue trades, as constructed. Private, and never changed after
+    /// Every instrument this venue trades, as constructed. Private, and the set never changes after
     /// construction: [`spot_pairs`](Self::spot_pairs) indexes it, and resting orders were accepted
-    /// against it. Read through [`instruments`](Self::instruments).
+    /// against it. The one term that changes is an option's strike, which a standard split
+    /// restates after cancelling every order on the option (see
+    /// [`apply_corporate_action`](Self::apply_corporate_action)). Read through
+    /// [`instruments`](Self::instruments).
     instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     /// The spot instruments of [`instruments`](Self::instruments), by the two assets each pairs.
     /// What values an account and picks a liquidation's legs without scanning every instrument.
@@ -984,6 +987,10 @@ pub struct SimulatedVenue {
     /// The id of every corporate action this venue has applied, so that applying one again changes
     /// nothing. See [`apply_corporate_action`](Self::apply_corporate_action).
     corporate_actions_applied: FnvHashSet<SmolStr>,
+    /// The strike a split has given each option it restated, by option: what a
+    /// [`snapshot`](Self::snapshot) carries so that a restored venue trades the options on the
+    /// strikes this one does. Empty until a standard split restates an option.
+    restated_strikes: FnvHashMap<InstrumentNameExchange, Decimal>,
     /// What a split does to the open orders on its equity. Fixed at construction from
     /// [`MockExecutionConfig::split`].
     split: SplitConfig,
@@ -1186,6 +1193,7 @@ impl SimulatedVenue {
             sell_outs,
             next_sell_out: None,
             corporate_actions_applied: FnvHashSet::default(),
+            restated_strikes: FnvHashMap::default(),
             split: config.split,
         }
     }
@@ -4261,8 +4269,9 @@ impl SimulatedVenue {
         events
     }
 
-    /// Every instrument this venue trades, keyed by its exchange name, exactly as it was
-    /// constructed with.
+    /// Every instrument this venue trades, keyed by its exchange name, as it was constructed with,
+    /// except that an option's strike is the one the latest standard split of its underlying gave
+    /// it (see [`apply_corporate_action`](Self::apply_corporate_action)).
     ///
     /// Read only: the set of instruments is fixed for the venue's life. To trade a different set,
     /// construct a new venue.

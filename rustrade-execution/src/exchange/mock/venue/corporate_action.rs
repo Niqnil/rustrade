@@ -1,8 +1,8 @@
 //! A corporate action applied to the venue. See [`SimulatedVenue::apply_corporate_action`].
 
 use super::{
-    Reentry, Release, SimulatedVenue, VenueInstrumentMarket, VenueOutcome, booked_report,
-    mid_or_last,
+    NetPosition, Reentry, Release, SimulatedVenue, VenueInstrumentMarket, VenueOutcome,
+    booked_report, mid_or_last,
 };
 use crate::{
     UnindexedAccountEvent,
@@ -25,8 +25,8 @@ use fnv::FnvHashSet;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
-    corporate_action::{CorporateActionKind, SplitRatio, SplitRoundingPolicy},
-    instrument::{name::InstrumentNameExchange, round_toward_zero_to_step},
+    corporate_action::{CorporateActionKind, SplitAdjustmentKind, SplitRatio, SplitRoundingPolicy},
+    instrument::{kind::InstrumentKind, name::InstrumentNameExchange, round_toward_zero_to_step},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::SmolStr;
@@ -80,6 +80,13 @@ pub enum CorporateActionRefusal {
     NoPriceForCashInLieu,
     /// A holding or a price the split restates does not fit a [`Decimal`].
     Overflow,
+    /// A [non-standard](SplitAdjustmentKind::NonStandard) split (a reverse split, or a forward
+    /// split by a ratio that is not a whole number), while the account holds a position in, or
+    /// has an order on, an option on the equity. Such a split changes what each option contract
+    /// delivers rather than its strike and contract count, and listed options then trade under a
+    /// new symbol, closing only. The venue does not model that. Close the positions and cancel
+    /// the orders, then apply the action again.
+    OptionExposureAtNonStandardSplit,
 }
 
 impl SimulatedVenue {
@@ -96,7 +103,9 @@ impl SimulatedVenue {
     ///   [`Adjust`](SplitAction::Adjust), a resting buy limit order is adjusted. A cancel is
     ///   reported as for a client's cancel: `[balance, cash flow.., order]`, the order an ended
     ///   [`Cancelled`](crate::order::state::Cancelled) snapshot stamped at the split, or `[order]`
-    ///   alone for one that held nothing. These cancels come first, by client order id.
+    ///   alone for one that held nothing. Every order on an option on `instrument` (see below) is
+    ///   cancelled the same way, whatever the [`SplitAction`]: options exchanges cancel the resting
+    ///   orders in options a split adjusts. These cancels come first, by client order id.
     /// - **Holdings:** the balance of the equity, with what the account owes of it, is restated:
     ///   `total`, `free`, the loan's principal and its interest are each multiplied by `ratio`.
     ///   Under [`SplitRoundingPolicy::Floor`], `total` is then rounded down to a whole share, and
@@ -126,9 +135,33 @@ impl SimulatedVenue {
     ///   reported in its turn among the adjusted orders. That cancel releases only the quote
     ///   asset the buy order held, so it leaves the restated holding as it is.
     ///
+    /// # What a split does to the options on the equity
+    /// The options on `instrument` are the ones the venue lists whose underlying is
+    /// `instrument`'s pair. What happens to them depends on the split's
+    /// [`SplitAdjustmentKind`]:
+    /// - **[`Standard`](SplitAdjustmentKind::Standard)** (a whole-number forward split): each
+    ///   option is adjusted as listed options are. Its strike is divided by `ratio`, with its
+    ///   contract size unchanged. The account's position in it is multiplied by `ratio`, and the
+    ///   position's entry price divided by it. The market the venue holds for it is restated and
+    ///   trades nothing until observed again, as the equity's is. The collateral a short holds
+    ///   follows from the restated position and strike: a put holds the same cash, and a call the
+    ///   restated shares. The strike is divided exactly. A clearing house rounds an adjusted
+    ///   strike to an increment of its own, which the venue does not model. The venue reports no
+    ///   event for these changes, as it reports none for a position: an engine applying the same
+    ///   action restates its own positions in the options, and a consumer keeping positions
+    ///   without one applies the same restatement. The restated strikes are part of the venue's
+    ///   [`snapshot`](Self::snapshot), and [`instruments`](Self::instruments) reports them.
+    /// - **[`NonStandard`](SplitAdjustmentKind::NonStandard)** (a reverse split, or a forward
+    ///   split by a ratio that is not a whole number), or a kind this venue does not know:
+    ///   refused with [`OptionExposureAtNonStandardSplit`] while the account holds a position in,
+    ///   or has an order on, an option on `instrument`. Such a split changes what each contract
+    ///   delivers, and the options then trade under a new symbol, closing only. With no such
+    ///   position or order the split is applied and the options are left as they are, so an
+    ///   order on one later trades it on its old terms. Stop trading them at the split.
+    ///
+    /// [`OptionExposureAtNonStandardSplit`]: CorporateActionRefusal::OptionExposureAtNonStandardSplit
+    ///
     /// # What it does not do yet
-    /// - **Options on `instrument` are untouched:** their strikes, positions and orders keep their
-    ///   pre-split terms.
     /// - **No minimum price or size:** an adjusted order is rounded to the tick and the quantity
     ///   step, but not checked against the instrument's minimums.
     ///
@@ -170,7 +203,13 @@ impl SimulatedVenue {
                 let CorporateActionKind::StockSplit { ratio } = kind else {
                     unreachable!("corporate_action_refusal refuses every kind but a split");
                 };
-                match self.plan_split(instrument, *ratio, policy) {
+                // A kind this venue does not know yet is taken as non-standard, as the engine
+                // takes it: it touches no option.
+                let options = match kind.split_kind() {
+                    Some(SplitAdjustmentKind::Standard) => OptionSplit::Restate,
+                    _ => OptionSplit::RefuseIfHeld,
+                };
+                match self.plan_split(instrument, *ratio, policy, options) {
                     Err(reason) => self.refuse_corporate_action(id, instrument, kind, reason),
                     Ok(plan) => {
                         self.commit_split(instrument, plan, time_exchange, &mut events);
@@ -244,6 +283,10 @@ impl SimulatedVenue {
                  to price it"
             }
             CorporateActionRefusal::Overflow => "a restated holding or price overflows",
+            CorporateActionRefusal::OptionExposureAtNonStandardSplit => {
+                "a non-standard split would change what the account's options on the equity \
+                 deliver"
+            }
         };
         warn!(
             exchange = %self.exchange,
@@ -267,6 +310,7 @@ impl SimulatedVenue {
         instrument: &InstrumentNameExchange,
         ratio: SplitRatio,
         policy: SplitRoundingPolicy,
+        option_split: OptionSplit,
     ) -> Result<SplitPlan, CorporateActionRefusal> {
         let ratio = ratio.get();
         let Some(traded) = self.instruments.get(instrument) else {
@@ -275,9 +319,23 @@ impl SimulatedVenue {
         let base = &traded.underlying.base;
         let orders = self.account.orders();
 
+        let options = self.options_on(instrument);
+        if option_split == OptionSplit::RefuseIfHeld
+            && options
+                .iter()
+                .any(|option| self.has_option_exposure(option))
+        {
+            return Err(CorporateActionRefusal::OptionExposureAtNonStandardSplit);
+        }
+        // Past that check, an order on an option of the equity remains only on a standard split,
+        // which cancels it with the equity's own: neither counts as held elsewhere.
+        let split_by_this = |order_instrument: &InstrumentNameExchange| {
+            order_instrument == instrument || options.contains(&order_instrument)
+        };
+
         let held_elsewhere = orders
             .iter()
-            .filter(|order| order.key.instrument != *instrument)
+            .filter(|order| !split_by_this(&order.key.instrument))
             .filter_map(|order| orders.resting_order(&order.key.cid)?.reservation.as_ref())
             .any(|reservation| reservation.asset == *base);
         if held_elsewhere {
@@ -305,7 +363,7 @@ impl SimulatedVenue {
             .collect::<FnvHashSet<_>>();
         let mut cancel = orders
             .iter()
-            .filter(|order| order.key.instrument == *instrument)
+            .filter(|order| split_by_this(&order.key.instrument))
             .map(|order| &order.key.cid)
             .filter(|cid| !adjusted.contains(cid))
             .cloned()
@@ -361,6 +419,15 @@ impl SimulatedVenue {
             })
             .transpose()?;
 
+        let options = match option_split {
+            OptionSplit::Restate => options
+                .into_iter()
+                .map(|option| self.restate_option(option, ratio))
+                .collect::<Result<_, _>>()?,
+            // Nothing on them is held, as checked above.
+            OptionSplit::RefuseIfHeld => Vec::new(),
+        };
+
         Ok(SplitPlan {
             cancel,
             adjust,
@@ -368,6 +435,66 @@ impl SimulatedVenue {
             cash_in_lieu,
             market,
             borrow_prices,
+            options,
+        })
+    }
+
+    /// The options this venue lists on the equity `instrument`: those whose underlying is its
+    /// pair. Sorted by name, so the plan built from them does not depend on the map's order.
+    fn options_on(&self, instrument: &InstrumentNameExchange) -> Vec<&InstrumentNameExchange> {
+        let underlying = &self.instruments[instrument].underlying;
+        let mut options = self
+            .instruments
+            .iter()
+            .filter(|(_, listed)| {
+                matches!(listed.kind, InstrumentKind::Option(_)) && listed.underlying == *underlying
+            })
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        options.sort_unstable();
+        options
+    }
+
+    /// The option `option`'s terms, position and market after a standard split of `ratio`: the
+    /// strike divided by it, the contracts multiplied by it and their entry price divided by it,
+    /// and the market restated as the equity's is.
+    fn restate_option(
+        &self,
+        option: &InstrumentNameExchange,
+        ratio: Decimal,
+    ) -> Result<OptionRestatement, CorporateActionRefusal> {
+        let InstrumentKind::Option(contract) = &self.instruments[option].kind else {
+            unreachable!("options_on lists only options, and {option} is listed");
+        };
+        let strike = contract
+            .strike
+            .checked_div(ratio)
+            .ok_or(CorporateActionRefusal::Overflow)?;
+        let position = self
+            .positions
+            .get(option)
+            .map(|position| {
+                Ok(NetPosition {
+                    quantity: position
+                        .quantity
+                        .checked_mul(ratio)
+                        .ok_or(CorporateActionRefusal::Overflow)?,
+                    entry: position
+                        .entry
+                        .checked_div(ratio)
+                        .ok_or(CorporateActionRefusal::Overflow)?,
+                })
+            })
+            .transpose()?;
+        let market = self
+            .market(option)
+            .map(|market| restate_market(market, ratio).ok_or(CorporateActionRefusal::Overflow))
+            .transpose()?;
+        Ok(OptionRestatement {
+            option: option.clone(),
+            strike,
+            position,
+            market,
         })
     }
 
@@ -390,6 +517,7 @@ impl SimulatedVenue {
             cash_in_lieu,
             market,
             borrow_prices,
+            options,
         } = plan;
 
         self.cancel_each(cancel, time_exchange, events);
@@ -436,6 +564,14 @@ impl SimulatedVenue {
             self.borrow_prices.insert(instrument.clone(), window);
         }
 
+        let positions_changed = options.iter().any(|option| option.position.is_some());
+        for option in options {
+            self.commit_option_restatement(option, time_exchange);
+        }
+        if positions_changed {
+            self.refresh_next_charge();
+        }
+
         for adjustment in adjust {
             self.adjust_for_split(adjustment, time_exchange, events);
         }
@@ -444,6 +580,42 @@ impl SimulatedVenue {
         // equity.
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(events);
+    }
+
+    /// Gives an option on a split equity the strike, position and market `restatement` holds. It
+    /// reports nothing: see [`apply_corporate_action`](Self::apply_corporate_action).
+    fn commit_option_restatement(
+        &mut self,
+        restatement: OptionRestatement,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let OptionRestatement {
+            option,
+            strike,
+            position,
+            market,
+        } = restatement;
+        let Some(InstrumentKind::Option(contract)) = self
+            .instruments
+            .get_mut(&option)
+            .map(|listed| &mut listed.kind)
+        else {
+            unreachable!("plan_split found {option} listed as an option, and the list is fixed");
+        };
+        contract.strike = strike;
+        self.restated_strikes.insert(option.clone(), strike);
+        if let Some(position) = position {
+            self.positions.insert(option.clone(), position);
+        }
+        if let Some(market) = market {
+            self.market.insert(
+                option,
+                VenueInstrumentMarket {
+                    split_at: Some(time_exchange),
+                    ..market
+                },
+            );
+        }
     }
 
     /// Adjusts the buy limit order `adjustment` names to its terms after the split, recommitting
@@ -551,6 +723,30 @@ struct SplitPlan {
     market: Option<VenueInstrumentMarket>,
     /// The equity's borrow price window, restated, if the venue keeps one.
     borrow_prices: Option<super::PriceWindow>,
+    /// The options on the equity, restated: every one the venue lists on a standard split, by
+    /// name, and none on any other.
+    options: Vec<OptionRestatement>,
+}
+
+/// What a split does to the options on its equity, by its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionSplit {
+    /// A standard split: each option's strike, position and market are restated.
+    Restate,
+    /// Any other split: refused while the account holds a position in, or has an order on, an
+    /// option on the equity, and otherwise touching no option.
+    RefuseIfHeld,
+}
+
+/// An option on a split equity, after a standard split.
+#[derive(Debug)]
+struct OptionRestatement {
+    option: InstrumentNameExchange,
+    strike: Decimal,
+    /// The account's position in it, or `None` if it holds none.
+    position: Option<NetPosition>,
+    /// The market held for it, or `None` if the venue holds none.
+    market: Option<VenueInstrumentMarket>,
 }
 
 /// A buy limit order's terms after a split.

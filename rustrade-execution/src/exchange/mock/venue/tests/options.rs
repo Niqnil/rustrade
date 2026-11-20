@@ -1162,7 +1162,7 @@ pub(super) fn funds(usd_balance: &str, spy_balance: &str) -> impl FnOnce(&mut Mo
 }
 
 /// Sells `quantity` of the option on a market-driven venue, asserting it fills.
-fn sell(venue: &mut SimulatedVenue, quantity: &str) -> Vec<UnindexedAccountEvent> {
+pub(super) fn sell(venue: &mut SimulatedVenue, quantity: &str) -> Vec<UnindexedAccountEvent> {
     let outcome = venue.open_order(option_request(Side::Sell, quantity, None));
     assert!(
         outcome.response.state.is_accepted(),
@@ -1173,14 +1173,14 @@ fn sell(venue: &mut SimulatedVenue, quantity: &str) -> Vec<UnindexedAccountEvent
 }
 
 /// What [`SimulatedVenue::collateral_held`] reports for a short holding `amount` of `asset`.
-fn collateral(asset: AssetNameExchange, amount: &str) -> Option<Collateral> {
+pub(super) fn collateral(asset: AssetNameExchange, amount: &str) -> Option<Collateral> {
     Some(Collateral {
         asset,
         amount: d(amount),
     })
 }
 
-fn totals(venue: &SimulatedVenue, asset: AssetNameExchange) -> (Decimal, Decimal) {
+pub(super) fn totals(venue: &SimulatedVenue, asset: AssetNameExchange) -> (Decimal, Decimal) {
     let balance = balance(venue, asset);
     (balance.total, balance.free)
 }

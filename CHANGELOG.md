@@ -587,9 +587,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument as well as to the engine, and drops the market it folded for the instrument. A paper
   venue applies one sent with `PaperVenue::apply_corporate_action`, and a `MockExchange` one sent
   as `MockExchangeRequest::corporate_action`. A backtest with orders resting across a split now ends
-  them at the split, unless the venue is configured to adjust them (see the next entry). Not yet
-  modelled: options on the split asset keep their pre-split terms, so a wrapper must still cancel
-  the orders an `OpenOrdersAtSplit` lists on an option.
+  them at the split, unless the venue is configured to adjust them (see the next entry). What a
+  split does to the options on the split equity is two entries below.
 - **A split restates the simulated venue's holdings, and can adjust its buy limits**
   (`rustrade-execution`, `rustrade-instrument`, `rustrade`). On a stock split the simulated venue
   now restates the account's balance of the split equity (`total`, `free`, and a loan's principal
@@ -617,6 +616,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-exported at `rustrade::SplitRoundingPolicy` and
   `rustrade::engine::state::position::SplitRoundingPolicy`, and gains
   `SplitRoundingPolicy::round_shares`, with which the engine and the venue both round.
+- **A split restates the simulated venue's options on the split equity** (`rustrade-execution`).
+  The simulated venue left options on a split equity untouched: their strikes and the account's
+  positions kept their pre-split terms, so an option settled at expiry against the wrong strike
+  and contract count, and a short call's collateral no longer matched the shares the restated
+  balance held. Every order on an option on the equity is now cancelled at the split, whatever
+  `SplitConfig` says, as options exchanges cancel the resting orders in options a split adjusts.
+  On a standard split (a whole-number forward split, `SplitAdjustmentKind::Standard`) the venue
+  adjusts the options as listed options are adjusted, matching the engine: every option's strike
+  is divided by the ratio, exactly, with the contract size unchanged; the account's position in
+  it is multiplied by the ratio and its entry price divided by it; and the market held for it is
+  restated and trades nothing until observed again, as the equity's is. Short collateral follows:
+  a put holds the same cash, a call the restated shares. `SimulatedVenue::instruments` reports the
+  restated strikes, and the venue's snapshot carries them, so a restore gives the options their
+  restated strikes (new `VenueRestoreError::RestatedStrikeOfNonOption` for a snapshot that names
+  something else). A non-standard split (a reverse split, or a ratio that is not a whole number)
+  changes what each contract delivers, and the options then trade under a new symbol, which the
+  venue does not model: it is refused with the new
+  `CorporateActionRefusal::OptionExposureAtNonStandardSplit` while the account holds a position in,
+  or has an order on, an option on the equity, changing nothing so it can be applied once they are
+  closed. With none, the options are left as they are.
 - **Breaking: `OrderQuantityUnits::Base`, and why an instrument has no quantity step**
   (`rustrade-instrument`, #981). The new variant counts quantities in the instrument's own base
   asset without naming it, so a spec in it cannot disagree with the base. Before, a spot spec had

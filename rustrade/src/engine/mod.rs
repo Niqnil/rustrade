@@ -1869,9 +1869,10 @@ pub enum EngineOutput<
     /// In backtest, the simulated venue cancels or adjusts each order on the split equity itself,
     /// by its configured rule (see
     /// [`SimulatedVenue::apply_corporate_action`](rustrade_execution::exchange::mock::SimulatedVenue::apply_corporate_action)),
-    /// and its report of each follows this output. It leaves orders on options of the equity on
-    /// their old terms, and would fill them against post-split prices, so the wrapper **must**
-    /// cancel those in backtest.
+    /// and its report of each follows this output. It cancels every order on an option of the
+    /// equity, which an `OpenOrdersAtSplit` for that option lists on a standard split, and
+    /// refuses a non-standard split while the account holds an option of the equity or has an
+    /// order on one.
     OpenOrdersAtSplit {
         /// Instrument whose orders are listed.
         instrument: InstrumentKey,

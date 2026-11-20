@@ -1011,3 +1011,293 @@ fn a_split_whose_restated_holding_overflows_is_refused_and_changes_nothing() {
     );
     assert_eq!(applied.response, CorporateActionResponse::Applied);
 }
+
+// -------------------------------------------------------------------------------------------
+// The options on the split equity.
+// -------------------------------------------------------------------------------------------
+
+mod options_on_the_equity {
+    use super::super::options::{
+        STRIKE, buy, collateral, config as option_config, driven_instruments, driven_venue, feed,
+        funds, option_name, option_position, option_request, sell, spy, spy_name, totals, usd,
+    };
+    use super::*;
+    use rustrade_instrument::instrument::kind::option::{OptionKind, OptionSettlement};
+
+    fn split_spy(
+        venue: &mut SimulatedVenue,
+        id: &str,
+        ratio: &str,
+        seconds: i64,
+    ) -> CorporateActionOutcome {
+        venue.apply_corporate_action(
+            id,
+            &spy_name(),
+            &split(ratio),
+            SplitRoundingPolicy::Fractional,
+            time(seconds),
+        )
+    }
+
+    fn strike(venue: &SimulatedVenue) -> Decimal {
+        match &venue.instruments()[&option_name()].kind {
+            InstrumentKind::Option(contract) => contract.strike,
+            other => panic!("the option is listed as an option: {other:?}"),
+        }
+    }
+
+    /// The entry price of the option position the venue reports, `None` while flat.
+    fn option_entry(venue: &SimulatedVenue) -> Option<Decimal> {
+        venue
+            .account_snapshot()
+            .instruments
+            .iter()
+            .find(|instrument| instrument.instrument == option_name())
+            .and_then(|instrument| instrument.position.open()?.entry_price)
+    }
+
+    fn rest_on_option(venue: &mut SimulatedVenue, cid: &str, side: Side, limit: &str) {
+        let mut request = limit_request(cid, side, "1", limit, gtc());
+        request.key.instrument = option_name();
+        let outcome = venue.open_order(request);
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Active(ActiveOrderState::Open(_))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+    }
+
+    fn refusal(outcome: &CorporateActionOutcome) -> Option<CorporateActionRefusal> {
+        match outcome.response {
+            CorporateActionResponse::Refused(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_standard_split_divides_the_strike_of_an_option_the_account_does_not_hold() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+
+        let outcome = split_spy(&mut venue, "split-1", "2", 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(strike(&venue), d(STRIKE) / d("2"));
+        assert_eq!(option_position(&venue), None);
+    }
+
+    #[test]
+    fn a_standard_split_multiplies_a_long_option_position_and_divides_its_entry() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        buy(&mut venue, "1");
+        let cash = totals(&venue, usd());
+
+        let outcome = split_spy(&mut venue, "split-1", "3", 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(option_position(&venue), Some(d("3")));
+        assert_eq!(option_entry(&venue), Some(d("0.5")));
+        assert_eq!(totals(&venue, usd()), cash, "no cash changes hands");
+    }
+
+    #[test]
+    fn a_standard_split_keeps_a_short_put_holding_the_same_cash() {
+        let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+
+        let _ = split_spy(&mut venue, "split-1", "2", 5);
+
+        assert_eq!(option_position(&venue), Some(d("-2")));
+        assert_eq!(strike(&venue), d("50"));
+        assert_eq!(totals(&venue, usd()), (d("10150"), d("150")));
+        assert_eq!(
+            venue.collateral_held(&option_name()),
+            collateral(usd(), "10000"),
+            "50 × 2 contracts × 100, as 100 × 1 × 100 before"
+        );
+    }
+
+    #[test]
+    fn a_standard_split_keeps_a_short_call_covered_by_the_restated_shares() {
+        let mut venue = driven_venue(
+            OptionKind::Call,
+            OptionSettlement::Physical,
+            funds("0", "100"),
+        );
+        feed(&mut venue, "100", "1.5", time(2));
+        sell(&mut venue, "1");
+
+        let _ = split_spy(&mut venue, "split-1", "2", 5);
+
+        assert_eq!(option_position(&venue), Some(d("-2")));
+        assert_eq!(totals(&venue, spy()), (d("200"), Decimal::ZERO));
+        assert_eq!(
+            venue.collateral_held(&option_name()),
+            collateral(spy(), "200"),
+            "the position held as collateral is what the restated balance holds"
+        );
+
+        // Buying the restated short back releases every share the call held.
+        feed(&mut venue, "50", "0.75", time(6));
+        buy(&mut venue, "2");
+        assert_eq!(option_position(&venue), None);
+        assert_eq!(totals(&venue, spy()), (d("200"), d("200")));
+        assert_eq!(totals(&venue, usd()), (Decimal::ZERO, Decimal::ZERO));
+    }
+
+    #[test]
+    fn a_split_cancels_every_order_on_an_option_on_its_equity() {
+        let mut venue = driven_venue(
+            OptionKind::Call,
+            OptionSettlement::Physical,
+            funds("1000", "100"),
+        );
+        feed(&mut venue, "100", "1.5", time(2));
+        rest_on_option(&mut venue, "call-bid", Side::Buy, "1");
+        // A sale that would open a short holds the shares it would deliver: an order on another
+        // instrument holding the equity, which the split cancels rather than refusing.
+        rest_on_option(&mut venue, "call-ask", Side::Sell, "5");
+        assert_eq!(totals(&venue, spy()), (d("100"), Decimal::ZERO));
+
+        let outcome = split_spy(&mut venue, "split-1", "2", 5);
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(cancelled_cids(&outcome.events), ["call-ask", "call-bid"]);
+        assert!(venue.orders_open(&[]).is_empty());
+        assert_eq!(totals(&venue, spy()), (d("200"), d("200")));
+        assert_eq!(totals(&venue, usd()), (d("1000"), d("1000")));
+    }
+
+    #[test]
+    fn a_standard_split_restates_the_option_market_which_trades_nothing_until_observed_again() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+
+        let _ = split_spy(&mut venue, "split-1", "2", 5);
+
+        let market = venue.market(&option_name()).expect("kept for valuation");
+        assert_eq!(market.snapshot.last_price, Some(d("0.75")));
+        assert_eq!(market.split_at, Some(time(5)));
+        let refused = venue.open_order(option_request(Side::Buy, "1", None));
+        match &refused.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::OrderRejected(reason),
+            ))) => assert!(reason.contains("since a split"), "{reason}"),
+            other => panic!("expected the market order refused, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_standard_split_is_refused_while_the_account_holds_an_option_on_its_equity() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        buy(&mut venue, "1");
+
+        let outcome = split_spy(&mut venue, "reverse-1", "0.5", 5);
+
+        assert_eq!(
+            refusal(&outcome),
+            Some(CorporateActionRefusal::OptionExposureAtNonStandardSplit)
+        );
+        assert_eq!(strike(&venue), d(STRIKE));
+        assert_eq!(option_position(&venue), Some(d("1")));
+
+        // Closed, the same action applies, and leaves the option as it is.
+        feed(&mut venue, "100", "1.5", time(6));
+        sell(&mut venue, "1");
+        let outcome = split_spy(&mut venue, "reverse-1", "0.5", 7);
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(strike(&venue), d(STRIKE));
+        assert_eq!(option_position(&venue), None);
+    }
+
+    #[test]
+    fn a_non_standard_split_is_refused_while_an_order_rests_on_an_option_on_its_equity() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        rest_on_option(&mut venue, "call-bid", Side::Buy, "1");
+
+        let outcome = split_spy(&mut venue, "split-3-for-2", "1.5", 5);
+
+        assert_eq!(
+            refusal(&outcome),
+            Some(CorporateActionRefusal::OptionExposureAtNonStandardSplit)
+        );
+        assert_eq!(venue.orders_open(&[]).len(), 1, "nothing cancelled");
+        assert_eq!(totals(&venue, spy()), (Decimal::ZERO, Decimal::ZERO));
+    }
+
+    #[test]
+    fn an_option_expiring_at_the_split_settles_on_its_strike_before_the_split() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Cash, |_| {});
+        feed(&mut venue, "100", "1.5", time(2));
+        buy(&mut venue, "1");
+        feed(&mut venue, "120", "20", time(50));
+
+        let outcome = split_spy(
+            &mut venue,
+            "split-1",
+            "2",
+            super::super::options::expiry().timestamp(),
+        );
+
+        assert_eq!(outcome.response, CorporateActionResponse::Applied);
+        assert_eq!(option_position(&venue), None, "settled at expiry");
+        assert_eq!(
+            totals(&venue, usd()).0,
+            d("10000") - d("150") + d("2000"),
+            "(120 − 100) × 100: the strike the call had before the split"
+        );
+    }
+
+    #[test]
+    fn a_restored_venue_trades_the_options_on_their_restated_strikes() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        let _ = split_spy(&mut venue, "split-1", "2", 5);
+        let json = serde_json::to_value(venue.snapshot()).unwrap();
+        assert_eq!(
+            json["restated_strikes"],
+            serde_json::json!([[option_name(), d("50")]])
+        );
+
+        // Restored with the instruments as constructed, on the pre-split strike.
+        let restore = |json: serde_json::Value| {
+            SimulatedVenue::from_snapshot(
+                &option_config("10000", FeeModelConfig::default()),
+                driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+                serde_json::from_value(json).unwrap(),
+            )
+        };
+        let restored = restore(json.clone()).unwrap();
+        assert_eq!(strike(&restored), d("50"));
+        assert_eq!(
+            serde_json::to_value(restored.snapshot()).unwrap()["restated_strikes"],
+            json["restated_strikes"],
+            "kept by the restored venue"
+        );
+
+        let mut not_an_option = json;
+        not_an_option["restated_strikes"][0][0] = serde_json::json!(spy_name());
+        assert_eq!(
+            restore(not_an_option).err(),
+            Some(VenueRestoreError::RestatedStrikeOfNonOption(spy_name()))
+        );
+    }
+
+    #[test]
+    fn a_snapshot_of_a_venue_whose_options_no_split_restated_is_written_as_before() {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+        let _ = split_spy(&mut venue, "reverse-1", "0.5", 5);
+
+        let json = serde_json::to_value(venue.snapshot()).unwrap();
+
+        assert!(
+            json.get("restated_strikes").is_none(),
+            "left out when empty, so an older reader sees no new field: {json}"
+        );
+    }
+}
