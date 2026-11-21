@@ -1546,3 +1546,82 @@ async fn test_option_greeks_stream() {
         Err(e) => panic!("Stream init failed: {e}"),
     }
 }
+
+/// Tier 1: a halted contract's quote subscription reports its trading status.
+///
+/// Needs `IBKR_HALTED_SYMBOL`, a US stock halted at the time of the run (a current halt list:
+/// Nasdaq Trader's trading halts page), and skips without it. Streams quotes for it and for AAPL,
+/// and tick-by-tick trades for it, for 30 seconds. The halted contract must report
+/// [`TradingState::Halted`] or [`TradingState::Paused`], and its trades must carry no zero-price
+/// halt marker. What AAPL reports is printed: IB documents a "not halted" value only for a contract
+/// in a TWS watchlist.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_quotes_report_a_halted_contracts_trading_status() {
+    use rustrade_data::subscription::trading_status::TradingState;
+
+    init_logging();
+    let Ok(halted) = std::env::var("IBKR_HALTED_SYMBOL") else {
+        println!("IBKR_HALTED_SYMBOL is not set; skipping");
+        return;
+    };
+
+    let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 41);
+    let registry = ContractRegistry::new();
+    registry.register_by_name_only(halted.as_str().into(), Contract::stock(&halted).build());
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    let subscription = |name: &str, kind| IbkrSubscription {
+        instrument: name.into(),
+        key: name.to_string(),
+        kind,
+    };
+    let subscriptions = vec![
+        subscription(&halted, IbkrSubscriptionKind::Quotes),
+        subscription(&halted, IbkrSubscriptionKind::Trades),
+        subscription("AAPL", IbkrSubscriptionKind::Quotes),
+    ];
+
+    let mut stream = init_stream(config, Arc::new(registry), subscriptions)
+        .await
+        .expect("stream init failed");
+
+    let mut halted_states = Vec::new();
+    let mut zero_trades = 0;
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(result) = stream.next().await {
+            let event = match result {
+                Ok(event) => event,
+                Err(e) => {
+                    println!("Stream error: {e:?}");
+                    continue;
+                }
+            };
+            match &event.kind {
+                DataKind::TradingStatus(status) => {
+                    println!("{}: {status:?}", event.instrument);
+                    if event.instrument == halted {
+                        halted_states.push(status.state);
+                    }
+                }
+                DataKind::Trade(trade) if event.instrument == halted => {
+                    println!("{halted} trade: {} x {}", trade.price, trade.amount);
+                    if trade.price.is_zero() {
+                        zero_trades += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    println!("{halted} states: {halted_states:?}");
+    assert!(
+        halted_states
+            .iter()
+            .any(|state| matches!(state, TradingState::Halted | TradingState::Paused)),
+        "{halted} reported no halt: {halted_states:?}"
+    );
+    assert_eq!(zero_trades, 0, "a zero-price trade passed as a trade");
+}
