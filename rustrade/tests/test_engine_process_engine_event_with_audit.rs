@@ -10333,7 +10333,7 @@ enum Replay {
 /// The fee WARNs that reach the subscriber while the engine applies a fill whose ETH fee nothing
 /// values (ETH pairs only with BTC, the fill is on BTCUSDT), and then while a
 /// `StateReplicaManager` replays it. `env_filter` is an `EnvFilter` directive placed in front, and
-/// `dedup` adds the `AuditSpanFilter`.
+/// `dedup` adds the `ReplicaLogFilter`.
 fn fee_warnings_with_a_replica(env_filter: Option<&str>, dedup: bool, replay: Replay) -> usize {
     use rustrade::engine::audit::{Auditor, ProcessAudit, state_replica::StateReplicaManager};
     use std::sync::{
@@ -10371,7 +10371,7 @@ fn fee_warnings_with_a_replica(env_filter: Option<&str>, dedup: bool, replay: Re
     let layer = Layer::and_then(
         Layer::and_then(
             env_filter.map(tracing_subscriber::EnvFilter::new),
-            dedup.then_some(rustrade::logging::AuditSpanFilter),
+            dedup.then_some(rustrade::logging::ReplicaLogFilter),
         ),
         FeeWarnings(Arc::clone(&count)),
     );
@@ -10396,11 +10396,11 @@ fn fee_warnings_with_a_replica(env_filter: Option<&str>, dedup: bool, replay: Re
 }
 
 /// A `StateReplicaManager` applies each fill through the same path as the engine, so it logs the
-/// engine's fee WARN again; the `AuditSpanFilter` drops its copy. It does so under a level filter
+/// engine's fee WARN again; the `ReplicaLogFilter` drops its copy. It does so under a level filter
 /// that excludes the replica's INFO span and under a filter naming only another target, both of
 /// which disable that span, and when the replica is updated directly rather than through `run`.
 #[test]
-fn test_state_replica_fee_warning_is_written_once_behind_the_audit_span_filter() {
+fn test_state_replica_fee_warning_is_written_once_behind_the_replica_log_filter() {
     for replay in [Replay::Run, Replay::Direct] {
         assert_eq!(
             fee_warnings_with_a_replica(None, false, replay),

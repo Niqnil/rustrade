@@ -27,7 +27,7 @@ use tracing::{info, info_span};
 /// The name of the span [`StateReplicaManager::run`] applies the audit stream inside, so a log
 /// line the replica writes carries it as context.
 ///
-/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) does not rely on it: a log filter can
+/// [`ReplicaLogFilter`](crate::logging::ReplicaLogFilter) does not rely on it: a log filter can
 /// disable the span (an INFO span under `RUST_LOG=warn`, or any span under a filter that names
 /// only other targets), and the replica's lines would then be outside it.
 pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_update_span";
@@ -40,7 +40,7 @@ thread_local! {
 
 /// Whether this thread is applying an audit event to a replica: inside
 /// [`StateReplicaManager::update_from_event`], directly or through [`StateReplicaManager::run`].
-/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops what is logged then.
+/// [`ReplicaLogFilter`](crate::logging::ReplicaLogFilter) drops what is logged then.
 pub(crate) fn updating_replica() -> bool {
     UPDATING_REPLICA.get()
 }
@@ -90,7 +90,7 @@ impl Drop for UpdatingReplica {
 /// The replica applies each event through the same `EngineState` methods as the engine, so
 /// whatever they log, the replica logs again. While [`update_from_event`](Self::update_from_event)
 /// applies an event, called directly or by [`run`](Self::run), it marks its thread, and
-/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops every event logged on that thread
+/// [`ReplicaLogFilter`](crate::logging::ReplicaLogFilter) drops every event logged on that thread
 /// meanwhile, whatever the subscriber's level or target filters. That includes what your own
 /// `GlobalData` and instrument data processors log as the replica applies an event, which they
 /// already logged when the engine applied it. The [`logging`](crate::logging) initialisers install
@@ -146,7 +146,7 @@ where
         info!("StateReplicaManager running");
 
         // Context for the replica's log lines; `update_from_event` marks the thread for
-        // `AuditSpanFilter`, which a log filter cannot disable as it can this span.
+        // `ReplicaLogFilter`, which a log filter cannot disable as it can this span.
         let audit_span = info_span!(AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME);
         let audit_span_guard = audit_span.enter();
 
@@ -240,8 +240,8 @@ where
     /// # Logging
     ///
     /// Marks its thread while it runs, so that
-    /// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops the log lines the engine already
-    /// wrote for this event. See the type's docs.
+    /// [`ReplicaLogFilter`](crate::logging::ReplicaLogFilter) drops the log lines the engine
+    /// already wrote for this event. See the type's docs.
     pub fn update_from_event<OnDisable, OnDisconnect>(
         &mut self,
         event: EngineEvent<InstrumentData::MarketEventKind>,
