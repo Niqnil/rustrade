@@ -6,7 +6,8 @@
 //
 // Architecture:
 // - REST (reqwest): account_snapshot, fetch_balances, fetch_open_orders,
-//   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol})
+//   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol}),
+//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close)
 // - WebSocket (tungstenite): account_stream via Alpaca's trade_updates stream
 //   at wss://[paper-]api.alpaca.markets/stream
 //
@@ -6475,6 +6476,151 @@ enum AlpacaBorrowStatus {
     HardToBorrow,
     #[serde(other)]
     Other,
+}
+
+// ---------------------------------------------------------------------------
+// Underlyings whose options close late
+// ---------------------------------------------------------------------------
+
+/// The asset attribute Alpaca gives an underlying whose options close at 16:15 ET.
+const OPTIONS_LATE_CLOSE: &str = "options_late_close";
+
+impl AlpacaClient {
+    /// Read the underlyings whose options close at 16:15 ET instead of 16:00 ET: the symbols of
+    /// the US equities Alpaca marks with the `options_late_close` asset attribute, sorted, with one
+    /// `GET /v2/assets` request.
+    ///
+    /// These options close at 13:15 ET instead of 13:00 ET on an early-close day. Alpaca times its
+    /// expiry-day cutoff for opening orders and its liquidation of at-risk positions from the
+    /// options' close, so a simulated venue standing in for Alpaca gives these underlyings'
+    /// options a close of their own, by kind and underlying in its `session_close_overrides`:
+    ///
+    /// ```no_run
+    /// use chrono::NaiveTime;
+    /// use rustrade_execution::client::{
+    ///     ExecutionClient as _,
+    ///     alpaca::{AlpacaClient, AlpacaConfig},
+    ///     mock::{SessionCalendarConfig, SessionCloseOverrides},
+    /// };
+    /// use rustrade_instrument::{
+    ///     Underlying,
+    ///     asset::name::AssetNameExchange,
+    ///     calendar::{DailyClose, Tz},
+    ///     instrument::kind::InstrumentKindDiscriminant,
+    /// };
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = AlpacaClient::new(AlpacaConfig::from_env()?);
+    /// // Give it the market's holidays and early closes with `DailyClose::with_dates`.
+    /// let late_close = SessionCalendarConfig::Daily(DailyClose::new(
+    ///     NaiveTime::from_hms_opt(16, 15, 0).unwrap(),
+    ///     "America/New_York".parse::<Tz>()?,
+    /// ));
+    /// // The underlyings your option instruments use, spelled as they spell them.
+    /// let traded = [AssetNameExchange::new("SPY"), AssetNameExchange::new("AAPL")];
+    ///
+    /// let overrides = client
+    ///     .fetch_options_late_close_underlyings()
+    ///     .await?
+    ///     .into_iter()
+    ///     .filter(|symbol| traded.contains(symbol))
+    ///     .fold(SessionCloseOverrides::new(), |overrides, symbol| {
+    ///         overrides.with_underlying(
+    ///             InstrumentKindDiscriminant::Option,
+    ///             // The quote name your option instruments' underlyings use.
+    ///             Underlying::new(symbol, AssetNameExchange::new("USD")),
+    ///             late_close.clone(),
+    ///         )
+    ///     });
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Key only the underlyings your instruments use: Alpaca lists dozens, and the venue warns of
+    /// each entry no instrument matches. A key matches an underlying's base and quote names
+    /// exactly, so build it with the names your instruments use.
+    ///
+    /// Assets of every status are read, inactive ones included, since a backtest may need an
+    /// underlying that is no longer listed. An asset Alpaca returns without the attribute is left
+    /// out, and their count logged at WARN; the call still returns the assets that list it. An
+    /// empty response returns an empty list, as Alpaca listing no such underlying is possible; for
+    /// today's market, where Alpaca names SPY, QQQ and IWM among them, it is implausible, and the
+    /// caller decides what to do with it.
+    ///
+    /// # Known limitations
+    /// - The list is as of the request. Alpaca gives no date on which an underlying gained or lost
+    ///   the attribute, so a backtest across such a change (Cboe moved VOO's options to a 16:15
+    ///   close in February 2026) needs those dates from elsewhere.
+    /// - Alpaca does not document whether a paper account and a live one list the same
+    ///   underlyings.
+    ///
+    /// # Errors
+    /// Fails if the request fails, or with [`UnindexedClientError::Internal`] if the response is
+    /// not a list of assets each with a symbol, or lists assets of which none carries the
+    /// attribute. A request filtered on the attribute cannot rightly return only assets without
+    /// it, so the response has changed shape, and an empty list would be a wrong answer.
+    pub async fn fetch_options_late_close_underlyings(
+        &self,
+    ) -> Result<Vec<AssetNameExchange>, UnindexedClientError> {
+        let url = format!("{}/v2/assets", self.base_url());
+        let assets: Vec<AlpacaListedAsset> = rest_with_retry(&self.rate_limiter, || {
+            self.http.get(&url).query(&[
+                ("asset_class", "us_equity"),
+                ("attributes", OPTIONS_LATE_CLOSE),
+            ])
+        })
+        .await?;
+        late_close_underlyings(assets)
+    }
+}
+
+/// The sorted symbols of the `assets` that list [`OPTIONS_LATE_CLOSE`], each once. Any others are
+/// left out and their count logged at WARN, as Alpaca returned them for a request filtered on it.
+///
+/// # Errors
+/// [`UnindexedClientError::Internal`] if `assets` is not empty but none lists the attribute.
+fn late_close_underlyings(
+    assets: Vec<AlpacaListedAsset>,
+) -> Result<Vec<AssetNameExchange>, UnindexedClientError> {
+    let (late, other): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
+        asset
+            .attributes
+            .iter()
+            .flatten()
+            .any(|attribute| attribute == OPTIONS_LATE_CLOSE)
+    });
+    if late.is_empty() && !other.is_empty() {
+        return Err(UnindexedClientError::Internal(format!(
+            "Alpaca listed {} assets for a request filtered on {OPTIONS_LATE_CLOSE}, none of them \
+             with it (first: {})",
+            other.len(),
+            other[0].symbol
+        )));
+    }
+    if !other.is_empty() {
+        warn!(
+            left_out = other.len(),
+            first = %other[0].symbol,
+            "Alpaca listed assets without {OPTIONS_LATE_CLOSE} for a request filtered on it; they \
+             are left out"
+        );
+    }
+    Ok(late
+        .into_iter()
+        .map(|asset| AssetNameExchange::new(asset.symbol))
+        .sorted()
+        .dedup()
+        .collect())
+}
+
+/// The fields of a `GET /v2/assets` entry that
+/// [`AlpacaClient::fetch_options_late_close_underlyings`] reads.
+#[derive(Debug, Deserialize)]
+struct AlpacaListedAsset {
+    symbol: SmolStr,
+    /// Read as plain strings, since Alpaca returns values its documentation does not list.
+    #[serde(default)]
+    attributes: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -14003,6 +14149,151 @@ mod tests {
                 ),
                 "{result:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn late_close_underlyings_are_read_with_the_attribute_filter() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "symbol": "SPY",
+                        "class": "us_equity",
+                        "status": "active",
+                        "attributes": ["has_options", "options_late_close", "an_unlisted_one"],
+                    },
+                    {
+                        "symbol": "IWM",
+                        "class": "us_equity",
+                        "status": "inactive",
+                        "attributes": ["options_late_close"],
+                    },
+                ])))
+                .mount(&server)
+                .await;
+
+            let symbols = client_for(&server)
+                .fetch_options_late_close_underlyings()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                symbols,
+                [AssetNameExchange::new("IWM"), AssetNameExchange::new("SPY")],
+                "sorted, an inactive asset kept, and an undocumented attribute read without failing"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let query = requests[0]
+                .url
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                query,
+                [
+                    ("asset_class".to_owned(), "us_equity".to_owned()),
+                    ("attributes".to_owned(), "options_late_close".to_owned()),
+                ],
+                "no status filter, so inactive assets are listed too"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_late_close_response_that_is_not_a_list_of_assets_is_internal() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!([{ "attributes": ["options_late_close"] }]),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .fetch_options_late_close_underlyings()
+                .await;
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(_))),
+                "an asset without a symbol fails the read: {result:?}"
+            );
+        }
+
+        fn listed(symbol: &str, attributes: Option<&[&str]>) -> AlpacaListedAsset {
+            AlpacaListedAsset {
+                symbol: SmolStr::new(symbol),
+                attributes: attributes
+                    .map(|attributes| attributes.iter().map(|&a| a.to_owned()).collect()),
+            }
+        }
+
+        #[test]
+        fn assets_without_the_late_close_attribute_are_left_out_with_a_warning() {
+            let (symbols, events) = rustrade_instrument::test_utils::logs::capture(|| {
+                late_close_underlyings(vec![
+                    listed("QQQ", Some(&["options_late_close"])),
+                    listed("AAPL", Some(&["has_options"])),
+                    listed("MSFT", Some(&[])),
+                    listed("GME", None),
+                    listed("QQQ", Some(&["options_late_close"])),
+                    listed("DIA", Some(&["options_late_close"])),
+                ])
+            });
+
+            assert_eq!(
+                symbols.unwrap(),
+                [AssetNameExchange::new("DIA"), AssetNameExchange::new("QQQ")],
+                "sorted, each once"
+            );
+            let warnings = events
+                .iter()
+                .filter(|event| event.level == tracing::Level::WARN)
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 1, "{events:?}");
+            assert!(
+                warnings[0]
+                    .fields
+                    .iter()
+                    .any(|(name, value)| *name == "left_out" && value == "3"),
+                "{events:?}"
+            );
+        }
+
+        #[test]
+        fn a_list_of_late_close_assets_alone_logs_no_warning() {
+            let (symbols, events) = rustrade_instrument::test_utils::logs::capture(|| {
+                late_close_underlyings(vec![listed("SPY", Some(&["options_late_close"]))])
+            });
+
+            assert_eq!(symbols.unwrap(), [AssetNameExchange::new("SPY")]);
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.level != tracing::Level::WARN),
+                "{events:?}"
+            );
+        }
+
+        #[test]
+        fn a_list_of_assets_none_with_the_late_close_attribute_is_internal() {
+            let result = late_close_underlyings(vec![
+                listed("SPY", None),
+                listed("QQQ", Some(&["has_options"])),
+            ]);
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(ref message)) if message.contains("SPY")),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn an_empty_list_has_no_late_close_underlyings() {
+            assert_eq!(late_close_underlyings(Vec::new()).unwrap(), []);
         }
 
         /// Answers every request with a 429. Every answer but the last says `Retry-After: 0`, so
