@@ -6542,7 +6542,10 @@ impl AlpacaClient {
     ///
     /// Assets of every status are read, inactive ones included, since a backtest may need an
     /// underlying that is no longer listed. An asset Alpaca returns without the attribute is left
-    /// out, and their count logged at WARN; the call still returns the assets that list it.
+    /// out, and their count logged at WARN; the call still returns the assets that list it. An
+    /// empty response returns an empty list, as Alpaca listing no such underlying is possible; for
+    /// today's market, where Alpaca names SPY, QQQ and IWM among them, it is implausible, and the
+    /// caller decides what to do with it.
     ///
     /// # Known limitations
     /// - The list is as of the request. Alpaca gives no date on which an underlying gained or lost
@@ -6554,8 +6557,8 @@ impl AlpacaClient {
     /// # Errors
     /// Fails if the request fails, or with [`UnindexedClientError::Internal`] if the response is
     /// not a list of assets each with a symbol, or lists assets of which none carries the
-    /// attribute: Alpaca's response has then changed shape, and an empty list would leave every
-    /// underlying on the standard close.
+    /// attribute. A request filtered on the attribute cannot rightly return only assets without
+    /// it, so the response has changed shape, and an empty list would be a wrong answer.
     pub async fn fetch_options_late_close_underlyings(
         &self,
     ) -> Result<Vec<AssetNameExchange>, UnindexedClientError> {
