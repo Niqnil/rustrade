@@ -409,8 +409,8 @@ impl MockExecutionConfig {
 ///   live venue refuses one with [`MockExecutionConfig::time_in_force`].
 ///
 /// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller. Not
-/// `Copy`, so that such a source may hold a list of dates; `Ord` and `Hash` are what
-/// [`MockExecutionConfig`] requires.
+/// `Copy`, since a [`DailyClose`] holds its holiday and early-close dates; `Ord` and `Hash` are
+/// what [`MockExecutionConfig`] requires.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]

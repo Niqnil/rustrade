@@ -147,11 +147,6 @@ impl SessionDates {
     pub fn early_closes(&self) -> &BTreeSet<NaiveDate> {
         &self.early_closes
     }
-
-    /// Whether there are no dates at all.
-    pub fn is_empty(&self) -> bool {
-        self.holidays.is_empty() && self.early_closes.is_empty()
-    }
 }
 
 /// [`SessionDates`]' serialised form, validated on the way in.
@@ -269,7 +264,9 @@ impl DailyClose {
     /// This rule, with no session on the holidays of `dates` and a close at local time
     /// `early_close` on its early-close days, replacing any dates and early close it had.
     ///
-    /// `early_close` may be `None` only if `dates` lists no early-close day.
+    /// `early_close` may be `None` only if `dates` lists no early-close day. One set with no
+    /// early-close day to use it is kept, so a class keeps its early-close time in a year with no
+    /// half day listed; such a rule answers as one without it but is not equal to it.
     ///
     /// # Errors
     /// - [`DailyCloseError::EarlyCloseMissing`] if `dates` lists an early-close day and
@@ -323,8 +320,10 @@ impl DailyClose {
         if is_weekend(date) || self.dates.holidays.contains(&date) {
             None
         } else if self.dates.early_closes.contains(&date) {
-            // `with_dates` refuses early-close days without an early close, so this is set.
-            Some(self.early_close.unwrap_or(self.close))
+            match self.early_close {
+                Some(early_close) => Some(early_close),
+                None => unreachable!("with_dates refuses early-close days without an early close"),
+            }
         } else {
             Some(self.close)
         }
@@ -802,13 +801,6 @@ mod tests {
                 &BTreeSet::from([date(2026, 11, 27)])
             )
         );
-        assert!(!dates.is_empty());
-        assert!(SessionDates::default().is_empty());
-        assert!(
-            !SessionDates::new([], [date(2026, 11, 27)])
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -890,5 +882,40 @@ mod tests {
         assert!(plain < early, "no early close sorts first");
         assert!(plain < holiday, "no dates sort first");
         assert_ne!(early.cmp(&holiday), Ordering::Equal);
+    }
+
+    #[test]
+    fn a_monday_holiday_moves_fridays_next_close_to_tuesday() {
+        // Monday 2027-01-18 is a holiday.
+        let close = new_york_close()
+            .with_dates(SessionDates::new([date(2027, 1, 18)], []).unwrap(), None)
+            .unwrap();
+
+        assert_eq!(
+            close.next_close_after(utc(2027, 1, 15, 21, 0, 0)),
+            Ok(utc(2027, 1, 19, 21, 0, 0))
+        );
+        assert_eq!(close.session_close_on(utc(2027, 1, 18, 15, 0, 0)), Ok(None));
+    }
+
+    #[test]
+    fn an_early_close_follows_daylight_saving() {
+        // Friday 2026-07-03 closes at 13:00 EDT = 17:00 UTC, an hour earlier in UTC than a winter
+        // early close.
+        let close = new_york_close()
+            .with_dates(
+                SessionDates::new([], [date(2026, 7, 3)]).unwrap(),
+                Some(at(13, 0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            close.next_close_after(utc(2026, 7, 2, 21, 0, 0)),
+            Ok(utc(2026, 7, 3, 17, 0, 0))
+        );
+        assert_eq!(
+            close.session_close_on(utc(2026, 7, 3, 12, 0, 0)),
+            Ok(Some(utc(2026, 7, 3, 17, 0, 0)))
+        );
     }
 }
