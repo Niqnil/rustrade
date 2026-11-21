@@ -266,3 +266,45 @@ fn an_initial_state_seeding_one_order_twice_is_refused() {
         )))
     );
 }
+
+#[test]
+fn a_fee_model_override_no_instrument_matches_is_logged_except_by_kind() {
+    let config = holding("BTC", "USDT").with_fee_model_overrides(
+        FeeModelOverrides::new()
+            .with_name("ETHUSDT", FeeModelConfig::default())
+            .with_underlying(
+                InstrumentKindDiscriminant::Spot,
+                Underlying::new(asset("ETH"), quote()),
+                FeeModelConfig::default(),
+            )
+            .with_underlying(
+                InstrumentKindDiscriminant::Spot,
+                Underlying::new(base(), quote()),
+                FeeModelConfig::default(),
+            )
+            .with_kind(
+                InstrumentKindDiscriminant::Future,
+                FeeModelConfig::default(),
+            ),
+    );
+
+    let (venue, events) = rustrade_instrument::test_utils::logs::capture(|| {
+        SimulatedVenue::try_new(&config, spot_instruments())
+    });
+
+    assert!(venue.is_ok());
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .map(|event| event.message().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings,
+        [
+            "fee model override names an instrument this venue does not have; it is never used",
+            "fee model override names a kind and underlying no instrument on this venue has; it \
+             is never used",
+        ],
+        "{events:?}"
+    );
+}
