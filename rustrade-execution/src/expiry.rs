@@ -269,8 +269,9 @@ pub enum ExpiryAnchorError {
 }
 
 impl ExpiryAnchor {
-    /// The offset before the anchor's reference instant.
-    pub const fn offset(&self) -> Duration {
+    /// The offset before the anchor's reference instant. Private: a later variant set at a clock
+    /// time would have none.
+    const fn offset(&self) -> Duration {
         match *self {
             Self::BeforeClose(offset) | Self::BeforeExpiry(offset) => offset,
         }

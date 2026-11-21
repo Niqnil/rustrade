@@ -985,6 +985,12 @@ fn a_sell_out_before_the_close_with_no_calendar_panics_when_the_clock_first_move
 
 #[test]
 #[should_panic(expected = "have no session calendar")]
+fn a_sell_out_before_the_close_with_no_calendar_panics_on_a_market_tick() {
+    feed(&mut uncalendared_venue(), "100", "1.5", time(1));
+}
+
+#[test]
+#[should_panic(expected = "have no session calendar")]
 fn a_sell_out_before_the_close_with_no_calendar_panics_when_asked_its_next_deadline() {
     let _ = uncalendared_venue().next_deadline();
 }
