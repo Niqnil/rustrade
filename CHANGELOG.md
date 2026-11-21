@@ -491,6 +491,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
     off at different offsets, or at one time of day whatever their close, cannot be modelled.
 
+- **`AlpacaClient::fetch_options_late_close_underlyings`** (`rustrade-execution`, `alpaca`
+  feature, #1017): the symbols of the underlyings whose options close at 16:15 ET instead of
+  16:00 ET (13:15 instead of 13:00 on an early close), sorted, read from the assets Alpaca marks
+  `options_late_close` with one `GET /v2/assets` request, inactive ones included. Use it to give
+  those underlyings' options their own close in a simulated venue's `session_close_overrides`,
+  from which its expiry-day cutoff and sell-out are measured; the rustdoc has an example. Key
+  only the underlyings your instruments use, as the venue warns of each entry no instrument
+  matches. Known limitation: the list is as of the request, and Alpaca gives no date on which an
+  underlying joined or left it.
+
 - **The engine tracks an order on the terms the venue states for it, and reports a change**
   (`rustrade`). An order changed at the venue other than by the engine's own amend (in the
   venue's interface, by another API client, or by the venue) was tracked on its old terms: its
@@ -959,6 +969,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `MockExecutionConfig` has an `expiry_day_cutoff` field** (`rustrade-execution`). A
   struct literal must set it (`None` to take opening orders until expiry);
   `MockExecutionConfig::new` sets it to `None`. A serialized config without it reads as `None`.
+
+- **Breaking: `MockExecutionConfig` has a `session_close_overrides` field** (`rustrade-execution`).
+  A struct literal must set it (`SessionCloseOverrides::default()` for none);
+  `MockExecutionConfig::new` sets it empty. A serialized config without it reads as empty.
 
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).

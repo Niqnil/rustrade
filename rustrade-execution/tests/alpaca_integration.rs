@@ -315,6 +315,34 @@ async fn test_fetch_shortability() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_fetch_options_late_close_underlyings() {
+    use rustrade_instrument::asset::name::AssetNameExchange;
+
+    init_logging();
+    let client = AlpacaClient::new(test_config());
+
+    let symbols = client
+        .fetch_options_late_close_underlyings()
+        .await
+        .expect("late-close underlyings");
+    println!("{} late-close underlyings: {symbols:?}", symbols.len());
+
+    // The three Alpaca support names as closing at 16:15 ET.
+    for symbol in ["SPY", "QQQ", "IWM"] {
+        assert!(
+            symbols.contains(&AssetNameExchange::new(symbol)),
+            "{symbol} closes late: {symbols:?}"
+        );
+    }
+    assert!(
+        !symbols.contains(&AssetNameExchange::new("AAPL")),
+        "a single stock's options close at 16:00 ET: {symbols:?}"
+    );
+    assert!(symbols.is_sorted(), "{symbols:?}");
+}
+
 // ============================================================================
 // Open Orders Tests
 // ============================================================================
