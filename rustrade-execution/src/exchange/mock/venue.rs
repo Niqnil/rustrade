@@ -1293,8 +1293,10 @@ impl SimulatedVenue {
     /// A day limit order seeded through `initial_state` is given the close after the instant the
     /// live venue accepted it (its [`Open::time_exchange`]), unless it already has one. An order
     /// already given a deadline keeps it, since a deadline is fixed when it is resolved, so one the
-    /// configured `session_close` already placed keeps that close. To have `calendar` place every
-    /// seeded order, build the venue from a configuration with no `session_close`.
+    /// configuration's session close already placed (its `session_close`, or a matching
+    /// `session_close_overrides` entry) keeps that close. To have `calendar` place every seeded
+    /// order, build the venue from a configuration with no `session_close` and no override
+    /// matching those orders' instruments.
     ///
     /// # Errors
     /// The [`CalendarError`] of the first seeded day order, by client order id, that `calendar`
