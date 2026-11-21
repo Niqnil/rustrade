@@ -44,19 +44,12 @@ pub const COMPETING_LIVE_SESSION: i32 = 10197;
 /// [`MAX_TICKERS`] and [`MAX_DEPTH_REQUESTS`].
 pub const SUBSCRIPTION_LIMIT_CODES: [i32; 2] = [MAX_TICKERS, MAX_DEPTH_REQUESTS];
 
-/// Codes saying the account may not have the instrument's market data, after which no tick comes:
-/// [`MARKET_DATA_NOT_SUBSCRIBED`], [`API_MARKET_DATA_NOT_SUBSCRIBED`] and
-/// [`DELAYED_MARKET_DATA_NOT_ENABLED`].
+/// Codes saying IB will send this account no market data for the instrument, after which no tick
+/// comes: it is not subscribed ([`MARKET_DATA_NOT_SUBSCRIBED`], [`API_MARKET_DATA_NOT_SUBSCRIBED`],
+/// [`DELAYED_MARKET_DATA_NOT_ENABLED`]), or another session has precedence
+/// ([`COMPETING_LIVE_SESSION`]).
 ///
 /// 10167, delayed data shown in place of live, is not one: the ticks follow it.
-pub const MARKET_DATA_NOT_SUBSCRIBED_CODES: [i32; 3] = [
-    MARKET_DATA_NOT_SUBSCRIBED,
-    API_MARKET_DATA_NOT_SUBSCRIBED,
-    DELAYED_MARKET_DATA_NOT_ENABLED,
-];
-
-/// Codes saying IB will send this account no market data for the instrument, after which no tick
-/// comes: the [`MARKET_DATA_NOT_SUBSCRIBED_CODES`], and [`COMPETING_LIVE_SESSION`].
 pub const MARKET_DATA_NOT_AVAILABLE_CODES: [i32; 4] = [
     MARKET_DATA_NOT_SUBSCRIBED,
     API_MARKET_DATA_NOT_SUBSCRIBED,
