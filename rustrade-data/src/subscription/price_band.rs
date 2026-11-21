@@ -3,6 +3,8 @@
 //! US equity venues bound each stock's price with a band around a reference price (Limit Up-Limit
 //! Down). A trade outside it is refused; a quote resting at a limit for too long triggers a trading
 //! pause. A [`PriceBand`] reports each band the venue publishes.
+//!
+//! [`PriceBand`]: crate::subscription::price_band::PriceBand
 
 use super::SubscriptionKind;
 use rust_decimal::Decimal;

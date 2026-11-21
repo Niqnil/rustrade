@@ -65,10 +65,11 @@
 //!   market data carries a top of book rather than a quote. A side Alpaca publishes at a zero price
 //!   has no quote and is `None`.
 //! - [`TradingStatuses`](crate::subscription::trading_status::TradingStatuses): halts, pauses and
-//!   resumptions, from the `statuses` channel. Stock feeds only. See [`status`] for how Alpaca's
-//!   codes map, and which are not reported.
+//!   resumptions, from the `statuses` channel. Stock feeds only. See
+//!   [`status`](crate::exchange::alpaca::status) for how Alpaca's codes map, and which are not
+//!   reported.
 //! - [`PriceBands`](crate::subscription::price_band::PriceBands): Limit Up-Limit Down bands, from
-//!   the `lulds` channel. Stock feeds only. See [`luld`].
+//!   the `lulds` channel. Stock feeds only. See [`luld`](crate::exchange::alpaca::luld).
 //!
 //! The crypto feed publishes no trading status or price bands, so a crypto subscription to either
 //! does not compile. Alpaca does not say which stock feeds carry them: the IEX feed accepts the
