@@ -3,7 +3,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialise default non-JSON logging.
 ///
-/// Installs [`AuditSpanFilter`], so a log line a
+/// Installs [`ReplicaLogFilter`], so a log line a
 /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) repeats while
 /// updating its replica `EngineState` is written once.
 pub fn init_logging() {
@@ -14,13 +14,13 @@ pub fn init_logging() {
                 .from_env_lossy(),
         )
         .with(tracing_subscriber::fmt::layer())
-        .with(AuditSpanFilter)
+        .with(ReplicaLogFilter)
         .init()
 }
 
 /// Initialise default JSON logging.
 ///
-/// Installs [`AuditSpanFilter`], so a log line a
+/// Installs [`ReplicaLogFilter`], so a log line a
 /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) repeats while
 /// updating its replica `EngineState` is written once.
 pub fn init_json_logging() {
@@ -31,7 +31,7 @@ pub fn init_json_logging() {
                 .from_env_lossy(),
         )
         .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
-        .with(AuditSpanFilter)
+        .with(ReplicaLogFilter)
         .init()
 }
 
@@ -48,12 +48,12 @@ pub fn init_json_logging() {
 /// added to see each line once:
 ///
 /// ```
-/// use rustrade::logging::AuditSpanFilter;
+/// use rustrade::logging::ReplicaLogFilter;
 /// use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 ///
 /// tracing_subscriber::registry()
 ///     .with(tracing_subscriber::fmt::layer())
-///     .with(AuditSpanFilter)
+///     .with(ReplicaLogFilter)
 ///     .init();
 /// ```
 ///
@@ -63,9 +63,9 @@ pub fn init_json_logging() {
 /// [`StateReplicaManager::update_from_event`]: crate::engine::audit::state_replica::StateReplicaManager::update_from_event
 /// [`EngineState`]: crate::engine::state::EngineState
 #[derive(Debug)]
-pub struct AuditSpanFilter;
+pub struct ReplicaLogFilter;
 
-impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for AuditSpanFilter {
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ReplicaLogFilter {
     fn event_enabled(
         &self,
         _: &tracing::Event<'_>,
@@ -98,11 +98,11 @@ mod tests {
         }
     }
 
-    /// How many of the events `f` logs reach a layer behind [`AuditSpanFilter`].
+    /// How many of the events `f` logs reach a layer behind [`ReplicaLogFilter`].
     fn events_kept(f: impl FnOnce()) -> usize {
         let count = Arc::new(AtomicUsize::new(0));
         rustrade_instrument::test_utils::logs::with_layer(
-            AuditSpanFilter.and_then(Count(Arc::clone(&count))),
+            ReplicaLogFilter.and_then(Count(Arc::clone(&count))),
             f,
         );
         count.load(Ordering::Relaxed)
