@@ -1,7 +1,10 @@
 //! Why [`SimulatedVenue::try_new`](super::SimulatedVenue::try_new) refuses a configuration, and
 //! the check that a venue's configuration spells each asset one way.
 
-use crate::{client::mock::MockExecutionConfig, exchange::mock::account::DuplicateSeededOrder};
+use crate::{
+    client::mock::MockExecutionConfig, exchange::mock::account::DuplicateSeededOrder,
+    expiry::ExpiryAnchorError,
+};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 use rust_decimal::Decimal;
@@ -92,6 +95,25 @@ pub enum VenueConfigError {
          initial_state: {0}"
     )]
     SessionCalendar(#[source] CalendarError),
+
+    /// The anchor of [`MockExecutionConfig::expiry_sell_out`] cannot place the sell-out of an
+    /// option the venue lists.
+    #[error(transparent)]
+    ExpirySellOut(#[from] ExpirySellOutUnplaceable),
+}
+
+/// The anchor of [`MockExecutionConfig::expiry_sell_out`] cannot place the sell-out of an option
+/// a [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored before the session
+/// close for an option with no session calendar.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+#[error("the expiry sell-out cannot be placed for the option {instrument}: {source}")]
+pub struct ExpirySellOutUnplaceable {
+    /// The option, the first by name the anchor cannot place.
+    pub instrument: InstrumentNameExchange,
+    /// Why.
+    #[source]
+    pub source: ExpiryAnchorError,
 }
 
 /// Two names in one [`SimulatedVenue`](super::SimulatedVenue)'s configuration that name one asset

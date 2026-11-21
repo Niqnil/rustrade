@@ -218,8 +218,12 @@ pub struct MockExecutionConfig {
     #[serde(default, skip_serializing_if = "FeeModelOverrides::is_empty")]
     pub fee_model_overrides: FeeModelOverrides,
     /// Whether the mock exchange sells a long option the account cannot afford to exercise, at a
-    /// set time before it expires, as a broker sells out an account short of the cash or shares.
-    /// See [`ExpirySellOut`].
+    /// set time before its expiry day's close or before its expiry, as a broker sells out an
+    /// account short of the cash or shares. See [`ExpirySellOut`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
+    /// each option: [`session_close`](Self::session_close), an entry of
+    /// [`session_close_overrides`](Self::session_close_overrides), or one the venue is given
+    /// later.
     ///
     /// Defaults to `None`: every long option is held to expiry and settles under
     /// [`long_option_expiry`](Self::long_option_expiry), an exercise the account cannot cover
@@ -1334,7 +1338,7 @@ pub async fn request_corporate_action(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::{AccountEventKind, balance::Balance};
+    use crate::{AccountEventKind, balance::Balance, expiry::ExpiryAnchor};
     use rust_decimal::Decimal;
     use rustrade_integration::collection::snapshot::Snapshot;
 
@@ -1504,7 +1508,8 @@ mod tests {
                 "America/New_York".parse().unwrap(),
             )),
         );
-        let expiry_sell_out = ExpirySellOut::new(Duration::from_secs(3600));
+        let expiry_sell_out =
+            ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(3600)));
 
         let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
             .with_fee_model(fee_model.clone())

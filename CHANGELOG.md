@@ -349,7 +349,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A calendar of your own:** `SimulatedVenue::with_session_calendar` and
     `SimVenueOptions::session_calendar` override the configured close. A day order seeded in
     `initial_state` expires at the close after the instant the live venue accepted it, placed
-    by the options' calendar when one is given.
+    by the options' calendar when one is given. `with_session_calendar` returns a
+    `VenueConfigError`: `SessionCalendar` for a seeded day order the calendar cannot place, or
+    `ExpirySellOut` for an expiry sell-out it cannot place.
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
@@ -425,15 +427,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The simulated venue sells out a long option the account cannot afford to exercise**
   (`rustrade-execution`, #917).
-  - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At
-    `before_expiry` before each physically settled option's expiry, a long in the money that the
-    account cannot afford to exercise is sold, as a broker sells out an account short of buying
-    power (Alpaca sells in the last hour before expiry). A call's exercise needs the strike's cash:
+  - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At the instant
+    its anchor places for each physically settled option, a long in the money that the account
+    cannot afford to exercise is sold, as a broker sells out an account short of buying power
+    (Alpaca sells in the last hour before the expiry day's close). A call's exercise needs the strike's cash:
     free quote, plus on a spot margin venue what it would lend for a buy. A put's needs free shares,
     which excludes shares securing a short call, and balances reserved for working orders, the
     option's own included, are not free. Longs checked at one instant share what the account has,
     in name order: each spends on what goes on to expiry, the contracts kept and any its sale left
     unsold.
+  - **`ExpiryAnchor`** (`#[non_exhaustive]`), set by `ExpirySellOut::new(anchor)` and read by
+    `anchor()`: `BeforeClose(Duration)` checks that long before the session close on the expiry's
+    date in the option's own calendar (its `session_close_overrides` entry, else the venue's
+    `session_close` or `with_session_calendar`); `BeforeExpiry(Duration)` checks that long before
+    the expiry instant, for a venue trading around the clock. Serialised externally tagged in
+    snake case, as `"anchor": {"before_close": {"secs": 3600, "nanos": 0}}`.
+    `ExpiryAnchor::instant` places it, or says why not (`ExpiryAnchorError`).
+  - **`BeforeClose` refusals:** building the venue (`VenueConfigError::ExpirySellOut`), restoring
+    it (`VenueRestoreError::ExpirySellOut`) or attaching a calendar refuses an option whose expiry
+    falls on a date with no session, whose expiry day closes after its expiry (stamp the expiry at
+    or after the close; a close equal to it is accepted), or whose calendar cannot answer; the
+    error is an `ExpirySellOutUnplaceable` naming the option. An option with no calendar at all is
+    built, so that `with_session_calendar` can supply one, and the venue panics when its clock
+    first moves (`advance_time`, `apply_market`) or on `next_deadline` if none has. An expiry stamped at midnight UTC falls on the previous New York date, so it is
+    anchored to that day's close, as the venue also settles it that evening.
   - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
     it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
   - **The sale** cancels the orders working on the option, then sells as a market sell fills
@@ -442,8 +459,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `next_deadline` includes each check. What is not sold, because it is affordable or out of the
     money, or because nothing prices the sale or the underlying, goes on to expiry under
     `long_option_expiry`. Cash-settled options are never sold.
-  - **Known limitations:** one check at the instant set, against the market held then; no cut-off
-    for orders between the check and expiry; one exercise's proceeds do not fund another.
+  - **Known limitations:** one check at the instant set, against the market held then; one anchor
+    for every option, so classes sold out at different offsets before their closes cannot be
+    modelled; no cut-off for orders between the check and expiry; one exercise's proceeds do not
+    fund another.
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
 
 - **The engine tracks an order on the terms the venue states for it, and reports a change**

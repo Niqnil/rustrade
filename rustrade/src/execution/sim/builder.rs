@@ -208,8 +208,7 @@ pub(crate) fn market_driven_venue(
     if let Some(calendar) = session_calendar {
         venue = venue.with_session_calendar(calendar).map_err(|error| {
             RustradeError::ExecutionBuilder(format!(
-                "simulated venue {exchange} cannot place a seeded day order's session close: \
-                 {error}"
+                "simulated venue {exchange} cannot apply its session calendar: {error}"
             ))
         })?;
     }
