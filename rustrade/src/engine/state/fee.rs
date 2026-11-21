@@ -571,7 +571,8 @@ mod tests {
         assert_eq!(setup.btc_usdt().tear_sheet.fills_fee_unconverted, 0);
     }
 
-    /// A fee in quote, or one already given a quote equivalent, is applied as it is, unreported.
+    /// A fee in quote or base, or one already given a quote equivalent, is applied as it is,
+    /// unreported.
     #[test]
     fn a_fee_in_quote_or_already_valued_is_not_converted() {
         let mut setup = Setup::new(
