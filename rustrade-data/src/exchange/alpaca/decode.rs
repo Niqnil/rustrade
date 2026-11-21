@@ -107,8 +107,10 @@ where
         input
             .into_iter()
             .filter_map(|message| {
+                // Found before decoding, so an unknown symbol is an error even when the decoder would
+                // drop its message; cloned only for a message that becomes an event.
                 let instrument = match self.instrument_map.find(message.subscription_id()) {
-                    Ok(instrument) => instrument.clone(),
+                    Ok(instrument) => instrument,
                     Err(unidentified) => {
                         return Some(Err(DataError::Socket(unidentified.to_string())));
                     }
@@ -120,7 +122,7 @@ where
                         time_exchange,
                         time_received,
                         exchange: self.exchange_id,
-                        instrument,
+                        instrument: instrument.clone(),
                         kind,
                     })
                 })

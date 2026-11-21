@@ -155,7 +155,16 @@ struct Provider {
 
 impl Provider {
     async fn start(url: &Mutex<Option<&'static str>>, auth: Auth, cap: usize) -> Self {
-        Self::start_ignoring(url, auth, cap, &[]).await
+        Self::start_with(
+            url,
+            Behaviour {
+                auth,
+                cap,
+                ignored: &[],
+                unavailable: &[],
+            },
+        )
+        .await
     }
 
     /// As [`start`](Self::start), but the provider never registers a subscribe for `ignored`
@@ -166,6 +175,37 @@ impl Provider {
         cap: usize,
         ignored: &'static [&'static str],
     ) -> Self {
+        Self::start_with(
+            url,
+            Behaviour {
+                auth,
+                cap,
+                ignored,
+                unavailable: &[],
+            },
+        )
+        .await
+    }
+
+    /// As [`start`](Self::start), but the feed lacks the `unavailable` channels: a subscribe naming
+    /// one is refused with Alpaca's 410, adding nothing.
+    async fn start_without_channels(
+        url: &Mutex<Option<&'static str>>,
+        unavailable: &'static [&'static str],
+    ) -> Self {
+        Self::start_with(
+            url,
+            Behaviour {
+                auth: Auth::Accept,
+                cap: 30,
+                ignored: &[],
+                unavailable,
+            },
+        )
+        .await
+    }
+
+    async fn start_with(url: &Mutex<Option<&'static str>>, behaviour: Behaviour) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address: &'static str =
             Box::leak(format!("ws://{}", listener.local_addr().unwrap()).into_boxed_str());
@@ -193,7 +233,7 @@ impl Provider {
                 tokio::spawn(serve_connection(
                     stream,
                     number,
-                    Behaviour { auth, cap, ignored },
+                    behaviour,
                     Arc::clone(&log),
                     rx,
                     Arc::clone(&closed),
@@ -296,6 +336,8 @@ struct Behaviour {
     auth: Auth,
     cap: usize,
     ignored: &'static [&'static str],
+    /// Channels the feed does not carry.
+    unavailable: &'static [&'static str],
 }
 
 async fn serve_connection(
@@ -306,7 +348,12 @@ async fn serve_connection(
     mut control: mpsc::UnboundedReceiver<Control>,
     closed: Arc<AtomicUsize>,
 ) {
-    let Behaviour { auth, cap, ignored } = behaviour;
+    let Behaviour {
+        auth,
+        cap,
+        ignored,
+        unavailable,
+    } = behaviour;
 
     let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
         closed.fetch_add(1, Ordering::SeqCst);
@@ -352,6 +399,13 @@ async fn serve_connection(
                     json!([{"T": "error", "code": 406, "msg": "connection limit exceeded"}])
                 }
             },
+            "subscribe"
+                if unavailable
+                    .iter()
+                    .any(|channel| !payload[*channel].is_null()) =>
+            {
+                json!([{"T": "error", "code": 410, "msg": "invalid subscribe action for this feed"}])
+            }
             "subscribe" => {
                 let mut next = held.clone();
                 let registered = |symbol: &String| !ignored.contains(&symbol.as_str());
@@ -832,4 +886,40 @@ async fn statuses_and_bands_share_the_connection_and_each_stream_decodes_only_it
     quiet(&mut statuses).await;
     quiet(&mut bands).await;
     quiet(&mut trading).await;
+}
+
+/// A feed that lacks a channel refuses its subscribe, and the refusal fails the stream's
+/// initialisation with Alpaca's code and message, leaving the other streams on the connection up.
+#[tokio::test]
+#[serial]
+async fn a_feed_refusing_the_status_channel_fails_its_subscribe_with_alpacas_code() {
+    type StatusStream =
+        AlpacaStream<AlpacaDecodeTransformer<Equities, MarketDataInstrument, AlpacaStatusDecoder>>;
+    let provider = Provider::start_without_channels(&EQUITIES_URL, &["statuses"]).await;
+    let subscriber = subscriber();
+
+    let mut trading = trade_stream(&subscriber.clone(), &[trades("aapl")])
+        .await
+        .unwrap();
+    let refused =
+        <StatusStream as MarketStream<Equities, MarketDataInstrument, TradingStatuses>>::init::<
+            NoInitialSnapshots,
+        >(
+            &subscriber,
+            &[Subscription::new(
+                Equities::default(),
+                MarketDataInstrument::from(("aapl", "usd", MarketDataInstrumentKind::Spot)),
+                TradingStatuses,
+            )],
+        )
+        .await
+        .unwrap_err();
+
+    let message = refused.to_string();
+    assert!(message.contains("410"), "{message}");
+    assert!(message.contains("invalid subscribe action"), "{message}");
+    assert_eq!(provider.connections(), 1);
+
+    provider.push(json!([trade("AAPL", 4)]));
+    assert_eq!(next_event(&mut trading).await.kind.id, "4");
 }

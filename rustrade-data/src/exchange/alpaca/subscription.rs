@@ -212,6 +212,24 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_channel_names_alpacas_code_and_message() {
+        for (code, msg) in [
+            (409, "insufficient subscription"),
+            (410, "invalid subscribe action for this feed"),
+        ] {
+            let response = AlpacaSubResponse(vec![AlpacaSubResponseInner::Error {
+                code: Some(code),
+                msg: msg.into(),
+            }]);
+
+            let message = response.validate().unwrap_err().to_string();
+
+            assert!(message.contains(&code.to_string()), "{message}");
+            assert!(message.contains(msg), "{message}");
+        }
+    }
+
+    #[test]
     fn test_validate_success_passes() {
         // Success messages are treated as benign during subscription validation
         // (they may arrive if auth confirmation is re-sent)

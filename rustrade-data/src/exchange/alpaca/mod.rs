@@ -218,7 +218,7 @@ pub struct AlpacaServerCrypto;
 ///
 /// The crypto feed does not:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use rustrade_data::{
 ///     exchange::{StreamSelector, alpaca::AlpacaCrypto},
 ///     subscription::trading_status::TradingStatuses,
@@ -234,6 +234,9 @@ pub struct AlpacaServerCrypto;
 ///
 /// serves::<AlpacaCrypto, TradingStatuses>();
 /// ```
+///
+/// Implementing it for a server of your own, such as a proxy or a test double of a stock feed,
+/// asserts that the server serves Alpaca's `statuses` and `lulds` channels.
 pub trait AlpacaStockServer: ExchangeServer {}
 
 impl AlpacaStockServer for AlpacaServerIex {}

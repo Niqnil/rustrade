@@ -246,6 +246,16 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_penny_limit_is_kept_exactly_and_a_null_one_is_none() {
+        let luld =
+            luld(r#"[{"T":"l","S":"X","u":3.2451,"d":null,"i":"B","t":"2023-04-06T13:34:45Z"}]"#);
+
+        let band = AlpacaLuldDecoder.decode(luld).unwrap();
+
+        assert_eq!((band.upper, band.lower), (Some(dec!(3.2451)), None));
+    }
+
+    #[test]
     fn a_zero_or_missing_limit_is_none() {
         let zero = luld(r#"[{"T":"l","S":"X","u":0,"d":2.65,"t":"2023-04-06T13:34:45Z"}]"#);
         let missing = luld(r#"[{"T":"l","S":"X","u":3.24,"t":"2023-04-06T13:34:45Z"}]"#);

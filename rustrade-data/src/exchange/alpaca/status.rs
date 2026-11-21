@@ -164,24 +164,9 @@ enum Reading {
 
 /// What status code `sc` with reason code `rc` reports on `plan`'s tapes.
 fn read(plan: Plan, sc: &str, rc: &str) -> Reading {
-    let halt = |reason| match reason {
-        Some(HaltReason::Volatility) => TradingStatus::new(TradingState::Paused),
-        _ => TradingStatus::new(TradingState::Halted),
-    };
-    let with_reason = |status: TradingStatus, reason: Option<HaltReason>| match reason {
-        Some(reason) => status.with_reason(reason),
-        None => status,
-    };
-
     let status = match (plan, sc) {
-        (Plan::Cta, "2") => {
-            let reason = cta_reason(rc);
-            with_reason(halt(reason), reason)
-        }
-        (Plan::Utp, "H") => {
-            let reason = utp_reason(rc);
-            with_reason(halt(reason), reason)
-        }
+        (Plan::Cta, "2") => halt(cta_reason(rc)),
+        (Plan::Utp, "H") => halt(utp_reason(rc)),
         (Plan::Utp, "P") => {
             TradingStatus::new(TradingState::Paused).with_reason(HaltReason::Volatility)
         }
@@ -193,6 +178,17 @@ fn read(plan: Plan, sc: &str, rc: &str) -> Reading {
         _ => return Reading::Undocumented,
     };
     Reading::State(status)
+}
+
+/// A halt with `reason`: a pause when the reason is volatility, which a volatility halt is.
+fn halt(reason: Option<HaltReason>) -> TradingStatus {
+    match reason {
+        Some(HaltReason::Volatility) => {
+            TradingStatus::new(TradingState::Paused).with_reason(HaltReason::Volatility)
+        }
+        Some(reason) => TradingStatus::new(TradingState::Halted).with_reason(reason),
+        None => TradingStatus::new(TradingState::Halted),
+    }
 }
 
 /// The reason a CTA halt's reason code gives, or `None` when it gives none.

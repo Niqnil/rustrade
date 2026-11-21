@@ -798,33 +798,36 @@ async fn test_iex_price_bands_receive_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
+    // A band with neither limit is valid (no band in effect, such as while bands are suspended),
+    // so one is logged and the wait goes on for one with a limit.
     let wait = Duration::from_secs(600);
-    match tokio::time::timeout(wait, async {
+    let band = tokio::time::timeout(wait, async {
         loop {
             match stream.next().await {
-                Some(Event::Item(band)) => return band,
+                Some(Event::Item(band))
+                    if band.kind.upper.is_some() || band.kind.lower.is_some() =>
+                {
+                    return band;
+                }
+                Some(Event::Item(band)) => tracing::info!(?band, "IEX price band with no limit"),
                 Some(Event::Reconnecting(_)) => continue,
                 None => panic!("Stream ended unexpectedly"),
             }
         }
     })
     .await
-    {
-        Ok(band) => {
-            tracing::info!(?band, "Received IEX price band");
-            assert!(
-                band.kind.upper.is_some() || band.kind.lower.is_some(),
-                "a band with neither limit: {band:?}"
-            );
-            assert!(
-                band.kind.venue_code.is_some(),
-                "a band without its venue code: {band:?}"
-            );
-        }
-        Err(_) => panic!(
-            "No IEX price band for {symbols:?} within {wait:?}, with the US regular session open"
-        ),
-    }
+    .unwrap_or_else(|_| {
+        panic!(
+            "No IEX price band with a limit for {symbols:?} within {wait:?}, with the US regular \
+             session open"
+        )
+    });
+
+    tracing::info!(?band, "Received IEX price band");
+    assert!(
+        band.kind.venue_code.is_some(),
+        "a band without its venue code: {band:?}"
+    );
 }
 
 // ============================================================================
