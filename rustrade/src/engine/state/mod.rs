@@ -666,11 +666,9 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
 
                 let instrument_state = self.instruments.instrument_index_mut(&trade.instrument);
                 if let Some(conversion) = &conversion {
-                    let unconverted = conversion.outcome.fees_quote().is_none();
-                    // The first unconverted fee the tear sheet counts gets the one WARN.
-                    conversion
-                        .log(unconverted && instrument_state.tear_sheet.fills_fee_unconverted == 0);
-                    if unconverted {
+                    // Before this fill is counted, so its fee takes the WARN if it is the first.
+                    conversion.log(instrument_state.tear_sheet.fills_fee_unconverted == 0);
+                    if conversion.outcome.fees_quote().is_none() {
                         instrument_state.tear_sheet.record_fill_fee_unconverted();
                     }
                 }

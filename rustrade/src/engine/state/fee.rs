@@ -68,14 +68,14 @@ where
     InstrumentKey: Display + Debug,
 {
     /// Logs the conversion. A valued fee logs at DEBUG. A fee left out of PnL logs at WARN when
-    /// `first_unconverted` says it is the first its instrument's tear sheet counts, and at DEBUG
-    /// after that.
+    /// `none_counted_yet`, that is when its instrument's tear sheet has counted no such fee
+    /// before it, and at DEBUG otherwise.
     ///
     /// The per-fill signals are [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion)
     /// and [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted);
     /// the one WARN only points a reader to them, so a run that pays every fee in an asset it
     /// cannot price does not log a WARN per fill.
-    pub(crate) fn log(&self, first_unconverted: bool) {
+    pub(crate) fn log(&self, none_counted_yet: bool) {
         match &self.outcome {
             FeeConversionOutcome::Converted {
                 pricing_instrument,
@@ -91,7 +91,7 @@ where
                 %fees_quote,
                 "valued a fill's third-asset fee in quote"
             ),
-            unconverted if first_unconverted => warn!(
+            unconverted if none_counted_yet => warn!(
                 instrument = %self.instrument,
                 trade_id = %self.trade_id,
                 fee_asset = %self.asset,
