@@ -60,7 +60,7 @@ use rustrade_instrument::{
             option::{OptionContract, OptionKind, OptionSettlement},
         },
         name::InstrumentNameExchange,
-        overrides::UnmatchedOverride,
+        overrides::{InstrumentOverrides, UnmatchedOverride},
     },
 };
 use rustrade_integration::collection::snapshot::Snapshot;
@@ -689,9 +689,11 @@ pub enum VenueRegime {
 ///
 /// ## A day order lives until the session closes
 /// A venue knows when its sessions close from [`MockExecutionConfig::session_close`], or from a
-/// calendar attached with [`with_session_calendar`](Self::with_session_calendar). Without either it
-/// refuses a `GoodUntilEndOfDay` limit order. With one, it resolves the order's deadline once, when
-/// it accepts the order: the first instant after the next session close. The order then rests,
+/// calendar attached with [`with_session_calendar`](Self::with_session_calendar), and an
+/// instrument an entry of [`MockExecutionConfig::session_close_overrides`] matches closes under
+/// that entry's calendar instead. Without any for the order's instrument, it refuses a
+/// `GoodUntilEndOfDay` limit order. With one, it resolves the order's deadline once, when it
+/// accepts the order: the first instant after the instrument's next session close. The order then rests,
 /// held or on the book, and expires at that deadline like a `GoodTillDate` order (see below), and
 /// it keeps reporting `GoodUntilEndOfDay`. An amend does not move the deadline, and a snapshot
 /// keeps it.
@@ -706,8 +708,7 @@ pub enum VenueRegime {
 ///   venue does not refuse one when it has no calendar, since the live venue already accepted
 ///   it, but then it has no deadline and works until cancelled.
 /// - The configured [`DailyClose`](rustrade_instrument::calendar::DailyClose) knows only the
-///   holidays and early closes it is given, and there is one calendar for the whole venue: see
-///   [`SessionCalendarConfig`]'s known limitations.
+///   holidays and early closes it is given: see [`SessionCalendarConfig`]'s known limitations.
 ///
 /// A market order works only on arrival, which honours every time in force that bounds *how long*
 /// an order works — so most of the table is moot for one. (It fills in full wherever the book has
@@ -958,8 +959,13 @@ pub struct SimulatedVenue {
     time_in_force: TimeInForceRules,
     /// When this venue's sessions close, which is when a day limit order expires, or `None` if it
     /// has no calendar and so refuses one. From [`MockExecutionConfig::session_close`], or
-    /// [`with_session_calendar`](Self::with_session_calendar).
+    /// [`with_session_calendar`](Self::with_session_calendar). An instrument in
+    /// [`session_calendars`](Self::session_calendars) closes under its own instead.
     session_calendar: Option<Arc<dyn SessionCalendar>>,
+    /// The session calendar of each instrument an entry of
+    /// [`MockExecutionConfig::session_close_overrides`] matches. Instruments are fixed at
+    /// construction, so this never changes.
+    session_calendars: FnvHashMap<InstrumentNameExchange, Arc<dyn SessionCalendar>>,
     /// The expiry of every option this venue lists, earliest first. Instruments are fixed at
     /// construction, so this never changes.
     option_expiries: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
@@ -1143,7 +1149,23 @@ impl SimulatedVenue {
             .expiry_sell_out
             .map(|sell_out| sell_out_instants(&instruments, sell_out.before_expiry()))
             .unwrap_or_default();
-        warn_unmatched_fee_overrides(&config.fee_model_overrides, &instruments);
+        warn_unmatched_overrides("fee model", &config.fee_model_overrides, &instruments);
+        warn_unmatched_overrides(
+            "session close",
+            &config.session_close_overrides,
+            &instruments,
+        );
+        let session_calendars = instruments
+            .iter()
+            .filter_map(|(name, instrument)| {
+                let close = config.session_close_overrides.resolve(
+                    name,
+                    instrument.kind.discriminant(),
+                    &instrument.underlying,
+                )?;
+                Some((name.clone(), close.calendar()))
+            })
+            .collect();
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model.clone(),
@@ -1186,6 +1208,7 @@ impl SimulatedVenue {
                 .session_close
                 .as_ref()
                 .map(SessionCalendarConfig::calendar),
+            session_calendars,
             option_expiries,
             next_option_expiry: None,
             option_spots,
@@ -1257,7 +1280,9 @@ impl SimulatedVenue {
     /// This venue, closing its sessions as `calendar` says rather than as the configured
     /// [`session_close`](MockExecutionConfig::session_close), so it accepts a
     /// [`TimeInForce::GoodUntilEndOfDay`] limit order and expires it at the first instant after
-    /// the next close: see the type's "Which `TimeInForce` this venue honours".
+    /// the next close: see the type's "Which `TimeInForce` this venue honours". An instrument an
+    /// entry of [`session_close_overrides`](MockExecutionConfig::session_close_overrides) matches
+    /// keeps that entry's close.
     ///
     /// The way to plug in a calendar of your own, such as one read from an exchange's published
     /// calendar. Like [`with_fill_model`](Self::with_fill_model), it is not part of the
@@ -1289,20 +1314,38 @@ impl SimulatedVenue {
     /// was accepted, if this venue has a session calendar. Only a seeded order can lack one: the
     /// venue resolves the deadline of every day order it accepts itself.
     fn resolve_seeded_deadlines(&mut self) -> Result<(), CalendarError> {
-        let Some(calendar) = self.session_calendar.clone() else {
-            return Ok(());
-        };
-        self.account.resolve_deadlines(|order| {
-            if is_day_limit(order.kind, order.time_in_force) {
-                deadline_after_close(calendar.as_ref(), order.state.time_exchange).map(Some)
-            } else {
-                Ok(None)
+        let Self {
+            account,
+            session_calendar,
+            session_calendars,
+            ..
+        } = self;
+        account.resolve_deadlines(|order| {
+            let calendar = session_calendars
+                .get(&order.key.instrument)
+                .or(session_calendar.as_ref());
+            match calendar {
+                Some(calendar) if is_day_limit(order.kind, order.time_in_force) => {
+                    deadline_after_close(calendar.as_ref(), order.state.time_exchange).map(Some)
+                }
+                _ => Ok(None),
             }
         })
     }
 
+    /// The session calendar `instrument` closes under: its own from
+    /// [`MockExecutionConfig::session_close_overrides`], else the venue's, if either is set.
+    fn session_calendar_of(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Option<&Arc<dyn SessionCalendar>> {
+        self.session_calendars
+            .get(instrument)
+            .or(self.session_calendar.as_ref())
+    }
+
     /// The deadline of a [`TimeInForce::GoodUntilEndOfDay`] limit order arriving at `now`: the
-    /// first instant after this venue's next session close. `None` for any other order.
+    /// first instant after its instrument's next session close. `None` for any other order.
     ///
     /// # Errors
     /// [`OrderError::UnsupportedTimeInForce`] if the calendar cannot answer for `now`. A venue with
@@ -1315,7 +1358,7 @@ impl SimulatedVenue {
         if !is_day_limit(request.state.kind, request.state.time_in_force) {
             return Ok(None);
         }
-        let Some(calendar) = &self.session_calendar else {
+        let Some(calendar) = self.session_calendar_of(&request.key.instrument) else {
             unreachable!("validate_time_in_force_supported refuses a day limit with no calendar");
         };
         deadline_after_close(calendar.as_ref(), now)
@@ -5459,7 +5502,7 @@ impl SimulatedVenue {
         if let Err(error) = validate_time_in_force_supported(
             request.state.kind,
             request.state.time_in_force,
-            self.session_calendar.is_some(),
+            self.session_calendar_of(&request.key.instrument).is_some(),
         ) {
             return (build_open_order_err_response(request, error), None);
         }
@@ -7499,27 +7542,28 @@ fn option_expiries(
         .collect()
 }
 
-/// Logs a warning for each entry of `overrides` that matches none of `instruments`
-/// ([`InstrumentOverrides::unmatched`]): likely a typo, which would charge the instrument it meant
-/// the default.
+/// Logs a warning for each entry of `overrides`, the venue's overrides of `what`, that matches
+/// none of `instruments` ([`InstrumentOverrides::unmatched`]): likely a typo, which would leave
+/// the instrument it meant on the default.
 ///
 /// [`InstrumentOverrides::unmatched`]: rustrade_instrument::instrument::overrides::InstrumentOverrides::unmatched
-fn warn_unmatched_fee_overrides(
-    overrides: &FeeModelOverrides,
+fn warn_unmatched_overrides<T>(
+    what: &str,
+    overrides: &InstrumentOverrides<T>,
     instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
 ) {
     for unmatched in overrides.unmatched(instruments.values()) {
         match unmatched {
             UnmatchedOverride::Name(name) => warn!(
                 instrument = %name,
-                "fee model override names an instrument this venue does not have; it is never used"
+                "{what} override names an instrument this venue does not have; it is never used"
             ),
             UnmatchedOverride::Underlying(kind, underlying) => warn!(
                 ?kind,
                 base = %underlying.base,
                 quote = %underlying.quote,
-                "fee model override names a kind and underlying no instrument on this venue has; \
-                 it is never used"
+                "{what} override names a kind and underlying no instrument on this venue has; it \
+                 is never used"
             ),
         }
     }
@@ -7877,7 +7921,8 @@ fn validate_time_in_force_supported(
 
         // Works until the session closes, so the venue must know when that is.
         (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay) if !session_close => {
-            "a session close (set MockExecutionConfig::session_close, or attach a calendar with \
+            "a session close for this instrument (set MockExecutionConfig::session_close or \
+             session_close_overrides, or attach a calendar with \
              SimulatedVenue::with_session_calendar)"
         }
 

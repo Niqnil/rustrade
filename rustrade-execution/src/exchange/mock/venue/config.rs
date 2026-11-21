@@ -133,6 +133,8 @@ pub enum AssetSource {
     SpotMargin,
     /// An underlying in [`MockExecutionConfig::fee_model_overrides`].
     FeeModelOverride,
+    /// An underlying in [`MockExecutionConfig::session_close_overrides`].
+    SessionCloseOverride,
 }
 
 impl fmt::Display for AssetSource {
@@ -143,6 +145,7 @@ impl fmt::Display for AssetSource {
             Self::FeeAsset => f.write_str("the fee asset"),
             Self::SpotMargin => f.write_str("the spot margin configuration"),
             Self::FeeModelOverride => f.write_str("a fee model override"),
+            Self::SessionCloseOverride => f.write_str("a session close override"),
         }
     }
 }
@@ -199,16 +202,22 @@ pub(super) fn configured_asset_names<'a>(
         .iter()
         .flat_map(|margin| margin.assets())
         .map(|asset| (asset, AssetSource::SpotMargin));
-    let overrides = config
+    let fee_overrides = config
         .fee_model_overrides
         .by_underlying()
         .flat_map(|(_, underlying, _)| [&underlying.base, &underlying.quote])
         .map(|asset| (asset, AssetSource::FeeModelOverride));
+    let session_close_overrides = config
+        .session_close_overrides
+        .by_underlying()
+        .flat_map(|(_, underlying, _)| [&underlying.base, &underlying.quote])
+        .map(|asset| (asset, AssetSource::SessionCloseOverride));
     listed
         .chain(balances.map(|asset| (asset, AssetSource::Balance)))
         .chain(fee_asset)
         .chain(spot_margin)
-        .chain(overrides)
+        .chain(fee_overrides)
+        .chain(session_close_overrides)
 }
 
 #[cfg(test)]

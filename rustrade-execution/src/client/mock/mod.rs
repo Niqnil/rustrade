@@ -35,7 +35,10 @@ use rustrade_instrument::{
     calendar::{DailyClose, SessionCalendar},
     corporate_action::{CorporateActionKind, SplitRoundingPolicy},
     exchange::ExchangeId,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::{
+        kind::InstrumentKindDiscriminant, name::InstrumentNameExchange,
+        overrides::InstrumentOverrides,
+    },
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -184,6 +187,23 @@ pub struct MockExecutionConfig {
     ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_close: Option<SessionCalendarConfig>,
+    /// Session closes for some instruments in place of [`session_close`](Self::session_close),
+    /// by name, by kind and underlying, or by kind: a venue whose index options close at 16:15
+    /// while everything else closes at 16:00. See [`SessionCloseOverrides`] for which entry an
+    /// instrument takes.
+    ///
+    /// An instrument an entry matches takes a day limit order even when `session_close` is
+    /// `None`, and keeps its entry's close when a calendar is attached with
+    /// [`SimulatedVenue::with_session_calendar`], which replaces only `session_close`. When it
+    /// builds, the venue logs a warning for each name, and each kind and underlying, that none of
+    /// its instruments has, as it does for [`fee_model_overrides`](Self::fee_model_overrides).
+    ///
+    /// Defaults to empty: every instrument closes under `session_close`.
+    ///
+    /// [`SimulatedVenue::with_session_calendar`]:
+    ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
+    #[serde(default, skip_serializing_if = "SessionCloseOverrides::is_empty")]
+    pub session_close_overrides: SessionCloseOverrides,
     /// Fee models for some instruments in place of [`fee_model`](Self::fee_model), by name, by
     /// kind and underlying, or by kind: a venue whose options and shares pay different fees, or
     /// whose index options pay more than its equity options. See [`FeeModelOverrides`] for which
@@ -243,6 +263,7 @@ impl MockExecutionConfig {
             amend: AmendConfig::default(),
             time_in_force: TimeInForceRules::default(),
             session_close: None,
+            session_close_overrides: SessionCloseOverrides::default(),
             fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
             split: SplitConfig::default(),
@@ -360,6 +381,19 @@ impl MockExecutionConfig {
         }
     }
 
+    /// This config with its [`session_close_overrides`](Self::session_close_overrides) set to
+    /// `session_close_overrides`.
+    #[must_use]
+    pub fn with_session_close_overrides(
+        self,
+        session_close_overrides: SessionCloseOverrides,
+    ) -> Self {
+        Self {
+            session_close_overrides,
+            ..self
+        }
+    }
+
     /// This config with its [`fee_model_overrides`](Self::fee_model_overrides) set to
     /// `fee_model_overrides`.
     #[must_use]
@@ -403,10 +437,10 @@ impl MockExecutionConfig {
 /// [`SessionDates`]: rustrade_instrument::calendar::SessionDates
 /// - **No open time**: a day order sent after the close works at once, so it can fill on
 ///   after-hours data that the live venue would hold until the next open.
-/// - **One close for the whole venue**: a venue whose instruments close at different times (US
-///   equity options at 16:00 ET, index options at 16:15 ET) has the wrong close for some, and
-///   an instrument that trades around the clock gets the same close. Refuse a day order where the
-///   live venue refuses one with [`MockExecutionConfig::time_in_force`].
+/// - **One close per instrument, fixed when the venue is built**: a venue whose instruments close
+///   at different times (US equity options at 16:00 ET, index options at 16:15 ET) gives each
+///   class its own with [`MockExecutionConfig::session_close_overrides`]. Refuse a day order
+///   where the live venue refuses one with [`MockExecutionConfig::time_in_force`].
 ///
 /// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller. Not
 /// `Copy`, since a [`DailyClose`] holds its holiday and early-close dates; `Ord` and `Hash` are
@@ -430,6 +464,15 @@ pub enum SessionCalendarConfig {
     /// ```
     Daily(DailyClose),
 }
+
+/// Session closes for some instruments, each in place of a venue's
+/// [`session_close`](MockExecutionConfig::session_close): by the instrument's exact name, by its
+/// kind and underlying, or by its kind alone.
+///
+/// The keys, the order an instrument's close is picked in and the serialised form are
+/// [`InstrumentOverrides`]'. An instrument no entry matches closes under the venue's
+/// `session_close`.
+pub type SessionCloseOverrides = InstrumentOverrides<SessionCalendarConfig>;
 
 impl SessionCalendarConfig {
     /// The calendar this configuration names.
@@ -1454,6 +1497,13 @@ mod tests {
             NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
             "America/New_York".parse().unwrap(),
         ));
+        let session_close_overrides = SessionCloseOverrides::new().with_kind(
+            InstrumentKindDiscriminant::Option,
+            SessionCalendarConfig::Daily(DailyClose::new(
+                NaiveTime::from_hms_opt(16, 15, 0).unwrap(),
+                "America/New_York".parse().unwrap(),
+            )),
+        );
         let expiry_sell_out = ExpirySellOut::new(Duration::from_secs(3600));
 
         let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
@@ -1470,6 +1520,7 @@ mod tests {
             .with_amend(AmendConfig::NONE)
             .with_time_in_force(time_in_force.clone())
             .with_session_close(session_close.clone())
+            .with_session_close_overrides(session_close_overrides.clone())
             .with_fee_model_overrides(fee_model_overrides.clone())
             .with_expiry_sell_out(expiry_sell_out);
 
@@ -1495,6 +1546,7 @@ mod tests {
         assert_eq!(config.amend, AmendConfig::NONE);
         assert_eq!(config.time_in_force, time_in_force);
         assert_eq!(config.session_close, Some(session_close));
+        assert_eq!(config.session_close_overrides, session_close_overrides);
         assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
         assert_eq!(config.fee_model_overrides, fee_model_overrides);
     }
