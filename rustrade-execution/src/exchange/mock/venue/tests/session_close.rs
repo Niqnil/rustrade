@@ -560,7 +560,9 @@ fn a_seeded_day_order_the_calendar_cannot_answer_for_is_an_error() {
 
     assert_eq!(
         venue.with_session_calendar(Arc::new(Unavailable)).err(),
-        Some(CalendarError::unavailable("down for maintenance"))
+        Some(VenueConfigError::SessionCalendar(
+            CalendarError::unavailable("down for maintenance")
+        ))
     );
 }
 

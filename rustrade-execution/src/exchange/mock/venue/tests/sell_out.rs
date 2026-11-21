@@ -14,14 +14,24 @@ use super::{
     *,
 };
 use crate::{
-    expiry::{ExpirySellOut, LongOptionExpiry, SellOutAffordability},
+    client::mock::{SessionCalendarConfig, SessionCloseOverrides},
+    exchange::mock::venue::{ExpirySellOutUnplaceable, VenueRestoreError},
+    expiry::{
+        ExpiryAnchor, ExpiryAnchorError, ExpirySellOut, LongOptionExpiry, SellOutAffordability,
+    },
     fill::SimFillConfig,
     margin::SpotMarginLiquidation,
     slippage::SlippageConfig,
 };
-use rustrade_instrument::instrument::{
-    kind::option::{OptionKind, OptionSettlement},
-    name::InstrumentNameInternal,
+use rustrade_instrument::{
+    calendar::{DailyClose, SessionDates},
+    instrument::{
+        kind::{
+            InstrumentKindDiscriminant,
+            option::{OptionKind, OptionSettlement},
+        },
+        name::InstrumentNameInternal,
+    },
 };
 use std::time::Duration;
 
@@ -32,7 +42,7 @@ fn check() -> DateTime<Utc> {
 
 /// Checked ten seconds before expiry, the whole position sold unless all of it is affordable.
 fn sell_out() -> ExpirySellOut {
-    ExpirySellOut::new(Duration::from_secs(10))
+    ExpirySellOut::new(ExpiryAnchor::BeforeExpiry(Duration::from_secs(10)))
 }
 
 /// Configures [`sell_out`] on a venue funded with `usd_balance` and `spy_balance`.
@@ -742,7 +752,11 @@ fn a_check_at_expiry_sells_before_settling() {
     let mut venue = driven_venue(
         OptionKind::Call,
         OptionSettlement::Physical,
-        selling_out("10000", "0", ExpirySellOut::new(Duration::ZERO)),
+        selling_out(
+            "10000",
+            "0",
+            ExpirySellOut::new(ExpiryAnchor::BeforeExpiry(Duration::ZERO)),
+        ),
     );
     feed(&mut venue, "100", "1.5", time(2));
     buy(&mut venue, "1");
@@ -761,7 +775,11 @@ fn a_check_at_expiry_that_keeps_the_long_leaves_it_to_be_exercised() {
     let mut venue = driven_venue(
         OptionKind::Call,
         OptionSettlement::Physical,
-        selling_out("20000", "0", ExpirySellOut::new(Duration::ZERO)),
+        selling_out(
+            "20000",
+            "0",
+            ExpirySellOut::new(ExpiryAnchor::BeforeExpiry(Duration::ZERO)),
+        ),
     );
     feed(&mut venue, "100", "1.5", time(2));
     buy(&mut venue, "1");
@@ -857,10 +875,161 @@ fn a_sell_out_round_trips_through_serde_and_a_bad_haircut_does_not_deserialise()
     );
     let bad = json.replace("0.02", "1.5");
     assert!(serde_json::from_str::<ExpirySellOut>(&bad).is_err());
-    // Only the time is required.
+    // Only the anchor is required, externally tagged in snake case.
     assert_eq!(
-        serde_json::from_str::<ExpirySellOut>(r#"{"before_expiry":{"secs":10,"nanos":0}}"#)
-            .unwrap(),
+        serde_json::from_str::<ExpirySellOut>(
+            r#"{"anchor":{"before_expiry":{"secs":10,"nanos":0}}}"#
+        )
+        .unwrap(),
         sell_out()
+    );
+    assert_eq!(
+        serde_json::to_value(ExpiryAnchor::BeforeClose(Duration::from_secs(3600))).unwrap(),
+        serde_json::json!({"before_close": {"secs": 3600, "nanos": 0}})
+    );
+}
+
+/// Checked ten seconds before the close of the option's expiry day.
+fn before_close() -> ExpirySellOut {
+    ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(10)))
+}
+
+/// A close every day at [`time`]`(seconds)`'s time of day, in UTC. [`expiry`] falls on that date.
+fn closing_at(seconds: i64) -> SessionCalendarConfig {
+    SessionCalendarConfig::Daily(DailyClose::new(time(seconds).time(), chrono_tz::UTC))
+}
+
+/// The option's sell-out cannot be placed, for `source`.
+fn unplaceable(source: ExpiryAnchorError) -> ExpirySellOutUnplaceable {
+    ExpirySellOutUnplaceable {
+        instrument: option_name(),
+        source,
+    }
+}
+
+/// The config of a venue selling out [`before_close`], with `session_close`.
+fn before_close_config(session_close: Option<SessionCalendarConfig>) -> MockExecutionConfig {
+    let mut config = option_config("10000", FeeModelConfig::default());
+    selling_out("10000", "0", before_close())(&mut config);
+    config.session_close = session_close;
+    config
+}
+
+/// The option closes under its own class's close, not the venue's, and is checked ten seconds
+/// before it.
+#[test]
+fn a_sell_out_before_the_close_checks_before_the_options_own_close() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+        selling_out("10000", "0", before_close())(config);
+        config.session_close = Some(closing_at(40));
+        config.session_close_overrides = SessionCloseOverrides::new()
+            .with_kind(InstrumentKindDiscriminant::Option, closing_at(80));
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    feed(&mut venue, "120", "20", time(50));
+    assert_eq!(venue.next_deadline(), Some(time(70)));
+
+    let events = venue.advance_time(time(70));
+
+    assert_eq!(liquidations(&events).len(), 1, "{events:?}");
+}
+
+#[test]
+fn a_sell_out_the_calendar_cannot_place_is_refused_at_build() {
+    let holiday = DailyClose::new(time(80).time(), chrono_tz::UTC)
+        .with_dates(
+            SessionDates::new([expiry().date_naive()], []).unwrap(),
+            None,
+        )
+        .unwrap();
+    for (close, source) in [
+        (
+            SessionCalendarConfig::Daily(holiday),
+            ExpiryAnchorError::NoSession { expiry: expiry() },
+        ),
+        (
+            closing_at(110),
+            ExpiryAnchorError::CloseAfterExpiry {
+                close: time(110),
+                expiry: expiry(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            SimulatedVenue::try_new_market_driven(
+                &before_close_config(Some(close)),
+                driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+            )
+            .err(),
+            Some(VenueConfigError::ExpirySellOut(unplaceable(source)))
+        );
+    }
+}
+
+/// A venue selling out before the close with no calendar for its option: built, for a calendar
+/// given later.
+fn uncalendared_venue() -> SimulatedVenue {
+    SimulatedVenue::try_new_market_driven(
+        &before_close_config(None),
+        driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+    )
+    .expect("built without a calendar, for one given later")
+}
+
+#[test]
+#[should_panic(expected = "have no session calendar")]
+fn a_sell_out_before_the_close_with_no_calendar_panics_on_the_first_input() {
+    let _ = uncalendared_venue().advance_time(time(1));
+}
+
+#[test]
+#[should_panic(expected = "have no session calendar")]
+fn a_sell_out_before_the_close_with_no_calendar_panics_when_asked_its_next_deadline() {
+    let _ = uncalendared_venue().next_deadline();
+}
+
+#[test]
+fn a_calendar_given_after_build_places_the_sell_out() {
+    let mut venue = uncalendared_venue()
+        .with_session_calendar(closing_at(80).calendar())
+        .unwrap();
+    advance(&mut venue, time(1));
+
+    assert_eq!(venue.next_deadline(), Some(time(70)));
+}
+
+#[test]
+fn a_calendar_given_after_build_that_cannot_place_the_sell_out_is_refused() {
+    assert_eq!(
+        uncalendared_venue()
+            .with_session_calendar(closing_at(110).calendar())
+            .err(),
+        Some(VenueConfigError::ExpirySellOut(unplaceable(
+            ExpiryAnchorError::CloseAfterExpiry {
+                close: time(110),
+                expiry: expiry(),
+            }
+        )))
+    );
+}
+
+#[test]
+fn a_restore_whose_sell_out_the_calendar_cannot_place_is_refused() {
+    let venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+
+    assert_eq!(
+        SimulatedVenue::from_snapshot(
+            &before_close_config(Some(closing_at(110))),
+            driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+            venue.snapshot(),
+        )
+        .err(),
+        Some(VenueRestoreError::ExpirySellOut(unplaceable(
+            ExpiryAnchorError::CloseAfterExpiry {
+                close: time(110),
+                expiry: expiry(),
+            }
+        )))
     );
 }

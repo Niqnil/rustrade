@@ -1,6 +1,8 @@
 //! How an option position settles at expiry, and what a simulated venue sells before it.
 
+use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
+use rustrade_instrument::calendar::{CalendarError, SessionCalendar};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -31,24 +33,24 @@ pub enum LongOptionExpiry {
 /// the cash or shares an exercise needs.
 ///
 /// Set on [`MockExecutionConfig::expiry_sell_out`]. For example, Alpaca exercises a long option in
-/// the money at expiry, but sells it in the last hour before expiry when the account lacks the
-/// buying power (a call) or the shares (a put):
+/// the money at expiry, but sells it in the last hour before the market closes on the expiry day
+/// when the account lacks the buying power (a call) or the shares (a put):
 ///
 /// ```
 /// use rust_decimal_macros::dec;
-/// use rustrade_execution::expiry::{ExpirySellOut, SellOutAffordability};
+/// use rustrade_execution::expiry::{ExpiryAnchor, ExpirySellOut, SellOutAffordability};
 /// use std::time::Duration;
 ///
-/// // Checked an hour before expiry, the whole position sold if it cannot all be exercised, at 2%
-/// // under the price a market sell would fill at.
-/// let sell_out = ExpirySellOut::new(Duration::from_secs(60 * 60))
+/// // Checked an hour before the expiry day's close, the whole position sold if it cannot all be
+/// // exercised, at 2% under the price a market sell would fill at.
+/// let sell_out = ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(60 * 60)))
 ///     .with_affordability(SellOutAffordability::PerPosition)
 ///     .with_haircut(dec!(0.02))
 ///     .unwrap();
 /// ```
 ///
 /// # What the venue does
-/// At [`before_expiry`](Self::before_expiry) before each physically settled option's expiry, the
+/// At the instant the [`anchor`](Self::anchor) places for each physically settled option, the
 /// venue looks at every long it holds in that option:
 /// - **In the money?** Against the underlying's price as expiry settlement takes it, the mid of
 ///   its spot market, else its last price. Only an option in the money, by any amount, is sold.
@@ -78,6 +80,8 @@ pub enum LongOptionExpiry {
 /// never sold: exercising it needs no money.
 ///
 /// # Known limitations
+/// - **One anchor for every option.** A venue whose classes of option are sold out at different
+///   offsets before their closes cannot be modelled; each option's own close is still used.
 /// - **One check.** A broker sells at some point in a window before expiry. The venue checks once,
 ///   at the instant this sets, against the market it holds then, however old. A price that
 ///   arrives later in the window does not sell what the check could not.
@@ -96,7 +100,7 @@ pub enum LongOptionExpiry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "ExpirySellOutRepr", into = "ExpirySellOutRepr")]
 pub struct ExpirySellOut {
-    before_expiry: Duration,
+    anchor: ExpiryAnchor,
     affordability: SellOutAffordability,
     haircut: Decimal,
 }
@@ -120,7 +124,7 @@ pub enum SellOutAffordability {
 /// The serialised form of an [`ExpirySellOut`], before validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 struct ExpirySellOutRepr {
-    before_expiry: Duration,
+    anchor: ExpiryAnchor,
     #[serde(default)]
     affordability: SellOutAffordability,
     #[serde(default, with = "rust_decimal::serde::str")]
@@ -140,12 +144,12 @@ pub enum ExpirySellOutError {
 }
 
 impl ExpirySellOut {
-    /// Sells `before_expiry` before each expiry, the whole position unless all of it is
-    /// affordable ([`SellOutAffordability::PerPosition`]), at the price a market sell would get
+    /// Sells at the instant `anchor` places for each option, the whole position unless all of it
+    /// is affordable ([`SellOutAffordability::PerPosition`]), at the price a market sell would get
     /// (no haircut).
-    pub const fn new(before_expiry: Duration) -> Self {
+    pub const fn new(anchor: ExpiryAnchor) -> Self {
         Self {
-            before_expiry,
+            anchor,
             affordability: SellOutAffordability::PerPosition,
             haircut: Decimal::ZERO,
         }
@@ -171,9 +175,9 @@ impl ExpirySellOut {
         Ok(self)
     }
 
-    /// How long before an option's expiry the venue checks it.
-    pub const fn before_expiry(&self) -> Duration {
-        self.before_expiry
+    /// When the venue checks each option.
+    pub const fn anchor(&self) -> ExpiryAnchor {
+        self.anchor
     }
 
     /// How much of a position the venue sells.
@@ -191,7 +195,7 @@ impl TryFrom<ExpirySellOutRepr> for ExpirySellOut {
     type Error = ExpirySellOutError;
 
     fn try_from(repr: ExpirySellOutRepr) -> Result<Self, Self::Error> {
-        Self::new(repr.before_expiry)
+        Self::new(repr.anchor)
             .with_affordability(repr.affordability)
             .with_haircut(repr.haircut)
     }
@@ -200,9 +204,245 @@ impl TryFrom<ExpirySellOutRepr> for ExpirySellOut {
 impl From<ExpirySellOut> for ExpirySellOutRepr {
     fn from(sell_out: ExpirySellOut) -> Self {
         Self {
-            before_expiry: sell_out.before_expiry,
+            anchor: sell_out.anchor,
             affordability: sell_out.affordability,
             haircut: sell_out.haircut,
+        }
+    }
+}
+
+/// When an expiry-day rule of a [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) applies
+/// to an option, as an offset before its expiry day's session close or before its expiry itself.
+///
+/// Serialised externally tagged in snake case, the offset as a [`Duration`]:
+/// `{"before_close": {"secs": 3600, "nanos": 0}}`.
+///
+/// # The expiry instant
+/// An option's [`expiry`](rustrade_instrument::instrument::kind::option::OptionContract::expiry)
+/// is the instant the venue settles it. [`BeforeClose`](Self::BeforeClose) reads the expiry day
+/// as the date that instant falls on in the session calendar's own time zone, so stamp the expiry
+/// at or after that day's close. A contract stamped at midnight UTC of its expiration date, as
+/// the market data connectors stamp theirs to carry the date, falls on the previous date in a
+/// time zone west of UTC, such as New York's: the venue settles it that evening, and this anchors
+/// to that previous day's close, consistently with the settlement but a day early against the
+/// market.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryAnchor {
+    /// This long before the close of the session on the expiry's date, from the option's session
+    /// calendar, as brokers set their expiry-day deadlines. Needs a calendar: a venue with none
+    /// for the option panics on its first input (see
+    /// [`SimulatedVenue::next_deadline`](crate::exchange::mock::SimulatedVenue::next_deadline)).
+    BeforeClose(Duration),
+    /// This long before the expiry instant itself, for a venue that trades around the clock and
+    /// has no session close.
+    BeforeExpiry(Duration),
+}
+
+/// Why an [`ExpiryAnchor`] could not place its instant for an option.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpiryAnchorError {
+    /// The anchor is [`ExpiryAnchor::BeforeClose`], and the option has no session calendar.
+    #[error("the anchor is before the session close, but the option has no session calendar")]
+    NoCalendar,
+    /// The expiry's date has no session (a weekend or a holiday) in the option's calendar.
+    #[error("the expiry {expiry} falls on a date with no session")]
+    NoSession {
+        /// The option's expiry.
+        expiry: DateTime<Utc>,
+    },
+    /// The session close on the expiry's date is after the expiry, so a rule anchored before the
+    /// close could apply after the option has settled. The expiry is likely stamped before the
+    /// close of its class, such as 16:00 for options that close at 16:15.
+    #[error("the session close {close} on the expiry's date is after the expiry {expiry}")]
+    CloseAfterExpiry {
+        /// The close of the session on the expiry's date.
+        close: DateTime<Utc>,
+        /// The option's expiry.
+        expiry: DateTime<Utc>,
+    },
+    /// The option's session calendar could not answer.
+    #[error(transparent)]
+    Calendar(#[from] CalendarError),
+}
+
+impl ExpiryAnchor {
+    /// The offset before the anchor's reference instant.
+    pub const fn offset(&self) -> Duration {
+        match *self {
+            Self::BeforeClose(offset) | Self::BeforeExpiry(offset) => offset,
+        }
+    }
+
+    /// The instant this anchor places for an option expiring at `expiry`, whose session calendar,
+    /// if it has one, is `calendar`. An instant earlier than a [`DateTime`] holds is clamped to
+    /// the earliest it does.
+    ///
+    /// # Errors
+    /// For [`BeforeClose`](Self::BeforeClose) only:
+    /// - [`ExpiryAnchorError::NoCalendar`] if `calendar` is `None`.
+    /// - [`ExpiryAnchorError::NoSession`] if the expiry's date has no session.
+    /// - [`ExpiryAnchorError::CloseAfterExpiry`] if that date's close is after `expiry`. A close
+    ///   equal to it is accepted: a rule at the settlement instant applies before settlement.
+    /// - [`ExpiryAnchorError::Calendar`] if `calendar` cannot answer.
+    pub fn instant(
+        &self,
+        expiry: DateTime<Utc>,
+        calendar: Option<&dyn SessionCalendar>,
+    ) -> Result<DateTime<Utc>, ExpiryAnchorError> {
+        let reference = match self {
+            Self::BeforeExpiry(_) => expiry,
+            Self::BeforeClose(_) => {
+                let calendar = calendar.ok_or(ExpiryAnchorError::NoCalendar)?;
+                let close = calendar
+                    .session_close_on(expiry)?
+                    .ok_or(ExpiryAnchorError::NoSession { expiry })?;
+                if close > expiry {
+                    return Err(ExpiryAnchorError::CloseAfterExpiry { close, expiry });
+                }
+                close
+            }
+        };
+        let offset = TimeDelta::from_std(self.offset()).unwrap_or(TimeDelta::MAX);
+        Ok(reference
+            .checked_sub_signed(offset)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: a failed unwrap is a failed test.
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveTime, TimeZone};
+    use rustrade_instrument::calendar::{DailyClose, SessionDates};
+
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, s).unwrap()
+    }
+
+    /// 16:00 New York every weekday, with Thanksgiving 2026 a holiday.
+    fn new_york() -> DailyClose {
+        let thanksgiving = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        DailyClose::new(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            chrono_tz::America::New_York,
+        )
+        .with_dates(SessionDates::new([thanksgiving], []).unwrap(), None)
+        .unwrap()
+    }
+
+    fn before_close(expiry: DateTime<Utc>) -> Result<DateTime<Utc>, ExpiryAnchorError> {
+        ExpiryAnchor::BeforeClose(HOUR).instant(expiry, Some(&new_york()))
+    }
+
+    #[test]
+    fn before_expiry_is_the_offset_before_the_expiry_and_needs_no_calendar() {
+        let expiry = utc(2026, 11, 20, 21, 0, 0);
+        assert_eq!(
+            ExpiryAnchor::BeforeExpiry(HOUR).instant(expiry, None),
+            Ok(utc(2026, 11, 20, 20, 0, 0))
+        );
+        assert_eq!(ExpiryAnchor::BeforeExpiry(HOUR).offset(), HOUR);
+        assert_eq!(ExpiryAnchor::BeforeClose(HOUR).offset(), HOUR);
+    }
+
+    /// An expiry stamped at the close itself is accepted, as is one stamped after it on the same
+    /// New York date, in winter (EST) and in summer (EDT).
+    #[test]
+    fn before_close_is_the_offset_before_the_close_of_the_expiry_date() {
+        // Friday 2026-11-20, 16:00 EST is 21:00Z.
+        for expiry in [utc(2026, 11, 20, 21, 0, 0), utc(2026, 11, 20, 23, 30, 0)] {
+            assert_eq!(before_close(expiry), Ok(utc(2026, 11, 20, 20, 0, 0)));
+        }
+        // Friday 2026-07-17, 16:00 EDT is 20:00Z.
+        assert_eq!(
+            before_close(utc(2026, 7, 17, 20, 0, 0)),
+            Ok(utc(2026, 7, 17, 19, 0, 0))
+        );
+    }
+
+    #[test]
+    fn a_close_after_the_expiry_is_refused() {
+        let expiry = utc(2026, 11, 20, 20, 59, 59);
+        assert_eq!(
+            before_close(expiry),
+            Err(ExpiryAnchorError::CloseAfterExpiry {
+                close: utc(2026, 11, 20, 21, 0, 0),
+                expiry,
+            })
+        );
+    }
+
+    #[test]
+    fn an_expiry_on_a_date_with_no_session_is_refused() {
+        // Thanksgiving, then a Saturday.
+        for expiry in [utc(2026, 11, 26, 21, 0, 0), utc(2026, 11, 21, 21, 0, 0)] {
+            assert_eq!(
+                before_close(expiry),
+                Err(ExpiryAnchorError::NoSession { expiry })
+            );
+        }
+    }
+
+    #[test]
+    fn before_close_without_a_calendar_is_refused() {
+        assert_eq!(
+            ExpiryAnchor::BeforeClose(HOUR).instant(utc(2026, 11, 20, 21, 0, 0), None),
+            Err(ExpiryAnchorError::NoCalendar)
+        );
+    }
+
+    #[derive(Debug)]
+    struct Unavailable;
+
+    impl SessionCalendar for Unavailable {
+        fn next_close_after(&self, _: DateTime<Utc>) -> Result<DateTime<Utc>, CalendarError> {
+            Err(CalendarError::unavailable("down"))
+        }
+
+        fn session_close_on(
+            &self,
+            _: DateTime<Utc>,
+        ) -> Result<Option<DateTime<Utc>>, CalendarError> {
+            Err(CalendarError::unavailable("down"))
+        }
+    }
+
+    #[test]
+    fn a_calendar_that_cannot_answer_is_reported() {
+        assert_eq!(
+            ExpiryAnchor::BeforeClose(HOUR)
+                .instant(utc(2026, 11, 20, 21, 0, 0), Some(&Unavailable)),
+            Err(ExpiryAnchorError::Calendar(CalendarError::unavailable(
+                "down"
+            )))
+        );
+    }
+
+    /// Midnight UTC of 2026-11-20 is the evening of 2026-11-19 in New York, so the anchor is that
+    /// day's close: consistent with a venue settling at that instant, a day early against the
+    /// market.
+    #[test]
+    fn an_expiry_stamped_at_midnight_utc_anchors_to_the_previous_new_york_close() {
+        assert_eq!(
+            before_close(utc(2026, 11, 20, 0, 0, 0)),
+            Ok(utc(2026, 11, 19, 20, 0, 0))
+        );
+    }
+
+    #[test]
+    fn an_offset_before_the_earliest_instant_is_clamped_to_it() {
+        let expiry = utc(2026, 11, 20, 21, 0, 0);
+        for offset in [Duration::MAX, Duration::from_secs(i64::MAX as u64 / 1_000)] {
+            assert_eq!(
+                ExpiryAnchor::BeforeExpiry(offset).instant(expiry, None),
+                Ok(DateTime::<Utc>::MIN_UTC)
+            );
         }
     }
 }

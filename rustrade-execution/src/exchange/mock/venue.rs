@@ -16,7 +16,7 @@ use crate::{
         account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
         orders::{AlreadyResting, NotQueued, OpenOrder, Rank, Reservation, RestingOrder},
     },
-    expiry::{ExpirySellOut, LongOptionExpiry, SellOutAffordability},
+    expiry::{ExpiryAnchorError, ExpirySellOut, LongOptionExpiry, SellOutAffordability},
     fee::{
         FeeAssetConfig, FeeInput, FeeModel, FeeModelConfig, FeeModelOverrides, Liquidity,
         SpotFeeAsset,
@@ -44,7 +44,7 @@ use crate::{
     slippage::Slippage,
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
 };
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
 use rust_decimal::Decimal;
@@ -77,7 +77,7 @@ mod sell_out;
 mod snapshot;
 mod spot_pairs;
 
-pub use config::{AssetSource, AssetSpelledTwice, VenueConfigError};
+pub use config::{AssetSource, AssetSpelledTwice, ExpirySellOutUnplaceable, VenueConfigError};
 pub use corporate_action::{
     CorporateActionOutcome, CorporateActionRefusal, CorporateActionResponse,
 };
@@ -477,12 +477,15 @@ pub enum VenueRegime {
 ///
 /// ## Sold out before expiry
 /// Configured with [`MockExecutionConfig::expiry_sell_out`], the venue also checks each long in a
-/// physically settled option at a set time before its expiry, a boundary like the expiry itself
-/// and included in [`next_deadline`](Self::next_deadline), and first among the boundaries at its
-/// instant. A long in the money that the account cannot afford to exercise (the strike's cash for
-/// a call, free shares for a put) is sold, after the orders working on it are cancelled, as a
-/// market sell fills, less a haircut, reported as `[order.., balance.., trade]` with a
-/// [`TradeOrigin::Liquidation`] trade. What is not sold settles at expiry as above. See
+/// physically settled option at the instant its [`ExpiryAnchor`](crate::expiry::ExpiryAnchor)
+/// places: an offset before the session close of its expiry day, from its session calendar (a
+/// venue without one for the option panics on its first input, see
+/// [`next_deadline`](Self::next_deadline)), or before its expiry itself. The check is a boundary
+/// like the expiry and included in [`next_deadline`](Self::next_deadline), and first among the
+/// boundaries at its instant. A long in the money that the account cannot afford to exercise (the
+/// strike's cash for a call, free shares for a put) is sold, after the orders working on it are
+/// cancelled, as a market sell fills, less a haircut, reported as `[order.., balance.., trade]`
+/// with a [`TradeOrigin::Liquidation`] trade. What is not sold settles at expiry as above. See
 /// [`ExpirySellOut`] for what is affordable, how much is sold, and what is not modelled. A check
 /// at or before the instant the clock first moves is not run: the venue then holds no market to
 /// sell at.
@@ -986,11 +989,18 @@ pub struct SimulatedVenue {
     expiry_sell_out: Option<ExpirySellOut>,
     /// The instant each physically settled option this venue lists is checked for a sell-out,
     /// earliest first, and by name at one instant. Empty without an
-    /// [`expiry_sell_out`](Self::expiry_sell_out). Fixed at construction.
+    /// [`expiry_sell_out`](Self::expiry_sell_out). Placed by
+    /// [`resolve_sell_outs`](Self::resolve_sell_outs) at construction, and again when
+    /// [`with_session_calendar`](Self::with_session_calendar) changes the venue's calendar.
     sell_outs: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
     /// The first of [`sell_outs`](Self::sell_outs) after `accrued_through`, cached like
     /// [`next_charge`](Self::next_charge).
     next_sell_out: Option<DateTime<Utc>>,
+    /// The physically settled options, by name, that a sell-out anchored before the session close
+    /// cannot yet place, having no session calendar. Left for
+    /// [`with_session_calendar`](Self::with_session_calendar) to place; the venue refuses to run
+    /// while any remain.
+    sell_outs_unplaced: Vec<InstrumentNameExchange>,
     /// The id of every corporate action this venue has applied, so that applying one again changes
     /// nothing. See [`apply_corporate_action`](Self::apply_corporate_action).
     corporate_actions_applied: FnvHashSet<SmolStr>,
@@ -1049,6 +1059,12 @@ impl SimulatedVenue {
     ///   instrument ([`MockExecutionConfig::session_close`] or an entry of
     ///   [`MockExecutionConfig::session_close_overrides`]) cannot place the close of the order,
     ///   seeded in `initial_state`.
+    /// - [`VenueConfigError::ExpirySellOut`] if the anchor of
+    ///   [`MockExecutionConfig::expiry_sell_out`] cannot place the sell-out of an option: its
+    ///   expiry falls on a date with no session, its expiry day closes after its expiry, or its
+    ///   calendar cannot answer. An option with no calendar at all is not refused here, so that
+    ///   [`with_session_calendar`](Self::with_session_calendar) can supply one: see the
+    ///   `# Panics` of [`next_deadline`](Self::next_deadline).
     pub fn try_new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -1130,6 +1146,7 @@ impl SimulatedVenue {
         venue
             .resolve_seeded_deadlines()
             .map_err(VenueConfigError::SessionCalendar)?;
+        venue.resolve_sell_outs()?;
         Ok(venue)
     }
 
@@ -1147,10 +1164,6 @@ impl SimulatedVenue {
     ) -> Self {
         let option_expiries = option_expiries(&instruments);
         let option_spots = option_spots(&instruments);
-        let sell_outs = config
-            .expiry_sell_out
-            .map(|sell_out| sell_out_instants(&instruments, sell_out.before_expiry()))
-            .unwrap_or_default();
         warn_unmatched_overrides("fee model", &config.fee_model_overrides, &instruments);
         warn_unmatched_overrides(
             "session close",
@@ -1216,8 +1229,9 @@ impl SimulatedVenue {
             option_spots,
             expiry_pending: BTreeSet::new(),
             expiry_sell_out: config.expiry_sell_out,
-            sell_outs,
+            sell_outs: Vec::new(),
             next_sell_out: None,
+            sell_outs_unplaced: Vec::new(),
             corporate_actions_applied: FnvHashSet::default(),
             restated_strikes: FnvHashMap::default(),
             split: config.split,
@@ -1298,9 +1312,15 @@ impl SimulatedVenue {
     /// order, build the venue from a configuration with no `session_close` and no override
     /// matching those orders' instruments.
     ///
+    /// An [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) is placed again under
+    /// `calendar`, for every option without a close of its own.
+    ///
     /// # Errors
-    /// The [`CalendarError`] of the first seeded day order, by client order id, that `calendar`
-    /// cannot answer for.
+    /// - [`VenueConfigError::SessionCalendar`] with the [`CalendarError`] of the first seeded day
+    ///   order, by client order id, that `calendar` cannot answer for.
+    /// - [`VenueConfigError::ExpirySellOut`] if the expiry sell-out cannot be placed under
+    ///   `calendar` for an option, such as one whose expiry falls on a date with no session.
     ///
     /// # Panics
     /// If `calendar` answers a close not after the instant it was asked from, breaking the
@@ -1308,10 +1328,71 @@ impl SimulatedVenue {
     pub fn with_session_calendar(
         mut self,
         calendar: Arc<dyn SessionCalendar>,
-    ) -> Result<Self, CalendarError> {
+    ) -> Result<Self, VenueConfigError> {
         self.session_calendar = Some(calendar);
-        self.resolve_seeded_deadlines()?;
+        self.resolve_seeded_deadlines()
+            .map_err(VenueConfigError::SessionCalendar)?;
+        self.resolve_sell_outs()?;
         Ok(self)
+    }
+
+    /// Places [`sell_outs`](Self::sell_outs) as the [`expiry_sell_out`](Self::expiry_sell_out)'s
+    /// anchor says, under each option's session calendar, and the next one after the instant the
+    /// clock has reached. A cash-settled option is never sold out: exercising it needs no money.
+    /// An option with no calendar to place it is left in
+    /// [`sell_outs_unplaced`](Self::sell_outs_unplaced), for a calendar given later.
+    ///
+    /// # Errors
+    /// [`ExpirySellOutUnplaceable`] for the first option, by name, the anchor cannot place for any
+    /// other reason. The sell-outs are then left as they were.
+    fn resolve_sell_outs(&mut self) -> Result<(), ExpirySellOutUnplaceable> {
+        let Some(anchor) = self.expiry_sell_out.map(|sell_out| sell_out.anchor()) else {
+            return Ok(());
+        };
+        let mut placed = Vec::new();
+        let mut unplaced = Vec::new();
+        let options = self
+            .instruments
+            .iter()
+            .filter_map(|(name, instrument)| match &instrument.kind {
+                InstrumentKind::Option(contract)
+                    if contract.settlement == OptionSettlement::Physical =>
+                {
+                    Some((name, contract.expiry))
+                }
+                _ => None,
+            })
+            .sorted_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (name, expiry) in options {
+            let calendar = self.session_calendar_of(name).map(AsRef::as_ref);
+            match anchor.instant(expiry, calendar) {
+                Ok(check) => placed.push((check, name.clone())),
+                Err(ExpiryAnchorError::NoCalendar) => unplaced.push(name.clone()),
+                Err(source) => {
+                    return Err(ExpirySellOutUnplaceable {
+                        instrument: name.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        placed.sort_unstable();
+        self.sell_outs = placed;
+        self.sell_outs_unplaced = unplaced;
+        self.refresh_next_sell_out();
+        Ok(())
+    }
+
+    /// Panics if [`sell_outs_unplaced`](Self::sell_outs_unplaced) holds an option: see
+    /// [`next_deadline`](Self::next_deadline)'s `# Panics`.
+    fn assert_sell_outs_placed(&self) {
+        assert!(
+            self.sell_outs_unplaced.is_empty(),
+            "SimulatedVenue's expiry sell-out is anchored before the session close, but the \
+             options {:?} have no session calendar: configure MockExecutionConfig::session_close, \
+             a session_close_overrides entry, or SimulatedVenue::with_session_calendar",
+            self.sell_outs_unplaced
+        );
     }
 
     /// Gives each open day limit order with no deadline of its own the close after the instant it
@@ -1397,7 +1478,18 @@ impl SimulatedVenue {
     /// Recompute it after anything that moves this venue: an order, a fill, or the clock. A
     /// holding-cost or interest boundary is reported only once the venue's clock has first moved,
     /// since that is where charging starts.
+    ///
+    /// # Panics
+    /// If the [expiry sell-out](MockExecutionConfig::expiry_sell_out) is anchored
+    /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose) and an option this
+    /// venue lists still has no session calendar to place it: neither
+    /// [`session_close`](MockExecutionConfig::session_close), an entry of
+    /// [`session_close_overrides`](MockExecutionConfig::session_close_overrides), nor
+    /// [`with_session_calendar`](Self::with_session_calendar). The venue is built without one, so
+    /// that `with_session_calendar` can supply it, and refuses to run on without one, as do
+    /// [`advance_time`](Self::advance_time) and [`apply_market`](Self::apply_market).
     pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        self.assert_sell_outs_placed();
         let expiry = self.account.orders().next_expiry();
         expiry
             .into_iter()
@@ -1527,8 +1619,11 @@ impl SimulatedVenue {
     /// none in between.
     ///
     /// # Panics
-    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
-    /// boundary not after the instant it was asked from, or a negative interest.
+    /// - If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
+    ///   boundary not after the instant it was asked from, or a negative interest.
+    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out) anchored before the session
+    ///   close still has an option with no session calendar: see
+    ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         let time_exchange = self.not_before_reached(time_exchange);
@@ -1568,6 +1663,7 @@ impl SimulatedVenue {
     /// If a model returns a boundary that is not after the instant it was asked from, or a
     /// negative interest — see the contracts of [`HoldingCostModel`] and [`MarginInterestModel`].
     fn accrue(&mut self, now: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        self.assert_sell_outs_placed();
         let after = match self.accrued_through {
             // The clock's first move: charging starts here.
             None => {
@@ -2865,8 +2961,11 @@ impl SimulatedVenue {
     /// tick does not restamp the balances it leaves untouched.
     ///
     /// # Panics
-    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
-    /// boundary not after the instant it was asked from, or a negative interest.
+    /// - If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
+    ///   boundary not after the instant it was asked from, or a negative interest.
+    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out) anchored before the session
+    ///   close still has an option with no session calendar: see
+    ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn apply_market(
         &mut self,
@@ -7502,34 +7601,6 @@ fn intrinsic(contract: &OptionContract<AssetNameExchange>, price: Decimal) -> De
         OptionKind::Call => price - contract.strike,
         OptionKind::Put => contract.strike - price,
     }
-}
-
-/// The instant each physically settled option in `instruments` is checked for a sell-out,
-/// `before_expiry` before its expiry, earliest first, and by name at one instant. A cash-settled
-/// option is never sold out: exercising it needs no money. An instant before the earliest a
-/// `DateTime` holds is clamped to it.
-fn sell_out_instants(
-    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
-    before_expiry: Duration,
-) -> Vec<(DateTime<Utc>, InstrumentNameExchange)> {
-    let before = TimeDelta::from_std(before_expiry).unwrap_or(TimeDelta::MAX);
-    let mut instants = instruments
-        .iter()
-        .filter_map(|(name, instrument)| match &instrument.kind {
-            InstrumentKind::Option(contract)
-                if contract.settlement == OptionSettlement::Physical =>
-            {
-                let check = contract
-                    .expiry
-                    .checked_sub_signed(before)
-                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
-                Some((check, name.clone()))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    instants.sort_unstable();
-    instants
 }
 
 /// The expiry of every option in `instruments`, earliest first, and by name at one instant.
