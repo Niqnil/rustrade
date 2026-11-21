@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
+  `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
+  `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,
+  `Unknown`), an optional `HaltReason`, and the venue's own code. The IBKR stream's quote
+  subscriptions report IB's Halted tick this way, on change only, with no extra market data line:
+  -1 is `Unknown`, 0 `Trading`, 1 `Halted` (regulatory), 2 `Paused` (volatility), delayed data
+  included. IB documents 0 as sent only for a contract in a TWS watchlist, so a contract that
+  trades normally may report no status at all; IB sends no Limit Up-Limit Down price bands.
+
+- **Alpaca trading status and Limit Up-Limit Down bands** (`rustrade-data`, #881). Two new
+  subscription kinds read the Alpaca stock feeds' `statuses` and `lulds` channels, on the feed's
+  shared connection: `TradingStatuses` yields `TradingStatus`, and `PriceBands` yields the new
+  `PriceBand` (optional upper and lower limits, a `PriceBandUpdate` saying why it was published,
+  and the venue's code), also as the new `DataKind::PriceBand`. Both are served by the typed
+  `Streams` builder and by `DynamicStreams` (`SubKind::TradingStatuses`, `SubKind::PriceBands`,
+  with `select_trading_statuses` / `select_price_bands` and their `select_all_*` forms) on
+  `AlpacaIex` and `AlpacaSip` only: the crypto feed has neither, and a crypto subscription to one
+  does not compile. Status and reason codes are read by tape, since the two US tape plans spell
+  them differently: a halt is `Halted` with a typed reason, a Limit Up-Limit Down or volatility
+  pause is `Paused`, a quotation resumption `QuoteOnly`, and a resumption `Trading` with no reason.
+  Codes that report no trading state (imbalances, indications, the short sale restriction) are not
+  reported, so they cannot overwrite the real state; an undocumented code or tape is dropped with
+  a warning once per connection. A band's zero limit is `None`. Alpaca does not document the band
+  indicator, so it is read as the Nasdaq-listed tapes' plan defines it on tapes C and O, and is
+  `PriceBandUpdate::Other` on tapes A and B; the raw codes are kept in `venue_code`
+  (`"<tape>:<sc>:<rc>"` for a status, `"<tape>:<i>"` for a band). The engine's
+  `DefaultInstrumentMarketData` and the simulated venue ignore price bands. Alpaca does not say
+  which stock feeds publish these channels; the IEX feed accepts the subscriptions.
+
 - **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
   #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`
   string: `DataError::SubscriptionLimitReached` when the account's market data lines (IB code
@@ -669,6 +698,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IbkrStreamConfig::new(host, port, client_id)` (or `Default`) and the `with_*` methods rather
   than a struct literal; a serialized configuration without `market_data_type` still loads, as
   live. The security type decides which prices mean "no quote" (see Fixed).
+- **Breaking: `DataKind` is `#[non_exhaustive]`** (`rustrade-data`, #881). It gains
+  `TradingStatus` (see Added), and kinds will keep being added as venues publish them, so a `match`
+  on it outside `rustrade-data` needs a wildcard arm. The engine's `DefaultInstrumentMarketData` and
+  the simulated venue ignore `TradingStatus`; a kind added later that reaches their wildcard arm is
+  logged (a rate-limited warning naming it) rather than ignored silently.
+- **Breaking: `SubKind` and `DynamicStreams` are `#[non_exhaustive]`, and `SubKind` gains
+  `TradingStatuses` and `PriceBands`** (`rustrade-data`, #881). Kinds keep being added as venues
+  publish them, so a `match` on `SubKind` outside `rustrade-data` needs a wildcard arm.
+  `DynamicStreams` gains the public fields `trading_statuses` and `price_bands`; it is
+  `#[non_exhaustive]` so that a later kind's field is not a breaking change, which means
+  destructuring it outside `rustrade-data` needs `..` and only its `init*` constructors build it.
+  `DynamicStreams::select_all` requires `MarketStreamResult<_, TradingStatus>` and
+  `MarketStreamResult<_, PriceBand>` to convert into its output too;
+  `MarketStreamResult<_, DataKind>` does.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
@@ -1129,6 +1172,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
+- **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
+  IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
+  subscription passed on as a `PublicTrade` at price 0. It is now skipped.
 
 - **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB
   sends a price of -1 for a side it has no quote on, for example while the market is closed, and

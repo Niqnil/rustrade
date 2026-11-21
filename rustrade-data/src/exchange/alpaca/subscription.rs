@@ -59,6 +59,10 @@ pub enum AlpacaSubResponseInner {
         quotes: Vec<SmolStr>,
         #[serde(default)]
         bars: Vec<SmolStr>,
+        #[serde(default)]
+        statuses: Vec<SmolStr>,
+        #[serde(default)]
+        lulds: Vec<SmolStr>,
     },
     /// Error response.
     Error {
@@ -76,21 +80,32 @@ impl AlpacaSubResponseInner {
     /// Only `Subscription` names symbols; `Success` and `Error` cover nothing. The report is the
     /// connection's whole state, not only what the last request added.
     pub(super) fn covered(&self) -> impl Iterator<Item = (AlpacaChannel, &SmolStr)> {
-        let (trades, quotes): (&[SmolStr], &[SmolStr]) = match self {
-            // `bars` is deliberately ignored: AlpacaChannel models only trades and quotes, so no
-            // subscription is ever keyed against a bars channel and nothing could match it.
+        let channels: [(AlpacaChannel, &[SmolStr]); 4] = match self {
+            // `bars` is deliberately ignored: AlpacaChannel models no bars channel, so no
+            // subscription is ever keyed against one and nothing could match it.
             Self::Subscription {
                 trades,
                 quotes,
                 bars: _,
-            } => (trades, quotes),
-            Self::Error { .. } | Self::Success { .. } => (&[], &[]),
+                statuses,
+                lulds,
+            } => [
+                (AlpacaChannel::Trades, trades),
+                (AlpacaChannel::Quotes, quotes),
+                (AlpacaChannel::Statuses, statuses),
+                (AlpacaChannel::Lulds, lulds),
+            ],
+            Self::Error { .. } | Self::Success { .. } => [
+                (AlpacaChannel::Trades, &[]),
+                (AlpacaChannel::Quotes, &[]),
+                (AlpacaChannel::Statuses, &[]),
+                (AlpacaChannel::Lulds, &[]),
+            ],
         };
 
-        let trades = trades.iter().map(|market| (AlpacaChannel::Trades, market));
-        let quotes = quotes.iter().map(|market| (AlpacaChannel::Quotes, market));
-
-        trades.chain(quotes)
+        channels
+            .into_iter()
+            .flat_map(|(channel, markets)| markets.iter().map(move |market| (channel, market)))
     }
 }
 
@@ -111,6 +126,27 @@ mod tests {
             }
             _ => panic!("expected Subscription variant"),
         }
+    }
+
+    #[test]
+    fn a_subscription_reports_every_channel_it_holds_and_never_bars() {
+        let input = r#"[{"T":"subscription","trades":["AAPL"],"quotes":["MSFT"],"bars":["SPY"],"statuses":["TSLA"],"lulds":["IONM"]}]"#;
+        let response: AlpacaSubResponse = serde_json::from_str(input).unwrap();
+
+        let covered = response.0[0]
+            .covered()
+            .map(|(channel, symbol)| (channel, symbol.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            covered,
+            [
+                (AlpacaChannel::Trades, "AAPL"),
+                (AlpacaChannel::Quotes, "MSFT"),
+                (AlpacaChannel::Statuses, "TSLA"),
+                (AlpacaChannel::Lulds, "IONM"),
+            ]
+        );
     }
 
     #[test]
@@ -160,6 +196,8 @@ mod tests {
             trades: vec!["AAPL".into()],
             quotes: vec![],
             bars: vec![],
+            statuses: vec![],
+            lulds: vec![],
         }]);
         assert!(response.validate().is_ok());
     }
@@ -171,6 +209,24 @@ mod tests {
             msg: "bad request".into(),
         }]);
         assert!(response.validate().is_err());
+    }
+
+    #[test]
+    fn a_refused_channel_names_alpacas_code_and_message() {
+        for (code, msg) in [
+            (409, "insufficient subscription"),
+            (410, "invalid subscribe action for this feed"),
+        ] {
+            let response = AlpacaSubResponse(vec![AlpacaSubResponseInner::Error {
+                code: Some(code),
+                msg: msg.into(),
+            }]);
+
+            let message = response.validate().unwrap_err().to_string();
+
+            assert!(message.contains(&code.to_string()), "{message}");
+            assert!(message.contains(msg), "{message}");
+        }
     }
 
     #[test]

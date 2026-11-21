@@ -6,7 +6,9 @@ use crate::{
         candle::Candle,
         greeks::OptionGreeks,
         liquidation::Liquidation,
+        price_band::PriceBand,
         trade::PublicTrade,
+        trading_status::TradingStatus,
     },
 };
 use chrono::{DateTime, Utc};
@@ -130,6 +132,22 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    /// This event with a reference to its [`TradingStatus`], if it is one.
+    pub fn as_trading_status(&self) -> Option<MarketEvent<&InstrumentKey, &TradingStatus>> {
+        match &self.kind {
+            DataKind::TradingStatus(status) => Some(self.as_event(status)),
+            _ => None,
+        }
+    }
+
+    /// This event with a reference to its [`PriceBand`], if it is one.
+    pub fn as_price_band(&self) -> Option<MarketEvent<&InstrumentKey, &PriceBand>> {
+        match &self.kind {
+            DataKind::PriceBand(band) => Some(self.as_event(band)),
+            _ => None,
+        }
+    }
+
     fn as_event<'a, K>(&'a self, kind: &'a K) -> MarketEvent<&'a InstrumentKey, &'a K> {
         MarketEvent {
             time_exchange: self.time_exchange,
@@ -152,6 +170,9 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
 ///   [`Subscription`](crate::subscription::Subscription)s directly, it is only used to
 ///   make ergonomic [`Streams`](crate::streams::Streams) containing many
 ///   [`MarketEvent<T>`](MarketEvent) kinds.
+/// - New kinds are added as venues publish them, so a `match` outside this crate needs a wildcard
+///   arm.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize, From)]
 pub enum DataKind {
     Trade(PublicTrade),
@@ -160,6 +181,8 @@ pub enum DataKind {
     Candle(Candle),
     Liquidation(Liquidation),
     OptionGreeks(OptionGreeks),
+    TradingStatus(TradingStatus),
+    PriceBand(PriceBand),
 }
 
 impl DataKind {
@@ -171,6 +194,8 @@ impl DataKind {
             DataKind::Candle(_) => "candle",
             DataKind::Liquidation(_) => "liquidation",
             DataKind::OptionGreeks(_) => "option_greeks",
+            DataKind::TradingStatus(_) => "trading_status",
+            DataKind::PriceBand(_) => "price_band",
         }
     }
 }
@@ -268,5 +293,134 @@ impl<InstrumentKey> From<MarketEvent<InstrumentKey, Liquidation>>
 {
     fn from(value: MarketEvent<InstrumentKey, Liquidation>) -> Self {
         value.map_kind(Liquidation::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, TradingStatus>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, TradingStatus>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, TradingStatus>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, TradingStatus>) -> Self {
+        value.map_kind(TradingStatus::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, PriceBand>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, PriceBand>) -> Self {
+        value.map_ok(MarketEvent::from)
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, PriceBand>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, PriceBand>) -> Self {
+        value.map_kind(PriceBand::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscription::trading_status::TradingState;
+
+    fn event(kind: DataKind) -> MarketEvent<u8, DataKind> {
+        MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MIN_UTC,
+            exchange: ExchangeId::Ibkr,
+            instrument: 7,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_trading_status_event_reads_as_one_and_nothing_else() {
+        let status = TradingStatus::new(TradingState::Halted);
+        let event = event(DataKind::TradingStatus(status.clone()));
+
+        let read = event.as_trading_status();
+
+        assert_eq!(
+            read.map(|read| (read.instrument, read.kind)),
+            Some((&7, &status))
+        );
+        assert!(event.as_option_greeks().is_none());
+    }
+
+    #[test]
+    fn another_kind_is_not_a_trading_status() {
+        let event = event(DataKind::OptionGreeks(OptionGreeks::default()));
+
+        assert!(event.as_trading_status().is_none());
+    }
+
+    #[test]
+    fn a_price_band_event_reads_as_one_and_nothing_else() {
+        let band = PriceBand::new(Some(rust_decimal::Decimal::ONE), None);
+        let event = event(DataKind::PriceBand(band.clone()));
+
+        let read = event.as_price_band();
+
+        assert_eq!(
+            read.map(|read| (read.instrument, read.kind)),
+            Some((&7, &band))
+        );
+        assert!(event.as_trading_status().is_none());
+    }
+
+    #[test]
+    fn a_status_and_a_band_convert_into_their_data_kinds_with_the_event_intact() {
+        let typed = MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MAX_UTC,
+            exchange: ExchangeId::AlpacaIex,
+            instrument: 7_u8,
+            kind: (),
+        };
+        let status = TradingStatus::new(TradingState::Halted);
+        let band = PriceBand::new(None, Some(rust_decimal::Decimal::ONE));
+
+        let status_item: MarketStreamResult<u8, TradingStatus> =
+            crate::streams::reconnect::Event::Item(Ok(typed.clone().map_kind(|()| status.clone())));
+        let band_item: MarketStreamResult<u8, PriceBand> =
+            crate::streams::reconnect::Event::Item(Ok(typed.clone().map_kind(|()| band.clone())));
+
+        for (converted, kind) in [
+            (
+                MarketStreamResult::<u8, DataKind>::from(status_item),
+                DataKind::TradingStatus(status),
+            ),
+            (
+                MarketStreamResult::<u8, DataKind>::from(band_item),
+                DataKind::PriceBand(band),
+            ),
+        ] {
+            let crate::streams::reconnect::Event::Item(Ok(converted)) = converted else {
+                panic!("expected the converted item");
+            };
+            assert_eq!(converted, typed.clone().map_kind(|()| kind));
+        }
+    }
+
+    #[test]
+    fn kind_names() {
+        let names = [
+            DataKind::OptionGreeks(OptionGreeks::default()),
+            DataKind::TradingStatus(TradingStatus::new(TradingState::Trading)),
+            DataKind::PriceBand(PriceBand::new(None, None)),
+        ]
+        .map(|kind| kind.kind_name().to_owned());
+
+        assert_eq!(names, ["option_greeks", "trading_status", "price_band"]);
     }
 }

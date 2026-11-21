@@ -34,17 +34,22 @@ use rustrade_data::{
     exchange::{
         ExchangeServer,
         alpaca::{
-            Alpaca, AlpacaCredentials, AlpacaSubscriber,
+            Alpaca, AlpacaCredentials, AlpacaStockServer, AlpacaSubscriber,
+            decode::AlpacaDecodeTransformer,
+            luld::AlpacaLuldDecoder,
             market::{AlpacaServer, AlpacaSymbolShape},
             quote::AlpacaQuoteTransformer,
+            status::AlpacaStatusDecoder,
             stream::AlpacaStream,
             trade::AlpacaTradeTransformer,
         },
     },
     subscription::{
         Subscription,
+        price_band::{PriceBand, PriceBandUpdate, PriceBands},
         quote::{Quote, Quotes},
         trade::{PublicTrade, PublicTrades},
+        trading_status::{HaltReason, TradingState, TradingStatus, TradingStatuses},
     },
 };
 use rustrade_instrument::{
@@ -95,6 +100,8 @@ impl ExchangeServer for EquitiesServer {
 impl AlpacaServer for EquitiesServer {
     const SYMBOL_SHAPE: AlpacaSymbolShape = AlpacaSymbolShape::Ticker;
 }
+
+impl AlpacaStockServer for EquitiesServer {}
 
 /// A second feed, on an endpoint of its own, as the crypto feed is.
 #[derive(Copy, Clone, Debug, Default)]
@@ -148,7 +155,16 @@ struct Provider {
 
 impl Provider {
     async fn start(url: &Mutex<Option<&'static str>>, auth: Auth, cap: usize) -> Self {
-        Self::start_ignoring(url, auth, cap, &[]).await
+        Self::start_with(
+            url,
+            Behaviour {
+                auth,
+                cap,
+                ignored: &[],
+                unavailable: &[],
+            },
+        )
+        .await
     }
 
     /// As [`start`](Self::start), but the provider never registers a subscribe for `ignored`
@@ -159,6 +175,37 @@ impl Provider {
         cap: usize,
         ignored: &'static [&'static str],
     ) -> Self {
+        Self::start_with(
+            url,
+            Behaviour {
+                auth,
+                cap,
+                ignored,
+                unavailable: &[],
+            },
+        )
+        .await
+    }
+
+    /// As [`start`](Self::start), but the feed lacks the `unavailable` channels: a subscribe naming
+    /// one is refused with Alpaca's 410, adding nothing.
+    async fn start_without_channels(
+        url: &Mutex<Option<&'static str>>,
+        unavailable: &'static [&'static str],
+    ) -> Self {
+        Self::start_with(
+            url,
+            Behaviour {
+                auth: Auth::Accept,
+                cap: 30,
+                ignored: &[],
+                unavailable,
+            },
+        )
+        .await
+    }
+
+    async fn start_with(url: &Mutex<Option<&'static str>>, behaviour: Behaviour) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address: &'static str =
             Box::leak(format!("ws://{}", listener.local_addr().unwrap()).into_boxed_str());
@@ -186,7 +233,7 @@ impl Provider {
                 tokio::spawn(serve_connection(
                     stream,
                     number,
-                    Behaviour { auth, cap, ignored },
+                    behaviour,
                     Arc::clone(&log),
                     rx,
                     Arc::clone(&closed),
@@ -271,12 +318,26 @@ fn named<'a>(payload: &'a Value, channel: &str) -> impl Iterator<Item = String> 
         .map(|symbol| symbol.as_str().unwrap().to_owned())
 }
 
+/// The channels the provider keeps state for, in the order of its state arrays.
+const CHANNELS: [&str; 4] = ["trades", "quotes", "statuses", "lulds"];
+
+/// The `subscription` message reporting what a connection holds.
+fn state(held: &[BTreeSet<String>; 4]) -> Value {
+    let mut state = json!({"T": "subscription", "bars": []});
+    for (channel, symbols) in CHANNELS.iter().zip(held) {
+        state[*channel] = json!(symbols);
+    }
+    json!([state])
+}
+
 /// How a provider answers, the same for every connection it serves.
 #[derive(Clone, Copy)]
 struct Behaviour {
     auth: Auth,
     cap: usize,
     ignored: &'static [&'static str],
+    /// Channels the feed does not carry.
+    unavailable: &'static [&'static str],
 }
 
 async fn serve_connection(
@@ -287,7 +348,12 @@ async fn serve_connection(
     mut control: mpsc::UnboundedReceiver<Control>,
     closed: Arc<AtomicUsize>,
 ) {
-    let Behaviour { auth, cap, ignored } = behaviour;
+    let Behaviour {
+        auth,
+        cap,
+        ignored,
+        unavailable,
+    } = behaviour;
 
     let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
         closed.fetch_add(1, Ordering::SeqCst);
@@ -297,8 +363,8 @@ async fn serve_connection(
     let connected = json!([{"T": "success", "msg": "connected"}]);
     let _ = websocket.send(Message::text(connected.to_string())).await;
 
-    let mut trades = BTreeSet::<String>::new();
-    let mut quotes = BTreeSet::<String>::new();
+    // Each channel's symbols, as the connection holds them.
+    let mut held: [BTreeSet<String>; 4] = Default::default();
 
     loop {
         let payload = tokio::select! {
@@ -333,29 +399,34 @@ async fn serve_connection(
                     json!([{"T": "error", "code": 406, "msg": "connection limit exceeded"}])
                 }
             },
+            "subscribe"
+                if unavailable
+                    .iter()
+                    .any(|channel| !payload[*channel].is_null()) =>
+            {
+                json!([{"T": "error", "code": 410, "msg": "invalid subscribe action for this feed"}])
+            }
             "subscribe" => {
-                let mut next_trades = trades.clone();
-                let mut next_quotes = quotes.clone();
+                let mut next = held.clone();
                 let registered = |symbol: &String| !ignored.contains(&symbol.as_str());
-                next_trades.extend(named(&payload, "trades").filter(registered));
-                next_quotes.extend(named(&payload, "quotes").filter(registered));
+                for (channel, symbols) in CHANNELS.iter().zip(&mut next) {
+                    symbols.extend(named(&payload, channel).filter(registered));
+                }
 
-                if next_trades.len() + next_quotes.len() > cap {
+                if next.iter().map(BTreeSet::len).sum::<usize>() > cap {
                     json!([{"T": "error", "code": 405, "msg": "symbol limit exceeded"}])
                 } else {
-                    trades = next_trades;
-                    quotes = next_quotes;
-                    json!([{"T": "subscription", "trades": trades, "quotes": quotes, "bars": []}])
+                    held = next;
+                    state(&held)
                 }
             }
             "unsubscribe" => {
-                for symbol in named(&payload, "trades") {
-                    trades.remove(&symbol);
+                for (channel, symbols) in CHANNELS.iter().zip(&mut held) {
+                    for symbol in named(&payload, channel) {
+                        symbols.remove(&symbol);
+                    }
                 }
-                for symbol in named(&payload, "quotes") {
-                    quotes.remove(&symbol);
-                }
-                json!([{"T": "subscription", "trades": trades, "quotes": quotes, "bars": []}])
+                state(&held)
             }
             _ => continue,
         };
@@ -717,4 +788,146 @@ async fn an_unconfirmed_subscribe_times_out_and_releases_what_it_sent() {
         json!({"action": "unsubscribe", "trades": ["TSLA"]}),
     );
     assert_eq!(provider.connections(), 1);
+}
+
+/// Trading status and price bands share the feed's one connection with trades: each subscribes on
+/// its own channel, and a frame mixing all three reaches each stream as only its own messages,
+/// decoded. A status code that reports no state reaches its stream as nothing at all.
+#[tokio::test]
+#[serial]
+async fn statuses_and_bands_share_the_connection_and_each_stream_decodes_only_its_own() {
+    type StatusStream =
+        AlpacaStream<AlpacaDecodeTransformer<Equities, MarketDataInstrument, AlpacaStatusDecoder>>;
+    type BandStream =
+        AlpacaStream<AlpacaDecodeTransformer<Equities, MarketDataInstrument, AlpacaLuldDecoder>>;
+    let instrument =
+        |base: &str| MarketDataInstrument::from((base, "usd", MarketDataInstrumentKind::Spot));
+
+    let provider = Provider::start(&EQUITIES_URL, Auth::Accept, 30).await;
+    let subscriber = subscriber();
+
+    let mut trading = trade_stream(&subscriber.clone(), &[trades("aapl")])
+        .await
+        .unwrap();
+    let mut statuses =
+        <StatusStream as MarketStream<Equities, MarketDataInstrument, TradingStatuses>>::init::<
+            NoInitialSnapshots,
+        >(
+            &subscriber.clone(),
+            &[Subscription::new(
+                Equities::default(),
+                instrument("aapl"),
+                TradingStatuses,
+            )],
+        )
+        .await
+        .unwrap();
+    let mut bands =
+        <BandStream as MarketStream<Equities, MarketDataInstrument, PriceBands>>::init::<
+            NoInitialSnapshots,
+        >(
+            &subscriber,
+            &[Subscription::new(
+                Equities::default(),
+                instrument("aapl"),
+                PriceBands,
+            )],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(provider.connections(), 1);
+    assert_eq!(
+        provider.sent_on(1),
+        [
+            json!({"action": "subscribe", "trades": ["AAPL"]}),
+            json!({"action": "subscribe", "statuses": ["AAPL"]}),
+            json!({"action": "subscribe", "lulds": ["AAPL"]}),
+        ],
+    );
+
+    provider.push(json!([
+        {"T": "s", "S": "AAPL", "sc": "E", "rc": "", "t": "2026-09-25T14:00:00Z", "z": "A"},
+        {"T": "l", "S": "AAPL", "u": 160.5, "d": 0, "i": "B", "t": "2026-09-25T14:00:01Z", "z": "C"},
+        trade("AAPL", 1),
+        {"T": "s", "S": "AAPL", "sc": "H", "rc": "LUDP", "t": "2026-09-25T14:00:02Z", "z": "C"},
+    ]));
+
+    let status: MarketEvent<MarketDataInstrument, TradingStatus> = next_event(&mut statuses).await;
+    assert_eq!(status.instrument, instrument("aapl"));
+    assert_eq!(
+        status.time_exchange.to_rfc3339(),
+        "2026-09-25T14:00:02+00:00"
+    );
+    assert_eq!(
+        (
+            status.kind.state,
+            status.kind.reason,
+            status.kind.venue_code.as_deref()
+        ),
+        (
+            TradingState::Paused,
+            Some(HaltReason::Volatility),
+            Some("C:H:LUDP")
+        )
+    );
+
+    let band: MarketEvent<MarketDataInstrument, PriceBand> = next_event(&mut bands).await;
+    assert_eq!(band.instrument, instrument("aapl"));
+    assert_eq!(
+        band.kind,
+        PriceBand::new(Some(dec!(160.5)), None)
+            .with_update(PriceBandUpdate::Intraday)
+            .with_venue_code("C:B")
+    );
+
+    assert_eq!(next_event(&mut trading).await.kind.id, "1");
+
+    quiet(&mut statuses).await;
+    quiet(&mut bands).await;
+    quiet(&mut trading).await;
+}
+
+/// A feed that lacks a channel refuses its subscribe, and the refusal fails the stream's
+/// initialisation with Alpaca's code and message, leaving the other streams on the connection up.
+#[tokio::test]
+#[serial]
+async fn a_feed_refusing_the_status_channel_fails_its_subscribe_with_alpacas_code() {
+    type StatusStream =
+        AlpacaStream<AlpacaDecodeTransformer<Equities, MarketDataInstrument, AlpacaStatusDecoder>>;
+    let provider = Provider::start_without_channels(&EQUITIES_URL, &["statuses"]).await;
+    let subscriber = subscriber();
+
+    let mut trading = trade_stream(&subscriber.clone(), &[trades("aapl")])
+        .await
+        .unwrap();
+    let refused =
+        <StatusStream as MarketStream<Equities, MarketDataInstrument, TradingStatuses>>::init::<
+            NoInitialSnapshots,
+        >(
+            &subscriber,
+            &[Subscription::new(
+                Equities::default(),
+                MarketDataInstrument::from(("aapl", "usd", MarketDataInstrumentKind::Spot)),
+                TradingStatuses,
+            )],
+        )
+        .await
+        .unwrap_err();
+
+    let message = refused.to_string();
+    assert!(message.contains("410"), "{message}");
+    assert!(message.contains("invalid subscribe action"), "{message}");
+    assert_eq!(provider.connections(), 1);
+    assert_eq!(
+        provider.sent_on(1),
+        [
+            json!({"action": "subscribe", "trades": ["AAPL"]}),
+            json!({"action": "subscribe", "statuses": ["AAPL"]}),
+        ],
+        "a refused subscribe added nothing, so nothing is unsubscribed",
+    );
+
+    provider.push(json!([trade("AAPL", 4)]));
+    assert_eq!(next_event(&mut trading).await.kind.id, "4");
 }

@@ -63,7 +63,9 @@ use rustrade_data::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
     },
-    subscription::{quote::Quotes, trade::PublicTrades},
+    subscription::{
+        price_band::PriceBands, quote::Quotes, trade::PublicTrades, trading_status::TradingStatuses,
+    },
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use serial_test::serial;
@@ -692,6 +694,140 @@ async fn test_iex_quote_stream_receives_data() {
     }
 
     panic!("No IEX quote events received within 60 s, with the US regular session open");
+}
+
+/// The IEX feed confirms a subscription to trading status and price bands, on one connection.
+///
+/// Works at any time: Alpaca confirms the subscription whether or not anything is published.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_iex_trading_status_and_price_band_subscription() {
+    init_logging();
+    let subscriber = AlpacaSubscriber::from_env().unwrap();
+
+    let statuses = Streams::<TradingStatuses>::builder()
+        .subscribe(
+            subscriber.clone(),
+            [
+                (
+                    AlpacaIex::default(),
+                    "spy",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    TradingStatuses,
+                ),
+                (
+                    AlpacaIex::default(),
+                    "aapl",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    TradingStatuses,
+                ),
+            ],
+        )
+        .init()
+        .await;
+    let bands = Streams::<PriceBands>::builder()
+        .subscribe(
+            subscriber,
+            [
+                (
+                    AlpacaIex::default(),
+                    "spy",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PriceBands,
+                ),
+                (
+                    AlpacaIex::default(),
+                    "aapl",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PriceBands,
+                ),
+            ],
+        )
+        .init()
+        .await;
+
+    assert!(
+        statuses.is_ok(),
+        "IEX trading status subscribe failed: {:?}",
+        statuses.err()
+    );
+    assert!(
+        bands.is_ok(),
+        "IEX price band subscribe failed: {:?}",
+        bands.err()
+    );
+}
+
+/// The IEX feed delivers Limit Up-Limit Down bands, and each decodes to a band with a limit.
+///
+/// Needs the US regular session, and is best started at the open, when the venue publishes every
+/// symbol's opening band. Later in the day a band is published only when the reference price
+/// moves enough, so a quiet symbol can stay silent for the whole wait: a failure then means no
+/// band arrived, not that the feed carries none.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_iex_price_bands_receive_data() {
+    init_logging();
+    require_regular_session().await;
+
+    let symbols = ["spy", "qqq", "aapl", "tsla", "nvda", "amd", "amzn", "meta"];
+    let streams = Streams::<PriceBands>::builder()
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            symbols.map(|symbol| {
+                (
+                    AlpacaIex::default(),
+                    symbol,
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PriceBands,
+                )
+            }),
+        )
+        .init()
+        .await
+        .expect("Failed to init IEX price band stream");
+
+    let mut stream = streams
+        .select_all()
+        .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
+
+    // A band with neither limit is valid (no band in effect, such as while bands are suspended),
+    // so one is logged and the wait goes on for one with a limit.
+    let wait = Duration::from_secs(600);
+    let band = tokio::time::timeout(wait, async {
+        loop {
+            match stream.next().await {
+                Some(Event::Item(band))
+                    if band.kind.upper.is_some() || band.kind.lower.is_some() =>
+                {
+                    return band;
+                }
+                Some(Event::Item(band)) => tracing::info!(?band, "IEX price band with no limit"),
+                Some(Event::Reconnecting(_)) => continue,
+                None => panic!("Stream ended unexpectedly"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "No IEX price band with a limit for {symbols:?} within {wait:?}, with the US regular \
+             session open"
+        )
+    });
+
+    tracing::info!(?band, "Received IEX price band");
+    assert!(
+        band.kind.venue_code.is_some(),
+        "a band without its venue code: {band:?}"
+    );
 }
 
 // ============================================================================

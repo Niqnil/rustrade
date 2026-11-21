@@ -167,7 +167,8 @@ impl VenueMarketUpdate for DataKind {
     /// previous close carried forward. One reporting neither is fresh, since some feeds (spot FX)
     /// report no volume at all, and an unknown volume is not a zero one.
     ///
-    /// L2 depth, liquidations and greeks are never fresh: the state prices from none of them.
+    /// L2 depth, liquidations, greeks, trading statuses and price bands are never fresh: the state
+    /// prices from none of them.
     fn fresh(state: &Self::State, event: &MarketEvent<InstrumentIndex, Self>) -> bool {
         match &event.kind {
             DataKind::Trade(_) => state.takes_trade(event.time_exchange),
@@ -177,7 +178,20 @@ impl VenueMarketUpdate for DataKind {
                     && candle.volume != Some(Decimal::ZERO)
                     && candle.trade_count != Some(0)
             }
-            DataKind::OrderBook(_) | DataKind::Liquidation(_) | DataKind::OptionGreeks(_) => false,
+            DataKind::OrderBook(_)
+            | DataKind::Liquidation(_)
+            | DataKind::OptionGreeks(_)
+            | DataKind::TradingStatus(_)
+            | DataKind::PriceBand(_) => false,
+            // `DataKind` is `#[non_exhaustive]`: a kind added later prices nothing until it is
+            // handled above, and says so.
+            kind => {
+                crate::engine::state::instrument::data::warn_unhandled_kind(
+                    "simulated venue market data",
+                    kind,
+                );
+                false
+            }
         }
     }
 }
@@ -360,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_liquidations_and_greeks_are_never_fresh() {
+    fn depth_liquidations_greeks_statuses_and_bands_are_never_fresh() {
         let mut state = DefaultInstrumentMarketData::default();
         let liquidation =
             DataKind::Liquidation(rustrade_data::subscription::liquidation::Liquidation {
@@ -383,6 +397,21 @@ mod tests {
             &mut state,
             event(1, DataKind::OptionGreeks(Default::default()))
         ));
+        let halted = rustrade_data::subscription::trading_status::TradingStatus::new(
+            rustrade_data::subscription::trading_status::TradingState::Halted,
+        );
+        assert!(!fresh(
+            &mut state,
+            event(1, DataKind::TradingStatus(halted))
+        ));
+        let band = rustrade_data::subscription::price_band::PriceBand::new(None, None);
+        let ((), logs) = rustrade_instrument::test_utils::logs::capture(|| {
+            assert!(!fresh(&mut state, event(1, DataKind::PriceBand(band))));
+        });
+        assert!(
+            logs.is_empty(),
+            "a price band is handled, not unknown: {logs:?}"
+        );
     }
 
     /// A kind that carries a last price and no bars, implementing only what it must.

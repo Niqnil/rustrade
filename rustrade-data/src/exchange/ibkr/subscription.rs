@@ -80,14 +80,21 @@ impl<K> IbkrSubscription<K> {
 /// Type of IBKR market data subscription.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum IbkrSubscriptionKind {
-    /// Best bid/ask quotes via market_data()
+    /// Best bid/ask quotes via market_data().
+    ///
+    /// Also yields a [`TradingStatus`](crate::subscription::trading_status::TradingStatus) when
+    /// IB's Halted tick changes. IB stamps that tick with no time, so its event's
+    /// `time_exchange` is when it was received.
     Quotes,
     /// L2 order book via market_depth()
     Depth {
         /// Number of rows in the order book
         rows: i32,
     },
-    /// Tick-by-tick trades via tick_by_tick()
+    /// Tick-by-tick trades via tick_by_tick().
+    ///
+    /// Halts are reported on [`Quotes`](Self::Quotes), not here: the tick IB sends in this data
+    /// to mark a halt (zero price and size) is skipped.
     Trades,
     /// Real-time option Greeks via market_data() with OptionComputation ticks.
     ///

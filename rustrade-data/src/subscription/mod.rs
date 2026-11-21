@@ -31,8 +31,16 @@ pub mod liquidation;
 /// Quote [`SubscriptionKind`] and the associated output data model.
 pub mod quote;
 
+/// Price band [`SubscriptionKind`] and the associated output data model: the prices a venue lets
+/// an instrument trade between.
+pub mod price_band;
+
 /// Public trade [`SubscriptionKind`] and the associated output data model.
 pub mod trade;
+
+/// Trading status [`SubscriptionKind`] and the associated output data model: halts, pauses and
+/// resumptions a venue reports.
+pub mod trading_status;
 
 /// Defines kind of a [`Subscription`], and the output [`Self::Event`] that it yields.
 pub trait SubscriptionKind
@@ -85,6 +93,11 @@ where
     }
 }
 
+/// The kind of data a [`Subscription`] asks a venue for, chosen at runtime.
+///
+/// New kinds are added as venues publish them, so a `match` outside this crate needs a wildcard
+/// arm.
+#[non_exhaustive]
 #[derive(
     Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Display, Deserialize, Serialize,
 )]
@@ -108,6 +121,11 @@ pub enum SubKind {
     /// Real-time top-of-book quotes (best bid/ask). Generic subscription kind
     /// that may be supported by multiple exchanges providing quote data.
     Quotes,
+    /// Halts, pauses and resumptions, from a venue that publishes them on a channel of their own.
+    /// See [`TradingStatuses`](trading_status::TradingStatuses).
+    TradingStatuses,
+    /// The price bands a venue publishes. See [`PriceBands`](price_band::PriceBands).
+    PriceBands,
 }
 
 impl<Exchange, S, Kind> From<(Exchange, S, S, MarketDataInstrumentKind, Kind)>
@@ -330,6 +348,9 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         // has never been run against the real feed: it needs a paid subscription. See
         // `exchange::alpaca`.
         (AlpacaCrypto | AlpacaIex | AlpacaSip, Spot, PublicTrades | OrderBooksL1) => true,
+        // Trading status and Limit Up-Limit Down bands are US equity data: the stock feeds publish
+        // them, and the crypto feed does not.
+        (AlpacaIex | AlpacaSip, Spot, TradingStatuses | PriceBands) => true,
 
         // London Strategic Edge serves both kinds from ONE frame: its WebSocket publishes a single
         // tick carrying `price`, `bid`, `ask` and `volume` together, so a dataset that serves one
@@ -577,6 +598,34 @@ mod tests {
                     !exchange_supports_instrument_kind(ExchangeId::LseOptions, &denied),
                     "LseOptions should not support {denied:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn only_the_alpaca_stock_feeds_serve_trading_statuses_and_price_bands() {
+            use ExchangeId::*;
+            for sub_kind in [SubKind::TradingStatuses, SubKind::PriceBands] {
+                for exchange in [AlpacaIex, AlpacaSip] {
+                    assert!(
+                        exchange_supports_instrument_kind_sub_kind(
+                            &exchange,
+                            &MarketDataInstrumentKind::Spot,
+                            sub_kind
+                        ),
+                        "{exchange:?} should serve {sub_kind}"
+                    );
+                }
+                // The crypto feed publishes neither, and no other venue declares them.
+                for exchange in [AlpacaCrypto, BinanceSpot, LseEquities, MassiveStocks, Ibkr] {
+                    assert!(
+                        !exchange_supports_instrument_kind_sub_kind(
+                            &exchange,
+                            &MarketDataInstrumentKind::Spot,
+                            sub_kind
+                        ),
+                        "{exchange:?} should not serve {sub_kind}"
+                    );
+                }
             }
         }
 
