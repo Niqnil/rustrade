@@ -97,9 +97,10 @@ pub trait InstrumentDataState<
 /// # Which [`DataKind`]s update this state
 /// [`Trade`](DataKind::Trade), [`OrderBookL1`](DataKind::OrderBookL1) and
 /// [`Candle`](DataKind::Candle) are price inputs. [`OrderBook`](DataKind::OrderBook) (L2),
-/// [`Liquidation`](DataKind::Liquidation), [`OptionGreeks`](DataKind::OptionGreeks) and
-/// [`TradingStatus`](DataKind::TradingStatus) are deliberately ignored — see the [`Processor`]
-/// impl, where each exclusion is stated with its reason.
+/// [`Liquidation`](DataKind::Liquidation), [`OptionGreeks`](DataKind::OptionGreeks),
+/// [`TradingStatus`](DataKind::TradingStatus) and [`PriceBand`](DataKind::PriceBand) are
+/// deliberately ignored — see the [`Processor`] impl, where each exclusion is stated with its
+/// reason.
 ///
 /// Does not implement `Ord`/`PartialOrd`: `last_traded_price` holds a [`Timed`] value, whose
 /// whole-struct ordering is intentionally not provided (see [`Timed`] docs).
@@ -431,6 +432,8 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // A trading status says whether the price can be traded, not what it is. This simple
             // state does not track it; a strategy that acts on halts keeps it itself.
             DataKind::TradingStatus(_) => {}
+            // A price band bounds where the price may trade, not where it is.
+            DataKind::PriceBand(_) => {}
             // `DataKind` is `#[non_exhaustive]`: a kind added later carries no price this state
             // reads until it is handled above, and says so.
             kind => warn_unhandled_kind("DefaultInstrumentMarketData::process", kind),
@@ -956,6 +959,24 @@ mod tests {
         ));
 
         assert_eq!(data, before);
+    }
+
+    #[test]
+    fn a_price_band_leaves_the_state_alone_and_logs_nothing() {
+        use rustrade_data::subscription::price_band::PriceBand;
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(10), trade(dec!(200))));
+        let before = data.clone();
+
+        let ((), events) = rustrade_instrument::test_utils::logs::capture(|| {
+            data.process(&event(
+                at(20),
+                DataKind::PriceBand(PriceBand::new(Some(dec!(210)), Some(dec!(190)))),
+            ));
+        });
+
+        assert_eq!(data, before);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

@@ -5,8 +5,6 @@
 //! needs — fails the whole initialisation with nothing opened.
 
 use super::DynamicSubscribers;
-#[cfg(feature = "alpaca")]
-use crate::exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber};
 #[cfg(feature = "hyperliquid")]
 use crate::exchange::hyperliquid::{Hyperliquid, HyperliquidSpot};
 #[cfg(feature = "lse")]
@@ -52,8 +50,15 @@ use crate::{
         book::{OrderBookEvent, OrderBookL1, OrderBooksL1, OrderBooksL2},
         candle::{Candle, Candles},
         liquidation::{Liquidation, Liquidations},
+        price_band::PriceBand,
         trade::{PublicTrade, PublicTrades},
+        trading_status::TradingStatus,
     },
+};
+#[cfg(feature = "alpaca")]
+use crate::{
+    exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber},
+    subscription::{price_band::PriceBands, trading_status::TradingStatuses},
 };
 use fnv::FnvHashMap;
 use futures::future::BoxFuture;
@@ -74,6 +79,10 @@ pub struct Txs<InstrumentKey> {
     pub liquidations:
         FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, Liquidation>>>,
     pub candles: FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, Candle>>>,
+    pub trading_statuses:
+        FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, TradingStatus>>>,
+    pub price_bands:
+        FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, PriceBand>>>,
 }
 
 impl<InstrumentKey> Default for Txs<InstrumentKey> {
@@ -84,6 +93,8 @@ impl<InstrumentKey> Default for Txs<InstrumentKey> {
             l2s: Default::default(),
             liquidations: Default::default(),
             candles: Default::default(),
+            trading_statuses: Default::default(),
+            price_bands: Default::default(),
         }
     }
 }
@@ -495,10 +506,51 @@ where
                 tx(&txs.l1s, exchange),
                 options,
             ),
+            // Trading status and Limit Up-Limit Down bands: the stock feeds only.
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaIex, SubKind::TradingStatuses) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaIex::default(),
+                TradingStatuses,
+                subs,
+                tx(&txs.trading_statuses, exchange),
+                options,
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaIex, SubKind::PriceBands) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaIex::default(),
+                PriceBands,
+                subs,
+                tx(&txs.price_bands, exchange),
+                options,
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaSip, SubKind::TradingStatuses) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaSip::default(),
+                TradingStatuses,
+                subs,
+                tx(&txs.trading_statuses, exchange),
+                options,
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaSip, SubKind::PriceBands) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaSip::default(),
+                PriceBands,
+                subs,
+                tx(&txs.price_bands, exchange),
+                options,
+            ),
             #[cfg(not(feature = "alpaca"))]
             (
                 ExchangeId::AlpacaCrypto | ExchangeId::AlpacaIex | ExchangeId::AlpacaSip,
                 Trades | L1,
+            )
+            | (
+                ExchangeId::AlpacaIex | ExchangeId::AlpacaSip,
+                SubKind::TradingStatuses | SubKind::PriceBands,
             ) => {
                 return Err(feature_disabled(exchange, "alpaca"));
             }

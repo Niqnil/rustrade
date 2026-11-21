@@ -7,8 +7,35 @@
 //!
 //! [`TradingStatus`]: crate::subscription::trading_status::TradingStatus
 
+use super::SubscriptionKind;
+use rustrade_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+
+/// [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`TradingStatus`]
+/// [`MarketEvent<T>`](crate::event::MarketEvent) events.
+///
+/// For a venue that publishes trading status on a channel of its own. A venue that reports it
+/// alongside other data delivers it on that data's subscription instead: IBKR reports it on its
+/// quote subscription, for example. Each venue integration's documentation says which applies.
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, DeSubKind, SerSubKind,
+)]
+pub struct TradingStatuses;
+
+impl SubscriptionKind for TradingStatuses {
+    type Event = TradingStatus;
+
+    fn as_str(&self) -> &'static str {
+        "trading_statuses"
+    }
+}
+
+impl std::fmt::Display for TradingStatuses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
 /// A change in whether an instrument can trade at its venue, as the venue reported it.
 ///
@@ -108,6 +135,12 @@ mod tests {
         assert_eq!(status.state, TradingState::Paused);
         assert_eq!(status.reason, Some(HaltReason::Volatility));
         assert_eq!(status.venue_code.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn the_kind_is_named_trading_statuses() {
+        assert_eq!(TradingStatuses.as_str(), "trading_statuses");
+        assert_eq!(TradingStatuses.to_string(), "trading_statuses");
     }
 
     #[test]

@@ -1,7 +1,10 @@
-use super::Alpaca;
+use super::{Alpaca, AlpacaStockServer};
 use crate::{
     Identifier,
-    subscription::{Subscription, book::OrderBooksL1, quote::Quotes, trade::PublicTrades},
+    subscription::{
+        Subscription, book::OrderBooksL1, price_band::PriceBands, quote::Quotes,
+        trade::PublicTrades, trading_status::TradingStatuses,
+    },
 };
 
 /// Alpaca WebSocket channel types.
@@ -16,6 +19,10 @@ pub enum AlpacaChannel {
     Trades,
     /// Real-time quotes stream (NBBO for equities, bid/ask for crypto).
     Quotes,
+    /// Trading status: halts, pauses and resumptions. Stock feeds only.
+    Statuses,
+    /// Limit Up-Limit Down price bands. Stock feeds only.
+    Lulds,
 }
 
 impl AlpacaChannel {
@@ -24,6 +31,8 @@ impl AlpacaChannel {
         match name {
             "trades" => Some(Self::Trades),
             "quotes" => Some(Self::Quotes),
+            "statuses" => Some(Self::Statuses),
+            "lulds" => Some(Self::Lulds),
             _ => None,
         }
     }
@@ -34,6 +43,8 @@ impl AsRef<str> for AlpacaChannel {
         match self {
             Self::Trades => "trades",
             Self::Quotes => "quotes",
+            Self::Statuses => "statuses",
+            Self::Lulds => "lulds",
         }
     }
 }
@@ -64,6 +75,30 @@ impl<Server, Instrument> Identifier<AlpacaChannel>
     }
 }
 
+/// Implemented for the stock feeds only: Alpaca's crypto feed publishes no trading status, so a
+/// crypto subscription to it does not compile.
+impl<Server, Instrument> Identifier<AlpacaChannel>
+    for Subscription<Alpaca<Server>, Instrument, TradingStatuses>
+where
+    Server: AlpacaStockServer,
+{
+    fn id(&self) -> AlpacaChannel {
+        AlpacaChannel::Statuses
+    }
+}
+
+/// Implemented for the stock feeds only: Alpaca's crypto feed publishes no price bands, so a
+/// crypto subscription to them does not compile.
+impl<Server, Instrument> Identifier<AlpacaChannel>
+    for Subscription<Alpaca<Server>, Instrument, PriceBands>
+where
+    Server: AlpacaStockServer,
+{
+    fn id(&self) -> AlpacaChannel {
+        AlpacaChannel::Lulds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,11 +107,18 @@ mod tests {
     fn test_channel_as_ref() {
         assert_eq!(AlpacaChannel::Trades.as_ref(), "trades");
         assert_eq!(AlpacaChannel::Quotes.as_ref(), "quotes");
+        assert_eq!(AlpacaChannel::Statuses.as_ref(), "statuses");
+        assert_eq!(AlpacaChannel::Lulds.as_ref(), "lulds");
     }
 
     #[test]
     fn every_channel_round_trips_through_its_name() {
-        for channel in [AlpacaChannel::Trades, AlpacaChannel::Quotes] {
+        for channel in [
+            AlpacaChannel::Trades,
+            AlpacaChannel::Quotes,
+            AlpacaChannel::Statuses,
+            AlpacaChannel::Lulds,
+        ] {
             assert_eq!(AlpacaChannel::from_name(channel.as_ref()), Some(channel));
         }
         assert_eq!(AlpacaChannel::from_name("bars"), None);

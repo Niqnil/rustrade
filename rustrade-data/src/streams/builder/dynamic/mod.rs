@@ -15,7 +15,9 @@ use crate::{
         book::{OrderBookEvent, OrderBookL1},
         candle::Candle,
         liquidation::Liquidation,
+        price_band::PriceBand,
         trade::PublicTrade,
+        trading_status::TradingStatus,
     },
 };
 use fnv::FnvHashMap;
@@ -52,6 +54,12 @@ pub struct DynamicStreams<InstrumentKey> {
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Liquidation>>>,
     pub candles:
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Candle>>>,
+    pub trading_statuses: VecMap<
+        ExchangeId,
+        UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>,
+    >,
+    pub price_bands:
+        VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>>,
 }
 
 /// The subscribers [`DynamicStreams`] cannot build for itself.
@@ -112,6 +120,11 @@ impl DynamicSubscribers {
     /// typed [`Streams`](crate::streams::Streams) builder serves it. A confirmed crypto
     /// subscription may stay silent for minutes: Alpaca publishes a crypto quote only when the top
     /// of book changes. See [`exchange::alpaca`](crate::exchange::alpaca).
+    ///
+    /// `SubKind::TradingStatuses` and `SubKind::PriceBands` read the stock feeds' `statuses` and
+    /// `lulds` channels; the crypto feed has neither. See
+    /// [`exchange::alpaca::status`](crate::exchange::alpaca::status) and
+    /// [`exchange::alpaca::luld`](crate::exchange::alpaca::luld) for how Alpaca's codes map.
     ///
     /// The `(channel, symbol)` pairs every stream on a feed holds count together against Alpaca's
     /// per-connection cap — 30 on the free IEX plan, as last measured. Trades and L1 on one symbol
@@ -420,6 +433,16 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                 .into_iter()
                 .map(|(exchange, rx)| (exchange, rx.into_stream()))
                 .collect(),
+            trading_statuses: rxs
+                .trading_statuses
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
+            price_bands: rxs
+                .price_bands
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
         })
     }
 
@@ -532,6 +555,46 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         )
     }
 
+    /// Remove an exchange [`TradingStatus`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_trading_statuses(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>> {
+        self.trading_statuses.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`TradingStatus`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_trading_statuses(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>> {
+        futures_util::stream::select_all::select_all(
+            std::mem::take(&mut self.trading_statuses).into_values(),
+        )
+    }
+
+    /// Remove an exchange [`PriceBand`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_price_bands(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>> {
+        self.price_bands.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`PriceBand`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_price_bands(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>> {
+        futures_util::stream::select_all::select_all(
+            std::mem::take(&mut self.price_bands).into_values(),
+        )
+    }
+
     /// Select and merge every exchange `Stream` for every data type using [`select_all`](futures_util::stream::select_all::select_all)
     ///
     /// Note that using [`MarketStreamResult<Instrument, DataKind>`] as the `Output` is suitable for most
@@ -545,6 +608,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         MarketStreamResult<InstrumentKey, OrderBookEvent>: Into<Output>,
         MarketStreamResult<InstrumentKey, Liquidation>: Into<Output>,
         MarketStreamResult<InstrumentKey, Candle>: Into<Output>,
+        MarketStreamResult<InstrumentKey, TradingStatus>: Into<Output>,
+        MarketStreamResult<InstrumentKey, PriceBand>: Into<Output>,
     {
         let Self {
             trades,
@@ -552,6 +617,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             l2s,
             liquidations,
             candles,
+            trading_statuses,
+            price_bands,
         } = self;
 
         let trades = trades
@@ -574,11 +641,21 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             .into_values()
             .map(|stream| stream.map(MarketStreamResult::into).boxed());
 
+        let trading_statuses = trading_statuses
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
+        let price_bands = price_bands
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
         let all = trades
             .chain(l1s)
             .chain(l2s)
             .chain(liquidations)
-            .chain(candles);
+            .chain(candles)
+            .chain(trading_statuses)
+            .chain(price_bands);
 
         futures_util::stream::select_all::select_all(all)
     }
@@ -774,6 +851,26 @@ where
                         rxs.candles.insert(sub.exchange, rx);
                     }
                 }
+                SubKind::TradingStatuses => {
+                    if let (None, None) = (
+                        txs.trading_statuses.get(&sub.exchange),
+                        rxs.trading_statuses.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.trading_statuses.insert(sub.exchange, tx);
+                        rxs.trading_statuses.insert(sub.exchange, rx);
+                    }
+                }
+                SubKind::PriceBands => {
+                    if let (None, None) = (
+                        txs.price_bands.get(&sub.exchange),
+                        rxs.price_bands.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.price_bands.insert(sub.exchange, tx);
+                        rxs.price_bands.insert(sub.exchange, rx);
+                    }
+                }
                 sub_kind @ (SubKind::OrderBooksL3 | SubKind::Quotes) => {
                     return Err(DataError::Unsupported {
                         exchange: sub.exchange,
@@ -794,6 +891,9 @@ struct Rxs<InstrumentKey> {
     liquidations:
         FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, Liquidation>>>,
     candles: FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, Candle>>>,
+    trading_statuses:
+        FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, TradingStatus>>>,
+    price_bands: FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, PriceBand>>>,
 }
 
 impl<InstrumentKey> Default for Rxs<InstrumentKey> {
@@ -804,6 +904,8 @@ impl<InstrumentKey> Default for Rxs<InstrumentKey> {
             l2s: Default::default(),
             liquidations: Default::default(),
             candles: Default::default(),
+            trading_statuses: Default::default(),
+            price_bands: Default::default(),
         }
     }
 }
@@ -1013,6 +1115,8 @@ mod tests {
             SubKind::OrderBooksL3,
             SubKind::Liquidations,
             SubKind::Quotes,
+            SubKind::TradingStatuses,
+            SubKind::PriceBands,
         ]
         .into_iter()
         .chain(
@@ -1032,7 +1136,9 @@ mod tests {
                 | SubKind::OrderBooksL3
                 | SubKind::Liquidations
                 | SubKind::Candles { .. }
-                | SubKind::Quotes => {}
+                | SubKind::Quotes
+                | SubKind::TradingStatuses
+                | SubKind::PriceBands => {}
             }
         }
 

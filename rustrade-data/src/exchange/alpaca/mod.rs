@@ -64,6 +64,16 @@
 //!   [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) serves, since the engine's
 //!   market data carries a top of book rather than a quote. A side Alpaca publishes at a zero price
 //!   has no quote and is `None`.
+//! - [`TradingStatuses`](crate::subscription::trading_status::TradingStatuses): halts, pauses and
+//!   resumptions, from the `statuses` channel. Stock feeds only. See [`status`] for how Alpaca's
+//!   codes map, and which are not reported.
+//! - [`PriceBands`](crate::subscription::price_band::PriceBands): Limit Up-Limit Down bands, from
+//!   the `lulds` channel. Stock feeds only. See [`luld`].
+//!
+//! The crypto feed publishes no trading status or price bands, so a crypto subscription to either
+//! does not compile. Alpaca does not say which stock feeds carry them: the IEX feed accepts the
+//! subscriptions, but whether it sends status and band messages has not been confirmed. Alpaca
+//! refuses a channel a feed or plan lacks with an error, which fails the subscribe.
 //!
 //! # Subscription confirmation
 //!
@@ -83,8 +93,11 @@
 use self::{
     channel::AlpacaChannel,
     connection::{AlpacaAttachment, AlpacaConnections, AttachRequest, Slot},
+    decode::AlpacaDecodeTransformer,
+    luld::AlpacaLuldDecoder,
     market::AlpacaMarket,
     quote::AlpacaQuoteTransformer,
+    status::AlpacaStatusDecoder,
     stream::AlpacaStream,
     subscription::AlpacaSubResponse,
     trade::AlpacaTradeTransformer,
@@ -97,8 +110,9 @@ use crate::{
         Subscribed, Subscriber, mapper::SubscriptionMapper, validator::WebSocketSubValidator,
     },
     subscription::{
-        Subscription, SubscriptionKind, SubscriptionMeta, book::OrderBooksL1, quote::Quotes,
-        trade::PublicTrades,
+        Subscription, SubscriptionKind, SubscriptionMeta, book::OrderBooksL1,
+        price_band::PriceBands, quote::Quotes, trade::PublicTrades,
+        trading_status::TradingStatuses,
     },
 };
 use fnv::FnvHashSet;
@@ -117,11 +131,14 @@ use url::Url;
 
 pub mod channel;
 pub mod connection;
+pub mod decode;
+pub mod luld;
 pub mod market;
 pub mod options;
 pub mod quote;
 pub mod reference;
 pub mod rest;
+pub mod status;
 pub mod stream;
 pub mod subscription;
 pub mod trade;
@@ -174,6 +191,53 @@ pub struct AlpacaServerSip;
 /// Crypto server.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub struct AlpacaServerCrypto;
+
+/// An Alpaca server for a US stock feed: IEX or SIP.
+///
+/// Only these publish trading status and Limit Up-Limit Down bands, so only they serve
+/// [`TradingStatuses`] and [`PriceBands`]:
+///
+/// ```
+/// use rustrade_data::{
+///     exchange::{StreamSelector, alpaca::{AlpacaIex, AlpacaSip}},
+///     subscription::{price_band::PriceBands, trading_status::TradingStatuses},
+/// };
+/// use rustrade_instrument::instrument::market_data::MarketDataInstrument;
+///
+/// fn serves<Exchange, Kind>()
+/// where
+///     Exchange: StreamSelector<MarketDataInstrument, Kind>,
+///     Kind: rustrade_data::subscription::SubscriptionKind,
+/// {
+/// }
+///
+/// serves::<AlpacaIex, TradingStatuses>();
+/// serves::<AlpacaSip, PriceBands>();
+/// ```
+///
+/// The crypto feed does not:
+///
+/// ```compile_fail
+/// use rustrade_data::{
+///     exchange::{StreamSelector, alpaca::AlpacaCrypto},
+///     subscription::trading_status::TradingStatuses,
+/// };
+/// use rustrade_instrument::instrument::market_data::MarketDataInstrument;
+///
+/// fn serves<Exchange, Kind>()
+/// where
+///     Exchange: StreamSelector<MarketDataInstrument, Kind>,
+///     Kind: rustrade_data::subscription::SubscriptionKind,
+/// {
+/// }
+///
+/// serves::<AlpacaCrypto, TradingStatuses>();
+/// ```
+pub trait AlpacaStockServer: ExchangeServer {}
+
+impl AlpacaStockServer for AlpacaServerIex {}
+
+impl AlpacaStockServer for AlpacaServerSip {}
 
 impl ExchangeServer for AlpacaServerIex {
     const ID: ExchangeId = ExchangeId::AlpacaIex;
@@ -258,6 +322,26 @@ where
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = AlpacaStream<AlpacaQuoteTransformer<Self, Instrument::Key, OrderBooksL1>>;
+}
+
+/// Stock feeds only: see [`AlpacaStockServer`].
+impl<Instrument, Server> StreamSelector<Instrument, TradingStatuses> for Alpaca<Server>
+where
+    Instrument: InstrumentData,
+    Server: AlpacaStockServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = AlpacaStream<AlpacaDecodeTransformer<Self, Instrument::Key, AlpacaStatusDecoder>>;
+}
+
+/// Stock feeds only: see [`AlpacaStockServer`].
+impl<Instrument, Server> StreamSelector<Instrument, PriceBands> for Alpaca<Server>
+where
+    Instrument: InstrumentData,
+    Server: AlpacaStockServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = AlpacaStream<AlpacaDecodeTransformer<Self, Instrument::Key, AlpacaLuldDecoder>>;
 }
 
 impl<'de, Server> Deserialize<'de> for Alpaca<Server>
@@ -515,20 +599,28 @@ fn channel_message<'a>(
 ) -> WsMessage {
     let mut trades: Vec<&str> = Vec::new();
     let mut quotes: Vec<&str> = Vec::new();
+    let mut statuses: Vec<&str> = Vec::new();
+    let mut lulds: Vec<&str> = Vec::new();
 
     for (channel, symbol) in pairs {
         match channel {
             AlpacaChannel::Trades => trades.push(symbol),
             AlpacaChannel::Quotes => quotes.push(symbol),
+            AlpacaChannel::Statuses => statuses.push(symbol),
+            AlpacaChannel::Lulds => lulds.push(symbol),
         }
     }
 
     let mut payload = json!({"action": action});
-    if !trades.is_empty() {
-        payload["trades"] = json!(trades);
-    }
-    if !quotes.is_empty() {
-        payload["quotes"] = json!(quotes);
+    for (channel, symbols) in [
+        (AlpacaChannel::Trades, trades),
+        (AlpacaChannel::Quotes, quotes),
+        (AlpacaChannel::Statuses, statuses),
+        (AlpacaChannel::Lulds, lulds),
+    ] {
+        if !symbols.is_empty() {
+            payload[channel.as_ref()] = json!(symbols);
+        }
     }
 
     WsMessage::text(payload.to_string())
