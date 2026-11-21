@@ -3,8 +3,8 @@
 
 use super::{
     options::{
-        buy, config as option_config, driven_instruments, driven_venue, expiry, feed, funds, limit,
-        option_name, option_position, option_request, sell,
+        buy, config as option_config, driven_instruments, driven_venue, expiry, feed, funds,
+        held_option, limit, option_name, option_position, option_request, sell,
     },
     *,
 };
@@ -310,13 +310,24 @@ fn a_cutoff_before_the_close_with_no_calendar_panics_when_the_clock_first_moves(
 }
 
 #[test]
-#[should_panic(expected = "expiry-day cutoff SPY_C100")]
+#[should_panic(expected = "option SPY_C100 has no session calendar")]
 fn an_option_order_whose_cutoff_has_no_calendar_panics() {
     let _ = uncalendared_venue(&before_close_config(None)).open_order(option_request(
         Side::Buy,
         "1",
         None,
     ));
+}
+
+/// A sale closing a long held since `initial_state` could never be refused by the cutoff, but the
+/// venue still stops on it rather than run on without the option's cutoff.
+#[test]
+#[should_panic(expected = "option SPY_C100 has no session calendar")]
+fn a_closing_order_whose_cutoff_has_no_calendar_panics_too() {
+    let mut config = before_close_config(None);
+    config.initial_state.instruments.push(held_option());
+
+    let _ = uncalendared_venue(&config).open_order(option_request(Side::Sell, "1", None));
 }
 
 /// A sell-out with no calendar stops the venue only when its clock moves: an order before that

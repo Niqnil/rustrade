@@ -126,32 +126,41 @@ impl SimulatedVenue {
         );
     }
 
+    /// Panics if the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) is anchored before the
+    /// session close and the option `instrument` has no session calendar to place it: see
+    /// [`next_deadline`](Self::next_deadline)'s `# Panics`. Checked on every order on the option,
+    /// since a venue restored from a snapshot has its clock moved already, so an order it took
+    /// before a calendar was given could pass a cutoff not yet placed.
+    pub(super) fn assert_cutoff_placed(&self, instrument: &InstrumentNameExchange) {
+        assert!(
+            !self
+                .expiry_rules_unplaced
+                .iter()
+                .any(|(rule, name)| *rule == ExpiryRule::DayCutoff && name == instrument),
+            "SimulatedVenue's expiry-day cutoff is anchored before the session close, but the \
+             option {instrument} has no session calendar to place it. Configure \
+             MockExecutionConfig::session_close, a session_close_overrides entry, or \
+             SimulatedVenue::with_session_calendar"
+        );
+    }
+
     /// Refuses an order on the option `instrument` that would open or increase a position, if the
     /// venue's clock, at `now`, has reached the option's
-    /// [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff).
-    ///
-    /// # Panics
-    /// If the cutoff is anchored before the session close and the option has no session calendar
-    /// to place it: see [`next_deadline`](Self::next_deadline)'s `# Panics`. A venue restored
-    /// from a snapshot has its clock moved already, so an order it took then could pass a cutoff
-    /// not yet placed.
+    /// [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff). An option with no cutoff, or one not
+    /// yet placed, is not refused: [`assert_cutoff_placed`](Self::assert_cutoff_placed) runs
+    /// first.
     pub(super) fn check_expiry_day_cutoff(
         &self,
         instrument: &InstrumentNameExchange,
         now: DateTime<Utc>,
     ) -> Result<(), UnindexedApiError> {
-        let Some(&cutoff) = self.cutoffs.get(instrument) else {
-            // Every option is placed, or unplaced for want of a calendar, once a cutoff is set.
-            if self.expiry_day_cutoff.is_some() {
-                self.assert_expiry_rules_placed();
+        match self.cutoffs.get(instrument) {
+            Some(&cutoff) if now >= cutoff => {
+                Err(ApiError::OpenRefused(OpenRefusal::ExpiryDayCutoff {
+                    cutoff,
+                }))
             }
-            return Ok(());
-        };
-        if now >= cutoff {
-            return Err(ApiError::OpenRefused(OpenRefusal::ExpiryDayCutoff {
-                cutoff,
-            }));
+            _ => Ok(()),
         }
-        Ok(())
     }
 }

@@ -415,7 +415,8 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     ///
     /// Reported by the [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue), under its
     /// [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff). Other clients report such refusals as
-    /// [`OrderRejected`](Self::OrderRejected) until their venue's wording is confirmed.
+    /// [`OrderRejected`](Self::OrderRejected) until their venue's wording is confirmed, so a caller
+    /// trading live must handle that refusal there too.
     ///
     /// Not transient while the rule holds — the same order fails identically. An order that only
     /// closes the position may be accepted.

@@ -4674,8 +4674,8 @@ impl SimulatedVenue {
     ///   boundary not after the instant it was asked from, or a negative interest.
     /// - If the order is on an option that an
     ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) anchored before the session
-    ///   close cannot place, having no session calendar: see
-    ///   [`next_deadline`](Self::next_deadline).
+    ///   close cannot place, having no session calendar, whether the order opens a position or
+    ///   only closes one: see [`next_deadline`](Self::next_deadline).
     pub fn open_order(
         &mut self,
         mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -6055,7 +6055,7 @@ impl SimulatedVenue {
     /// for a short whose collateral is not free.
     ///
     /// # Panics
-    /// As [`check_expiry_day_cutoff`](Self::check_expiry_day_cutoff).
+    /// As [`assert_cutoff_placed`](Self::assert_cutoff_placed), for any order on the option.
     fn check_option_order(
         &self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -6089,6 +6089,10 @@ impl SimulatedVenue {
                 ),
             )));
         }
+
+        // Before any order on the option is judged, closing ones included, so a venue that cannot
+        // place the option's cutoff stops on the first order there, whatever it is.
+        self.assert_cutoff_placed(instrument);
 
         // What of this order would open or increase a position on its side rather than close one,
         // once every order already resting on that side filled.
