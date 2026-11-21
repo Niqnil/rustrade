@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use tracing::{info, info_span};
 
+/// The name of the span [`StateReplicaManager::run`] applies the audit stream inside.
+///
+/// Every event logged while the replica updates is in this span's scope, which is how
+/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops the replica's copy of each log line.
 pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_update_span";
 
 /// Manages a replica of an `EngineState` instance by processing AuditStream events produced by
@@ -44,6 +48,15 @@ pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_upda
 /// Nor does it learn which orders were sent reduce-only. It cuts a reduce-only fill as the
 /// engine did because the engine's [`EngineOutput::ReduceOnlyCapped`] output names each fill it
 /// cut.
+///
+/// # Logging
+///
+/// The replica applies each event through the same `EngineState` methods as the engine, so
+/// whatever they log, the replica logs again. [`run`](Self::run) applies them inside the span
+/// [`AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME`], and
+/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops every event in it. The
+/// [`logging`](crate::logging) initialisers install that filter; add it to a subscriber you build
+/// yourself, or each line on that path is written twice.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,

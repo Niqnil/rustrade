@@ -8,7 +8,7 @@ use rustrade_instrument::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
-use tracing::{debug, info};
+use tracing::{debug, warn};
 
 /// A fill's fee charged in a third asset, neither the instrument's base nor its quote, and how
 /// the engine valued it in quote.
@@ -67,10 +67,15 @@ where
     AssetKey: Display,
     InstrumentKey: Display + Debug,
 {
-    /// Logs the conversion: at DEBUG when the fee was valued, at INFO when it was left out of PnL.
-    /// The output and the tear sheet's count are the signal a caller acts on, so a run that pays
-    /// every fee in an asset it cannot price logs no WARN per fill.
-    pub(crate) fn log(&self) {
+    /// Logs the conversion. A valued fee logs at DEBUG. A fee left out of PnL logs at WARN when
+    /// `first_unconverted` says it is the first its instrument's tear sheet counts, and at DEBUG
+    /// after that.
+    ///
+    /// The per-fill signals are [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion)
+    /// and [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted);
+    /// the one WARN only points a reader to them, so a run that pays every fee in an asset it
+    /// cannot price does not log a WARN per fill.
+    pub(crate) fn log(&self, first_unconverted: bool) {
         match &self.outcome {
             FeeConversionOutcome::Converted {
                 pricing_instrument,
@@ -86,7 +91,18 @@ where
                 %fees_quote,
                 "valued a fill's third-asset fee in quote"
             ),
-            unconverted => info!(
+            unconverted if first_unconverted => warn!(
+                instrument = %self.instrument,
+                trade_id = %self.trade_id,
+                fee_asset = %self.asset,
+                fee = %self.fees,
+                outcome = ?unconverted,
+                "could not value a fill's third-asset fee in quote; it is left out of PnL. Later \
+                 such fills on this instrument log at DEBUG; each is reported as \
+                 EngineOutput::FeeConversion and counted in the tear sheet's \
+                 fills_fee_unconverted"
+            ),
+            unconverted => debug!(
                 instrument = %self.instrument,
                 trade_id = %self.trade_id,
                 fee_asset = %self.asset,
@@ -308,10 +324,24 @@ mod tests {
             fee_asset: &str,
             fee: Decimal,
         ) -> crate::engine::state::instrument::FillsApplied<AssetIndex> {
+            self.fill_on("btc_usdt", id, side, price, fee_asset, fee)
+        }
+
+        /// A fill of 1 unit on `instrument` (on [`EXCHANGE`]) at `price`, paying `fee` in
+        /// `fee_asset`.
+        fn fill_on(
+            &mut self,
+            instrument: &str,
+            id: &str,
+            side: Side,
+            price: Decimal,
+            fee_asset: &str,
+            fee: Decimal,
+        ) -> crate::engine::state::instrument::FillsApplied<AssetIndex> {
             let trade = Trade::new(
                 TradeId::new(id),
                 OrderId::new(id),
-                self.index(EXCHANGE, "btc_usdt"),
+                self.index(EXCHANGE, instrument),
                 StrategyId::new("strategy"),
                 time(1),
                 side,
@@ -585,5 +615,172 @@ mod tests {
                 .value_third_asset_fee(&trade(&setup, "btc", None))
                 .is_none()
         );
+    }
+
+    /// The level of each line `f` logs about valuing a third-asset fee.
+    fn fee_log_levels(f: impl FnOnce()) -> Vec<tracing::Level> {
+        let ((), events) = rustrade_instrument::test_utils::logs::capture(f);
+        events
+            .iter()
+            .filter(|event| event.message().contains("third-asset fee"))
+            .map(|event| event.level)
+            .collect()
+    }
+
+    /// `BTCUSDT` and `ETHUSDT` with a BNB fee asset nothing prices.
+    fn unpriceable_bnb() -> Setup {
+        Setup::new(
+            IndexedInstruments::builder()
+                .add_instrument(instrument(EXCHANGE, "btc", "usdt"))
+                .add_instrument(instrument(EXCHANGE, "eth", "usdt"))
+                .add_asset(bnb())
+                .build(),
+        )
+    }
+
+    /// An instrument's first fee left out of PnL logs a WARN; later ones log at DEBUG, while each
+    /// is still counted.
+    #[test]
+    fn the_first_unconverted_fee_warns_and_later_ones_log_at_debug() {
+        let mut setup = unpriceable_bnb();
+
+        let levels = fee_log_levels(|| {
+            for id in ["a", "b", "c"] {
+                setup.fill(id, Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            }
+        });
+
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG
+            ]
+        );
+        assert_eq!(setup.btc_usdt().tear_sheet.fills_fee_unconverted, 3);
+    }
+
+    /// A valued fee logs at DEBUG and a zero fee logs nothing; neither uses up the WARN.
+    #[test]
+    fn a_valued_or_zero_fee_does_not_use_up_the_warning() {
+        let mut setup = Setup::new(IndexedInstruments::new([
+            instrument(EXCHANGE, "btc", "usdt"),
+            instrument(EXCHANGE, "bnb", "usdt"),
+        ]));
+        setup.set_price(EXCHANGE, "bnb_usdt", dec!(600));
+
+        let levels = fee_log_levels(|| {
+            setup.fill("valued", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            setup.fill("zero", Side::Buy, dec!(50000), "bnb", Decimal::ZERO);
+            setup.set_price(EXCHANGE, "bnb_usdt", Decimal::ZERO);
+            setup.fill("unpriced", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+        });
+
+        assert_eq!(levels, [tracing::Level::DEBUG, tracing::Level::WARN]);
+    }
+
+    /// Each instrument gets its own WARN.
+    #[test]
+    fn each_instrument_warns_on_its_own_first_unconverted_fee() {
+        let mut setup = unpriceable_bnb();
+
+        let levels = fee_log_levels(|| {
+            setup.fill_on("btc_usdt", "a", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            setup.fill_on("eth_usdt", "b", Side::Buy, dec!(3000), "bnb", dec!(0.01));
+            setup.fill_on("btc_usdt", "c", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            setup.fill_on("eth_usdt", "d", Side::Buy, dec!(3000), "bnb", dec!(0.01));
+        });
+
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG
+            ]
+        );
+    }
+
+    /// Resetting the tear sheet starts its count from zero, and the WARN with it.
+    #[test]
+    fn resetting_the_tear_sheet_rearms_the_warning() {
+        let mut setup = unpriceable_bnb();
+        setup.fill("a", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+        let btc_usdt = setup.index(EXCHANGE, "btc_usdt");
+        setup
+            .state
+            .instruments
+            .instrument_index_mut(&btc_usdt)
+            .tear_sheet
+            .reset(time(2));
+
+        let levels = fee_log_levels(|| {
+            setup.fill("b", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+        });
+
+        assert_eq!(levels, [tracing::Level::WARN]);
+    }
+
+    /// The WARN is per engine state: two states cloned from one, as parallel backtests run, each
+    /// warn once.
+    #[test]
+    fn each_engine_state_warns_once() {
+        let mut setup = unpriceable_bnb();
+        let mut other = setup.state.clone();
+
+        let levels = fee_log_levels(|| {
+            setup.fill("a", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            std::mem::swap(&mut setup.state, &mut other);
+            setup.fill("a", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+            setup.fill("b", Side::Buy, dec!(50000), "bnb", dec!(0.01));
+        });
+
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::WARN,
+                tracing::Level::DEBUG
+            ]
+        );
+    }
+
+    /// The instrument's first unconverted fee takes the WARN whatever its asset or reason: a fee
+    /// that arrives before its pricing instrument's first price uses it up, and a later fee in
+    /// another asset nothing prices logs at DEBUG. The count and the output still report both.
+    #[test]
+    fn the_warning_goes_to_the_first_unconverted_fee_whatever_its_asset() {
+        let mut setup = Setup::new(
+            IndexedInstruments::builder()
+                .add_instrument(instrument(EXCHANGE, "btc", "usdt"))
+                .add_instrument(instrument(EXCHANGE, "bnb", "usdt"))
+                .add_asset(ExchangeAsset::new(
+                    EXCHANGE,
+                    Asset::new_from_exchange("eth"),
+                ))
+                .build(),
+        );
+
+        let mut outcomes = Vec::new();
+        let levels = fee_log_levels(|| {
+            for asset in ["bnb", "eth"] {
+                let applied = setup.fill(asset, Side::Buy, dec!(50000), asset, dec!(0.01));
+                outcomes.push(applied.fee_conversion.unwrap().outcome);
+            }
+        });
+
+        assert_eq!(
+            outcomes,
+            [
+                FeeConversionOutcome::NoPrice {
+                    pricing_instrument: setup.index(EXCHANGE, "bnb_usdt"),
+                },
+                FeeConversionOutcome::NoPricingInstrument,
+            ]
+        );
+        assert_eq!(levels, [tracing::Level::WARN, tracing::Level::DEBUG]);
+        assert_eq!(setup.btc_usdt().tear_sheet.fills_fee_unconverted, 2);
     }
 }

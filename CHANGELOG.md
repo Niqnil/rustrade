@@ -637,6 +637,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **A third-asset fee the engine cannot value logs one WARN per instrument, then DEBUG**
+  (`rustrade`). It logged at INFO on every such fill. Now the fill that takes the instrument's
+  `TearSheet::fills_fee_unconverted` from zero to one logs a WARN, and later ones log at DEBUG.
+  The WARN goes to the instrument's first such fill whatever its fee asset or reason, including
+  one that arrives before the pricing instrument's first price. `TearSheetGenerator::reset`
+  re-arms it. Each fill is still reported as `EngineOutput::FeeConversion` and counted.
 - **The engine logs each user command and each routine order update at DEBUG, not INFO**
   (`rustrade`). Every `Command` the engine actions (`SendOpenRequests`, `SendCancelRequests`,
   `SendCancelThenOpenRequests`, `SendAmendRequests`, `ClosePositions`, `CancelOrders`, each with its
@@ -1130,6 +1136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`AuditSpanFilter` drops a replica's log lines under a nested span too** (`rustrade`). A
+  `StateReplicaManager` applies the audit stream through the same `EngineState` methods as the
+  engine, so each log line on that path is written twice unless the filter drops the replica's
+  copy. It checked only the innermost span, so an event under any span entered inside the
+  replica's escaped it; it now checks the event's whole scope, and honours an event's explicit
+  parent. `AuditSpanFilter`, `AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME` and `StateReplicaManager` now
+  document that a subscriber built by hand needs the filter added; `init_logging` and
+  `init_json_logging` install it.
 - **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB
   sends a price of -1 for a side it has no quote on, for example while the market is closed, and
   the IBKR stream's `OrderBookL1` carried it as a level at -1. The side is now withdrawn (`None`,

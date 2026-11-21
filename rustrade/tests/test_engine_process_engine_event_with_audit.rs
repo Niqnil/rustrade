@@ -10306,3 +10306,78 @@ fn test_order_deadline_cancels_an_order_being_amended() {
         Some(VenueOrderId::Assigned(gen_order_id(0)))
     );
 }
+
+/// Counts the WARNs `rustrade::engine::state::fee` logs that reach it.
+struct FeeWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FeeWarnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        if *metadata.level() == tracing::Level::WARN
+            && metadata.module_path() == Some("rustrade::engine::state::fee")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// The fee WARNs logged while the engine applies a fill whose ETH fee nothing values (ETH pairs
+/// only with BTC, the fill is on BTCUSDT), and then while a `StateReplicaManager` replays it,
+/// with or without the `AuditSpanFilter`.
+fn fee_warnings_with_a_replica(filtered: bool) -> usize {
+    use rustrade::engine::audit::{Auditor, state_replica::StateReplicaManager};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing_subscriber::Layer;
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let seed = <TestEngine as Auditor<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >>::audit_snapshot(&mut engine);
+    let fill = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            gen_trade_id(0),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(50000),
+            dec!(0.1),
+            None,
+            AssetFees::new(AssetIndex(1), dec!(0.001), None),
+        )),
+    }));
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let run = || {
+        let audit = process_with_audit(&mut engine, fill);
+        let mut replica = StateReplicaManager::new(seed, std::iter::once(audit));
+        replica.run().unwrap();
+    };
+    let layer = FeeWarnings(Arc::clone(&count));
+    if filtered {
+        rustrade_instrument::test_utils::logs::with_layer(
+            rustrade::logging::AuditSpanFilter.and_then(layer),
+            run,
+        );
+    } else {
+        rustrade_instrument::test_utils::logs::with_layer(layer, run);
+    }
+    count.load(Ordering::Relaxed)
+}
+
+/// A `StateReplicaManager` applies each fill through the same path as the engine, so it logs the
+/// engine's fee WARN again; the `AuditSpanFilter` drops its copy.
+#[test]
+fn test_state_replica_fee_warning_is_written_once_behind_the_audit_span_filter() {
+    assert_eq!(fee_warnings_with_a_replica(false), 2);
+    assert_eq!(fee_warnings_with_a_replica(true), 1);
+}
