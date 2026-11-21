@@ -958,6 +958,37 @@ mod tests {
         assert_eq!(data, before);
     }
 
+    #[test]
+    fn an_unhandled_kind_is_logged_on_each_power_of_two_with_the_running_total() {
+        use rustrade_data::subscription::trading_status::{TradingState, TradingStatus};
+        let kind = DataKind::TradingStatus(TradingStatus::new(TradingState::Halted));
+
+        for _ in 0..9 {
+            // Read before each call: the counter is process-wide.
+            let ignored = UNHANDLED_KINDS_IGNORED.load(Ordering::Relaxed) + 1;
+            let (_, events) = rustrade_instrument::test_utils::logs::capture(|| {
+                warn_unhandled_kind("test", &kind);
+            });
+
+            if ignored.is_power_of_two() {
+                assert_eq!(events.len(), 1, "event {ignored}: {events:?}");
+                let fields = &events[0].fields;
+                assert!(
+                    fields.contains(&("ignored", ignored.to_string())),
+                    "{fields:?}"
+                );
+                assert!(
+                    fields
+                        .iter()
+                        .any(|(name, value)| *name == "kind" && value.contains("trading_status")),
+                    "{fields:?}"
+                );
+            } else {
+                assert!(events.is_empty(), "event {ignored}: {events:?}");
+            }
+        }
+    }
+
     mod option {
         use super::*;
 

@@ -193,6 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn an_undocumented_value_is_logged_when_it_arrives_and_a_documented_one_never() {
+        let mut changes = StatusChanges::default();
+
+        let (_, events) = rustrade_instrument::test_utils::logs::capture(|| {
+            changes.change(&tick(TickType::Halted, 1.0));
+            changes.change(&tick(TickType::Halted, 3.0));
+            changes.change(&tick(TickType::Halted, 3.0));
+            changes.change(&tick(TickType::Halted, 0.0));
+        });
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].fields.contains(&("value", "3.0".to_owned())),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn documented_values_are_the_four_ib_lists() {
         assert!([-1.0, 0.0, 1.0, 2.0].into_iter().all(is_documented));
         assert!(![3.0, -2.0, 0.5].into_iter().any(is_documented));
