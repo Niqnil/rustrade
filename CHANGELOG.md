@@ -577,6 +577,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **The engine logs each user command and each routine order update at DEBUG, not INFO**
+  (`rustrade`). Every `Command` the engine actions (`SendOpenRequests`, `SendCancelRequests`,
+  `SendCancelThenOpenRequests`, `SendAmendRequests`, `ClosePositions`, `CancelOrders`, each with its
+  payload), a fill sized to trade free base past the position it reduces, an order followed or
+  re-keyed after a venue replaced it, and an order's terms adopted from a venue's report. At high
+  order rates (backtests, simulations, reinforcement-learning training) these lines dominated an
+  INFO log. INFO keeps lifecycle, connectivity and margin events and anything unusual; enable
+  `rustrade::engine=debug` to see the per-order lines again.
 - **Breaking: the IBKR market data stream reconnects and resubscribes by itself** (`rustrade-data`,
   `rustrade-instrument`, #877). `IbkrMarketStream::init` is now `async`, takes a
   `MarketStreamOptions` (reconnect backoff and optional silence timeout, as for the other venues'

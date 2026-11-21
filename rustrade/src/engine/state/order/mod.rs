@@ -36,7 +36,7 @@ use std::{
     },
     fmt::Debug,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 pub mod applied;
 pub mod in_flight_recorder;
@@ -1167,7 +1167,7 @@ where
                 "OrderManager moved an order replaced at the venue to its new ClientOrderId, dropping the request in flight under the old one"
             );
         } else {
-            info!(
+            debug!(
                 exchange = ?key.exchange,
                 instrument = ?key.instrument,
                 strategy = %tracked.order.key.strategy,
@@ -1214,7 +1214,7 @@ where
             return None;
         }
         let key = &tracked.order.key;
-        info!(
+        debug!(
             exchange = ?key.exchange,
             instrument = ?key.instrument,
             strategy = %key.strategy,
@@ -1863,7 +1863,7 @@ where
 
     if terms != held_terms {
         terms.apply_to(order);
-        info!(
+        debug!(
             exchange = ?order.key.exchange,
             instrument = ?order.key.instrument,
             strategy = %order.key.strategy,
