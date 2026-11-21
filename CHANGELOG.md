@@ -595,7 +595,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live. The security type decides which prices mean "no quote" (see Fixed).
 - **Breaking: `DataKind` is `#[non_exhaustive]`** (`rustrade-data`, #881). It gains
   `TradingStatus` (see Added), and kinds will keep being added as venues publish them, so a `match`
-  on it outside `rustrade-data` needs a wildcard arm.
+  on it outside `rustrade-data` needs a wildcard arm. The engine's `DefaultInstrumentMarketData` and
+  the simulated venue ignore `TradingStatus`; a kind added later that reaches their wildcard arm is
+  logged (a rate-limited warning naming it) rather than ignored silently.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`

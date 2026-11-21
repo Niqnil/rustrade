@@ -131,6 +131,7 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    /// This event with a reference to its [`TradingStatus`], if it is one.
     pub fn as_trading_status(&self) -> Option<MarketEvent<&InstrumentKey, &TradingStatus>> {
         match &self.kind {
             DataKind::TradingStatus(status) => Some(self.as_event(status)),

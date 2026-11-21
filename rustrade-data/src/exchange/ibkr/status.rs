@@ -27,12 +27,22 @@ use ibapi::{contracts::tick_types::TickType, market_data::realtime::TickGeneric}
 use smol_str::format_smolstr;
 use tracing::warn;
 
+/// Whether `tick` is a Halted tick, live or delayed.
+fn is_halted_tick(tick: &TickGeneric) -> bool {
+    matches!(tick.tick_type, TickType::Halted | TickType::DelayedHalted)
+}
+
+/// Whether IB documents `value` as a Halted value.
+fn is_documented(value: f64) -> bool {
+    [-1.0, 0.0, 1.0, 2.0].contains(&value)
+}
+
 /// The trading status a generic tick reports, if it is a Halted tick.
 ///
 /// A value IB does not document is reported as [`TradingState::Unknown`], with the value as the
-/// venue code, and logged.
+/// venue code.
 pub(crate) fn trading_status_from_tick(tick: &TickGeneric) -> Option<TradingStatus> {
-    if !matches!(tick.tick_type, TickType::Halted | TickType::DelayedHalted) {
+    if !is_halted_tick(tick) {
         return None;
     }
     let value = tick.value;
@@ -45,30 +55,33 @@ pub(crate) fn trading_status_from_tick(tick: &TickGeneric) -> Option<TradingStat
     } else if value == 2.0 {
         TradingStatus::new(TradingState::Paused).with_reason(HaltReason::Volatility)
     } else {
-        warn!(
-            value,
-            tick_type = ?tick.tick_type,
-            "IB Halted tick has a value IB does not document; reporting the state as unknown"
-        );
         TradingStatus::new(TradingState::Unknown)
     };
     Some(status.with_venue_code(format_smolstr!("{value}")))
 }
 
 /// The changes in one subscription's trading status: IB may repeat a Halted value, and only a
-/// change is an event.
+/// change is an event. Holds the last Halted value, live and delayed alike, since both report the
+/// same state.
 #[derive(Debug, Default)]
-pub(crate) struct StatusChanges(Option<TradingStatus>);
+pub(crate) struct StatusChanges(Option<f64>);
 
 impl StatusChanges {
-    /// The status `tick` reports, if it is a Halted tick whose status differs from the last one.
+    /// The status `tick` reports, if it is a Halted tick whose value differs from the last one. A
+    /// value IB does not document is logged when it arrives, not on each repeat.
     pub(crate) fn change(&mut self, tick: &TickGeneric) -> Option<TradingStatus> {
-        let status = trading_status_from_tick(tick)?;
-        if self.0.as_ref() == Some(&status) {
+        if !is_halted_tick(tick) || self.0 == Some(tick.value) {
             return None;
         }
-        self.0 = Some(status.clone());
-        Some(status)
+        self.0 = Some(tick.value);
+        if !is_documented(tick.value) {
+            warn!(
+                value = tick.value,
+                tick_type = ?tick.tick_type,
+                "IB Halted tick has a value IB does not document; reporting the state as unknown"
+            );
+        }
+        trading_status_from_tick(tick)
     }
 }
 
@@ -155,6 +168,34 @@ mod tests {
                 Some(TradingState::Trading),
             ]
         );
+    }
+
+    #[test]
+    fn the_delayed_tick_with_the_same_value_is_no_change() {
+        let mut changes = StatusChanges::default();
+        changes.change(&tick(TickType::Halted, 1.0));
+
+        assert_eq!(changes.change(&tick(TickType::DelayedHalted, 1.0)), None);
+    }
+
+    #[test]
+    fn an_undocumented_value_is_reported_once_until_it_changes() {
+        let mut changes = StatusChanges::default();
+
+        let first = changes.change(&tick(TickType::Halted, 3.0));
+        let repeat = changes.change(&tick(TickType::Halted, 3.0));
+
+        assert_eq!(
+            first.map(|status| status.state),
+            Some(TradingState::Unknown)
+        );
+        assert_eq!(repeat, None);
+    }
+
+    #[test]
+    fn documented_values_are_the_four_ib_lists() {
+        assert!([-1.0, 0.0, 1.0, 2.0].into_iter().all(is_documented));
+        assert!(![3.0, -2.0, 0.5].into_iter().any(is_documented));
     }
 
     #[test]

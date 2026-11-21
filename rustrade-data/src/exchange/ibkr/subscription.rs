@@ -91,7 +91,10 @@ pub enum IbkrSubscriptionKind {
         /// Number of rows in the order book
         rows: i32,
     },
-    /// Tick-by-tick trades via tick_by_tick()
+    /// Tick-by-tick trades via tick_by_tick().
+    ///
+    /// Halts are reported on [`Quotes`](Self::Quotes), not here: the tick IB sends in this data
+    /// to mark a halt (zero price and size) is skipped.
     Trades,
     /// Real-time option Greeks via market_data() with OptionComputation ticks.
     ///

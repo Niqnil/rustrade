@@ -276,6 +276,30 @@ impl InstrumentDataState for DefaultInstrumentMarketData {
 /// a map on, which is the same reason the warning cannot name the instrument it came from.
 static LOOKAHEAD_CANDLES_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// How many market events of a [`DataKind`] the crate does not handle yet have been ignored,
+/// process-wide; see [`warn_unhandled_kind`].
+static UNHANDLED_KINDS_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+/// Log, rate-limited, that `site` ignored an event of a [`DataKind`] it does not handle.
+///
+/// [`DataKind`] is `#[non_exhaustive]`, so a `match` on it here needs a wildcard arm, and a kind
+/// added later reaches that arm without a compile error to prompt the edit. The warning makes
+/// that observable instead: it names the kind, on the 1st, 2nd, 4th, 8th … such event, with the
+/// running total.
+pub(crate) fn warn_unhandled_kind(site: &str, kind: &DataKind) {
+    let ignored = UNHANDLED_KINDS_IGNORED.fetch_add(1, Ordering::Relaxed) + 1;
+    if ignored.is_power_of_two() {
+        tracing::warn!(
+            site,
+            kind = kind.kind_name(),
+            ignored,
+            "ignoring a market data kind this build does not handle; the match on DataKind needs \
+             an arm for it. This warning is rate-limited; `ignored` is the running total for the \
+             process"
+        );
+    }
+}
+
 impl DefaultInstrumentMarketData {
     /// The [`OrderBookL1`]'s price contribution, or `None` if it has none to make.
     ///
@@ -308,10 +332,11 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     /// the power-of-two cadence and the `dropped` total on the line count drops across all of them
     /// combined, so neither is scoped to the exchange the line does name.
     ///
-    /// The match is **exhaustive on purpose**: a catch-all is how `DataKind::Candle` went unhandled
-    /// here for as long as it did — silently, with no compile error to prompt the edit. Each
-    /// excluded variant states why it is not a price input, so a new variant forces a deliberate
-    /// decision rather than inheriting a default of "ignore".
+    /// Every kind is matched by name, each excluded one with why it is not a price input: a
+    /// catch-all is how `DataKind::Candle` went unhandled here for as long as it did. `DataKind`
+    /// is `#[non_exhaustive]`, so the match still needs a wildcard arm, and a kind added later
+    /// compiles without prompting an edit here; the wildcard arm warns instead
+    /// (rate-limited, naming the kind).
     fn process(&mut self, event: &MarketEvent<InstrumentKey, DataKind>) -> Self::Audit {
         match &event.kind {
             DataKind::Trade(trade) => {
@@ -407,8 +432,8 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // state does not track it; a strategy that acts on halts keeps it itself.
             DataKind::TradingStatus(_) => {}
             // `DataKind` is `#[non_exhaustive]`: a kind added later carries no price this state
-            // reads until it is handled above.
-            _ => {}
+            // reads until it is handled above, and says so.
+            kind => warn_unhandled_kind("DefaultInstrumentMarketData::process", kind),
         }
     }
 }

@@ -183,8 +183,14 @@ impl VenueMarketUpdate for DataKind {
             | DataKind::OptionGreeks(_)
             | DataKind::TradingStatus(_) => false,
             // `DataKind` is `#[non_exhaustive]`: a kind added later prices nothing until it is
-            // handled above.
-            _ => false,
+            // handled above, and says so.
+            kind => {
+                crate::engine::state::instrument::data::warn_unhandled_kind(
+                    "simulated venue market data",
+                    kind,
+                );
+                false
+            }
         }
     }
 }
