@@ -637,6 +637,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `rustrade::logging::AuditSpanFilter` is renamed `ReplicaLogFilter`** (`rustrade`).
+  It no longer looks at a span: it drops the log lines a `StateReplicaManager` repeats while it
+  updates its replica (see Fixed). There is no deprecated alias: replace `AuditSpanFilter` with
+  `ReplicaLogFilter` where a subscriber is built by hand. `init_logging` and `init_json_logging`
+  install it as before.
 - **A third-asset fee the engine cannot value logs one WARN per instrument, then DEBUG**
   (`rustrade`). It logged at INFO on every such fill. Now the fill that takes the instrument's
   `TearSheet::fills_fee_unconverted` from zero to one logs a WARN, and later ones log at DEBUG.
@@ -1144,14 +1149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the same error. `rustrade_instrument::ibkr::codes::MARKET_DATA_NOT_AVAILABLE_CODES` holds
   every code after which IB sends no market data (354, 10089, 10168 and 10197); the market data
   stream and `fetch_shortability` both read it.
-- **`AuditSpanFilter` drops a replica's log lines whatever the log filters** (`rustrade`). A
-  `StateReplicaManager` applies the audit stream through the same `EngineState` methods as the
-  engine, so each log line on that path is written twice unless the filter drops the replica's
-  copy. The filter keyed on the replica's INFO span, so a level filter excluding INFO (such as
-  `RUST_LOG=warn`) or one naming only other targets disabled the span and let every copy
-  through, as did any span entered beneath it. `StateReplicaManager::update_from_event` now marks
-  its thread while it applies an event, and the filter drops what is logged then, also when
-  `update_from_event` is called directly. The span remains, as context. `AuditSpanFilter`,
+- **`ReplicaLogFilter` (formerly `AuditSpanFilter`) drops a replica's log lines whatever the log
+  filters** (`rustrade`). A `StateReplicaManager` applies the audit stream through the same
+  `EngineState` methods as the engine, so each log line on that path is written twice unless the
+  filter drops the replica's copy. The filter keyed on the replica's INFO span, so a level filter
+  excluding INFO (such as `RUST_LOG=warn`) or one naming only other targets disabled the span and
+  let every copy through, as did any span entered beneath it.
+  `StateReplicaManager::update_from_event` now marks its thread while it applies an event, and the
+  filter drops what is logged then, also when `update_from_event` is called directly. The span
+  remains, as context. `ReplicaLogFilter`,
   `AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME` and `StateReplicaManager` now document that a subscriber
   built by hand needs the filter added; `init_logging` and `init_json_logging` install it.
 - **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB

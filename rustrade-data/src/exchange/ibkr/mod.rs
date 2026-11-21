@@ -57,7 +57,7 @@
 //!   [`DataError::MarketDataNotAvailable`]. Without a live subscription (such as OPRA for US
 //!   options), ask for delayed data with
 //!   [`IbkrStreamConfig::with_market_data_type`]
-//! - **Trade side**: IB doesn't provide trade side; defaults to `Side::Buy`
+//! - **Trade side**: IB doesn't report which side was the aggressor, so a trade's `side` is `None`
 //! - **Blocking API**: Uses `std::thread::spawn` for long-lived subscriptions
 //! - **Reconnection**: a lost connection (the socket to TWS/Gateway, or TWS/Gateway's link to IB,
 //!   codes 1100 and 1101) is reported as [`DataError::ConnectionLost`]; the stream then connects
