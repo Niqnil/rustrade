@@ -353,6 +353,7 @@ mod tests {
             ("A", "2", "", Halted, None, "A:2:"),
             ("A", "3", "D", Trading, None, "A:3:D"),
             ("C", "H", "T12", Halted, Some(Regulatory), "C:H:T12"),
+            ("C", "H", "", Halted, None, "C:H:"),
             ("O", "H", "LUDP", Paused, Some(Volatility), "O:H:LUDP"),
             ("C", "H", "LUDS", Paused, Some(Volatility), "C:H:LUDS"),
             ("C", "H", "T5", Paused, Some(Volatility), "C:H:T5"),

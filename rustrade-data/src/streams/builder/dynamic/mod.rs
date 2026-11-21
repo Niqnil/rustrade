@@ -1221,6 +1221,115 @@ mod tests {
         }
     }
 
+    /// A `DynamicStreams` holding one trading status and one price band stream on `AlpacaIex`, each
+    /// with one event waiting.
+    fn streams_with_a_status_and_a_band() -> DynamicStreams<u8> {
+        use crate::{
+            event::MarketEvent, streams::reconnect::Event,
+            subscription::trading_status::TradingState,
+        };
+        fn event<Kind>(kind: Kind) -> MarketStreamResult<u8, Kind> {
+            Event::Item(Ok(MarketEvent {
+                time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                time_received: Utc.timestamp_opt(0, 0).unwrap(),
+                exchange: ExchangeId::AlpacaIex,
+                instrument: 1_u8,
+                kind,
+            }))
+        }
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (band_tx, band_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx
+            .send(event(TradingStatus::new(TradingState::Halted)))
+            .unwrap();
+        band_tx
+            .send(event(PriceBand::new(Some(Decimal::TEN), None)))
+            .unwrap();
+
+        DynamicStreams {
+            trades: VecMap::new(),
+            l1s: VecMap::new(),
+            l2s: VecMap::new(),
+            liquidations: VecMap::new(),
+            candles: VecMap::new(),
+            trading_statuses: [(
+                ExchangeId::AlpacaIex,
+                UnboundedReceiverStream::new(status_rx),
+            )]
+            .into_iter()
+            .collect(),
+            price_bands: [(ExchangeId::AlpacaIex, UnboundedReceiverStream::new(band_rx))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_status_and_band_stream_is_selected_once_by_its_exchange() {
+        let mut streams = streams_with_a_status_and_a_band();
+
+        assert!(
+            streams
+                .select_trading_statuses(ExchangeId::AlpacaSip)
+                .is_none()
+        );
+        let mut statuses = streams
+            .select_trading_statuses(ExchangeId::AlpacaIex)
+            .unwrap();
+        assert!(
+            streams
+                .select_trading_statuses(ExchangeId::AlpacaIex)
+                .is_none()
+        );
+        let mut bands = streams.select_price_bands(ExchangeId::AlpacaIex).unwrap();
+        assert!(streams.select_price_bands(ExchangeId::AlpacaIex).is_none());
+
+        assert!(matches!(
+            statuses.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+        assert!(matches!(
+            bands.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_all_of_one_kind_merges_its_streams_and_takes_them() {
+        let mut streams = streams_with_a_status_and_a_band();
+
+        let mut statuses = streams.select_all_trading_statuses();
+        let mut bands = streams.select_all_price_bands();
+
+        assert!(streams.trading_statuses.is_empty() && streams.price_bands.is_empty());
+        assert!(matches!(
+            statuses.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+        assert!(matches!(
+            bands.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_all_carries_statuses_and_bands_as_data_kinds() {
+        use crate::{event::DataKind, streams::reconnect::Event};
+        let streams = streams_with_a_status_and_a_band();
+
+        let mut all = streams.select_all::<MarketStreamResult<u8, DataKind>>();
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let Some(Event::Item(Ok(event))) = all.next().await else {
+                panic!("expected an event");
+            };
+            kinds.push(event.kind.kind_name().to_owned());
+        }
+        kinds.sort();
+
+        assert_eq!(kinds, ["price_band", "trading_status"]);
+    }
+
     #[test]
     fn each_group_carries_its_own_batch_options() {
         let spot = || MarketDataInstrumentKind::Spot;
