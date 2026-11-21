@@ -91,9 +91,11 @@ impl Drop for UpdatingReplica {
 /// whatever they log, the replica logs again. While [`update_from_event`](Self::update_from_event)
 /// applies an event, called directly or by [`run`](Self::run), it marks its thread, and
 /// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops every event logged on that thread
-/// meanwhile, whatever the subscriber's level or target filters. The
-/// [`logging`](crate::logging) initialisers install that filter; add it to a subscriber you build
-/// yourself, or each line on that path is written twice.
+/// meanwhile, whatever the subscriber's level or target filters. That includes what your own
+/// `GlobalData` and instrument data processors log as the replica applies an event, which they
+/// already logged when the engine applied it. The [`logging`](crate::logging) initialisers install
+/// that filter; add it to a subscriber you build yourself, or each line on that path is written
+/// twice.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,
