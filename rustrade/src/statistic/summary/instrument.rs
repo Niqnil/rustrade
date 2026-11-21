@@ -250,6 +250,13 @@ pub struct TearSheet<Interval> {
     /// valued with the prices held then, including one held for its order's acknowledgement
     /// before it reaches a position. See
     /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
+    ///
+    /// The fill that takes this count from zero to one logs a WARN, and later ones log at DEBUG,
+    /// so the log says once that fees are being left out and this count says how many. That one
+    /// WARN goes to the instrument's first such fill whatever its fee asset or reason, including
+    /// a fill that arrives before the pricing instrument's first price. A count restored from a
+    /// snapshot does not warn again; [`TearSheetGenerator::reset`] starts it from zero, and the
+    /// WARN with it.
     #[serde(default)]
     pub fills_fee_unconverted: usize,
 

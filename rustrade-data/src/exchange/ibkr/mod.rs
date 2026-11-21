@@ -60,7 +60,7 @@
 //!   [`DataError::MarketDataNotAvailable`]. Without a live subscription (such as OPRA for US
 //!   options), ask for delayed data with
 //!   [`IbkrStreamConfig::with_market_data_type`]
-//! - **Trade side**: IB doesn't provide trade side; defaults to `Side::Buy`
+//! - **Trade side**: IB doesn't report which side was the aggressor, so a trade's `side` is `None`
 //! - **Blocking API**: Uses `std::thread::spawn` for long-lived subscriptions
 //! - **Reconnection**: a lost connection (the socket to TWS/Gateway, or TWS/Gateway's link to IB,
 //!   codes 1100 and 1101) is reported as [`DataError::ConnectionLost`]; the stream then connects
@@ -306,7 +306,8 @@ impl Default for IbkrStreamConfig {
 /// - **A connection that ends soon after opening delays the next.** One that ends within 30
 ///   seconds of opening, such as one TWS/Gateway accepts and then ends at once, makes the next
 ///   attempt wait one more step of the reconnect backoff for each such end in a row, since a
-///   connection that opens otherwise resets the backoff.
+///   connection that opens otherwise resets the backoff. Only the first attempt after it waits:
+///   should that attempt fail, the ones after wait only the reconnect backoff.
 /// - **The market data type** of the [`IbkrStreamConfig`] is asked for again on each connection.
 ///
 /// # Pacing
@@ -410,15 +411,9 @@ where
             let contracts = contracts.clone();
             let subscriptions = subscriptions.clone();
             let shared = shared.clone();
-            let delay = shared.quick_ends.lock().delay(&backoff);
+            let delay = shared.quick_ends.lock().take_delay(&backoff);
             async move {
-                if !delay.is_zero() {
-                    debug!(
-                        ?delay,
-                        "IB connection ended soon after opening; waiting to reconnect"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+                wait_before_open(delay).await;
                 tokio::task::spawn_blocking(move || {
                     Connection::open(&config, &shared, &contracts, subscriptions)
                 })
@@ -434,6 +429,18 @@ where
             inner: reconnecting_events(attempts, options),
         })
     }
+}
+
+/// Wait `delay` ([`QuickEnds::take_delay`]) before an attempt to open a connection.
+async fn wait_before_open(delay: std::time::Duration) {
+    if delay.is_zero() {
+        return;
+    }
+    debug!(
+        ?delay,
+        "IB connection ended soon after opening; waiting to reconnect"
+    );
+    tokio::time::sleep(delay).await;
 }
 
 /// The events a consumer receives from a stream's connection attempts: each connection's items up
@@ -513,31 +520,41 @@ struct Shared {
 /// [`QuickEnds`].
 const QUICK_END: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How many of a stream's connections in a row ended within [`QUICK_END`] of opening.
+/// How many of a stream's connections in a row ended within [`QUICK_END`] of opening, and whether
+/// the attempt after the last one has yet to wait for it.
 ///
 /// The shared reconnect handling resets its backoff whenever a connection opens, so a connection
 /// that TWS/Gateway accepts and then ends at once (an 1100 sent to each new connection while the
 /// link is down, say) would otherwise be remade with no wait, again and again. Each quick end in a
-/// row delays the next attempt by one more step of the reconnect backoff.
+/// row delays the next attempt by one more step of the reconnect backoff. Only that attempt waits:
+/// should it fail, the shared reconnect handling's own backoff spaces out the ones after, and a
+/// second wait would stack on it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct QuickEnds(u32);
+struct QuickEnds {
+    in_a_row: u32,
+    /// Whether the next attempt has yet to wait for the last quick end.
+    owed: bool,
+}
 
 impl QuickEnds {
     /// Count a connection that ended after `lived`.
     fn record(&mut self, lived: std::time::Duration) {
-        self.0 = if lived < QUICK_END {
-            self.0.saturating_add(1)
+        if lived < QUICK_END {
+            self.in_a_row = self.in_a_row.saturating_add(1);
+            self.owed = true;
         } else {
-            0
-        };
+            *self = Self::default();
+        }
     }
 
-    /// The wait before the next attempt: none after a connection that lasted, else the backoff
-    /// `policy` gives the attempt after as many failures as there were quick ends.
-    fn delay(self, policy: &ReconnectionBackoffPolicy) -> std::time::Duration {
-        let Some(steps) = self.0.checked_sub(1) else {
+    /// The wait before the next attempt, which it takes: the backoff `policy` gives the attempt
+    /// after as many failures as there were quick ends in a row, once after each quick end, else
+    /// none.
+    fn take_delay(&mut self, policy: &ReconnectionBackoffPolicy) -> std::time::Duration {
+        if !std::mem::take(&mut self.owed) {
             return std::time::Duration::ZERO;
-        };
+        }
+        let steps = self.in_a_row.saturating_sub(1);
         let multiplier = u64::from(policy.backoff_multiplier);
         let mut millis = policy.backoff_ms_initial;
         for _ in 0..steps {
@@ -1533,10 +1550,10 @@ mod tests {
     #[test]
     fn a_connection_that_lasted_delays_nothing() {
         let mut ends = QuickEnds::default();
-        assert_eq!(ends.delay(&BACKOFF), std::time::Duration::ZERO);
+        assert_eq!(ends.take_delay(&BACKOFF), std::time::Duration::ZERO);
 
         ends.record(QUICK_END);
-        assert_eq!(ends.delay(&BACKOFF), std::time::Duration::ZERO);
+        assert_eq!(ends.take_delay(&BACKOFF), std::time::Duration::ZERO);
     }
 
     #[test]
@@ -1545,7 +1562,7 @@ mod tests {
         let mut delays = Vec::new();
         for _ in 0..6 {
             ends.record(QUICK_END - std::time::Duration::from_millis(1));
-            delays.push(ends.delay(&BACKOFF).as_millis());
+            delays.push(ends.take_delay(&BACKOFF).as_millis());
         }
 
         assert_eq!(delays, [100, 200, 400, 800, 1_000, 1_000]);
@@ -1560,6 +1577,32 @@ mod tests {
         ends.record(QUICK_END);
 
         assert_eq!(ends, QuickEnds::default());
+    }
+
+    #[test]
+    fn only_the_first_attempt_after_a_quick_end_waits() {
+        let mut ends = QuickEnds::default();
+        ends.record(std::time::Duration::ZERO);
+        ends.record(std::time::Duration::ZERO);
+
+        // The first attempt after waits; the ones after it, should it fail, do not.
+        assert_eq!(ends.take_delay(&BACKOFF).as_millis(), 200);
+        assert_eq!(ends.take_delay(&BACKOFF), std::time::Duration::ZERO);
+
+        // The count stays until a connection lasts, so the next quick end waits one step more.
+        ends.record(std::time::Duration::ZERO);
+        assert_eq!(ends.take_delay(&BACKOFF).as_millis(), 400);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_before_an_open_waits_the_delay() {
+        let start = tokio::time::Instant::now();
+        wait_before_open(std::time::Duration::from_millis(500)).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(500));
+
+        let start = tokio::time::Instant::now();
+        wait_before_open(std::time::Duration::ZERO).await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 
     #[test]

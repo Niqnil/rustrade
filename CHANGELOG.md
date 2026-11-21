@@ -325,7 +325,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, `rustrade-instrument`, `rustrade`, #905).
   - **New `MockExecutionConfig::session_close: Option<SessionCalendarConfig>`**, opt-in. Its one
     variant, `SessionCalendarConfig::Daily(DailyClose)`, is a close time in an IANA time zone,
-    every weekday. Without it, a `GoodUntilEndOfDay` limit order is still refused.
+    every weekday except the holidays and early closes it is given. Without it, a
+    `GoodUntilEndOfDay` limit order is still refused.
   - **With it, the venue accepts a day limit order and expires it at the first instant after the
     next session close.** The deadline is fixed when the order is accepted. An amend does not move
     it, a snapshot keeps it, and it is kept while the order is held for a fresh market. Something
@@ -333,16 +334,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     weekend, or before the open expires at the next close. The order keeps reporting
     `GoodUntilEndOfDay`, and a cancel after expiry is answered `OrderAlreadyExpired`. A marketable
     day limit that fills in part rests its remainder.
-  - **Known limitations:** no holidays or early closes; no open time, so an order sent after the
-    close can fill on after-hours data; one close for the whole venue.
+  - **A close per class of instrument:** `MockExecutionConfig::session_close_overrides`
+    (`SessionCloseOverrides`, keyed like `FeeModelOverrides`: by name, by kind and underlying, or
+    by kind) gives the instruments an entry matches their own close, such as 16:15 for index
+    options on a venue closing at 16:00. Such an instrument takes a day order without
+    `session_close`, keeps its close when a calendar is attached, and the venue warns of an entry
+    no instrument matches.
+  - **Known limitations:** holidays and early closes only as listed (none are built in); no open
+    time, so an order sent after the close can fill on after-hours data.
   - **New `rustrade_instrument::calendar`:** the `SessionCalendar` trait (`next_close_after`,
-    strictly after, UTC in and out), `CalendarError`, `DailyClose`, `instant_at_local` (local time
-    to UTC, with the daylight-saving rule `DailyAccrual` already used), and a re-export of
-    `chrono_tz::Tz`.
+    strictly after, and `session_close_on`, the close of the session on an instant's own local
+    date or `None` on a day without one; UTC in and out), `CalendarError`, `DailyClose`,
+    `instant_at_local` (local time to UTC, with the daylight-saving rule `DailyAccrual` already
+    used), and a re-export of `chrono_tz::Tz`.
+  - **Holidays and early closes:** `SessionDates` lists a market's holidays and early-close days
+    by local date, once for every class of instrument trading there; `SessionDates::new` and
+    deserialising refuse a weekend date and a date in both lists (`SessionDatesError`).
+    `DailyClose::with_dates(dates, early_close)` gives a close rule those dates and its own
+    early-close time (16:00 options close early at 13:00, 16:15 ones at 13:15), refusing
+    early-close days with no early-close time and an early close not before the regular close
+    (`DailyCloseError`). Serialised, a `DailyClose` adds `early_close`, `holidays` and
+    `early_closes` to `close` and `zone`, each left out when empty, and refuses an unknown field.
   - **A calendar of your own:** `SimulatedVenue::with_session_calendar` and
     `SimVenueOptions::session_calendar` override the configured close. A day order seeded in
     `initial_state` expires at the close after the instant the live venue accepted it, placed
-    by the options' calendar when one is given.
+    by the options' calendar when one is given. `with_session_calendar` returns a
+    `VenueConfigError`: `SessionCalendar` for a seeded day order the calendar cannot place, or
+    `ExpiryRule` for an expiry sell-out or expiry-day cutoff it cannot place.
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
@@ -367,9 +385,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     by its kind and underlying, or by its kind, in that order of precedence. `resolve` picks one
     for an instrument. A key by kind and underlying separates the options on an underlying from
     the underlying itself; two option families on one underlying need keys by name. Serialised,
-    the entries by kind and underlying are a list, and a repeated entry or an unknown key is
-    refused (`FeeModelOverridesError`). When it is built, the simulated venue logs a warning for
-    each entry by name, or by kind and underlying, that none of its instruments matches.
+    the entries by kind and underlying are a list, each naming its model `value`, and a repeated
+    entry or an unknown key is refused (`FeeModelOverridesError`). When it is built, the simulated
+    venue logs a warning for each entry by name, or by kind and underlying, that none of its
+    instruments matches.
+  - **`FeeModelOverrides` is `InstrumentOverrides<FeeModelConfig>`** (`rustrade-instrument`): the
+    keys, the order of precedence, the serialised form and the check for entries no instrument
+    matches (`unmatched`, returning `UnmatchedOverride`s) are generic over the value, so other
+    per-instrument settings can be keyed the same way. `FeeModelOverridesError` is
+    `InstrumentOverridesError`.
   - The `CompositeFeeModel` rustdoc has an index option example of both new rules.
   - The `CompositeFeeModel` rustdoc also has IBKR's US option commissions at one volume tier, with
     their premium bands, minimum per order and pass-through clearing and regulatory fees, and says
@@ -412,15 +436,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The simulated venue sells out a long option the account cannot afford to exercise**
   (`rustrade-execution`, #917).
-  - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At
-    `before_expiry` before each physically settled option's expiry, a long in the money that the
-    account cannot afford to exercise is sold, as a broker sells out an account short of buying
-    power (Alpaca sells in the last hour before expiry). A call's exercise needs the strike's cash:
+  - **New `MockExecutionConfig::expiry_sell_out: Option<ExpirySellOut>`**, opt-in. At the instant
+    its anchor places for each physically settled option, a long in the money that the account
+    cannot afford to exercise is sold, as a broker sells out an account short of buying power
+    (Alpaca sells in the last hour before the expiry day's close). A call's exercise needs the strike's cash:
     free quote, plus on a spot margin venue what it would lend for a buy. A put's needs free shares,
     which excludes shares securing a short call, and balances reserved for working orders, the
     option's own included, are not free. Longs checked at one instant share what the account has,
     in name order: each spends on what goes on to expiry, the contracts kept and any its sale left
     unsold.
+  - **`ExpiryAnchor`** (`#[non_exhaustive]`), set by `ExpirySellOut::new(anchor)` and read by
+    `anchor()`: `BeforeClose(Duration)` checks that long before the session close on the expiry's
+    date in the option's own calendar (its `session_close_overrides` entry, else the venue's
+    `session_close` or `with_session_calendar`); `BeforeExpiry(Duration)` checks that long before
+    the expiry instant, for a venue trading around the clock. Serialised externally tagged in
+    snake case, as `"anchor": {"before_close": {"secs": 3600, "nanos": 0}}`.
+    `ExpiryAnchor::instant` places it, or says why not (`ExpiryAnchorError`).
+  - **`BeforeClose` refusals:** building the venue (`VenueConfigError::ExpiryRule`), restoring
+    it (`VenueRestoreError::ExpiryRule`) or attaching a calendar refuses an option whose expiry
+    falls on a date with no session, whose expiry day closes after its expiry (stamp the expiry at
+    or after the close; a close equal to it is accepted), or whose calendar cannot answer; the
+    error is an `ExpiryRuleUnplaceable` naming the rule (`ExpiryRule::SellOut`) and the option.
+    An option with no calendar at all is built, so that `with_session_calendar` can supply one,
+    and the venue panics when its clock first moves (`advance_time`, `apply_market`) or on
+    `next_deadline` if none has. An expiry stamped at midnight UTC falls on the previous New York
+    date, so it is anchored to that day's close, as the venue also settles it that evening.
   - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
     it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
   - **The sale** cancels the orders working on the option, then sells as a market sell fills
@@ -429,9 +469,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `next_deadline` includes each check. What is not sold, because it is affordable or out of the
     money, or because nothing prices the sale or the underlying, goes on to expiry under
     `long_option_expiry`. Cash-settled options are never sold.
-  - **Known limitations:** one check at the instant set, against the market held then; no cut-off
-    for orders between the check and expiry; one exercise's proceeds do not fund another.
+  - **Known limitations:** one check at the instant set, against the market held then; one anchor
+    for every option, so classes sold out at different offsets before their closes cannot be
+    modelled; one exercise's proceeds do not fund another. Orders between the check and expiry
+    are refused only under the expiry-day cutoff (below).
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
+
+- **The simulated venue refuses orders that open a position in an option about to expire**
+  (`rustrade-execution`).
+  - **New `MockExecutionConfig::expiry_day_cutoff: Option<ExpiryDayCutoff>`**, opt-in, set with
+    `with_expiry_day_cutoff`. From the instant `ExpiryDayCutoff::new(anchor)` places for an option
+    until its expiry, the venue refuses an order on it of which any part would open or increase a
+    position, as a broker stops taking new exposure in an option on its expiry day. Every option
+    is covered, cash-settled too. Serialised as `{"anchor": {"before_close": {...}}}`.
+  - **What counts as closing:** an order is measured against the position as it would stand once
+    every order already working on its side filled, in acceptance order, so working orders that
+    together close the whole position leave nothing for a new one to close. An order that would
+    close the position and open the other side is refused whole. The venue amends no option
+    order, so the cutoff cannot be passed by amending a closing order upwards.
+  - **New `ApiError::OpenRefused(OpenRefusal)`**, with `OpenRefusal::ExpiryDayCutoff { cutoff }`
+    (`#[non_exhaustive]`): an order refused because it would open a position while only closing
+    orders are taken. The simulated venue reports it; live clients report such a refusal as
+    `OrderRejected` until their venue's wording is confirmed.
+  - **Placement** follows the expiry sell-out's: `BeforeClose` anchors to the option's own session
+    close, refusals at build, restore or `with_session_calendar` are a
+    `VenueConfigError::ExpiryRule` / `VenueRestoreError::ExpiryRule` naming
+    `ExpiryRule::DayCutoff`, and an option with no calendar at all panics when the clock first
+    moves, or on any order on it before its expiry, closing ones included.
+  - **Known limitations:** orders accepted before the cutoff keep working and may fill until
+    expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
+    off at different offsets, or at one time of day whatever their close, cannot be modelled.
+
+- **`AlpacaClient::fetch_options_late_close_underlyings`** (`rustrade-execution`, `alpaca`
+  feature, #1017): the symbols of the underlyings whose options close at 16:15 ET instead of
+  16:00 ET (13:15 instead of 13:00 on an early close), sorted, read from the assets Alpaca marks
+  `options_late_close` with one `GET /v2/assets` request, inactive ones included. Use it to give
+  those underlyings' options their own close in a simulated venue's `session_close_overrides`,
+  from which its expiry-day cutoff and sell-out are measured; the rustdoc has an example. Key
+  only the underlyings your instruments use, as the venue warns of each entry no instrument
+  matches. Known limitation: the list is as of the request, and Alpaca gives no date on which an
+  underlying joined or left it.
 
 - **The engine tracks an order on the terms the venue states for it, and reports a change**
   (`rustrade`). An order changed at the venue other than by the engine's own amend (in the
@@ -569,25 +646,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
-- **Breaking: the IBKR market data stream reconnects and resubscribes by itself**
-  (`rustrade-data`, `rustrade-instrument`, #877). `IbkrMarketStream::init` is now `async`, takes a
+- **Breaking: `rustrade::logging::AuditSpanFilter` is renamed `ReplicaLogFilter`** (`rustrade`).
+  It no longer looks at a span: it drops the log lines a `StateReplicaManager` repeats while it
+  updates its replica (see Fixed). There is no deprecated alias: replace `AuditSpanFilter` with
+  `ReplicaLogFilter` where a subscriber is built by hand. `init_logging` and `init_json_logging`
+  install it as before.
+- **A third-asset fee the engine cannot value logs one WARN per instrument, then DEBUG**
+  (`rustrade`). It logged at INFO on every such fill. Now the fill that takes the instrument's
+  `TearSheet::fills_fee_unconverted` from zero to one logs a WARN, and later ones log at DEBUG.
+  The WARN goes to the instrument's first such fill whatever its fee asset or reason, including
+  one that arrives before the pricing instrument's first price. `TearSheetGenerator::reset`
+  re-arms it. Each fill is still reported as `EngineOutput::FeeConversion` and counted.
+- **The engine logs each user command and each routine order update at DEBUG, not INFO**
+  (`rustrade`). Every `Command` the engine actions (`SendOpenRequests`, `SendCancelRequests`,
+  `SendCancelThenOpenRequests`, `SendAmendRequests`, `ClosePositions`, `CancelOrders`, each with its
+  payload), a fill sized to trade free base past the position it reduces, an order followed or
+  re-keyed after a venue replaced it, and an order's terms adopted from a venue's report. At high
+  order rates (backtests, simulations, reinforcement-learning training) these lines dominated an
+  INFO log. INFO keeps lifecycle, connectivity and margin events and anything unusual; enable
+  `rustrade::engine=debug` to see the per-order lines again.
+- **Breaking: the IBKR market data stream reconnects and resubscribes by itself** (`rustrade-data`,
+  `rustrade-instrument`, #877). `IbkrMarketStream::init` is now `async`, takes a
   `MarketStreamOptions` (reconnect backoff and optional silence timeout, as for the other venues'
   market streams), and yields `MarketStreamResult` (`reconnect::Event<ExchangeId,
   Result<MarketEvent, DataError>>`) rather than bare results. When the connection is lost (the
-  socket to TWS/Gateway closing, TWS/Gateway losing its link to IB's servers (1100) or regaining
-  it with its subscriptions lost (1101), or the `ibapi` client shutting down) the stream yields the
-  new `DataError::ConnectionLost`, then `Event::Reconnecting`, then connects again and makes every
+  socket to TWS/Gateway closing, TWS/Gateway losing its link to IB's servers (1100) or regaining it
+  with its subscriptions lost (1101), or the `ibapi` client shutting down) the stream yields the new
+  `DataError::ConnectionLost`, then `Event::Reconnecting`, then connects again and makes every
   subscription anew; each failed attempt yields `DataError::ReinitFailed`. A connection made during
   a link outage is remade on the 1102 restore, and connections that end soon after opening space
-  their reconnects out with the backoff. Before, a socket loss ended the stream, and a 1101 left every subscription silent with
-  nothing reported. The stream no longer ends by itself, not even when every subscription has
-  ended (it stays open, silent): drop it to stop it. `disconnect` is removed (dropping closes the
-  connection, on a thread of its own, so the dropping task never blocks), and the per-connection
-  stream is no longer public. Every request passes a per-connection rate limiter,
-  `IbkrStreamConfig::max_messages_per_second` (default 40; IB documents 50 per second for all
-  clients of one gateway together), so resubscribing many lines does not exceed IB's message rate;
-  a serialized configuration without it still loads. IB's link codes 1100, 1101 and 1102 are in
-  `rustrade_instrument::ibkr::codes`.
+  their reconnects out with the backoff. Before, a socket loss ended the stream, and a 1101 left
+  every subscription silent with nothing reported. The stream no longer ends by itself, not even
+  when every subscription has ended (it stays open, silent): drop it to stop it. `disconnect` is
+  removed (dropping closes the connection, on a thread of its own, so the dropping task never
+  blocks), and the per-connection stream is no longer public. Every request passes a per-connection
+  rate limiter, `IbkrStreamConfig::max_messages_per_second` (default 40; IB documents 50 per second
+  for all clients of one gateway together), so resubscribing many lines does not exceed IB's message
+  rate; a serialized configuration without it still loads. IB's link codes 1100, 1101 and 1102 are
+  in `rustrade_instrument::ibkr::codes`.
 - **Breaking: `IbkrStreamConfig` is `#[non_exhaustive]`, and `QuoteAggregator::new` takes the
   instrument's security type** (`rustrade-data`, #877). Build the configuration with
   `IbkrStreamConfig::new(host, port, client_id)` (or `Default`) and the `with_*` methods rather
@@ -895,6 +991,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as
   `None`.
 
+- **Breaking: `MockExecutionConfig` has an `expiry_day_cutoff` field** (`rustrade-execution`). A
+  struct literal must set it (`None` to take opening orders until expiry);
+  `MockExecutionConfig::new` sets it to `None`. A serialized config without it reads as `None`.
+
+- **Breaking: `MockExecutionConfig` has a `session_close_overrides` field** (`rustrade-execution`).
+  A struct literal must set it (`SessionCloseOverrides::default()` for none);
+  `MockExecutionConfig::new` sets it empty. A serialized config without it reads as empty.
+
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).
   - `MockExecutionConfig` has a `session_close` field. A struct literal must set it (`None` for
@@ -1054,7 +1158,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
-
+- **`ReplicaLogFilter` (formerly `AuditSpanFilter`) drops a replica's log lines whatever the log
+  filters** (`rustrade`). A `StateReplicaManager` applies the audit stream through the same
+  `EngineState` methods as the engine, so each log line on that path is written twice unless the
+  filter drops the replica's copy. The filter keyed on the replica's INFO span, so a level filter
+  excluding INFO (such as `RUST_LOG=warn`) or one naming only other targets disabled the span and
+  let every copy through, as did any span entered beneath it.
+  `StateReplicaManager::update_from_event` now marks its thread while it applies an event, and the
+  filter drops what is logged then, also when `update_from_event` is called directly. The span
+  remains, as context. `ReplicaLogFilter`,
+  `AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME` and `StateReplicaManager` now document that a subscriber
+  built by hand needs the filter added; `init_logging` and `init_json_logging` install it.
 - **IBKR quotes no longer report IB's "no quote" price as a price** (`rustrade-data`, #877). IB
   sends a price of -1 for a side it has no quote on, for example while the market is closed, and
   the IBKR stream's `OrderBookL1` carried it as a level at -1. The side is now withdrawn (`None`,

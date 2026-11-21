@@ -266,3 +266,103 @@ fn an_initial_state_seeding_one_order_twice_is_refused() {
         )))
     );
 }
+
+#[test]
+fn a_fee_model_override_no_instrument_matches_is_logged_except_by_kind() {
+    let config = holding("BTC", "USDT").with_fee_model_overrides(
+        FeeModelOverrides::new()
+            .with_name("ETHUSDT", FeeModelConfig::default())
+            .with_underlying(
+                InstrumentKindDiscriminant::Spot,
+                Underlying::new(asset("ETH"), quote()),
+                FeeModelConfig::default(),
+            )
+            .with_underlying(
+                InstrumentKindDiscriminant::Spot,
+                Underlying::new(base(), quote()),
+                FeeModelConfig::default(),
+            )
+            .with_kind(
+                InstrumentKindDiscriminant::Future,
+                FeeModelConfig::default(),
+            ),
+    );
+
+    let (venue, events) = rustrade_instrument::test_utils::logs::capture(|| {
+        SimulatedVenue::try_new(&config, spot_instruments())
+    });
+
+    assert!(venue.is_ok());
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .map(|event| event.message().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings,
+        [
+            "fee model override names an instrument this venue does not have; it is never used",
+            "fee model override names a kind and underlying no instrument on this venue has; it \
+             is never used",
+        ],
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_session_close_override_spelling_an_underlying_differently_is_refused() {
+    let config = holding("BTC", "USDT").with_session_close_overrides(
+        crate::client::mock::SessionCloseOverrides::new().with_underlying(
+            InstrumentKindDiscriminant::Spot,
+            Underlying::new(base(), asset("usdt")),
+            new_york_close(),
+        ),
+    );
+
+    let refused = SimulatedVenue::try_new(&config, spot_instruments());
+
+    assert_eq!(
+        refused.err(),
+        Some(VenueConfigError::AssetSpelledTwice(spelled_twice(
+            "USDT",
+            btcusdt(),
+            "usdt",
+            AssetSource::SessionCloseOverride,
+        )))
+    );
+}
+
+#[test]
+fn a_session_close_override_no_instrument_matches_is_logged() {
+    let config = holding("BTC", "USDT").with_session_close_overrides(
+        crate::client::mock::SessionCloseOverrides::new()
+            .with_name("ETHUSDT", new_york_close())
+            .with_kind(InstrumentKindDiscriminant::Future, new_york_close()),
+    );
+
+    let (venue, events) = rustrade_instrument::test_utils::logs::capture(|| {
+        SimulatedVenue::try_new(&config, spot_instruments())
+    });
+
+    assert!(venue.is_ok());
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .map(|event| event.message().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings,
+        ["session close override names an instrument this venue does not have; it is never used"],
+        "{events:?}"
+    );
+}
+
+/// 16:00 New York, every weekday.
+fn new_york_close() -> crate::client::mock::SessionCalendarConfig {
+    crate::client::mock::SessionCalendarConfig::Daily(
+        rustrade_instrument::calendar::DailyClose::new(
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            chrono_tz::America::New_York,
+        ),
+    )
+}

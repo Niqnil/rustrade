@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -70,7 +70,7 @@ use rustrade_execution::{
     balance::{AssetBalance, Balance},
     cash_flow::CashFlow,
     client::mock::MockExecutionConfig,
-    expiry::ExpirySellOut,
+    expiry::{ExpiryAnchor, ExpirySellOut},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -80,6 +80,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side, Underlying,
     asset::{AssetIndex, ExchangeAsset, name::AssetNameExchange, name::AssetNameInternal},
+    calendar::{DailyClose, Tz},
     corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
@@ -368,6 +369,31 @@ async fn run_split(
     sell_out: Option<ExpirySellOut>,
     split: Option<(DateTime<Utc>, Decimal)>,
 ) -> BacktestResult<Daily, BacktestState> {
+    run_venue(
+        kind,
+        settlement,
+        sell,
+        spy_at_expiry,
+        usd,
+        sell_out,
+        split,
+        SimVenueOptions::default(),
+    )
+    .await
+}
+
+/// A run as [`run_split`]'s, with the venue modelling what `venue_options` add.
+#[allow(clippy::too_many_arguments)] // Test helper: each argument is one varied input of a run.
+async fn run_venue(
+    kind: OptionKind,
+    settlement: OptionSettlement,
+    sell: bool,
+    spy_at_expiry: Decimal,
+    usd: Decimal,
+    sell_out: Option<ExpirySellOut>,
+    split: Option<(DateTime<Utc>, Decimal)>,
+    venue_options: SimVenueOptions,
+) -> BacktestResult<Daily, BacktestState> {
     let instruments = instruments_of(kind, settlement);
     let (spy, call) = (key(&instruments, "SPY"), key(&instruments, "SPY_C100"));
 
@@ -412,7 +438,7 @@ async fn run_split(
 
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
-        venue_options: FnvHashMap::default(),
+        venue_options: FnvHashMap::from_iter([(EXCHANGE, venue_options)]),
         executions: vec![ExecutionConfig::Mock(config)],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
@@ -544,12 +570,46 @@ async fn a_backtest_call_the_account_cannot_exercise_is_sold_before_expiry() {
         false,
         dec!(110),
         dec!(10_000),
-        Some(ExpirySellOut::new(Duration::from_secs(30 * 60))),
+        Some(ExpirySellOut::new(ExpiryAnchor::BeforeExpiry(
+            Duration::from_secs(30 * 60),
+        ))),
     )
     .await;
 
     assert_eq!(open_positions(&result), []);
     assert_eq!(option_pnl(&result), dec!(1_000) - dec!(150));
+    assert_eq!(
+        balance_end(&result, "usd").total,
+        dec!(10_000) - dec!(150) + dec!(1_000)
+    );
+    assert_eq!(balance_end(&result, "spy").total, Decimal::ZERO);
+}
+
+/// The same sale anchored half an hour before the close of the expiry day, from a calendar the
+/// venue options hand in after the venue is built. The call expires at 20:00Z, the 16:00 close in
+/// New York (EDT) itself, so it is sold at 19:30Z as above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_sell_out_before_the_close_takes_its_calendar_from_the_venue_options() {
+    let close = DailyClose::new(
+        NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        "America/New_York".parse::<Tz>().unwrap(),
+    );
+    let result = run_venue(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        false,
+        dec!(110),
+        dec!(10_000),
+        Some(ExpirySellOut::new(ExpiryAnchor::BeforeClose(
+            Duration::from_secs(30 * 60),
+        ))),
+        None,
+        SimVenueOptions::default().with_session_calendar(Arc::new(close)),
+    )
+    .await;
+
+    assert_eq!(open_positions(&result), []);
+    // Sold, not exercised: no shares delivered, and the sale's 1,000 in cash.
     assert_eq!(
         balance_end(&result, "usd").total,
         dec!(10_000) - dec!(150) + dec!(1_000)

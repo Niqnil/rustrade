@@ -15,6 +15,7 @@ use crate::{
     margin::MarginEffect,
     order::{TimeInForce, id::ClientOrderId},
 };
+use chrono::{DateTime, Utc};
 use derive_more::{Constructor, Display};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -404,6 +405,23 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — the same request fails identically until the venue's lending changes.
     #[error("borrow rejected: {0}")]
     BorrowRejected(BorrowReject),
+
+    /// Order refused because part of it would open or increase a position, under a venue rule that
+    /// takes only orders that close one. An order that only closes is not refused this way.
+    ///
+    /// Distinct from [`OrderRejected`](Self::OrderRejected) so a caller can tell that reducing the
+    /// position is still allowed, and from [`BalanceInsufficient`](Self::BalanceInsufficient):
+    /// the account could pay for the order. [`OpenRefusal`] says which rule refused it.
+    ///
+    /// Reported by the [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue), under its
+    /// [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff). Other clients report such refusals as
+    /// [`OrderRejected`](Self::OrderRejected) until their venue's wording is confirmed, so a caller
+    /// trading live must handle that refusal there too.
+    ///
+    /// Not transient while the rule holds — the same order fails identically. An order that only
+    /// closes the position may be accepted.
+    #[error("open refused: {0}")]
+    OpenRefused(OpenRefusal),
 }
 
 impl<AssetKey, InstrumentKey> ApiError<AssetKey, InstrumentKey> {
@@ -420,6 +438,26 @@ impl<AssetKey, InstrumentKey> ApiError<AssetKey, InstrumentKey> {
             _ => None,
         }
     }
+}
+
+/// Which rule refused an order that would open or increase a position, as carried by
+/// [`ApiError::OpenRefused`].
+#[non_exhaustive]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error,
+)]
+pub enum OpenRefusal {
+    /// The order is on an option at or after the venue's cutoff on its expiry day, from which the
+    /// venue takes only orders that close a position in it: see
+    /// [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff).
+    #[error(
+        "the option's expiry-day cutoff at {cutoff} has passed, and only an order that closes a \
+         position is taken"
+    )]
+    ExpiryDayCutoff {
+        /// The instant from which the venue refuses the option's opening orders.
+        cutoff: DateTime<Utc>,
+    },
 }
 
 /// Formats a [`RateLimit`](ApiError::RateLimit)'s hint for its message: nothing when there is

@@ -8,7 +8,7 @@ use crate::{
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
-    expiry::{ExpirySellOut, LongOptionExpiry},
+    expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
@@ -35,7 +35,10 @@ use rustrade_instrument::{
     calendar::{DailyClose, SessionCalendar},
     corporate_action::{CorporateActionKind, SplitRoundingPolicy},
     exchange::ExchangeId,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::{
+        kind::InstrumentKindDiscriminant, name::InstrumentNameExchange,
+        overrides::InstrumentOverrides,
+    },
 };
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -184,6 +187,23 @@ pub struct MockExecutionConfig {
     ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_close: Option<SessionCalendarConfig>,
+    /// Session closes for some instruments in place of [`session_close`](Self::session_close),
+    /// by name, by kind and underlying, or by kind: a venue whose index options close at 16:15
+    /// while everything else closes at 16:00. See [`SessionCloseOverrides`] for which entry an
+    /// instrument takes.
+    ///
+    /// An instrument an entry matches takes a day limit order even when `session_close` is
+    /// `None`, and keeps its entry's close when a calendar is attached with
+    /// [`SimulatedVenue::with_session_calendar`], which replaces only `session_close`. When it
+    /// builds, the venue logs a warning for each name, and each kind and underlying, that none of
+    /// its instruments has, as it does for [`fee_model_overrides`](Self::fee_model_overrides).
+    ///
+    /// Defaults to empty: every instrument closes under `session_close`.
+    ///
+    /// [`SimulatedVenue::with_session_calendar`]:
+    ///     crate::exchange::mock::SimulatedVenue::with_session_calendar
+    #[serde(default, skip_serializing_if = "SessionCloseOverrides::is_empty")]
+    pub session_close_overrides: SessionCloseOverrides,
     /// Fee models for some instruments in place of [`fee_model`](Self::fee_model), by name, by
     /// kind and underlying, or by kind: a venue whose options and shares pay different fees, or
     /// whose index options pay more than its equity options. See [`FeeModelOverrides`] for which
@@ -198,8 +218,12 @@ pub struct MockExecutionConfig {
     #[serde(default, skip_serializing_if = "FeeModelOverrides::is_empty")]
     pub fee_model_overrides: FeeModelOverrides,
     /// Whether the mock exchange sells a long option the account cannot afford to exercise, at a
-    /// set time before it expires, as a broker sells out an account short of the cash or shares.
-    /// See [`ExpirySellOut`].
+    /// set time before its expiry day's close or before its expiry, as a broker sells out an
+    /// account short of the cash or shares. See [`ExpirySellOut`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
+    /// each option: [`session_close`](Self::session_close), an entry of
+    /// [`session_close_overrides`](Self::session_close_overrides), or one the venue is given
+    /// later.
     ///
     /// Defaults to `None`: every long option is held to expiry and settles under
     /// [`long_option_expiry`](Self::long_option_expiry), an exercise the account cannot cover
@@ -207,6 +231,16 @@ pub struct MockExecutionConfig {
     /// [`spot_margin`](Self::spot_margin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_sell_out: Option<ExpirySellOut>,
+    /// Whether the mock exchange refuses an order that would open or increase a position in an
+    /// option from a set time before its expiry day's close, or before its expiry, until it
+    /// expires, as a broker stops taking new exposure in an expiring option. See
+    /// [`ExpiryDayCutoff`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
+    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    ///
+    /// Defaults to `None`: an option takes opening orders until its expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_day_cutoff: Option<ExpiryDayCutoff>,
     /// What a stock split does to the mock exchange's open orders on the split equity: cancelled,
     /// or adjusted. See [`SplitConfig`].
     ///
@@ -243,8 +277,10 @@ impl MockExecutionConfig {
             amend: AmendConfig::default(),
             time_in_force: TimeInForceRules::default(),
             session_close: None,
+            session_close_overrides: SessionCloseOverrides::default(),
             fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
+            expiry_day_cutoff: None,
             split: SplitConfig::default(),
         }
     }
@@ -360,6 +396,19 @@ impl MockExecutionConfig {
         }
     }
 
+    /// This config with its [`session_close_overrides`](Self::session_close_overrides) set to
+    /// `session_close_overrides`.
+    #[must_use]
+    pub fn with_session_close_overrides(
+        self,
+        session_close_overrides: SessionCloseOverrides,
+    ) -> Self {
+        Self {
+            session_close_overrides,
+            ..self
+        }
+    }
+
     /// This config with its [`fee_model_overrides`](Self::fee_model_overrides) set to
     /// `fee_model_overrides`.
     #[must_use]
@@ -376,6 +425,16 @@ impl MockExecutionConfig {
     pub fn with_expiry_sell_out(self, expiry_sell_out: ExpirySellOut) -> Self {
         Self {
             expiry_sell_out: Some(expiry_sell_out),
+            ..self
+        }
+    }
+
+    /// This config refusing orders that open a position in an option about to expire, under
+    /// `expiry_day_cutoff`: see [`expiry_day_cutoff`](Self::expiry_day_cutoff).
+    #[must_use]
+    pub fn with_expiry_day_cutoff(self, expiry_day_cutoff: ExpiryDayCutoff) -> Self {
+        Self {
+            expiry_day_cutoff: Some(expiry_day_cutoff),
             ..self
         }
     }
@@ -397,18 +456,20 @@ impl MockExecutionConfig {
 /// sent after Friday's close expires at Monday's.
 ///
 /// # Known limitations
-/// - **No holidays or early closes** in [`Daily`](Self::Daily): a day order lives through a
-///   market holiday, and past an early close, until the next weekday's regular close.
+/// - **Holidays and early closes only as listed** in [`Daily`](Self::Daily): a day order lives
+///   through a market holiday, and past an early close, that its [`SessionDates`] do not list.
+///
+/// [`SessionDates`]: rustrade_instrument::calendar::SessionDates
 /// - **No open time**: a day order sent after the close works at once, so it can fill on
 ///   after-hours data that the live venue would hold until the next open.
-/// - **One close for the whole venue**: a venue whose instruments close at different times (US
-///   equity options at 16:00 ET, index options at 16:15 ET) has the wrong close for some, and
-///   an instrument that trades around the clock gets the same close. Refuse a day order where the
-///   live venue refuses one with [`MockExecutionConfig::time_in_force`].
+/// - **One close per instrument, fixed when the venue is built**: a venue whose instruments close
+///   at different times (US equity options at 16:00 ET, index options at 16:15 ET) gives each
+///   class its own with [`MockExecutionConfig::session_close_overrides`]. Refuse a day order
+///   where the live venue refuses one with [`MockExecutionConfig::time_in_force`].
 ///
 /// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller. Not
-/// `Copy`, so that such a source may hold a list of dates; `Ord` and `Hash` are what
-/// [`MockExecutionConfig`] requires.
+/// `Copy`, since a [`DailyClose`] holds its holiday and early-close dates; `Ord` and `Hash` are
+/// what [`MockExecutionConfig`] requires.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -429,11 +490,20 @@ pub enum SessionCalendarConfig {
     Daily(DailyClose),
 }
 
+/// Session closes for some instruments, each in place of a venue's
+/// [`session_close`](MockExecutionConfig::session_close): by the instrument's exact name, by its
+/// kind and underlying, or by its kind alone.
+///
+/// The keys, the order an instrument's close is picked in and the serialised form are
+/// [`InstrumentOverrides`]'. An instrument no entry matches closes under the venue's
+/// `session_close`.
+pub type SessionCloseOverrides = InstrumentOverrides<SessionCalendarConfig>;
+
 impl SessionCalendarConfig {
     /// The calendar this configuration names.
     pub fn calendar(&self) -> Arc<dyn SessionCalendar> {
         match self {
-            Self::Daily(close) => Arc::new(*close),
+            Self::Daily(close) => Arc::new(close.clone()),
         }
     }
 }
@@ -1289,7 +1359,7 @@ pub async fn request_corporate_action(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::{AccountEventKind, balance::Balance};
+    use crate::{AccountEventKind, balance::Balance, expiry::ExpiryAnchor};
     use rust_decimal::Decimal;
     use rustrade_integration::collection::snapshot::Snapshot;
 
@@ -1452,7 +1522,17 @@ mod tests {
             NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
             "America/New_York".parse().unwrap(),
         ));
-        let expiry_sell_out = ExpirySellOut::new(Duration::from_secs(3600));
+        let session_close_overrides = SessionCloseOverrides::new().with_kind(
+            InstrumentKindDiscriminant::Option,
+            SessionCalendarConfig::Daily(DailyClose::new(
+                NaiveTime::from_hms_opt(16, 15, 0).unwrap(),
+                "America/New_York".parse().unwrap(),
+            )),
+        );
+        let expiry_sell_out =
+            ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(3600)));
+        let expiry_day_cutoff =
+            ExpiryDayCutoff::new(ExpiryAnchor::BeforeClose(Duration::from_secs(2700)));
 
         let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
             .with_fee_model(fee_model.clone())
@@ -1468,8 +1548,10 @@ mod tests {
             .with_amend(AmendConfig::NONE)
             .with_time_in_force(time_in_force.clone())
             .with_session_close(session_close.clone())
+            .with_session_close_overrides(session_close_overrides.clone())
             .with_fee_model_overrides(fee_model_overrides.clone())
-            .with_expiry_sell_out(expiry_sell_out);
+            .with_expiry_sell_out(expiry_sell_out)
+            .with_expiry_day_cutoff(expiry_day_cutoff);
 
         assert_eq!(config.mocked_exchange, ExchangeId::Mock);
         assert_eq!(config.initial_state, empty_snapshot());
@@ -1493,7 +1575,9 @@ mod tests {
         assert_eq!(config.amend, AmendConfig::NONE);
         assert_eq!(config.time_in_force, time_in_force);
         assert_eq!(config.session_close, Some(session_close));
+        assert_eq!(config.session_close_overrides, session_close_overrides);
         assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
+        assert_eq!(config.expiry_day_cutoff, Some(expiry_day_cutoff));
         assert_eq!(config.fee_model_overrides, fee_model_overrides);
     }
 
