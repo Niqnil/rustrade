@@ -919,6 +919,14 @@ async fn a_feed_refusing_the_status_channel_fails_its_subscribe_with_alpacas_cod
     assert!(message.contains("410"), "{message}");
     assert!(message.contains("invalid subscribe action"), "{message}");
     assert_eq!(provider.connections(), 1);
+    assert_eq!(
+        provider.sent_on(1),
+        [
+            json!({"action": "subscribe", "trades": ["AAPL"]}),
+            json!({"action": "subscribe", "statuses": ["AAPL"]}),
+        ],
+        "a refused subscribe added nothing, so nothing is unsubscribed",
+    );
 
     provider.push(json!([trade("AAPL", 4)]));
     assert_eq!(next_event(&mut trading).await.kind.id, "4");

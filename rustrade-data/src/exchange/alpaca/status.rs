@@ -180,7 +180,8 @@ fn read(plan: Plan, sc: &str, rc: &str) -> Reading {
     Reading::State(status)
 }
 
-/// A halt with `reason`: a pause when the reason is volatility, which a volatility halt is.
+/// The status a halt with `reason` reports: `Paused` when the reason is volatility, since such a
+/// halt is a timed pause, and otherwise `Halted` with the reason, if any.
 fn halt(reason: Option<HaltReason>) -> TradingStatus {
     match reason {
         Some(HaltReason::Volatility) => {
