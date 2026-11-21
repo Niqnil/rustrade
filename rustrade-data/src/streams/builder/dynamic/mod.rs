@@ -40,7 +40,13 @@ pub mod indexed;
 
 mod plan;
 
+/// Market streams of every [`SubKind`], one per [`ExchangeId`] in each kind's map.
+///
+/// Built only by [`init`](Self::init), [`init_with`](Self::init_with) and
+/// [`init_with_options`](Self::init_with_options). It is `#[non_exhaustive]` because each kind
+/// added later gains a field: destructure it with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DynamicStreams<InstrumentKey> {
     pub trades:
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PublicTrade>>>,

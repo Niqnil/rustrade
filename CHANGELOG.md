@@ -618,12 +618,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on it outside `rustrade-data` needs a wildcard arm. The engine's `DefaultInstrumentMarketData` and
   the simulated venue ignore `TradingStatus`; a kind added later that reaches their wildcard arm is
   logged (a rate-limited warning naming it) rather than ignored silently.
-- **Breaking: `SubKind` is `#[non_exhaustive]` and gains `TradingStatuses` and `PriceBands`**
-  (`rustrade-data`, #881). Kinds keep being added as venues publish them, so a `match` on it
-  outside `rustrade-data` needs a wildcard arm. `DynamicStreams` gains the public fields
-  `trading_statuses` and `price_bands`, and `DynamicStreams::select_all` requires
-  `MarketStreamResult<_, TradingStatus>` and `MarketStreamResult<_, PriceBand>` to convert into its
-  output too; `MarketStreamResult<_, DataKind>` does.
+- **Breaking: `SubKind` and `DynamicStreams` are `#[non_exhaustive]`, and `SubKind` gains
+  `TradingStatuses` and `PriceBands`** (`rustrade-data`, #881). Kinds keep being added as venues
+  publish them, so a `match` on `SubKind` outside `rustrade-data` needs a wildcard arm.
+  `DynamicStreams` gains the public fields `trading_statuses` and `price_bands`; it is
+  `#[non_exhaustive]` so that a later kind's field is not a breaking change, which means
+  destructuring it outside `rustrade-data` needs `..` and only its `init*` constructors build it.
+  `DynamicStreams::select_all` requires `MarketStreamResult<_, TradingStatus>` and
+  `MarketStreamResult<_, PriceBand>` to convert into its output too;
+  `MarketStreamResult<_, DataKind>` does.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
