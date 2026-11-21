@@ -358,9 +358,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     by its kind and underlying, or by its kind, in that order of precedence. `resolve` picks one
     for an instrument. A key by kind and underlying separates the options on an underlying from
     the underlying itself; two option families on one underlying need keys by name. Serialised,
-    the entries by kind and underlying are a list, and a repeated entry or an unknown key is
-    refused (`FeeModelOverridesError`). When it is built, the simulated venue logs a warning for
-    each entry by name, or by kind and underlying, that none of its instruments matches.
+    the entries by kind and underlying are a list, each naming its model `value`, and a repeated
+    entry or an unknown key is refused (`FeeModelOverridesError`). When it is built, the simulated
+    venue logs a warning for each entry by name, or by kind and underlying, that none of its
+    instruments matches.
+  - **`FeeModelOverrides` is `InstrumentOverrides<FeeModelConfig>`** (`rustrade-instrument`): the
+    keys, the order of precedence, the serialised form and the check for entries no instrument
+    matches (`unmatched`, returning `UnmatchedOverride`s) are generic over the value, so other
+    per-instrument settings can be keyed the same way. `FeeModelOverridesError` is
+    `InstrumentOverridesError`.
   - The `CompositeFeeModel` rustdoc has an index option example of both new rules.
   - The `CompositeFeeModel` rustdoc also has IBKR's US option commissions at one volume tier, with
     their premium bands, minimum per order and pass-through clearing and regulatory fees, and says

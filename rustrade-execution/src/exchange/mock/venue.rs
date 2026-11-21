@@ -60,6 +60,7 @@ use rustrade_instrument::{
             option::{OptionContract, OptionKind, OptionSettlement},
         },
         name::InstrumentNameExchange,
+        overrides::UnmatchedOverride,
     },
 };
 use rustrade_integration::collection::snapshot::Snapshot;
@@ -7498,19 +7499,22 @@ fn option_expiries(
         .collect()
 }
 
-/// Logs a warning for each entry of `overrides` that [`unmatched_fee_overrides`] finds: likely a
-/// typo, which would charge the instrument it meant the default.
+/// Logs a warning for each entry of `overrides` that matches none of `instruments`
+/// ([`InstrumentOverrides::unmatched`]): likely a typo, which would charge the instrument it meant
+/// the default.
+///
+/// [`InstrumentOverrides::unmatched`]: rustrade_instrument::instrument::overrides::InstrumentOverrides::unmatched
 fn warn_unmatched_fee_overrides(
     overrides: &FeeModelOverrides,
     instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
 ) {
-    for unmatched in unmatched_fee_overrides(overrides, instruments) {
+    for unmatched in overrides.unmatched(instruments.values()) {
         match unmatched {
-            UnmatchedFeeOverride::Name(name) => warn!(
+            UnmatchedOverride::Name(name) => warn!(
                 instrument = %name,
                 "fee model override names an instrument this venue does not have; it is never used"
             ),
-            UnmatchedFeeOverride::Underlying(kind, underlying) => warn!(
+            UnmatchedOverride::Underlying(kind, underlying) => warn!(
                 ?kind,
                 base = %underlying.base,
                 quote = %underlying.quote,
@@ -7519,39 +7523,6 @@ fn warn_unmatched_fee_overrides(
             ),
         }
     }
-}
-
-/// An entry of a [`FeeModelOverrides`] that matches none of a venue's instruments.
-#[derive(Debug, PartialEq)]
-enum UnmatchedFeeOverride<'a> {
-    Name(&'a InstrumentNameExchange),
-    Underlying(
-        InstrumentKindDiscriminant,
-        &'a Underlying<AssetNameExchange>,
-    ),
-}
-
-/// The entries of `overrides` by name, or by kind and underlying, that match none of
-/// `instruments`. Entries by kind are not checked: one config often serves venues of different
-/// instruments, and a kind they lack is no sign of a mistake.
-fn unmatched_fee_overrides<'a>(
-    overrides: &'a FeeModelOverrides,
-    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
-) -> Vec<UnmatchedFeeOverride<'a>> {
-    let names = overrides
-        .by_name()
-        .keys()
-        .filter(|name| !instruments.contains_key(*name))
-        .map(UnmatchedFeeOverride::Name);
-    let underlyings = overrides
-        .by_underlying()
-        .filter(|(kind, underlying, _)| {
-            !instruments.values().any(|instrument| {
-                instrument.kind.discriminant() == *kind && &instrument.underlying == *underlying
-            })
-        })
-        .map(|(kind, underlying, _)| UnmatchedFeeOverride::Underlying(kind, underlying));
-    names.chain(underlyings).collect()
 }
 
 /// The spot instrument each option in `instruments` settles against: the only spot instrument

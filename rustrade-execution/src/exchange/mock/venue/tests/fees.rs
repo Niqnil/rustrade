@@ -1,7 +1,7 @@
 //! Fees: which model prices an instrument's fills, and fees tiered by premium and by order size.
 
 use super::{
-    options::{driven_instruments, driven_venue, feed, option_name, spy, spy_name, usd},
+    options::{driven_venue, feed, option_name, spy, spy_name, usd},
     *,
 };
 use crate::fee::{FeeModelOverrides, PriceBand, PriceBands};
@@ -115,47 +115,4 @@ fn a_threshold_charges_an_order_from_its_size_and_not_below() {
 
     assert_eq!(fee_of_buy(&mut venue, option_name(), "9"), Decimal::ZERO);
     assert_eq!(fee_of_buy(&mut venue, option_name(), "10"), d("6.50"));
-}
-
-#[test]
-fn an_override_no_instrument_matches_is_found_except_by_kind() {
-    let instruments = driven_instruments(OptionKind::Call, OptionSettlement::Physical);
-    let spx_usd = Underlying::new("spx", "usd");
-    let spy_eur = Underlying::new("spy", "eur");
-    let overrides = FeeModelOverrides::new()
-        .with_name(option_name(), per_contract("1"))
-        .with_name("SPX_C100", per_contract("1"))
-        .with_underlying(
-            InstrumentKindDiscriminant::Option,
-            spy_usd(),
-            per_contract("1"),
-        )
-        .with_underlying(
-            InstrumentKindDiscriminant::Option,
-            spy_eur.clone(),
-            per_contract("1"),
-        )
-        .with_underlying(
-            InstrumentKindDiscriminant::Spot,
-            spx_usd.clone(),
-            per_contract("1"),
-        )
-        // SPY trades here, but only as spot: a key matches on kind and underlying together.
-        .with_underlying(
-            InstrumentKindDiscriminant::Future,
-            spy_usd(),
-            per_contract("1"),
-        )
-        .with_kind(InstrumentKindDiscriminant::Future, per_contract("1"));
-
-    assert_eq!(
-        unmatched_fee_overrides(&overrides, &instruments),
-        vec![
-            UnmatchedFeeOverride::Name(&InstrumentNameExchange::new("SPX_C100")),
-            UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Spot, &spx_usd),
-            UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Future, &spy_usd()),
-            UnmatchedFeeOverride::Underlying(InstrumentKindDiscriminant::Option, &spy_eur),
-        ]
-    );
-    assert!(unmatched_fee_overrides(&FeeModelOverrides::new(), &instruments).is_empty());
 }
