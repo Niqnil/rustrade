@@ -596,7 +596,9 @@ mod tests {
             )
         };
 
-        for (asset, fees_quote) in [("usdt", Some(dec!(0.01))), ("bnb", Some(dec!(7)))] {
+        // The quote fee carries no quote equivalent, so only its asset keeps it from conversion;
+        // the BNB fee is a third asset's, kept from conversion only by the value it carries.
+        for (asset, fees_quote) in [("usdt", None), ("bnb", Some(dec!(7)))] {
             assert!(
                 setup
                     .state
