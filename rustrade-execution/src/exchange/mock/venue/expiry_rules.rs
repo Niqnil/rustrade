@@ -128,9 +128,9 @@ impl SimulatedVenue {
 
     /// Panics if the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) is anchored before the
     /// session close and the option `instrument` has no session calendar to place it: see
-    /// [`next_deadline`](Self::next_deadline)'s `# Panics`. Checked on every order on the option,
-    /// since a venue restored from a snapshot has its clock moved already, so an order it took
-    /// before a calendar was given could pass a cutoff not yet placed.
+    /// [`next_deadline`](Self::next_deadline)'s `# Panics`. Checked on every order on the option
+    /// before its expiry, since a venue restored from a snapshot has its clock moved already, so
+    /// an order it took before a calendar was given could pass a cutoff not yet placed.
     pub(super) fn assert_cutoff_placed(&self, instrument: &InstrumentNameExchange) {
         assert!(
             !self

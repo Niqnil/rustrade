@@ -486,7 +486,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     close, refusals at build, restore or `with_session_calendar` are a
     `VenueConfigError::ExpiryRule` / `VenueRestoreError::ExpiryRule` naming
     `ExpiryRule::DayCutoff`, and an option with no calendar at all panics when the clock first
-    moves, or on any order on it, closing ones included.
+    moves, or on any order on it before its expiry, closing ones included.
   - **Known limitations:** orders accepted before the cutoff keep working and may fill until
     expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
     off at different offsets, or at one time of day whatever their close, cannot be modelled.

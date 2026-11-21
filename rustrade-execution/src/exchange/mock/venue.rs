@@ -4672,10 +4672,11 @@ impl SimulatedVenue {
     /// # Panics
     /// - If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     ///   boundary not after the instant it was asked from, or a negative interest.
-    /// - If the order is on an option that an
+    /// - If the order is on an unexpired option that an
     ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) anchored before the session
     ///   close cannot place, having no session calendar, whether the order opens a position or
-    ///   only closes one: see [`next_deadline`](Self::next_deadline).
+    ///   only closes one: see [`next_deadline`](Self::next_deadline). An order on an expired one
+    ///   is refused as expired.
     pub fn open_order(
         &mut self,
         mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -6055,7 +6056,8 @@ impl SimulatedVenue {
     /// for a short whose collateral is not free.
     ///
     /// # Panics
-    /// As [`assert_cutoff_placed`](Self::assert_cutoff_placed), for any order on the option.
+    /// As [`assert_cutoff_placed`](Self::assert_cutoff_placed), for any order on the option
+    /// before its expiry.
     fn check_option_order(
         &self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -6090,8 +6092,8 @@ impl SimulatedVenue {
             )));
         }
 
-        // Before any order on the option is judged, closing ones included, so a venue that cannot
-        // place the option's cutoff stops on the first order there, whatever it is.
+        // Before any order on the unexpired option is judged, closing ones included, so a venue
+        // that cannot place the option's cutoff stops on the first such order there.
         self.assert_cutoff_placed(instrument);
 
         // What of this order would open or increase a position on its side rather than close one,
