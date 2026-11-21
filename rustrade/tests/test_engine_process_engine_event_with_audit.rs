@@ -849,6 +849,57 @@ fn test_pnl_unrealised_updates_on_market_tick() {
     );
 }
 
+/// The Engine logs each user command it actions at DEBUG, payload included, never louder. A
+/// simulation or training loop can command an order on every step, so an INFO line per command
+/// would dominate a user's log.
+#[test]
+fn test_engine_logs_each_user_command_at_debug() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let snapshot = account_event_snapshot(&engine.state.assets);
+    let _ = process_with_audit(&mut engine, snapshot);
+
+    let open = OrderRequestOpen {
+        key: OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument: InstrumentIndex(1),
+            strategy: strategy_id(),
+            cid: gen_cid(1),
+        },
+        state: RequestOpen::new(
+            Side::Sell,
+            Some(dec!(0.05)),
+            dec!(1),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: true },
+        ),
+    };
+    let commands = [
+        Command::SendOpenRequests(OneOrMany::One(open)),
+        Command::CancelOrders(InstrumentFilter::None),
+        Command::ClosePositions(InstrumentFilter::None),
+    ];
+
+    let ((), events) = rustrade_instrument::test_utils::logs::capture(|| {
+        for command in commands {
+            let _ = process_with_audit(&mut engine, EngineEvent::Command(command));
+        }
+    });
+
+    let actioning: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event
+                .message()
+                .starts_with("Engine actioning user Command::")
+        })
+        .collect();
+    assert_eq!(actioning.len(), 3, "one line per command: {events:?}");
+    for event in actioning {
+        assert_eq!(event.level, tracing::Level::DEBUG, "{event:?}");
+    }
+}
+
 /// Routes a `BalanceStreamUpdate` (the WS-sourced partial) end-to-end through
 /// `EngineState::update_from_account` → `AssetState::apply_balance_update`, asserting both the
 /// resulting balance state and the audit trail.

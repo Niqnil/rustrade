@@ -455,21 +455,21 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         match &command {
             Command::SendCancelRequests(requests) => {
-                info!(
+                debug!(
                     ?requests,
                     "Engine actioning user Command::SendCancelRequests"
                 );
                 ActionOutput::CancelOrders(self.send_cancel_requests(requests.clone()))
             }
             Command::SendOpenRequests(requests) => {
-                info!(?requests, "Engine actioning user Command::SendOpenRequests");
+                debug!(?requests, "Engine actioning user Command::SendOpenRequests");
                 // Stamped like any other open the Engine emits -- a user command is no less a
                 // decision point than an algo order, and a simulated venue needs a price for it
                 // just the same. See `MarketSnapshotSource`.
                 ActionOutput::OpenOrders(self.send_open_requests(requests.clone()))
             }
             Command::SendCancelThenOpenRequests(groups) => {
-                info!(
+                debug!(
                     ?groups,
                     "Engine actioning user Command::SendCancelThenOpenRequests"
                 );
@@ -477,15 +477,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 ActionOutput::CancelThenOpens(self.send_cancel_then_open_requests(groups.clone()))
             }
             Command::SendAmendRequests(amends) => {
-                info!(?amends, "Engine actioning user Command::SendAmendRequests");
+                debug!(?amends, "Engine actioning user Command::SendAmendRequests");
                 ActionOutput::Amends(self.send_amend_requests(amends.clone()))
             }
             Command::ClosePositions(filter) => {
-                info!(?filter, "Engine actioning user Command::ClosePositions");
+                debug!(?filter, "Engine actioning user Command::ClosePositions");
                 ActionOutput::ClosePositions(self.close_positions(filter))
             }
             Command::CancelOrders(filter) => {
-                info!(?filter, "Engine actioning user Command::CancelOrders");
+                debug!(?filter, "Engine actioning user Command::CancelOrders");
                 ActionOutput::CancelOrders(self.cancel_orders(filter))
             }
         }
