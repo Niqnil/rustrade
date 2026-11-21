@@ -512,6 +512,10 @@ impl SessionCalendar for Unavailable {
     fn next_close_after(&self, _: DateTime<Utc>) -> Result<DateTime<Utc>, CalendarError> {
         Err(CalendarError::unavailable("down for maintenance"))
     }
+
+    fn session_close_on(&self, _: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, CalendarError> {
+        Err(CalendarError::unavailable("down for maintenance"))
+    }
 }
 
 #[test]
@@ -558,6 +562,10 @@ struct Stuck;
 impl SessionCalendar for Stuck {
     fn next_close_after(&self, after: DateTime<Utc>) -> Result<DateTime<Utc>, CalendarError> {
         Ok(after)
+    }
+
+    fn session_close_on(&self, at: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, CalendarError> {
+        Ok(Some(at))
     }
 }
 

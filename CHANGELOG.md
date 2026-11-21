@@ -316,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, `rustrade-instrument`, `rustrade`, #905).
   - **New `MockExecutionConfig::session_close: Option<SessionCalendarConfig>`**, opt-in. Its one
     variant, `SessionCalendarConfig::Daily(DailyClose)`, is a close time in an IANA time zone,
-    every weekday. Without it, a `GoodUntilEndOfDay` limit order is still refused.
+    every weekday except the holidays and early closes it is given. Without it, a
+    `GoodUntilEndOfDay` limit order is still refused.
   - **With it, the venue accepts a day limit order and expires it at the first instant after the
     next session close.** The deadline is fixed when the order is accepted. An amend does not move
     it, a snapshot keeps it, and it is kept while the order is held for a fresh market. Something
@@ -324,12 +325,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     weekend, or before the open expires at the next close. The order keeps reporting
     `GoodUntilEndOfDay`, and a cancel after expiry is answered `OrderAlreadyExpired`. A marketable
     day limit that fills in part rests its remainder.
-  - **Known limitations:** no holidays or early closes; no open time, so an order sent after the
-    close can fill on after-hours data; one close for the whole venue.
+  - **Known limitations:** holidays and early closes only as listed (none are built in); no open
+    time, so an order sent after the close can fill on after-hours data; one close for the whole
+    venue.
   - **New `rustrade_instrument::calendar`:** the `SessionCalendar` trait (`next_close_after`,
-    strictly after, UTC in and out), `CalendarError`, `DailyClose`, `instant_at_local` (local time
-    to UTC, with the daylight-saving rule `DailyAccrual` already used), and a re-export of
-    `chrono_tz::Tz`.
+    strictly after, and `session_close_on`, the close of the session on an instant's own local
+    date or `None` on a day without one; UTC in and out), `CalendarError`, `DailyClose`,
+    `instant_at_local` (local time to UTC, with the daylight-saving rule `DailyAccrual` already
+    used), and a re-export of `chrono_tz::Tz`.
+  - **Holidays and early closes:** `SessionDates` lists a market's holidays and early-close days
+    by local date, once for every class of instrument trading there; `SessionDates::new` and
+    deserialising refuse a weekend date and a date in both lists (`SessionDatesError`).
+    `DailyClose::with_dates(dates, early_close)` gives a close rule those dates and its own
+    early-close time (16:00 options close early at 13:00, 16:15 ones at 13:15), refusing
+    early-close days with no early-close time and an early close not before the regular close
+    (`DailyCloseError`). Serialised, a `DailyClose` adds `early_close`, `holidays` and
+    `early_closes` to `close` and `zone`, each left out when empty, and refuses an unknown field.
   - **A calendar of your own:** `SimulatedVenue::with_session_calendar` and
     `SimVenueOptions::session_calendar` override the configured close. A day order seeded in
     `initial_state` expires at the close after the instant the live venue accepted it, placed
