@@ -67,10 +67,12 @@ pub struct SimVenueOptions {
     pub margin_interest: Option<Arc<dyn MarginInterestModel>>,
     /// When the venue's trading sessions close, in place of the configuration's
     /// [`session_close`](MockExecutionConfig::session_close) — see
-    /// [`SimulatedVenue::with_session_calendar`]. It replaces the configured close entirely: a day
-    /// order seeded in the configuration or held in a restored snapshot is placed by it, and the
-    /// configured close is never asked. `None` uses the configured one, if any. With neither, the
-    /// venue refuses a day limit order.
+    /// [`SimulatedVenue::with_session_calendar`]. It replaces the configured `session_close`
+    /// entirely: a day order seeded in the configuration or held in a restored snapshot is placed
+    /// by it, and the configured close is never asked. An instrument an entry of
+    /// [`session_close_overrides`](MockExecutionConfig::session_close_overrides) matches keeps
+    /// that entry's close. `None` uses the configured one, if any. With neither, the venue refuses
+    /// a day limit order on an instrument no override matches.
     pub session_calendar: Option<Arc<dyn SessionCalendar>>,
 }
 

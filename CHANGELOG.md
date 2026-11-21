@@ -325,9 +325,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     weekend, or before the open expires at the next close. The order keeps reporting
     `GoodUntilEndOfDay`, and a cancel after expiry is answered `OrderAlreadyExpired`. A marketable
     day limit that fills in part rests its remainder.
+  - **A close per class of instrument:** `MockExecutionConfig::session_close_overrides`
+    (`SessionCloseOverrides`, keyed like `FeeModelOverrides`: by name, by kind and underlying, or
+    by kind) gives the instruments an entry matches their own close, such as 16:15 for index
+    options on a venue closing at 16:00. Such an instrument takes a day order without
+    `session_close`, keeps its close when a calendar is attached, and the venue warns of an entry
+    no instrument matches.
   - **Known limitations:** holidays and early closes only as listed (none are built in); no open
-    time, so an order sent after the close can fill on after-hours data; one close for the whole
-    venue.
+    time, so an order sent after the close can fill on after-hours data.
   - **New `rustrade_instrument::calendar`:** the `SessionCalendar` trait (`next_close_after`,
     strictly after, and `session_close_on`, the close of the session on an instant's own local
     date or `None` on a day without one; UTC in and out), `CalendarError`, `DailyClose`,
