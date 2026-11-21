@@ -21,10 +21,50 @@ use rustrade_instrument::{
 };
 use rustrade_integration::Terminal;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{cell::Cell, fmt::Debug};
 use tracing::{info, info_span};
 
+/// The name of the span [`StateReplicaManager::run`] applies the audit stream inside, so a log
+/// line the replica writes carries it as context.
+///
+/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) does not rely on it: a log filter can
+/// disable the span (an INFO span under `RUST_LOG=warn`, or any span under a filter that names
+/// only other targets), and the replica's lines would then be outside it.
 pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_update_span";
+
+thread_local! {
+    /// Whether this thread is applying an audit event to a replica, in
+    /// [`StateReplicaManager::update_from_event`].
+    static UPDATING_REPLICA: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is applying an audit event to a replica: inside
+/// [`StateReplicaManager::update_from_event`], directly or through [`StateReplicaManager::run`].
+/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops what is logged then.
+pub(crate) fn updating_replica() -> bool {
+    UPDATING_REPLICA.get()
+}
+
+/// Marks this thread as [`updating_replica`] until dropped, restoring the previous mark, also on
+/// unwind.
+#[must_use = "the thread is marked only while the guard is held"]
+pub(crate) struct UpdatingReplica {
+    previous: bool,
+}
+
+impl UpdatingReplica {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: UPDATING_REPLICA.replace(true),
+        }
+    }
+}
+
+impl Drop for UpdatingReplica {
+    fn drop(&mut self) {
+        UPDATING_REPLICA.set(self.previous);
+    }
+}
 
 /// Manages a replica of an `EngineState` instance by processing AuditStream events produced by
 /// the `Engine`.
@@ -44,6 +84,18 @@ pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_upda
 /// Nor does it learn which orders were sent reduce-only. It cuts a reduce-only fill as the
 /// engine did because the engine's [`EngineOutput::ReduceOnlyCapped`] output names each fill it
 /// cut.
+///
+/// # Logging
+///
+/// The replica applies each event through the same `EngineState` methods as the engine, so
+/// whatever they log, the replica logs again. While [`update_from_event`](Self::update_from_event)
+/// applies an event, called directly or by [`run`](Self::run), it marks its thread, and
+/// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops every event logged on that thread
+/// meanwhile, whatever the subscriber's level or target filters. That includes what your own
+/// `GlobalData` and instrument data processors log as the replica applies an event, which they
+/// already logged when the engine applied it. The [`logging`](crate::logging) initialisers install
+/// that filter; add it to a subscriber you build yourself, or each line on that path is written
+/// twice.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,
@@ -93,7 +145,8 @@ where
     {
         info!("StateReplicaManager running");
 
-        // Create Tracing Span used to filter duplicate replica EngineState update logs
+        // Context for the replica's log lines; `update_from_event` marks the thread for
+        // `AuditSpanFilter`, which a log filter cannot disable as it can this span.
         let audit_span = info_span!(AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME);
         let audit_span_guard = audit_span.enter();
 
@@ -122,7 +175,6 @@ where
             }
         };
 
-        // End Tracing Span used to filter duplicate EngineState update logs
         drop(audit_span_guard);
 
         info!(%shutdown_audit, "AuditManager stopped");
@@ -184,11 +236,18 @@ where
     /// Adding a new event type: choose event replay (deterministic transition) or output
     /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce
     /// the live engine's branching from the event alone.
+    ///
+    /// # Logging
+    ///
+    /// Marks its thread while it runs, so that
+    /// [`AuditSpanFilter`](crate::logging::AuditSpanFilter) drops the log lines the engine already
+    /// wrote for this event. See the type's docs.
     pub fn update_from_event<OnDisable, OnDisconnect>(
         &mut self,
         event: EngineEvent<InstrumentData::MarketEventKind>,
         outputs: &NoneOneOrMany<EngineOutput<OnDisable, OnDisconnect>>,
     ) {
+        let _updating = UpdatingReplica::enter();
         match event {
             EngineEvent::Shutdown(_) | EngineEvent::Command(_) => {
                 // No action required

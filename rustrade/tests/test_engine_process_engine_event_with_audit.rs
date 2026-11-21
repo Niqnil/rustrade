@@ -10306,3 +10306,113 @@ fn test_order_deadline_cancels_an_order_being_amended() {
         Some(VenueOrderId::Assigned(gen_order_id(0)))
     );
 }
+
+/// Counts the WARNs `rustrade::engine::state::fee` logs that reach it.
+struct FeeWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FeeWarnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        if *metadata.level() == tracing::Level::WARN
+            && metadata.module_path() == Some("rustrade::engine::state::fee")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// How the replica is given the engine's audit.
+#[derive(Clone, Copy, Debug)]
+enum Replay {
+    /// Through `StateReplicaManager::run`.
+    Run,
+    /// By calling `StateReplicaManager::update_from_event` directly.
+    Direct,
+}
+
+/// The fee WARNs that reach the subscriber while the engine applies a fill whose ETH fee nothing
+/// values (ETH pairs only with BTC, the fill is on BTCUSDT), and then while a
+/// `StateReplicaManager` replays it. `env_filter` is an `EnvFilter` directive placed in front, and
+/// `dedup` adds the `AuditSpanFilter`.
+fn fee_warnings_with_a_replica(env_filter: Option<&str>, dedup: bool, replay: Replay) -> usize {
+    use rustrade::engine::audit::{Auditor, ProcessAudit, state_replica::StateReplicaManager};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing_subscriber::Layer;
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let seed = <TestEngine as Auditor<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >>::audit_snapshot(&mut engine);
+    let fill = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            gen_trade_id(0),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(50000),
+            dec!(0.1),
+            None,
+            AssetFees::new(AssetIndex(1), dec!(0.001), None),
+        )),
+    }));
+
+    let count = Arc::new(AtomicUsize::new(0));
+    // `Layer::and_then` by path: `Option`'s own `and_then` would shadow it.
+    let layer = Layer::and_then(
+        Layer::and_then(
+            env_filter.map(tracing_subscriber::EnvFilter::new),
+            dedup.then_some(rustrade::logging::AuditSpanFilter),
+        ),
+        FeeWarnings(Arc::clone(&count)),
+    );
+    rustrade_instrument::test_utils::logs::with_layer(layer, || {
+        let audit = process_with_audit(&mut engine, fill);
+        match replay {
+            Replay::Run => {
+                StateReplicaManager::new(seed, std::iter::once(audit))
+                    .run()
+                    .unwrap();
+            }
+            Replay::Direct => {
+                let EngineAudit::Process(ProcessAudit { event, outputs, .. }) = audit.event else {
+                    panic!("the fill should be audited as processed");
+                };
+                let no_updates: DummyAuditUpdates = std::iter::empty();
+                StateReplicaManager::new(seed, no_updates).update_from_event(event, &outputs);
+            }
+        }
+    });
+    count.load(Ordering::Relaxed)
+}
+
+/// A `StateReplicaManager` applies each fill through the same path as the engine, so it logs the
+/// engine's fee WARN again; the `AuditSpanFilter` drops its copy. It does so under a level filter
+/// that excludes the replica's INFO span and under a filter naming only another target, both of
+/// which disable that span, and when the replica is updated directly rather than through `run`.
+#[test]
+fn test_state_replica_fee_warning_is_written_once_behind_the_audit_span_filter() {
+    for replay in [Replay::Run, Replay::Direct] {
+        assert_eq!(
+            fee_warnings_with_a_replica(None, false, replay),
+            2,
+            "{replay:?}"
+        );
+        for env_filter in [None, Some("warn"), Some("rustrade::engine::state=debug")] {
+            assert_eq!(
+                fee_warnings_with_a_replica(env_filter, true, replay),
+                1,
+                "{replay:?} {env_filter:?}"
+            );
+        }
+    }
+}
