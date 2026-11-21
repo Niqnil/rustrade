@@ -397,8 +397,10 @@ impl MockExecutionConfig {
 /// sent after Friday's close expires at Monday's.
 ///
 /// # Known limitations
-/// - **No holidays or early closes** in [`Daily`](Self::Daily): a day order lives through a
-///   market holiday, and past an early close, until the next weekday's regular close.
+/// - **Holidays and early closes only as listed** in [`Daily`](Self::Daily): a day order lives
+///   through a market holiday, and past an early close, that its [`SessionDates`] do not list.
+///
+/// [`SessionDates`]: rustrade_instrument::calendar::SessionDates
 /// - **No open time**: a day order sent after the close works at once, so it can fill on
 ///   after-hours data that the live venue would hold until the next open.
 /// - **One close for the whole venue**: a venue whose instruments close at different times (US
@@ -433,7 +435,7 @@ impl SessionCalendarConfig {
     /// The calendar this configuration names.
     pub fn calendar(&self) -> Arc<dyn SessionCalendar> {
         match self {
-            Self::Daily(close) => Arc::new(*close),
+            Self::Daily(close) => Arc::new(close.clone()),
         }
     }
 }

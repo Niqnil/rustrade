@@ -705,8 +705,8 @@ pub enum VenueRegime {
 ///   live venue accepted it, its [`Open::time_exchange`], which may already have passed. The
 ///   venue does not refuse one when it has no calendar, since the live venue already accepted
 ///   it, but then it has no deadline and works until cancelled.
-/// - The configured [`DailyClose`](rustrade_instrument::calendar::DailyClose) knows no holidays
-///   or early closes, and there is one calendar for the whole venue: see
+/// - The configured [`DailyClose`](rustrade_instrument::calendar::DailyClose) knows only the
+///   holidays and early closes it is given, and there is one calendar for the whole venue: see
 ///   [`SessionCalendarConfig`]'s known limitations.
 ///
 /// A market order works only on arrival, which honours every time in force that bounds *how long*
@@ -1259,8 +1259,8 @@ impl SimulatedVenue {
     /// [`TimeInForce::GoodUntilEndOfDay`] limit order and expires it at the first instant after
     /// the next close: see the type's "Which `TimeInForce` this venue honours".
     ///
-    /// The way to plug in a calendar of your own, such as one with a market's holidays and early
-    /// closes. Like [`with_fill_model`](Self::with_fill_model), it is not part of the
+    /// The way to plug in a calendar of your own, such as one read from an exchange's published
+    /// calendar. Like [`with_fill_model`](Self::with_fill_model), it is not part of the
     /// configuration, so a serialised configuration no longer says when sessions close.
     ///
     /// A day limit order seeded through `initial_state` is given the close after the instant the
