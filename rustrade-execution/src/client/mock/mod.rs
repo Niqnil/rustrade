@@ -8,7 +8,7 @@ use crate::{
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
-    expiry::{ExpirySellOut, LongOptionExpiry},
+    expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
@@ -231,6 +231,16 @@ pub struct MockExecutionConfig {
     /// [`spot_margin`](Self::spot_margin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_sell_out: Option<ExpirySellOut>,
+    /// Whether the mock exchange refuses an order that would open or increase a position in an
+    /// option from a set time before its expiry day's close, or before its expiry, until it
+    /// expires, as a broker stops taking new exposure in an expiring option. See
+    /// [`ExpiryDayCutoff`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
+    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    ///
+    /// Defaults to `None`: an option takes opening orders until its expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_day_cutoff: Option<ExpiryDayCutoff>,
     /// What a stock split does to the mock exchange's open orders on the split equity: cancelled,
     /// or adjusted. See [`SplitConfig`].
     ///
@@ -270,6 +280,7 @@ impl MockExecutionConfig {
             session_close_overrides: SessionCloseOverrides::default(),
             fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
+            expiry_day_cutoff: None,
             split: SplitConfig::default(),
         }
     }
@@ -414,6 +425,16 @@ impl MockExecutionConfig {
     pub fn with_expiry_sell_out(self, expiry_sell_out: ExpirySellOut) -> Self {
         Self {
             expiry_sell_out: Some(expiry_sell_out),
+            ..self
+        }
+    }
+
+    /// This config refusing orders that open a position in an option about to expire, under
+    /// `expiry_day_cutoff`: see [`expiry_day_cutoff`](Self::expiry_day_cutoff).
+    #[must_use]
+    pub fn with_expiry_day_cutoff(self, expiry_day_cutoff: ExpiryDayCutoff) -> Self {
+        Self {
+            expiry_day_cutoff: Some(expiry_day_cutoff),
             ..self
         }
     }
@@ -1510,6 +1531,8 @@ mod tests {
         );
         let expiry_sell_out =
             ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(3600)));
+        let expiry_day_cutoff =
+            ExpiryDayCutoff::new(ExpiryAnchor::BeforeClose(Duration::from_secs(2700)));
 
         let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
             .with_fee_model(fee_model.clone())
@@ -1527,7 +1550,8 @@ mod tests {
             .with_session_close(session_close.clone())
             .with_session_close_overrides(session_close_overrides.clone())
             .with_fee_model_overrides(fee_model_overrides.clone())
-            .with_expiry_sell_out(expiry_sell_out);
+            .with_expiry_sell_out(expiry_sell_out)
+            .with_expiry_day_cutoff(expiry_day_cutoff);
 
         assert_eq!(config.mocked_exchange, ExchangeId::Mock);
         assert_eq!(config.initial_state, empty_snapshot());
@@ -1553,6 +1577,7 @@ mod tests {
         assert_eq!(config.session_close, Some(session_close));
         assert_eq!(config.session_close_overrides, session_close_overrides);
         assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
+        assert_eq!(config.expiry_day_cutoff, Some(expiry_day_cutoff));
         assert_eq!(config.fee_model_overrides, fee_model_overrides);
     }
 

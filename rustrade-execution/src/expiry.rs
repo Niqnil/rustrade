@@ -1,4 +1,5 @@
-//! How an option position settles at expiry, and what a simulated venue sells before it.
+//! How an option position settles at expiry, what a simulated venue sells before it, and when it
+//! stops taking orders that open a position in it.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -85,8 +86,8 @@ pub enum LongOptionExpiry {
 /// - **One check.** A broker sells at some point in a window before expiry. The venue checks once,
 ///   at the instant this sets, against the market it holds then, however old. A price that
 ///   arrives later in the window does not sell what the check could not.
-/// - **No order cut-off.** Orders that open or add to an expiring position are still taken
-///   between the check and expiry, which a broker may refuse.
+/// - **No order cut-off of its own.** Orders that open or add to an expiring position are still
+///   taken between the check and expiry, unless an [`ExpiryDayCutoff`] refuses them.
 /// - **Only the account's own money.** What exercising one option receives (a put's cash) does
 ///   not fund another (a call), and an option a little out of the money, which a broker may also
 ///   sell, is left to expire.
@@ -208,6 +209,69 @@ impl From<ExpirySellOut> for ExpirySellOutRepr {
             affordability: sell_out.affordability,
             haircut: sell_out.haircut,
         }
+    }
+}
+
+/// When a [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) stops taking orders that open
+/// or increase a position in an option about to expire, as a broker does on an option's expiry
+/// day, so that no new exposure is taken on that it could not settle or sell out in time.
+///
+/// Set on [`MockExecutionConfig::expiry_day_cutoff`]. For example, a broker that refuses such
+/// orders in the last 45 minutes before the expiry day's close:
+///
+/// ```
+/// use rustrade_execution::expiry::{ExpiryAnchor, ExpiryDayCutoff};
+/// use std::time::Duration;
+///
+/// let cutoff = ExpiryDayCutoff::new(ExpiryAnchor::BeforeClose(Duration::from_secs(45 * 60)));
+/// ```
+///
+/// # What the venue does
+/// From the instant the [`anchor`](Self::anchor) places for an option until its expiry, the venue
+/// refuses an order on it of which any part would open or increase a position, with
+/// [`ApiError::OpenRefused`] carrying [`OpenRefusal::ExpiryDayCutoff`]. Every option is covered,
+/// cash-settled or physically settled.
+///
+/// An order is measured against the position as it would stand once every order already working
+/// on the same side of the option filled, in the order the venue accepted them: an order closes
+/// only what the position has left after those orders close their part. A sell of 3 against a
+/// long of 5 with a sell of 4 already working closes 1 and opens 2, so it is refused. An order
+/// that would close the position and open one on the other side, such as a sell of 7 against a
+/// long of 5, is refused whole. An order that only closes is taken as before the cutoff.
+///
+/// The venue amends no option order, so a working order cannot be amended past the cutoff
+/// either.
+///
+/// # Known limitations
+/// - **Working orders are left working.** An order that opens a position, accepted before the
+///   cutoff, keeps working after it and may fill until the option expires, or until an
+///   [`ExpirySellOut`] check cancels it. Whether a broker cancels such orders at its cutoff is
+///   not documented.
+/// - **One anchor for every option.** A venue whose classes of option are cut off at different
+///   offsets before their closes, or at one fixed time of day whatever each class's close, cannot
+///   be modelled; each option's own close is still used.
+/// - **Only the simulated venue refuses this way.** A live client reports its venue's refusal of
+///   such an order as [`ApiError::OrderRejected`] until that venue's wording is confirmed.
+///
+/// [`MockExecutionConfig::expiry_day_cutoff`]:
+///     crate::client::mock::MockExecutionConfig::expiry_day_cutoff
+/// [`ApiError::OpenRefused`]: crate::error::ApiError::OpenRefused
+/// [`ApiError::OrderRejected`]: crate::error::ApiError::OrderRejected
+/// [`OpenRefusal::ExpiryDayCutoff`]: crate::error::OpenRefusal::ExpiryDayCutoff
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct ExpiryDayCutoff {
+    anchor: ExpiryAnchor,
+}
+
+impl ExpiryDayCutoff {
+    /// Refuses opening orders from the instant `anchor` places for each option.
+    pub const fn new(anchor: ExpiryAnchor) -> Self {
+        Self { anchor }
+    }
+
+    /// When the venue starts refusing opening orders on each option.
+    pub const fn anchor(&self) -> ExpiryAnchor {
+        self.anchor
     }
 }
 

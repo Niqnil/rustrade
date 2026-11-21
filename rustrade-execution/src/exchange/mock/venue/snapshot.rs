@@ -3,7 +3,7 @@
 use super::price_window::PriceWindow;
 use super::{
     NetPosition, SimulatedVenue, VenueRegime,
-    config::{self, AssetSpelledTwice, ExpirySellOutUnplaceable},
+    config::{self, AssetSpelledTwice, ExpiryRuleUnplaceable},
     liquidation::LiquidationState,
 };
 use crate::{
@@ -269,11 +269,12 @@ pub enum VenueRestoreError {
     #[error("venue snapshot holds a day order whose session close cannot be placed: {0}")]
     SessionCalendar(#[source] CalendarError),
 
-    /// The anchor of the configuration's
-    /// [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) cannot place the sell-out of an
+    /// The anchor of one of the configuration's expiry-day rules, its
+    /// [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) or
+    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff), cannot place the rule for an
     /// option the venue lists, as [`try_new`](SimulatedVenue::try_new) refuses.
     #[error(transparent)]
-    ExpirySellOut(#[from] ExpirySellOutUnplaceable),
+    ExpiryRule(#[from] ExpiryRuleUnplaceable),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -452,8 +453,8 @@ impl SimulatedVenue {
     /// - [`VenueRestoreError::SessionCalendar`] if `config`'s session close for its instrument
     ///   cannot place the close of a day limit order the snapshot holds with no deadline of its
     ///   own.
-    /// - [`VenueRestoreError::ExpirySellOut`] if `config`'s expiry sell-out cannot be placed for
-    ///   an option, as [`try_new`](Self::try_new) refuses.
+    /// - [`VenueRestoreError::ExpiryRule`] if `config`'s expiry sell-out or expiry-day cutoff
+    ///   cannot be placed for an option, as [`try_new`](Self::try_new) refuses.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -623,7 +624,7 @@ impl SimulatedVenue {
         venue
             .resolve_seeded_deadlines()
             .map_err(VenueRestoreError::SessionCalendar)?;
-        venue.resolve_sell_outs()?;
+        venue.resolve_expiry_rules()?;
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.corporate_actions_applied = corporate_actions_applied.into_iter().collect();
