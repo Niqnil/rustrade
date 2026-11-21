@@ -96,24 +96,47 @@ pub enum VenueConfigError {
     )]
     SessionCalendar(#[source] CalendarError),
 
-    /// The anchor of [`MockExecutionConfig::expiry_sell_out`] cannot place the sell-out of an
-    /// option the venue lists.
+    /// The anchor of an expiry-day rule, [`MockExecutionConfig::expiry_sell_out`] or
+    /// [`MockExecutionConfig::expiry_day_cutoff`], cannot place the rule for an option the venue
+    /// lists.
     #[error(transparent)]
-    ExpirySellOut(#[from] ExpirySellOutUnplaceable),
+    ExpiryRule(#[from] ExpiryRuleUnplaceable),
 }
 
-/// The anchor of [`MockExecutionConfig::expiry_sell_out`] cannot place the sell-out of an option
-/// a [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored before the session
-/// close for an option with no session calendar.
+/// The anchor of an expiry-day rule cannot place the rule for an option a
+/// [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored before the session close
+/// for an option whose expiry falls on a date with no session.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
-#[error("the expiry sell-out cannot be placed for the option {instrument}: {source}")]
-pub struct ExpirySellOutUnplaceable {
+#[error("the {rule} cannot be placed for the option {instrument}: {source}")]
+pub struct ExpiryRuleUnplaceable {
+    /// The rule.
+    pub rule: ExpiryRule,
     /// The option, the first by name the anchor cannot place.
     pub instrument: InstrumentNameExchange,
     /// Why.
     #[source]
     pub source: ExpiryAnchorError,
+}
+
+/// An expiry-day rule of a [`SimulatedVenue`](super::SimulatedVenue), placed for each option by
+/// an [`ExpiryAnchor`](crate::expiry::ExpiryAnchor).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExpiryRule {
+    /// [`MockExecutionConfig::expiry_sell_out`].
+    SellOut,
+    /// [`MockExecutionConfig::expiry_day_cutoff`].
+    DayCutoff,
+}
+
+impl fmt::Display for ExpiryRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SellOut => "expiry sell-out",
+            Self::DayCutoff => "expiry-day cutoff",
+        })
+    }
 }
 
 /// Two names in one [`SimulatedVenue`](super::SimulatedVenue)'s configuration that name one asset

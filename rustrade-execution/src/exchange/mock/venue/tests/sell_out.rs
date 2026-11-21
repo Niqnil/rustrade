@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     client::mock::{SessionCalendarConfig, SessionCloseOverrides},
-    exchange::mock::venue::{ExpirySellOutUnplaceable, VenueRestoreError},
+    exchange::mock::venue::{ExpiryRule, ExpiryRuleUnplaceable, VenueRestoreError},
     expiry::{
         ExpiryAnchor, ExpiryAnchorError, ExpirySellOut, LongOptionExpiry, SellOutAffordability,
     },
@@ -900,8 +900,9 @@ fn closing_at(seconds: i64) -> SessionCalendarConfig {
 }
 
 /// The option's sell-out cannot be placed, for `source`.
-fn unplaceable(source: ExpiryAnchorError) -> ExpirySellOutUnplaceable {
-    ExpirySellOutUnplaceable {
+fn unplaceable(source: ExpiryAnchorError) -> ExpiryRuleUnplaceable {
+    ExpiryRuleUnplaceable {
+        rule: ExpiryRule::SellOut,
         instrument: option_name(),
         source,
     }
@@ -962,7 +963,7 @@ fn a_sell_out_the_calendar_cannot_place_is_refused_at_build() {
                 driven_instruments(OptionKind::Call, OptionSettlement::Physical),
             )
             .err(),
-            Some(VenueConfigError::ExpirySellOut(unplaceable(source)))
+            Some(VenueConfigError::ExpiryRule(unplaceable(source)))
         );
     }
 }
@@ -1011,7 +1012,7 @@ fn a_calendar_given_after_build_that_cannot_place_the_sell_out_is_refused() {
         uncalendared_venue()
             .with_session_calendar(closing_at(110).calendar())
             .err(),
-        Some(VenueConfigError::ExpirySellOut(unplaceable(
+        Some(VenueConfigError::ExpiryRule(unplaceable(
             ExpiryAnchorError::CloseAfterExpiry {
                 close: time(110),
                 expiry: expiry(),
@@ -1031,7 +1032,7 @@ fn a_restore_whose_sell_out_the_calendar_cannot_place_is_refused() {
             venue.snapshot(),
         )
         .err(),
-        Some(VenueRestoreError::ExpirySellOut(unplaceable(
+        Some(VenueRestoreError::ExpiryRule(unplaceable(
             ExpiryAnchorError::CloseAfterExpiry {
                 close: time(110),
                 expiry: expiry(),

@@ -351,7 +351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `initial_state` expires at the close after the instant the live venue accepted it, placed
     by the options' calendar when one is given. `with_session_calendar` returns a
     `VenueConfigError`: `SessionCalendar` for a seeded day order the calendar cannot place, or
-    `ExpirySellOut` for an expiry sell-out it cannot place.
+    `ExpiryRule` for an expiry sell-out or expiry-day cutoff it cannot place.
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
@@ -443,14 +443,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the expiry instant, for a venue trading around the clock. Serialised externally tagged in
     snake case, as `"anchor": {"before_close": {"secs": 3600, "nanos": 0}}`.
     `ExpiryAnchor::instant` places it, or says why not (`ExpiryAnchorError`).
-  - **`BeforeClose` refusals:** building the venue (`VenueConfigError::ExpirySellOut`), restoring
-    it (`VenueRestoreError::ExpirySellOut`) or attaching a calendar refuses an option whose expiry
+  - **`BeforeClose` refusals:** building the venue (`VenueConfigError::ExpiryRule`), restoring
+    it (`VenueRestoreError::ExpiryRule`) or attaching a calendar refuses an option whose expiry
     falls on a date with no session, whose expiry day closes after its expiry (stamp the expiry at
     or after the close; a close equal to it is accepted), or whose calendar cannot answer; the
-    error is an `ExpirySellOutUnplaceable` naming the option. An option with no calendar at all is
-    built, so that `with_session_calendar` can supply one, and the venue panics when its clock
-    first moves (`advance_time`, `apply_market`) or on `next_deadline` if none has. An expiry stamped at midnight UTC falls on the previous New York date, so it is
-    anchored to that day's close, as the venue also settles it that evening.
+    error is an `ExpiryRuleUnplaceable` naming the rule (`ExpiryRule::SellOut`) and the option.
+    An option with no calendar at all is built, so that `with_session_calendar` can supply one,
+    and the venue panics when its clock first moves (`advance_time`, `apply_market`) or on
+    `next_deadline` if none has. An expiry stamped at midnight UTC falls on the previous New York
+    date, so it is anchored to that day's close, as the venue also settles it that evening.
   - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
     it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
   - **The sale** cancels the orders working on the option, then sells as a market sell fills
@@ -461,9 +462,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `long_option_expiry`. Cash-settled options are never sold.
   - **Known limitations:** one check at the instant set, against the market held then; one anchor
     for every option, so classes sold out at different offsets before their closes cannot be
-    modelled; no cut-off for orders between the check and expiry; one exercise's proceeds do not
-    fund another.
+    modelled; one exercise's proceeds do not fund another. Orders between the check and expiry
+    are refused only under the expiry-day cutoff (below).
   - `TradeOrigin::Liquidation`'s rustdoc now also covers this sale.
+
+- **The simulated venue refuses orders that open a position in an option about to expire**
+  (`rustrade-execution`).
+  - **New `MockExecutionConfig::expiry_day_cutoff: Option<ExpiryDayCutoff>`**, opt-in, set with
+    `with_expiry_day_cutoff`. From the instant `ExpiryDayCutoff::new(anchor)` places for an option
+    until its expiry, the venue refuses an order on it of which any part would open or increase a
+    position, as a broker stops taking new exposure in an option on its expiry day. Every option
+    is covered, cash-settled too. Serialised as `{"anchor": {"before_close": {...}}}`.
+  - **What counts as closing:** an order is measured against the position as it would stand once
+    every order already working on its side filled, in acceptance order, so working orders that
+    together close the whole position leave nothing for a new one to close. An order that would
+    close the position and open the other side is refused whole. The venue amends no option
+    order, so the cutoff cannot be passed by amending a closing order upwards.
+  - **New `ApiError::OpenRefused(OpenRefusal)`**, with `OpenRefusal::ExpiryDayCutoff { cutoff }`
+    (`#[non_exhaustive]`): an order refused because it would open a position while only closing
+    orders are taken. The simulated venue reports it; live clients report such a refusal as
+    `OrderRejected` until their venue's wording is confirmed.
+  - **Placement** follows the expiry sell-out's: `BeforeClose` anchors to the option's own session
+    close, refusals at build, restore or `with_session_calendar` are a
+    `VenueConfigError::ExpiryRule` / `VenueRestoreError::ExpiryRule` naming
+    `ExpiryRule::DayCutoff`, and an option with no calendar at all panics when the clock first
+    moves, or on any order on it before its expiry, closing ones included.
+  - **Known limitations:** orders accepted before the cutoff keep working and may fill until
+    expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
+    off at different offsets, or at one time of day whatever their close, cannot be modelled.
 
 - **The engine tracks an order on the terms the venue states for it, and reports a change**
   (`rustrade`). An order changed at the venue other than by the engine's own amend (in the
@@ -929,6 +955,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #917). A struct literal must set it (`None` to hold every long to expiry), and
   `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as
   `None`.
+
+- **Breaking: `MockExecutionConfig` has an `expiry_day_cutoff` field** (`rustrade-execution`). A
+  struct literal must set it (`None` to take opening orders until expiry);
+  `MockExecutionConfig::new` sets it to `None`. A serialized config without it reads as `None`.
 
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).
