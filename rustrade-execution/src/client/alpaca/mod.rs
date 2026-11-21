@@ -6527,6 +6527,7 @@ impl AlpacaClient {
     ///     .fold(SessionCloseOverrides::new(), |overrides, symbol| {
     ///         overrides.with_underlying(
     ///             InstrumentKindDiscriminant::Option,
+    ///             // The quote name your option instruments' underlyings use.
     ///             Underlying::new(symbol, AssetNameExchange::new("USD")),
     ///             late_close.clone(),
     ///         )
@@ -6541,7 +6542,7 @@ impl AlpacaClient {
     ///
     /// Assets of every status are read, inactive ones included, since a backtest may need an
     /// underlying that is no longer listed. An asset Alpaca returns without the attribute is left
-    /// out, and their count logged at WARN.
+    /// out, and their count logged at WARN; the call still returns the assets that list it.
     ///
     /// # Known limitations
     /// - The list is as of the request. Alpaca gives no date on which an underlying gained or lost
@@ -6552,7 +6553,9 @@ impl AlpacaClient {
     ///
     /// # Errors
     /// Fails if the request fails, or with [`UnindexedClientError::Internal`] if the response is
-    /// not a list of assets each with a symbol.
+    /// not a list of assets each with a symbol, or lists assets of which none carries the
+    /// attribute: Alpaca's response has then changed shape, and an empty list would leave every
+    /// underlying on the standard close.
     pub async fn fetch_options_late_close_underlyings(
         &self,
     ) -> Result<Vec<AssetNameExchange>, UnindexedClientError> {
@@ -6564,13 +6567,18 @@ impl AlpacaClient {
             ])
         })
         .await?;
-        Ok(late_close_underlyings(assets))
+        late_close_underlyings(assets)
     }
 }
 
 /// The sorted symbols of the `assets` that list [`OPTIONS_LATE_CLOSE`], each once. Any others are
 /// left out and their count logged at WARN, as Alpaca returned them for a request filtered on it.
-fn late_close_underlyings(assets: Vec<AlpacaListedAsset>) -> Vec<AssetNameExchange> {
+///
+/// # Errors
+/// [`UnindexedClientError::Internal`] if `assets` is not empty but none lists the attribute.
+fn late_close_underlyings(
+    assets: Vec<AlpacaListedAsset>,
+) -> Result<Vec<AssetNameExchange>, UnindexedClientError> {
     let (late, other): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
         asset
             .attributes
@@ -6578,6 +6586,14 @@ fn late_close_underlyings(assets: Vec<AlpacaListedAsset>) -> Vec<AssetNameExchan
             .flatten()
             .any(|attribute| attribute == OPTIONS_LATE_CLOSE)
     });
+    if late.is_empty() && !other.is_empty() {
+        return Err(UnindexedClientError::Internal(format!(
+            "Alpaca listed {} assets for a request filtered on {OPTIONS_LATE_CLOSE}, none of them \
+             with it (first: {})",
+            other.len(),
+            other[0].symbol
+        )));
+    }
     if !other.is_empty() {
         warn!(
             left_out = other.len(),
@@ -6586,11 +6602,12 @@ fn late_close_underlyings(assets: Vec<AlpacaListedAsset>) -> Vec<AssetNameExchan
              are left out"
         );
     }
-    late.into_iter()
+    Ok(late
+        .into_iter()
         .map(|asset| AssetNameExchange::new(asset.symbol))
         .sorted()
         .dedup()
-        .collect()
+        .collect())
 }
 
 /// The fields of a `GET /v2/assets` entry that
@@ -14225,7 +14242,7 @@ mod tests {
             });
 
             assert_eq!(
-                symbols,
+                symbols.unwrap(),
                 [AssetNameExchange::new("DIA"), AssetNameExchange::new("QQQ")],
                 "sorted, each once"
             );
@@ -14249,13 +14266,31 @@ mod tests {
                 late_close_underlyings(vec![listed("SPY", Some(&["options_late_close"]))])
             });
 
-            assert_eq!(symbols, [AssetNameExchange::new("SPY")]);
+            assert_eq!(symbols.unwrap(), [AssetNameExchange::new("SPY")]);
             assert!(
                 events
                     .iter()
                     .all(|event| event.level != tracing::Level::WARN),
                 "{events:?}"
             );
+        }
+
+        #[test]
+        fn a_list_of_assets_none_with_the_late_close_attribute_is_internal() {
+            let result = late_close_underlyings(vec![
+                listed("SPY", None),
+                listed("QQQ", Some(&["has_options"])),
+            ]);
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(ref message)) if message.contains("SPY")),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn an_empty_list_has_no_late_close_underlyings() {
+            assert_eq!(late_close_underlyings(Vec::new()).unwrap(), []);
         }
 
         /// Answers every request with a 429. Every answer but the last says `Retry-After: 0`, so

@@ -329,7 +329,7 @@ async fn test_fetch_options_late_close_underlyings() {
         .expect("late-close underlyings");
     println!("{} late-close underlyings: {symbols:?}", symbols.len());
 
-    // The three Alpaca support names as closing at 16:15 ET.
+    // Alpaca support names SPY, QQQ and IWM as closing at 16:15 ET.
     for symbol in ["SPY", "QQQ", "IWM"] {
         assert!(
             symbols.contains(&AssetNameExchange::new(symbol)),
