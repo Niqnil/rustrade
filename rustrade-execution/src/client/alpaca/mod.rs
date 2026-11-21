@@ -6543,9 +6543,9 @@ impl AlpacaClient {
     /// Assets of every status are read, inactive ones included, since a backtest may need an
     /// underlying that is no longer listed. An asset Alpaca returns without the attribute is left
     /// out, and their count logged at WARN; the call still returns the assets that list it. An
-    /// empty response returns an empty list, as Alpaca listing no such underlying is possible; for
-    /// today's market, where Alpaca names SPY, QQQ and IWM among them, it is implausible, and the
-    /// caller decides what to do with it.
+    /// empty response returns an empty list, and the caller decides what to do with it: Alpaca
+    /// listing no such underlying is possible, though unlikely (in November 2026 it listed SPY,
+    /// QQQ and IWM among them).
     ///
     /// # Known limitations
     /// - The list is as of the request. Alpaca gives no date on which an underlying gained or lost
