@@ -5462,6 +5462,33 @@ mod tests {
             orders.update_from_order_snapshot(Snapshot(report))
         }
 
+        /// [`apply`], asserting it logged each of `routine` (by message prefix) and nothing above
+        /// DEBUG: a venue that reports each amend as a replace sends these on the normal path, so
+        /// an INFO line per report would flood a user's log.
+        fn apply_routine(
+            orders: &mut Orders<ExchangeId, u64>,
+            report: &OrderReport<ExchangeId, u64, u64>,
+            routine: &[&str],
+        ) -> SnapshotApplied<ExchangeId, u64> {
+            let (applied, events) =
+                rustrade_instrument::test_utils::logs::capture(|| apply(orders, report));
+            // `Level` orders by verbosity: anything louder than DEBUG compares below it.
+            let loud: Vec<_> = events
+                .iter()
+                .filter(|event| event.level < tracing::Level::DEBUG)
+                .collect();
+            assert!(loud.is_empty(), "logged above DEBUG: {loud:?}");
+            for message in routine {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event.message().starts_with(message)),
+                    "{message:?} not logged: {events:?}"
+                );
+            }
+            applied
+        }
+
         fn cancelled(venue_id: &str, secs: i64) -> OrderState<u64, u64> {
             OrderState::inactive(Cancelled {
                 id: id(venue_id),
@@ -5504,7 +5531,14 @@ mod tests {
                 Some(Replaces::new(id("1"))),
             );
 
-            let applied = apply(&mut orders, &linked);
+            let applied = apply_routine(
+                &mut orders,
+                &linked,
+                &[
+                    "OrderManager followed an order replaced at the venue",
+                    "OrderManager adopted the terms a venue reported",
+                ],
+            );
 
             assert!(!applied.retired);
             let tracked = orders.tracked(&old_cid()).expect("tracked");
@@ -5688,7 +5722,11 @@ mod tests {
                     Some(replaces.clone()),
                 );
 
-                let applied = apply(&mut orders, &linked);
+                let applied = apply_routine(
+                    &mut orders,
+                    &linked,
+                    &["OrderManager moved an order replaced at the venue to its new ClientOrderId"],
+                );
 
                 let case = format!("{venue_id} {replaces:?}");
                 assert!(orders.get(&old_cid()).is_none(), "{case}");
