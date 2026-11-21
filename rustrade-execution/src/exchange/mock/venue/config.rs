@@ -83,9 +83,14 @@ pub enum VenueConfigError {
         free: Decimal,
     },
 
-    /// [`MockExecutionConfig::session_close`] cannot place the close of a day limit order seeded
-    /// in `initial_state`.
-    #[error("session_close cannot place the close of a day order seeded in initial_state: {0}")]
+    /// The session close of a day limit order's instrument, from
+    /// [`MockExecutionConfig::session_close`] or an entry of
+    /// [`MockExecutionConfig::session_close_overrides`], cannot place the close of the order,
+    /// seeded in `initial_state`.
+    #[error(
+        "the instrument's session close cannot place the close of a day order seeded in \
+         initial_state: {0}"
+    )]
     SessionCalendar(#[source] CalendarError),
 }
 

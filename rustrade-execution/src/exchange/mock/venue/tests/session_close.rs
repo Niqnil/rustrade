@@ -728,3 +728,50 @@ fn a_seeded_order_that_is_not_a_day_order_is_given_no_deadline() {
 
     assert_eq!(deadline_of(&venue, "seeded"), None);
 }
+
+#[test]
+fn a_restored_seeded_day_order_is_placed_by_its_instruments_override() {
+    let monday = utc(2026, 11, 9, 15, 0, 0);
+    let venue =
+        SimulatedVenue::new_market_driven(&seeded_day_config(None, monday), spot_instruments());
+    assert_eq!(
+        deadline_of(&venue, "seeded"),
+        None,
+        "no calendar, no deadline"
+    );
+    let snapshot: SimulatedVenueSnapshot =
+        serde_json::from_str(&serde_json::to_string(&venue.snapshot()).unwrap()).unwrap();
+
+    let with_override = day_config().with_session_close_overrides(
+        SessionCloseOverrides::new().with_name(instrument_name(), late_close()),
+    );
+    let restored =
+        SimulatedVenue::from_snapshot(&with_override, spot_instruments(), snapshot).unwrap();
+
+    assert_eq!(
+        deadline_of(&restored, "seeded"),
+        Some(just_after(utc(2026, 11, 9, 21, 15, 0)))
+    );
+}
+
+#[test]
+fn an_attached_calendar_closes_the_instruments_no_override_matches() {
+    let config = day_config().with_session_close_overrides(
+        SessionCloseOverrides::new().with_kind(InstrumentKindDiscriminant::Option, late_close()),
+    );
+    let noon = SessionCalendarConfig::Daily(DailyClose::new(
+        NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        chrono_tz::America::New_York,
+    ));
+    let mut venue = venue_from(&config)
+        .with_session_calendar(noon.calendar())
+        .unwrap();
+
+    venue.open_order(limit_request("day", Side::Buy, "1", "48000", day()));
+
+    // Tuesday 12:00 EST.
+    assert_eq!(
+        deadline_of(&venue, "day"),
+        Some(just_after(utc(2026, 11, 10, 17, 0, 0)))
+    );
+}

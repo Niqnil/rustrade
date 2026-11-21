@@ -1045,8 +1045,10 @@ impl SimulatedVenue {
     ///   position that is a cash-settled call, whose collateral asset it holds no balance of, or
     ///   that its seeded free balances do not cover: see `# How an option is accounted` on
     ///   [`SimulatedVenue`].
-    /// - [`VenueConfigError::SessionCalendar`] if [`MockExecutionConfig::session_close`] cannot
-    ///   place the close of a day limit order seeded in `initial_state`.
+    /// - [`VenueConfigError::SessionCalendar`] if the session close of a day limit order's
+    ///   instrument ([`MockExecutionConfig::session_close`] or an entry of
+    ///   [`MockExecutionConfig::session_close_overrides`]) cannot place the close of the order,
+    ///   seeded in `initial_state`.
     pub fn try_new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
