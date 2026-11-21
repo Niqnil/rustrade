@@ -1136,6 +1136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IBKR `fetch_shortability` ends at once on a competing live session** (`rustrade-execution`,
+  `rustrade-instrument`). IB's notice 10197, no market data on a paper account while the same
+  user is logged in to a live session elsewhere, was gathered like any other notice, so the read
+  waited out `IbkrConfig::shortability_timeout` (10 s by default) before failing with
+  `ApiError::RequestRejected`. It now ends the read at once, as the not-subscribed notices do,
+  with the same error. `rustrade_instrument::ibkr::codes::MARKET_DATA_NOT_AVAILABLE_CODES` holds
+  every code after which IB sends no market data (354, 10089, 10168 and 10197); the market data
+  stream and `fetch_shortability` both read it.
 - **`AuditSpanFilter` drops a replica's log lines whatever the log filters** (`rustrade`). A
   `StateReplicaManager` applies the audit stream through the same `EngineState` methods as the
   engine, so each log line on that path is written twice unless the filter drops the replica's

@@ -71,8 +71,9 @@ impl ShortabilityClient for IbkrClient {
     /// can send no tick 89 at all for one it has few or none of, which then comes back with
     /// `available` unknown. While it runs it holds one of the account's market data lines, and it
     /// is cancelled when the read ends. Calls made at once each hold their own line, so checking
-    /// many stocks together can fill the account's lines. The read runs on a blocking thread, so dropping the
-    /// returned future does not end it early: it runs to its end, holding the line until then.
+    /// many stocks together can fill the account's lines. The read runs on a blocking thread, so
+    /// dropping the returned future does not end it early: it runs to its end, holding the line
+    /// until then.
     ///
     /// The request asks for IB's delayed market data, which IB serves only where the account has
     /// no live subscription for the stock, so an account without one still gets the ticks. IB
@@ -84,8 +85,9 @@ impl ShortabilityClient for IbkrClient {
     ///   for one that is not a stock, as only a stock is sold short by borrowing it.
     /// - [`ConnectivityError::Timeout`] if neither tick arrives in time, or
     ///   [`ApiError::RequestRejected`] when IB sent notices instead. The message carries IB's
-    ///   notices. A notice that the account may not have the stock's market data, live or
-    ///   delayed, ends the read at once.
+    ///   notices. A notice that IB will send the account no market data for the stock, live or
+    ///   delayed, ends the read at once: it is not subscribed, or, on a paper account, the same
+    ///   user's live session elsewhere has precedence.
     /// - [`ApiError::CapacityExceeded`] if every one of the account's market data lines is in use,
     ///   by this client, another API client or TWS. Waiting does not free one; cancelling a
     ///   subscription does.
@@ -239,8 +241,8 @@ impl ShortabilityTicks {
 /// when the request ends. A streaming request ends only on an error, which comes first, or on the
 /// connection dropping, which the caller checks.
 ///
-/// A notice that the account may not have the stock's market data ends the read with the notices
-/// gathered so far.
+/// A notice that IB will send the account no market data for the stock (it is not subscribed,
+/// or a competing live session has precedence) ends the read with the notices gathered so far.
 ///
 /// # Errors
 /// The error IB or `ibapi` ended the request with, or IB's notice that the account has no market
@@ -269,7 +271,7 @@ fn read_shortability_ticks(
                 return Err(ibapi::Error::Notice(notice));
             }
             Some(Ok(SubscriptionItem::Notice(notice)))
-                if codes::MARKET_DATA_NOT_SUBSCRIBED_CODES.contains(&notice.code) =>
+                if codes::MARKET_DATA_NOT_AVAILABLE_CODES.contains(&notice.code) =>
             {
                 debug!(%notice, "IBKR shortability request has no market data");
                 ticks.notices.push(notice);
@@ -523,26 +525,38 @@ mod tests {
 
     #[test]
     fn nothing_but_notices_is_a_rejection_naming_them() {
-        let started = Instant::now();
-        let ticks = read_shortability_ticks(
-            Duration::from_secs(5),
-            SHORTABLE_SHARES_GRACE,
-            subscription(vec![Ok(SubscriptionItem::Notice(notice(
+        for (code, text) in [
+            (354, "Requested market data is not subscribed."),
+            (
                 10089,
                 "Requested market data requires additional subscription for API.",
-            )))]),
-        )
-        .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "a no-data notice should end the read"
-        );
-        let error = ticks.into_shortability(&instrument(), true).unwrap_err();
-        let UnindexedClientError::Api(ApiError::RequestRejected(message)) = error else {
-            panic!("expected RequestRejected, got {error:?}");
-        };
-        assert!(message.starts_with("AAPL: "), "{message}");
-        assert!(message.contains("10089 Requested market data"), "{message}");
+            ),
+            (
+                10168,
+                "Requested market data is not subscribed. Delayed market data is not enabled.",
+            ),
+            (10197, "No market data during competing live session"),
+        ] {
+            let started = Instant::now();
+            let ticks = read_shortability_ticks(
+                Duration::from_secs(5),
+                SHORTABLE_SHARES_GRACE,
+                subscription(vec![Ok(SubscriptionItem::Notice(notice(code, text)))]),
+            )
+            .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a no-data notice should end the read ({code})"
+            );
+            let error = ticks.into_shortability(&instrument(), true).unwrap_err();
+            let UnindexedClientError::Api(ApiError::RequestRejected(message)) = error else {
+                panic!("expected RequestRejected, got {error:?}");
+            };
+            assert_eq!(
+                message,
+                format!("AAPL: IB sent no shortability, only: {code} {text}")
+            );
+        }
     }
 
     #[test]

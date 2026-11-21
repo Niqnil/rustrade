@@ -54,3 +54,12 @@ pub const MARKET_DATA_NOT_SUBSCRIBED_CODES: [i32; 3] = [
     API_MARKET_DATA_NOT_SUBSCRIBED,
     DELAYED_MARKET_DATA_NOT_ENABLED,
 ];
+
+/// Codes saying IB will send this account no market data for the instrument, after which no tick
+/// comes: the [`MARKET_DATA_NOT_SUBSCRIBED_CODES`], and [`COMPETING_LIVE_SESSION`].
+pub const MARKET_DATA_NOT_AVAILABLE_CODES: [i32; 4] = [
+    MARKET_DATA_NOT_SUBSCRIBED,
+    API_MARKET_DATA_NOT_SUBSCRIBED,
+    DELAYED_MARKET_DATA_NOT_ENABLED,
+    COMPETING_LIVE_SESSION,
+];
