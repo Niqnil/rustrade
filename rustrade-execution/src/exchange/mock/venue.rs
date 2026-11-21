@@ -479,7 +479,7 @@ pub enum VenueRegime {
 /// Configured with [`MockExecutionConfig::expiry_sell_out`], the venue also checks each long in a
 /// physically settled option at the instant its [`ExpiryAnchor`](crate::expiry::ExpiryAnchor)
 /// places: an offset before the session close of its expiry day, from its session calendar (a
-/// venue without one for the option panics on its first input, see
+/// venue without one for the option panics when its clock first moves, see
 /// [`next_deadline`](Self::next_deadline)), or before its expiry itself. The check is a boundary
 /// like the expiry and included in [`next_deadline`](Self::next_deadline), and first among the
 /// boundaries at its instant. A long in the money that the account cannot afford to exercise (the

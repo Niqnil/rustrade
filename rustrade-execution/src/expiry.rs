@@ -232,7 +232,7 @@ impl From<ExpirySellOut> for ExpirySellOutRepr {
 pub enum ExpiryAnchor {
     /// This long before the close of the session on the expiry's date, from the option's session
     /// calendar, as brokers set their expiry-day deadlines. Needs a calendar: a venue with none
-    /// for the option panics on its first input (see
+    /// for the option panics when its clock first moves (see
     /// [`SimulatedVenue::next_deadline`](crate::exchange::mock::SimulatedVenue::next_deadline)).
     BeforeClose(Duration),
     /// This long before the expiry instant itself, for a venue that trades around the clock and

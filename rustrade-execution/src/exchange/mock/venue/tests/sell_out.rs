@@ -979,7 +979,7 @@ fn uncalendared_venue() -> SimulatedVenue {
 
 #[test]
 #[should_panic(expected = "have no session calendar")]
-fn a_sell_out_before_the_close_with_no_calendar_panics_on_the_first_input() {
+fn a_sell_out_before_the_close_with_no_calendar_panics_when_the_clock_first_moves() {
     let _ = uncalendared_venue().advance_time(time(1));
 }
 

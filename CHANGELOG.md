@@ -448,8 +448,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     falls on a date with no session, whose expiry day closes after its expiry (stamp the expiry at
     or after the close; a close equal to it is accepted), or whose calendar cannot answer; the
     error is an `ExpirySellOutUnplaceable` naming the option. An option with no calendar at all is
-    built, so that `with_session_calendar` can supply one, and the venue panics on its first input
-    if none has. An expiry stamped at midnight UTC falls on the previous New York date, so it is
+    built, so that `with_session_calendar` can supply one, and the venue panics when its clock
+    first moves (`advance_time`, `apply_market`) or on `next_deadline` if none has. An expiry stamped at midnight UTC falls on the previous New York date, so it is
     anchored to that day's close, as the venue also settles it that evening.
   - **`SellOutAffordability`:** `PerPosition`, the default, sells the whole position unless all of
     it is affordable. `PerContract` keeps the contracts the account can exercise and sells the rest.
