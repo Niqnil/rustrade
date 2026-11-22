@@ -57,8 +57,8 @@
 //! The tests never log the values of what they receive (prices, sizes, Greeks), in a log line or a
 //! failure message: a received event is logged as what it is (`log_received`: exchange, instrument
 //! and exchange time), and snapshots only by their counts. One exception is the library's own: a
-//! frame it cannot read is reported with an excerpt of the frame, so that the failure is
-//! observable.
+//! frame it cannot read is reported with the frame, as an excerpt in its warning or in full in the
+//! stream error these tests log, so that the failure is observable.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
