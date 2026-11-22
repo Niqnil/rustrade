@@ -833,7 +833,7 @@ async fn test_iex_price_bands_receive_data() {
                 {
                     return band;
                 }
-                Some(Event::Item(band)) => tracing::info!(?band, "IEX price band with no limit"),
+                Some(Event::Item(band)) => log_received("IEX price band with no limit", &band),
                 Some(Event::Reconnecting(_)) => continue,
                 None => panic!("Stream ended unexpectedly"),
             }
@@ -847,10 +847,12 @@ async fn test_iex_price_bands_receive_data() {
         )
     });
 
-    tracing::info!(?band, "Received IEX price band");
+    log_received("IEX price band", &band);
     assert!(
         band.kind.venue_code.is_some(),
-        "a band without its venue code: {band:?}"
+        "a band without its venue code: {} at {}",
+        band.instrument,
+        band.time_exchange
     );
 }
 
