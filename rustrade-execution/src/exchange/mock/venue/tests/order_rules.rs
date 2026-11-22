@@ -328,6 +328,57 @@ fn a_refused_held_order_survives_a_snapshot() {
     );
 }
 
+/// A new order under a refused order's client order id forgets the refusal, as it forgets how any
+/// earlier order under the id ended: a snapshot lists the id once, as open.
+#[test]
+fn a_new_order_under_a_refused_orders_id_forgets_the_refusal() {
+    let mut venue = holding_under(notional_at_least_150());
+    let _ = venue.open_order(ioc_buy("held", "1"));
+    let _ = feed_bar(&mut venue, 2, ohlc("140", "145", "135", "142"));
+    let refused = serde_json::to_value(venue.snapshot()).unwrap();
+    assert_eq!(
+        refused["account"]["orders_refused"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let outcome = venue.open_order(limit_request("held", Side::Buy, "1", "100", gtc()));
+    assert!(rested_open(&outcome).filled_quantity.is_zero());
+
+    let json = serde_json::to_value(venue.snapshot()).unwrap();
+    assert!(
+        json["account"].get("orders_refused").is_none(),
+        "{}",
+        json["account"]
+    );
+}
+
+/// A restore refuses a snapshot whose refused order names an instrument the venue does not trade,
+/// as it does for an order in any other state.
+#[test]
+fn a_snapshot_whose_refused_order_names_an_unknown_instrument_is_refused() {
+    let config = ruled_config(notional_at_least_150())
+        .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open));
+    let mut venue = holding_under(notional_at_least_150());
+    let _ = venue.open_order(ioc_buy("held", "1"));
+    let _ = feed_bar(&mut venue, 2, ohlc("140", "145", "135", "142"));
+    let mut json = serde_json::to_value(venue.snapshot()).unwrap();
+    json["account"]["orders_refused"][0]["key"]["instrument"] = serde_json::json!("ETHUSDT");
+
+    let refused = SimulatedVenue::from_snapshot(
+        &config,
+        spot_instruments(),
+        serde_json::from_value(json).unwrap(),
+    );
+
+    assert_eq!(
+        refused.unwrap_err(),
+        VenueRestoreError::UnknownInstrument(InstrumentNameExchange::new("ETHUSDT"))
+    );
+}
+
 // --- Amends ------------------------------------------------------------------------------------
 
 /// A venue under `rules()` resting a buy of 1 at 90 under `resting`, the market last at 100.
