@@ -1,6 +1,7 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance, MarginDetails},
+    error::OrderError,
     exchange::mock::orders::{
         AlreadyResting, NotQueued, OpenOrder, OpenOrderEntry, OpenOrders, Rank, Reservation,
         RestingOrder, as_open,
@@ -24,6 +25,14 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// An order the venue accepted and later refused, its state the error it was refused with: see
+/// [`AccountState::ack_refused`].
+pub type RefusedOrder = Order<
+    ExchangeId,
+    InstrumentNameExchange,
+    OrderError<AssetNameExchange, InstrumentNameExchange>,
+>;
+
 #[derive(Debug)]
 pub struct AccountState {
     balances: FnvHashMap<AssetNameExchange, AssetBalance<AssetNameExchange>>,
@@ -45,6 +54,10 @@ pub struct AccountState {
     /// else records an expiry, so a snapshot has no other source for it — whereas a fill is already
     /// in [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled`.
     orders_expired: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Expired>>,
+    /// Orders the venue accepted, held, and then refused on release for breaking an order rule,
+    /// each with the error it was refused with, kept so an order-state lookup can report how it
+    /// ended. Grows with the run, like `orders_cancelled`.
+    orders_refused: FnvHashMap<ClientOrderId, RefusedOrder>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
     /// Whether this is a margin account, which reports every balance's loan, or a cash account,
     /// which reports none and borrows nothing. Set by [`enable_margin`](Self::enable_margin).
@@ -70,6 +83,7 @@ impl AccountState {
             orders_cancelled,
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
+            orders_refused: FnvHashMap::default(),
             trades,
             margin: false,
             loans_changed: 0,
@@ -271,6 +285,7 @@ impl AccountState {
         self.orders_cancelled.remove(cid);
         self.orders_filled.remove(cid);
         self.orders_expired.remove(cid);
+        self.orders_refused.remove(cid);
     }
 
     /// Records that `order` was cancelled, so it is reported by a later account snapshot and a
@@ -316,11 +331,23 @@ impl AccountState {
             Some(filled.clone().map_state(InactiveOrderState::FullyFilled))
         } else if let Some(cancelled) = self.orders_cancelled.get(cid) {
             Some(cancelled.clone().map_state(InactiveOrderState::Cancelled))
+        } else if let Some(expired) = self.orders_expired.get(cid) {
+            Some(expired.clone().map_state(InactiveOrderState::Expired))
         } else {
-            self.orders_expired
+            self.orders_refused
                 .get(cid)
-                .map(|expired| expired.clone().map_state(InactiveOrderState::Expired))
+                .map(|refused| refused.clone().map_state(InactiveOrderState::OpenFailed))
         }
+    }
+
+    /// Records that `order`, accepted and held, was refused on release with the error it carries
+    /// as its state, so an order-state lookup can report it. Not listed by an account snapshot,
+    /// like a filled order.
+    ///
+    /// Replaces whatever the ledgers held for an earlier order under the same id.
+    pub fn ack_refused(&mut self, order: RefusedOrder) {
+        self.forget_ended(&order.key.cid);
+        self.orders_refused.insert(order.key.cid.clone(), order);
     }
 
     /// Records that `order` reached its own deadline, so it is reported by a later account snapshot
@@ -1064,6 +1091,8 @@ pub struct AccountStateSnapshot {
     orders_cancelled: Vec<Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
     orders_filled: Vec<Order<ExchangeId, InstrumentNameExchange, Filled>>,
     orders_expired: Vec<Order<ExchangeId, InstrumentNameExchange, Expired>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    orders_refused: Vec<RefusedOrder>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
     margin: bool,
     loans_changed: u64,
@@ -1096,6 +1125,11 @@ impl AccountStateSnapshot {
                     .iter()
                     .map(|order| &order.key.instrument),
             )
+            .chain(
+                self.orders_refused
+                    .iter()
+                    .map(|order| &order.key.instrument),
+            )
             .chain(self.trades.iter().map(|trade| &trade.instrument))
     }
 }
@@ -1124,6 +1158,7 @@ impl AccountState {
             orders_cancelled: by_id(&self.orders_cancelled),
             orders_filled: by_id(&self.orders_filled),
             orders_expired: by_id(&self.orders_expired),
+            orders_refused: by_id(&self.orders_refused),
             trades: self.trades.clone(),
             margin: self.margin,
             loans_changed: self.loans_changed,
@@ -1159,6 +1194,7 @@ impl AccountState {
             orders_cancelled,
             orders_filled,
             orders_expired,
+            orders_refused,
             trades,
             margin,
             loans_changed,
@@ -1173,6 +1209,7 @@ impl AccountState {
             orders_cancelled: by_id(orders_cancelled)?,
             orders_filled: by_id(orders_filled)?,
             orders_expired: by_id(orders_expired)?,
+            orders_refused: by_id(orders_refused)?,
             trades,
             margin,
             loans_changed,
@@ -1253,6 +1290,7 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
             orders_cancelled,
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
+            orders_refused: FnvHashMap::default(),
             trades: vec![],
             margin: false,
             loans_changed: 0,

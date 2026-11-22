@@ -2,8 +2,10 @@
 //! the check that a venue's configuration spells each asset one way.
 
 use crate::{
-    client::mock::MockExecutionConfig, exchange::mock::account::DuplicateSeededOrder,
+    client::mock::MockExecutionConfig,
+    exchange::mock::account::DuplicateSeededOrder,
     expiry::ExpiryAnchorError,
+    rules::{OrderRules, OrderRulesField},
 };
 use fnv::FnvHashMap;
 use itertools::Itertools;
@@ -14,7 +16,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{Instrument, name::InstrumentNameExchange},
 };
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 
 /// Why [`SimulatedVenue::try_new`](super::SimulatedVenue::try_new) or
@@ -101,6 +103,60 @@ pub enum VenueConfigError {
     /// lists.
     #[error(transparent)]
     ExpiryRule(#[from] ExpiryRuleUnplaceable),
+
+    /// An entry of [`MockExecutionConfig::order_rules`] cannot be enforced as given.
+    #[error(transparent)]
+    OrderRules(#[from] InvalidOrderRules),
+}
+
+/// Why a [`SimulatedVenue`](super::SimulatedVenue) cannot enforce an entry of
+/// [`MockExecutionConfig::order_rules`]. The first entry by instrument name is reported.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum InvalidOrderRules {
+    /// The entry names an instrument the venue does not trade: likely a typo, which would leave
+    /// the instrument meant unchecked.
+    #[error("order rules are given for {0}, which the venue does not trade")]
+    UnknownInstrument(InstrumentNameExchange),
+
+    /// One of the entry's rules has a minimum above its maximum, so no value passes it.
+    #[error("the {rule} rule of {instrument} has a minimum {min} above its maximum {max}")]
+    MinAboveMax {
+        /// The instrument the rules are for.
+        instrument: InstrumentNameExchange,
+        /// Which rule.
+        rule: OrderRulesField,
+        /// Its minimum.
+        min: Decimal,
+        /// Its maximum, below `min`.
+        max: Decimal,
+    },
+}
+
+/// Refuses the first entry of `order_rules`, by instrument name, that the venue trading
+/// `instruments` cannot enforce.
+pub(super) fn check_order_rules(
+    order_rules: &BTreeMap<InstrumentNameExchange, OrderRules>,
+    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+) -> Result<(), InvalidOrderRules> {
+    for (instrument, rules) in order_rules {
+        if !instruments.contains_key(instrument) {
+            return Err(InvalidOrderRules::UnknownInstrument(instrument.clone()));
+        }
+        for (rule, value) in rules.by_field() {
+            if let (Some(min), Some(max)) = (value.min, value.max)
+                && min > max
+            {
+                return Err(InvalidOrderRules::MinAboveMax {
+                    instrument: instrument.clone(),
+                    rule,
+                    min,
+                    max,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The anchor of an expiry-day rule cannot place the rule for an option a

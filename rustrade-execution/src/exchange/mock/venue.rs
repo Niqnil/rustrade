@@ -36,9 +36,12 @@ use crate::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, ReduceOnly,
             UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
         },
-        state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
+        state::{
+            Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
+        },
     },
     position::{Position, PositionReport},
+    rules::OrderRules,
     short_option::{Collateral, ShortPutCollateral},
     shortability::ShortabilityProvider,
     slippage::Slippage,
@@ -79,7 +82,8 @@ mod snapshot;
 mod spot_pairs;
 
 pub use config::{
-    AssetSource, AssetSpelledTwice, ExpiryRule, ExpiryRuleUnplaceable, VenueConfigError,
+    AssetSource, AssetSpelledTwice, ExpiryRule, ExpiryRuleUnplaceable, InvalidOrderRules,
+    VenueConfigError,
 };
 pub use corporate_action::{
     CorporateActionOutcome, CorporateActionRefusal, CorporateActionResponse,
@@ -814,6 +818,42 @@ pub enum VenueRegime {
 /// asset cannot cover the excess.
 ///
 /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
+///
+/// # Order rules
+/// An instrument with an entry in [`MockExecutionConfig::order_rules`] takes only orders its
+/// [`OrderRules`] allow, as the live venue does: a price on its tick, a quantity on its step and in
+/// its range, and a notional in its range. An order that breaks one is refused with the error a
+/// live client loading the same rules refuses it with, [`OrderError::InvalidPrecision`] or
+/// [`OrderError::OutOfBounds`], before anything touches the ledger. Nothing is rounded. An
+/// instrument with no entry is not checked, which is the default. Read an instrument's rules
+/// through [`order_rules`](Self::order_rules).
+///
+/// - **On arrival**, every order is checked by [`OrderRules::check`]. A market order's notional
+///   is then checked by [`OrderRules::check_market_notional`] at the price this venue's
+///   [`FillModel`] gives it before slippage, times the whole quantity asked for, before slippage
+///   is drawn. A market order with no price is refused as unpriceable, as without rules.
+/// - **A held market order** ([`MarketOrderTiming::NextBar`], or a stale market under
+///   [`StaleMarketPolicy::Wait`]) has its notional checked when it is released, at the price it
+///   is released at. One that breaks the rule then ends as
+///   [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed) with the same
+///   [`OrderError::OutOfBounds`], after its reservation is released: a balance event, then the
+///   order. The rest of it was checked on arrival.
+/// - **An amend**, a client's or an [external](Self::modify_externally) one, is checked by
+///   [`OrderRules::check`] on the whole order as amended, and refused with the same errors.
+/// - **No exemption for a closing order**: a venue that enforces a minimum enforces it on a close.
+///
+/// Known differences from a live venue:
+/// - **Static rules.** They are fixed when the venue is built. A live venue changes its rules, and
+///   a live client reloads them.
+/// - **The notional reference is this venue's.** A live venue measures a market order's notional
+///   at a price of its own, such as a reference price or an average of recent trades, which a
+///   venue fed snapshots cannot know. This venue uses its fill model's price before slippage.
+/// - **Only the rules [`OrderRules`] holds.** A venue rule it has no field for, such as a price
+///   band around the last trade or a cap on open orders, is not enforced.
+/// - **A split does not restate the rules.** An instrument's rules stay as given after
+///   [`apply_corporate_action`](Self::apply_corporate_action) applies a split.
+/// - **Seeded orders are not checked.** An order in `initial_state` stands for one the live venue
+///   has already taken.
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
@@ -1033,6 +1073,9 @@ pub struct SimulatedVenue {
     /// What a split does to the open orders on its equity. Fixed at construction from
     /// [`MockExecutionConfig::split`].
     split: SplitConfig,
+    /// The order rules of each instrument that has them. Fixed at construction from
+    /// [`MockExecutionConfig::order_rules`]. See the type's `# Order rules`.
+    order_rules: FnvHashMap<InstrumentNameExchange, OrderRules>,
 }
 
 impl SimulatedVenue {
@@ -1088,6 +1131,9 @@ impl SimulatedVenue {
     ///   calendar at all is not refused here, so that
     ///   [`with_session_calendar`](Self::with_session_calendar) can supply one: see the
     ///   `# Panics` of [`next_deadline`](Self::next_deadline).
+    /// - [`VenueConfigError::OrderRules`] if [`MockExecutionConfig::order_rules`] gives rules for
+    ///   an instrument the venue does not trade, or a rule whose minimum is above its maximum: see
+    ///   [`InvalidOrderRules`].
     pub fn try_new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -1145,6 +1191,7 @@ impl SimulatedVenue {
                 .iter()
                 .map(|balance| &balance.asset),
         ))?;
+        config::check_order_rules(&config.order_rules, &instruments)?;
         let positions = seeded_positions(&config.initial_state, &instruments)?;
         let mut account = AccountState::try_from(config.initial_state.clone())?;
         if config.spot_margin.is_some() {
@@ -1260,6 +1307,11 @@ impl SimulatedVenue {
             corporate_actions_applied: FnvHashSet::default(),
             restated_strikes: FnvHashMap::default(),
             split: config.split,
+            order_rules: config
+                .order_rules
+                .iter()
+                .map(|(instrument, rules)| (instrument.clone(), *rules))
+                .collect(),
         }
     }
 
@@ -3416,6 +3468,15 @@ impl SimulatedVenue {
             return self.cancel_unfilled(order, released, time_exchange);
         };
 
+        // Checked now that the order has a price, as on arrival: see the type's `# Order rules`.
+        if let Err(error) =
+            self.check_market_notional(&order.key.instrument, order.kind, reference, quantity)
+        {
+            let released =
+                reservation.map(|reservation| self.release_reservation(reservation, time_exchange));
+            return self.refuse_held(order, released, error, time_exchange);
+        }
+
         // What the releasing observation has to give this order, which is all of it wherever no
         // size is known -- as on every candle feed.
         let filled_quantity = match self.depth_available(&order.key.instrument, side) {
@@ -4398,6 +4459,61 @@ impl SimulatedVenue {
         events
     }
 
+    /// Ends a held order that its release has found breaks a rule, as
+    /// [`OpenFailed`](InactiveOrderState::OpenFailed) with `error`, an arrival's refusal of it,
+    /// and returns `[balance, cash flow.., order]`, as
+    /// [`cancel_unfilled`](Self::cancel_unfilled) does, for the reservation `released`.
+    fn refuse_held(
+        &mut self,
+        order: OpenOrder,
+        released: Option<Released>,
+        error: UnindexedOrderError,
+        time_exchange: DateTime<Utc>,
+    ) -> Vec<UnindexedAccountEvent> {
+        let flows = released
+            .as_ref()
+            .map_or(0, |released| released.interest.len());
+        let mut events = Vec::with_capacity(2 + flows);
+        if let Some(Released { balance, interest }) = released {
+            events.push(self.build_account_event(Snapshot(balance)));
+            self.push_interest(&mut events, interest, time_exchange);
+        }
+
+        let refused = Order {
+            key: order.key,
+            side: order.side,
+            price: order.price,
+            quantity: order.quantity,
+            kind: order.kind,
+            time_in_force: order.time_in_force,
+            state: error,
+        };
+        self.account.ack_refused(refused.clone());
+        events.push(self.build_account_event(Snapshot(booked_report(
+            refused.map_state(|error| OrderState::Inactive(InactiveOrderState::OpenFailed(error))),
+        ))));
+
+        events
+    }
+
+    /// Refuses a market order on `instrument` whose notional at `reference`, times `quantity`,
+    /// breaks the instrument's [`OrderRules::market_notional`]. Any other kind, and an instrument
+    /// with no rules, passes.
+    fn check_market_notional(
+        &self,
+        instrument: &InstrumentNameExchange,
+        kind: OrderKind,
+        reference: Decimal,
+        quantity: Decimal,
+    ) -> Result<(), UnindexedOrderError> {
+        match self.order_rules.get(instrument) {
+            Some(rules) if kind == OrderKind::Market => {
+                rules.check_market_notional(reference, quantity)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Every instrument this venue trades, keyed by its exchange name, as it was constructed with,
     /// except that an option's strike is the one the latest standard split of its underlying gave
     /// it (see [`apply_corporate_action`](Self::apply_corporate_action)).
@@ -4416,6 +4532,12 @@ impl SimulatedVenue {
         name: &InstrumentNameExchange,
     ) -> Option<&Instrument<ExchangeId, AssetNameExchange>> {
         self.instruments.get(name)
+    }
+
+    /// The order rules this venue checks orders on `instrument` against, or `None` if it checks
+    /// none: see the type's `# Order rules`.
+    pub fn order_rules(&self, instrument: &InstrumentNameExchange) -> Option<&OrderRules> {
+        self.order_rules.get(instrument)
     }
 
     /// This venue's view of `instrument`, or `None` if nothing has fed it one.
@@ -4611,7 +4733,8 @@ impl SimulatedVenue {
     }
 
     /// How each of `orders` ended, for those that have: filled, cancelled (including the
-    /// unfilled remainder of a market order) or expired at its own deadline.
+    /// unfilled remainder of a market order), expired at its own deadline, or refused when it was
+    /// released after being held (see the type's `# Order rules`).
     ///
     /// An order still open is omitted, and so is one this venue never held, including one it
     /// rejected on arrival, whose rejection was the answer to its open request. An empty `orders`
@@ -5037,6 +5160,10 @@ impl SimulatedVenue {
         let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
 
         self.check_amendable_on_book(cid, instrument)?;
+        // The whole order as amended, as a new order arriving with its terms is checked.
+        if let Some(rules) = self.order_rules.get(instrument) {
+            rules.check(amended.side, amended.kind, amended.price, amended.quantity)?;
+        }
 
         let filled = order.state.filled_quantity;
         let Some(limit) = amended.price else {
@@ -5617,6 +5744,19 @@ impl SimulatedVenue {
             Ok(terms) => terms,
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
+
+        // Before the deadline and the stale-market gate, so that no order the rules refuse is
+        // held. A market order's notional needs a price, so it is checked where one is found.
+        if let Some(rules) = self.order_rules.get(&request.key.instrument)
+            && let Err(error) = rules.check(
+                request.state.side,
+                request.state.kind,
+                request.state.price,
+                request.state.quantity,
+            )
+        {
+            return (build_open_order_err_response(request, error), None);
+        }
 
         if let Err(error) = self.check_option_order(&request, &terms) {
             return (build_open_order_err_response(request, error), None);
@@ -6468,6 +6608,17 @@ impl SimulatedVenue {
                 None,
             );
         };
+
+        // At the price before slippage, so a refused order draws none, and on the whole quantity
+        // asked for, whatever the book has: see the type's `# Order rules`.
+        if let Err(error) = self.check_market_notional(
+            &request.key.instrument,
+            request.state.kind,
+            reference,
+            request.state.quantity,
+        ) {
+            return (build_open_order_err_response(request, error), None);
+        }
 
         let time_exchange = self.time_exchange();
         let side = request.state.side;
@@ -20677,6 +20828,7 @@ mod tests {
     mod fees;
     mod liquidation;
     mod options;
+    mod order_rules;
     mod sell_out;
     mod session_close;
     mod snapshot;
