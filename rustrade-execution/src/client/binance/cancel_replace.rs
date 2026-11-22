@@ -895,7 +895,12 @@ mod tests {
         assert!(order_rate_limit_exceeded_mode.is_none() && recv_window.is_none());
         assert!(peg_price_type.is_none() && peg_offset_value.is_none());
         assert!(peg_offset_type.is_none());
+    }
 
+    /// A stop order cancelling by client order id: the cancel names that id, the stop carries its
+    /// trigger and no limit price or time in force, and `SendOpens` asks for `ALLOW_FAILURE`.
+    #[test]
+    fn the_params_cancel_by_client_order_id_and_carry_a_stops_trigger() {
         let stop = params(
             CancelTarget::ClientOrderId(ClientOrderId::new("stop")),
             OrderKind::Stop {
