@@ -6,6 +6,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Installs [`ReplicaLogFilter`], so a log line a
 /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) repeats while
 /// updating its replica `EngineState` is written once.
+///
+/// The level defaults to `INFO`; the `RUST_LOG` environment variable overrides it.
+///
+/// # Panics
+///
+/// Panics if a global `tracing` subscriber or a `log` logger is already set. Call it once, at the
+/// start of the program. When only a `log` logger was set, the panic comes after the `tracing`
+/// subscriber is installed, so that subscriber stays in place.
 pub fn init_logging() {
     tracing_subscriber::registry()
         .with(
@@ -23,6 +31,14 @@ pub fn init_logging() {
 /// Installs [`ReplicaLogFilter`], so a log line a
 /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) repeats while
 /// updating its replica `EngineState` is written once.
+///
+/// The level defaults to `INFO`; the `RUST_LOG` environment variable overrides it.
+///
+/// # Panics
+///
+/// Panics if a global `tracing` subscriber or a `log` logger is already set. Call it once, at the
+/// start of the program. When only a `log` logger was set, the panic comes after the `tracing`
+/// subscriber is installed, so that subscriber stays in place.
 pub fn init_json_logging() {
     tracing_subscriber::registry()
         .with(
