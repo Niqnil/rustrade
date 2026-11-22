@@ -54,8 +54,11 @@
 //! # Logs carry no market data
 //!
 //! CI runs these tests and its logs are public, and Alpaca's market data is not ours to publish.
-//! The tests log what a received event is (`log_received`: exchange, instrument and exchange
-//! time) and never its prices or sizes, in a log line or a failure message.
+//! The tests never log the values of what they receive (prices, sizes, Greeks), in a log line or a
+//! failure message: a received event is logged as what it is (`log_received`: exchange, instrument
+//! and exchange time), and snapshots only by their counts. One exception is the library's own: a
+//! frame it cannot read is reported with an excerpt of the frame, so that the failure is
+//! observable.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
@@ -1059,30 +1062,14 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
     // but we should get at least some
     assert!(!snapshots.is_empty(), "No snapshots received");
 
-    // Log snapshot details
+    // Count snapshots with Greeks; their values stay out of the log (see the module docs).
     let mut greeks_count = 0;
     for snapshot in &snapshots {
         if snapshot.has_greeks() {
             greeks_count += 1;
-            let greeks = snapshot.greeks();
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                delta = ?greeks.delta,
-                gamma = ?greeks.gamma,
-                theta = ?greeks.theta,
-                vega = ?greeks.vega,
-                iv = ?greeks.implied_volatility,
-                "Snapshot with Greeks"
-            );
         }
 
         if let Some(ref quote) = snapshot.latest_quote {
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                bid = %quote.bid_price,
-                ask = %quote.ask_price,
-                "Snapshot quote"
-            );
             assert!(
                 quote.bid_price >= Decimal::ZERO,
                 "Bid should be non-negative"
@@ -1173,16 +1160,6 @@ async fn test_fetch_opra_snapshots() {
     for snapshot in &snapshots {
         if snapshot.has_greeks() {
             greeks_count += 1;
-            let greeks = snapshot.greeks();
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                delta = ?greeks.delta,
-                gamma = ?greeks.gamma,
-                theta = ?greeks.theta,
-                vega = ?greeks.vega,
-                iv = ?greeks.implied_volatility,
-                "OPRA snapshot with Greeks"
-            );
         }
     }
 
