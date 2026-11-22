@@ -1,7 +1,10 @@
 //! Why [`SimulatedVenue::try_new`](super::SimulatedVenue::try_new) refuses a configuration, and
 //! the check that a venue's configuration spells each asset one way.
 
-use crate::{client::mock::MockExecutionConfig, exchange::mock::account::DuplicateSeededOrder};
+use crate::{
+    client::mock::MockExecutionConfig, exchange::mock::account::DuplicateSeededOrder,
+    expiry::ExpiryAnchorError,
+};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 use rust_decimal::Decimal;
@@ -83,10 +86,57 @@ pub enum VenueConfigError {
         free: Decimal,
     },
 
-    /// [`MockExecutionConfig::session_close`] cannot place the close of a day limit order seeded
-    /// in `initial_state`.
-    #[error("session_close cannot place the close of a day order seeded in initial_state: {0}")]
+    /// The session close of a day limit order's instrument, from
+    /// [`MockExecutionConfig::session_close`] or an entry of
+    /// [`MockExecutionConfig::session_close_overrides`], cannot place the close of the order,
+    /// seeded in `initial_state`.
+    #[error(
+        "the instrument's session close cannot place the close of a day order seeded in \
+         initial_state: {0}"
+    )]
     SessionCalendar(#[source] CalendarError),
+
+    /// The anchor of an expiry-day rule, [`MockExecutionConfig::expiry_sell_out`] or
+    /// [`MockExecutionConfig::expiry_day_cutoff`], cannot place the rule for an option the venue
+    /// lists.
+    #[error(transparent)]
+    ExpiryRule(#[from] ExpiryRuleUnplaceable),
+}
+
+/// The anchor of an expiry-day rule cannot place the rule for an option a
+/// [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored before the session close
+/// for an option whose expiry falls on a date with no session.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+#[error("the {rule} cannot be placed for the option {instrument}: {source}")]
+pub struct ExpiryRuleUnplaceable {
+    /// The rule.
+    pub rule: ExpiryRule,
+    /// The option, the first by name the anchor cannot place.
+    pub instrument: InstrumentNameExchange,
+    /// Why.
+    #[source]
+    pub source: ExpiryAnchorError,
+}
+
+/// An expiry-day rule of a [`SimulatedVenue`](super::SimulatedVenue), placed for each option by
+/// an [`ExpiryAnchor`](crate::expiry::ExpiryAnchor).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExpiryRule {
+    /// [`MockExecutionConfig::expiry_sell_out`].
+    SellOut,
+    /// [`MockExecutionConfig::expiry_day_cutoff`].
+    DayCutoff,
+}
+
+impl fmt::Display for ExpiryRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SellOut => "expiry sell-out",
+            Self::DayCutoff => "expiry-day cutoff",
+        })
+    }
 }
 
 /// Two names in one [`SimulatedVenue`](super::SimulatedVenue)'s configuration that name one asset
@@ -133,6 +183,8 @@ pub enum AssetSource {
     SpotMargin,
     /// An underlying in [`MockExecutionConfig::fee_model_overrides`].
     FeeModelOverride,
+    /// An underlying in [`MockExecutionConfig::session_close_overrides`].
+    SessionCloseOverride,
 }
 
 impl fmt::Display for AssetSource {
@@ -143,6 +195,7 @@ impl fmt::Display for AssetSource {
             Self::FeeAsset => f.write_str("the fee asset"),
             Self::SpotMargin => f.write_str("the spot margin configuration"),
             Self::FeeModelOverride => f.write_str("a fee model override"),
+            Self::SessionCloseOverride => f.write_str("a session close override"),
         }
     }
 }
@@ -199,16 +252,22 @@ pub(super) fn configured_asset_names<'a>(
         .iter()
         .flat_map(|margin| margin.assets())
         .map(|asset| (asset, AssetSource::SpotMargin));
-    let overrides = config
+    let fee_overrides = config
         .fee_model_overrides
         .by_underlying()
         .flat_map(|(_, underlying, _)| [&underlying.base, &underlying.quote])
         .map(|asset| (asset, AssetSource::FeeModelOverride));
+    let session_close_overrides = config
+        .session_close_overrides
+        .by_underlying()
+        .flat_map(|(_, underlying, _)| [&underlying.base, &underlying.quote])
+        .map(|asset| (asset, AssetSource::SessionCloseOverride));
     listed
         .chain(balances.map(|asset| (asset, AssetSource::Balance)))
         .chain(fee_asset)
         .chain(spot_margin)
-        .chain(overrides)
+        .chain(fee_overrides)
+        .chain(session_close_overrides)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use super::price_window::PriceWindow;
 use super::{
     NetPosition, SimulatedVenue, VenueRegime,
-    config::{self, AssetSpelledTwice},
+    config::{self, AssetSpelledTwice, ExpiryRuleUnplaceable},
     liquidation::LiquidationState,
 };
 use crate::{
@@ -261,11 +261,20 @@ pub enum VenueRestoreError {
     #[error(transparent)]
     AssetSpelledTwice(#[from] AssetSpelledTwice),
 
-    /// The configuration's [`session_close`](MockExecutionConfig::session_close) cannot place
-    /// the close of a day limit order the snapshot holds with no deadline of its own: one seeded
+    /// The configuration's session close for a day limit order's instrument, its
+    /// [`session_close`](MockExecutionConfig::session_close) or an entry of its
+    /// [`session_close_overrides`](MockExecutionConfig::session_close_overrides), cannot place the
+    /// close of the order, which the snapshot holds with no deadline of its own: one seeded
     /// through a configured `initial_state` rather than accepted by the venue.
     #[error("venue snapshot holds a day order whose session close cannot be placed: {0}")]
     SessionCalendar(#[source] CalendarError),
+
+    /// The anchor of one of the configuration's expiry-day rules, its
+    /// [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) or
+    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff), cannot place the rule for an
+    /// option the venue lists, as [`try_new`](SimulatedVenue::try_new) refuses.
+    #[error(transparent)]
+    ExpiryRule(#[from] ExpiryRuleUnplaceable),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -441,8 +450,11 @@ impl SimulatedVenue {
     ///   its short options secure.
     /// - [`VenueRestoreError::AssetSpelledTwice`] if its balances, `instruments` and `config`
     ///   spell one asset two ways, as [`try_new`](Self::try_new) refuses.
-    /// - [`VenueRestoreError::SessionCalendar`] if `config`'s session close cannot place the
-    ///   close of a day limit order the snapshot holds with no deadline of its own.
+    /// - [`VenueRestoreError::SessionCalendar`] if `config`'s session close for its instrument
+    ///   cannot place the close of a day limit order the snapshot holds with no deadline of its
+    ///   own.
+    /// - [`VenueRestoreError::ExpiryRule`] if `config`'s expiry sell-out or expiry-day cutoff
+    ///   cannot be placed for an option, as [`try_new`](Self::try_new) refuses.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -612,6 +624,7 @@ impl SimulatedVenue {
         venue
             .resolve_seeded_deadlines()
             .map_err(VenueRestoreError::SessionCalendar)?;
+        venue.resolve_expiry_rules()?;
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.corporate_actions_applied = corporate_actions_applied.into_iter().collect();

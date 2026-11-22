@@ -42,6 +42,10 @@ pub mod market_data;
 /// Defines the [`InstrumentQuoteAsset`] (underlying base or quote) for an [`Instrument`].
 pub mod quote;
 
+/// Defines [`InstrumentOverrides`](overrides::InstrumentOverrides): a value for some instruments in
+/// place of a default, keyed by name, by kind and underlying, or by kind.
+pub mod overrides;
+
 /// Unique identifier for an `Instrument` traded on an execution.
 ///
 /// Used to key data events in a memory efficient way.

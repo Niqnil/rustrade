@@ -2276,7 +2276,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             && matches!(self.instrument.kind, InstrumentKind::Spot)
             && (held.is_zero() || held.is_sign_negative() != excess.is_sign_negative());
         if trades_free_base {
-            info!(
+            debug!(
                 instrument = ?trade.instrument,
                 order_id = %trade.order_id,
                 cid = ?client_order_id,
@@ -7158,9 +7158,10 @@ mod tests {
     // --- A fill sized to trade free base past its position -------------------------------------
 
     /// A fill of an order sent to trade free base is cut at the position like any reduce-only
-    /// fill, but its excess is read as intended: no WARN, and counted apart from the reduce-only
-    /// fills cut. A sell past a long sells free base; a buy past a short buys base owed outside
-    /// it. The excess's share of the fee goes to the tear sheet.
+    /// fill, but its excess is read as intended: nothing logged above DEBUG, since such a fill can
+    /// come on every step of a simulation, and counted apart from the reduce-only fills cut. A
+    /// sell past a long sells free base; a buy past a short buys base owed outside it. The
+    /// excess's share of the fee goes to the tear sheet.
     #[test]
     fn a_fill_sized_to_trade_free_base_is_cut_at_the_position_and_counted_apart() {
         for (held_side, side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
@@ -7175,7 +7176,7 @@ mod tests {
                 ReduceOnly::PositionAndFreeBase,
             );
 
-            let (applied, warnings) = count_warnings(|| {
+            let (applied, events) = rustrade_instrument::test_utils::logs::capture(|| {
                 state.update_from_trade(&charged(
                     fill(exchange_id, side, dec!(1.5)),
                     quote,
@@ -7184,7 +7185,18 @@ mod tests {
                 ))
             });
 
-            assert_eq!(warnings, 0, "{side}");
+            // `Level` orders by verbosity: anything louder than DEBUG compares below it.
+            let loud: Vec<_> = events
+                .iter()
+                .filter(|event| event.level < tracing::Level::DEBUG)
+                .collect();
+            assert!(loud.is_empty(), "{side}: logged above DEBUG: {loud:?}");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.message().starts_with("fill sized to trade free base")),
+                "{side}: the fill is still logged at DEBUG: {events:?}"
+            );
             let exited = applied.exited.expect("the position closes");
             assert_eq!(exited.fees_exit.fees_quote, Some(dec!(0.1)), "{side}");
             assert!(netting_position(&state).is_none(), "{side}");

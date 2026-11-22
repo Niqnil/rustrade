@@ -1,12 +1,11 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, Underlying,
+    Side,
     asset::name::AssetNameExchange,
-    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+    instrument::overrides::{InstrumentOverrides, InstrumentOverridesError},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Which side of the trade a fill was on: the one that supplied liquidity, or the one that took it.
@@ -1138,237 +1137,12 @@ impl FeeModelConfig {
 /// Fee models for some instruments, each in place of a venue's default model: by the
 /// instrument's exact name, by its kind and underlying, or by its kind alone.
 ///
-/// [`resolve`](Self::resolve) picks the model of the most specific entry that matches an
-/// instrument, in this order, and `None` if none does, so the caller falls back to its default:
-/// 1. its name, exactly (see [`with_name`](Self::with_name));
-/// 2. its kind and underlying, base and quote (see [`with_underlying`](Self::with_underlying));
-/// 3. its kind (see [`with_kind`](Self::with_kind)).
-///
-/// An entry that matches no instrument is never used, and an instrument no entry matches pays the
-/// default.
-///
-/// # Choosing a key
-/// A key by kind separates a venue's options from its shares. A key by kind and underlying
-/// separates the options on one underlying from the options on others, without catching the
-/// underlying itself, which is of another kind. It cannot separate two families of options on one
-/// underlying, such as an index's standard and weekly options, which an [`OptionContract`] does
-/// not tell apart: key those by name.
-///
-/// [`OptionContract`]: rustrade_instrument::instrument::kind::option::OptionContract
-///
-/// # Serialised form
-/// Each part is left out when empty, and deserialising refuses an unknown key and an underlying
-/// listed twice for one kind ([`FeeModelOverridesError::DuplicateUnderlying`]):
-///
-/// ```json
-/// {
-///   "by_name": {"SPXW261218C06000000": <model>},
-///   "by_underlying": [
-///     {"kind": "option", "underlying": {"base": "spx", "quote": "usd"}, "model": <model>}
-///   ],
-///   "by_kind": {"option": <model>}
-/// }
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(try_from = "FeeModelOverridesRepr", into = "FeeModelOverridesRepr")]
-pub struct FeeModelOverrides {
-    by_name: BTreeMap<InstrumentNameExchange, FeeModelConfig>,
-    by_underlying: BTreeMap<
-        InstrumentKindDiscriminant,
-        BTreeMap<Underlying<AssetNameExchange>, FeeModelConfig>,
-    >,
-    by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
-}
-
-impl FeeModelOverrides {
-    /// No overrides: every instrument pays the default.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// These overrides, with the instrument named `name` on the venue charged under `model`,
-    /// replacing any model it had.
-    #[must_use]
-    pub fn with_name(
-        mut self,
-        name: impl Into<InstrumentNameExchange>,
-        model: FeeModelConfig,
-    ) -> Self {
-        self.by_name.insert(name.into(), model);
-        self
-    }
-
-    /// These overrides, with instruments of `kind` on `underlying` charged under `model`,
-    /// replacing any model they had.
-    #[must_use]
-    pub fn with_underlying(
-        mut self,
-        kind: InstrumentKindDiscriminant,
-        underlying: Underlying<AssetNameExchange>,
-        model: FeeModelConfig,
-    ) -> Self {
-        self.by_underlying
-            .entry(kind)
-            .or_default()
-            .insert(underlying, model);
-        self
-    }
-
-    /// These overrides, with instruments of `kind` charged under `model`, replacing any model
-    /// they had.
-    #[must_use]
-    pub fn with_kind(mut self, kind: InstrumentKindDiscriminant, model: FeeModelConfig) -> Self {
-        self.by_kind.insert(kind, model);
-        self
-    }
-
-    /// The models by instrument name.
-    pub fn by_name(&self) -> &BTreeMap<InstrumentNameExchange, FeeModelConfig> {
-        &self.by_name
-    }
-
-    /// The models by kind and underlying, flattened into one entry each, in order of kind and
-    /// then underlying.
-    pub fn by_underlying(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            InstrumentKindDiscriminant,
-            &Underlying<AssetNameExchange>,
-            &FeeModelConfig,
-        ),
-    > {
-        self.by_underlying.iter().flat_map(|(kind, models)| {
-            models
-                .iter()
-                .map(|(underlying, model)| (*kind, underlying, model))
-        })
-    }
-
-    /// The models by kind.
-    pub fn by_kind(&self) -> &BTreeMap<InstrumentKindDiscriminant, FeeModelConfig> {
-        &self.by_kind
-    }
-
-    /// Whether there are no overrides at all.
-    pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty() && self.by_underlying.is_empty() && self.by_kind.is_empty()
-    }
-
-    /// The model of the most specific entry matching the instrument named `name`, of `kind`, on
-    /// `underlying`, or `None` if no entry matches. See the type's documentation for the order.
-    pub fn resolve(
-        &self,
-        name: &InstrumentNameExchange,
-        kind: InstrumentKindDiscriminant,
-        underlying: &Underlying<AssetNameExchange>,
-    ) -> Option<&FeeModelConfig> {
-        self.by_name
-            .get(name)
-            .or_else(|| {
-                self.by_underlying
-                    .get(&kind)
-                    .and_then(|models| models.get(underlying))
-            })
-            .or_else(|| self.by_kind.get(&kind))
-    }
-}
-
-/// [`FeeModelOverrides`]'s serialised form, validated on the way in.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FeeModelOverridesRepr {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    by_name: BTreeMap<InstrumentNameExchange, FeeModelConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    by_underlying: Vec<UnderlyingFeeModelRepr>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    by_kind: BTreeMap<InstrumentKindDiscriminant, FeeModelConfig>,
-}
-
-/// One entry of [`FeeModelOverridesRepr::by_underlying`]: a list rather than a map, since a JSON
-/// map's keys are strings and this one is a kind and an underlying.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct UnderlyingFeeModelRepr {
-    kind: InstrumentKindDiscriminant,
-    underlying: Underlying<AssetNameExchange>,
-    model: FeeModelConfig,
-}
-
-impl TryFrom<FeeModelOverridesRepr> for FeeModelOverrides {
-    type Error = FeeModelOverridesError;
-
-    fn try_from(repr: FeeModelOverridesRepr) -> Result<Self, Self::Error> {
-        let FeeModelOverridesRepr {
-            by_name,
-            by_underlying: entries,
-            by_kind,
-        } = repr;
-        let mut by_underlying: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
-        for UnderlyingFeeModelRepr {
-            kind,
-            underlying,
-            model,
-        } in entries
-        {
-            let models = by_underlying.entry(kind).or_default();
-            if models.contains_key(&underlying) {
-                return Err(FeeModelOverridesError::DuplicateUnderlying { kind, underlying });
-            }
-            models.insert(underlying, model);
-        }
-        Ok(Self {
-            by_name,
-            by_underlying,
-            by_kind,
-        })
-    }
-}
-
-impl From<FeeModelOverrides> for FeeModelOverridesRepr {
-    fn from(overrides: FeeModelOverrides) -> Self {
-        let FeeModelOverrides {
-            by_name,
-            by_underlying,
-            by_kind,
-        } = overrides;
-        Self {
-            by_name,
-            by_underlying: by_underlying
-                .into_iter()
-                .flat_map(|(kind, models)| {
-                    models
-                        .into_iter()
-                        .map(move |(underlying, model)| UnderlyingFeeModelRepr {
-                            kind,
-                            underlying,
-                            model,
-                        })
-                })
-                .collect(),
-            by_kind,
-        }
-    }
-}
+/// The keys, the order an instrument's model is picked in and the serialised form are
+/// [`InstrumentOverrides`]'. An instrument no entry matches pays the venue's default model.
+pub type FeeModelOverrides = InstrumentOverrides<FeeModelConfig>;
 
 /// Why a [`FeeModelOverrides`] was refused.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[non_exhaustive]
-pub enum FeeModelOverridesError {
-    /// `underlying` is listed more than once for instruments of `kind`.
-    #[error(
-        "fee model overrides list {kind:?} on {}/{} more than once",
-        .underlying.base,
-        .underlying.quote
-    )]
-    DuplicateUnderlying {
-        /// The instruments' kind.
-        kind: InstrumentKindDiscriminant,
-        /// Their underlying.
-        underlying: Underlying<AssetNameExchange>,
-    },
-}
+pub type FeeModelOverridesError = InstrumentOverridesError;
 
 /// Which asset the simulated venue charges a spot fill's fee in.
 ///
@@ -1528,6 +1302,7 @@ impl FeeModel for FeeModelConfig {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rustrade_instrument::{Underlying, instrument::kind::InstrumentKindDiscriminant};
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -2550,152 +2325,26 @@ mod tests {
         assert!(!FeeModelConfig::Dated(dated).is_linear());
     }
 
-    fn option_kind() -> InstrumentKindDiscriminant {
-        InstrumentKindDiscriminant::Option
-    }
-
-    fn spx() -> Underlying<AssetNameExchange> {
-        Underlying::new("spx", "usd")
-    }
-
-    fn name(name: &str) -> InstrumentNameExchange {
-        InstrumentNameExchange::new(name)
-    }
-
-    /// One override of each kind, each a different per-contract fee.
-    fn overrides() -> FeeModelOverrides {
-        FeeModelOverrides::new()
+    /// Fee models serialise as themselves inside the generic form.
+    #[test]
+    fn fee_model_overrides_serialise_by_the_generic_form() {
+        let overrides = FeeModelOverrides::new()
             .with_name("SPXW-C", per_contract("3"))
-            .with_underlying(option_kind(), spx(), per_contract("2"))
-            .with_kind(option_kind(), per_contract("1"))
-    }
-
-    #[test]
-    fn an_override_by_name_beats_one_by_underlying_which_beats_one_by_kind() {
-        let overrides = overrides();
-
-        assert_eq!(
-            overrides.resolve(&name("SPXW-C"), option_kind(), &spx()),
-            Some(&per_contract("3"))
-        );
-        assert_eq!(
-            overrides.resolve(&name("SPX-C"), option_kind(), &spx()),
-            Some(&per_contract("2"))
-        );
-        assert_eq!(
-            overrides.resolve(
-                &name("NDX-C"),
-                option_kind(),
-                &Underlying::new("ndx", "usd")
-            ),
-            Some(&per_contract("1"))
-        );
-        // The same base in another quote is another underlying.
-        assert_eq!(
-            overrides.resolve(
-                &name("SPX-C"),
-                option_kind(),
-                &Underlying::new("spx", "eur")
-            ),
-            Some(&per_contract("1"))
-        );
-    }
-
-    #[test]
-    fn an_override_by_underlying_does_not_catch_another_kind_on_it() {
-        let overrides =
-            FeeModelOverrides::new().with_underlying(option_kind(), spx(), per_contract("2"));
-
-        assert_eq!(
-            overrides.resolve(&name("SPX"), InstrumentKindDiscriminant::Spot, &spx()),
-            None
-        );
-        assert_eq!(
-            FeeModelOverrides::new().resolve(&name("SPX"), option_kind(), &spx()),
-            None
-        );
-    }
-
-    #[test]
-    fn a_later_override_replaces_an_earlier_one_with_its_key() {
-        let overrides = overrides()
-            .with_name("SPXW-C", per_contract("13"))
-            .with_underlying(option_kind(), spx(), per_contract("12"))
-            .with_kind(option_kind(), per_contract("11"));
-
-        assert_eq!(
-            overrides.by_name(),
-            &BTreeMap::from([(name("SPXW-C"), per_contract("13"))])
-        );
-        assert_eq!(
-            overrides.by_underlying().collect::<Vec<_>>(),
-            vec![(option_kind(), &spx(), &per_contract("12"))]
-        );
-        assert_eq!(
-            overrides.by_kind(),
-            &BTreeMap::from([(option_kind(), per_contract("11"))])
-        );
-    }
-
-    #[test]
-    fn overrides_are_empty_only_with_no_entry_of_any_kind() {
-        assert!(FeeModelOverrides::new().is_empty());
-        assert!(
-            !FeeModelOverrides::new()
-                .with_name("x", per_contract("1"))
-                .is_empty()
-        );
-        assert!(
-            !FeeModelOverrides::new()
-                .with_underlying(option_kind(), spx(), per_contract("1"))
-                .is_empty()
-        );
-        assert!(
-            !FeeModelOverrides::new()
-                .with_kind(option_kind(), per_contract("1"))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn overrides_round_trip_with_underlyings_as_a_list() {
-        let overrides = overrides();
+            .with_underlying(
+                InstrumentKindDiscriminant::Option,
+                Underlying::new("spx", "usd"),
+                per_contract("2"),
+            )
+            .with_kind(InstrumentKindDiscriminant::Option, per_contract("1"));
         let json = serde_json::to_string(&overrides).unwrap();
 
         assert_eq!(
             json,
-            r#"{"by_name":{"SPXW-C":{"PerContract":{"commission_per_contract":"3"}}},"by_underlying":[{"kind":"option","underlying":{"base":"spx","quote":"usd"},"model":{"PerContract":{"commission_per_contract":"2"}}}],"by_kind":{"option":{"PerContract":{"commission_per_contract":"1"}}}}"#
+            r#"{"by_name":{"SPXW-C":{"PerContract":{"commission_per_contract":"3"}}},"by_underlying":[{"kind":"option","underlying":{"base":"spx","quote":"usd"},"value":{"PerContract":{"commission_per_contract":"2"}}}],"by_kind":{"option":{"PerContract":{"commission_per_contract":"1"}}}}"#
         );
         assert_eq!(
             serde_json::from_str::<FeeModelOverrides>(&json).unwrap(),
             overrides
         );
-        assert_eq!(
-            serde_json::to_string(&FeeModelOverrides::new()).unwrap(),
-            "{}"
-        );
-        assert_eq!(
-            serde_json::from_str::<FeeModelOverrides>("{}").unwrap(),
-            FeeModelOverrides::new()
-        );
-    }
-
-    #[test]
-    fn deserialising_overrides_refuses_a_repeated_underlying_and_an_unknown_key() {
-        let entry =
-            r#"{"kind":"option","underlying":{"base":"spx","quote":"usd"},"model":{"Zero":null}}"#;
-        let error = serde_json::from_str::<FeeModelOverrides>(&format!(
-            r#"{{"by_underlying":[{entry},{entry}]}}"#
-        ))
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("fee model overrides list Option on spx/usd more than once"),
-            "{error}"
-        );
-
-        let error = serde_json::from_str::<FeeModelOverrides>(r#"{"by_names":{}}"#).unwrap_err();
-        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 }
