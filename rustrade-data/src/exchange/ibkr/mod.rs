@@ -1218,9 +1218,7 @@ fn notice_error(instrument: &InstrumentNameExchange, notice: &Notice) -> Option<
             code,
             message,
         })
-    } else if codes::MARKET_DATA_NOT_SUBSCRIBED_CODES.contains(&notice.code)
-        || notice.code == codes::COMPETING_LIVE_SESSION
-    {
+    } else if codes::MARKET_DATA_NOT_AVAILABLE_CODES.contains(&notice.code) {
         Some(DataError::MarketDataNotAvailable {
             exchange,
             instrument,
