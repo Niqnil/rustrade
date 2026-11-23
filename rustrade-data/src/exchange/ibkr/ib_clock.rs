@@ -4,9 +4,16 @@
 //! Candle subscriptions time a bar's end against it, so that a host clock running ahead of IB's
 //! does not end bars early, and a step of the host's wall clock (NTP, a VM resume) moves no
 //! deadline: between samples, time advances on [`Instant`].
+//!
+//! Reading the time never waits on IB: the first sample is taken before any subscription is made
+//! ([`IbClock::sync`]), and each resample runs on a thread of its own ([`IbClock::resync`]), so
+//! a slow answer from IB never delays a candle worker's handling of an update.
 
 use chrono::{DateTime, TimeDelta, Utc};
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::{debug, warn};
 
 /// How often IB's server time is sampled again. Even a clock drifting 200 parts per million
@@ -97,23 +104,51 @@ impl IbClock {
         offset.abs() > self.warn_offset
     }
 
-    /// IB's time now. Samples it with `server_time` first when a sample is due, without holding
-    /// the lock, so that other subscriptions read the last base meanwhile.
+    /// IB's time now, counted from the last sample. Never waits on IB.
     ///
-    /// Before the first sample succeeds, the host's wall clock stands in: a failed sample is
-    /// logged and tried again [`RESYNC`] later.
-    pub(super) fn now<E: std::fmt::Display>(
-        &self,
-        server_time: impl FnOnce() -> Result<DateTime<Utc>, E>,
-    ) -> DateTime<Utc> {
-        let claimed = self.state.lock().claim_sample(Instant::now());
-        if claimed {
-            self.sample(server_time);
-        }
+    /// Before the first sample succeeds, the host's wall clock stands in.
+    pub(super) fn now(&self) -> DateTime<Utc> {
         let base = self.state.lock().base;
         match base {
             Some(base) => base.time_at(Instant::now()),
             None => Utc::now(),
+        }
+    }
+
+    /// Sample IB's time with `server_time` now, on this thread, if a sample is due: once when the
+    /// connection opens, before any subscription is made, so that each starts on IB's time.
+    ///
+    /// A failed sample is logged, and the host's clock stands in until a later one succeeds.
+    pub(super) fn sync<E: std::fmt::Display>(
+        &self,
+        server_time: impl FnOnce() -> Result<DateTime<Utc>, E>,
+    ) {
+        if self.state.lock().claim_sample(Instant::now()) {
+            self.sample(server_time);
+        }
+    }
+
+    /// Resample IB's time with `server_time` on a thread of its own if [`RESYNC`] has passed since
+    /// the last sample, and return at once; [`now`](Self::now) reads the last base meanwhile.
+    /// One caller claims each resample, so the others return without starting one.
+    pub(super) fn resync<F, E>(self: &Arc<Self>, server_time: F)
+    where
+        F: FnOnce() -> Result<DateTime<Utc>, E> + Send + 'static,
+        E: std::fmt::Display,
+    {
+        if !self.state.lock().claim_sample(Instant::now()) {
+            return;
+        }
+        let clock = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("ibkr-clock".to_owned())
+            .spawn(move || clock.sample(server_time))
+        {
+            warn!(
+                %error,
+                "Could not start a thread to resample IB's server time; candle bar ends stay \
+                 timed on the last estimate until the next resync"
+            );
         }
     }
 
@@ -244,7 +279,8 @@ mod tests {
     fn now_reads_ibs_time_from_the_sample() {
         let clock = IbClock::new(TimeDelta::seconds(2));
         let ahead = TimeDelta::seconds(3_600);
-        let read = clock.now(|| Ok::<_, String>(Utc::now() + ahead));
+        clock.sync(|| Ok::<_, String>(Utc::now() + ahead));
+        let read = clock.now();
         let host = Utc::now();
         assert!(
             read > host + ahead - TimeDelta::seconds(1),
@@ -255,10 +291,55 @@ mod tests {
             read < host + ahead + TimeDelta::seconds(1),
             "{read} vs {host}"
         );
-        // The next read uses the base without sampling again.
-        let again = clock
-            .now(|| -> Result<DateTime<Utc>, String> { panic!("sampled again before the resync") });
-        assert!(again >= read);
+        // A sync before the resync is due samples nothing.
+        clock.sync(|| -> Result<DateTime<Utc>, String> {
+            panic!("sampled again before the resync")
+        });
+        assert!(clock.now() >= read);
+    }
+
+    #[test]
+    fn resync_samples_on_another_thread_once_due() {
+        use std::sync::mpsc;
+        use std::thread::ThreadId;
+
+        // A sample reporting `time` and the thread it ran on.
+        fn probe(
+            tx: &mpsc::Sender<ThreadId>,
+            time: DateTime<Utc>,
+        ) -> impl FnOnce() -> Result<DateTime<Utc>, String> + Send + 'static {
+            let tx = tx.clone();
+            move || {
+                tx.send(std::thread::current().id()).unwrap();
+                Ok(time)
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let quiet = Duration::from_millis(200);
+
+        let clock = Arc::new(IbClock::new(TimeDelta::seconds(2)));
+        clock.sync(probe(&tx, at("2026-11-23T14:30:00Z")));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            std::thread::current().id()
+        );
+        // Not due: nothing is sampled.
+        clock.resync(probe(&tx, at("2026-11-23T15:30:00Z")));
+        assert!(rx.recv_timeout(quiet).is_err());
+
+        clock.state.lock().next_sample = Some(Instant::now());
+        clock.resync(probe(&tx, at("2026-11-23T15:30:00Z")));
+        let sampler = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(sampler, std::thread::current().id());
+        // The sampling thread records the base after its sample returns.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while clock.now() < at("2026-11-23T15:30:00Z") {
+            assert!(Instant::now() < deadline, "the resample was never recorded");
+            std::thread::yield_now();
+        }
+        // The resample was claimed: the next is RESYNC away.
+        clock.resync(probe(&tx, at("2026-11-23T16:30:00Z")));
+        assert!(rx.recv_timeout(quiet).is_err());
     }
 
     #[test]
@@ -273,8 +354,7 @@ mod tests {
             state.base = Some(base);
             state.next_sample = Some(Instant::now() + RESYNC);
         }
-        let read =
-            clock.now(|| -> Result<DateTime<Utc>, String> { panic!("sampled before the resync") });
+        let read = clock.now();
         assert!(read >= at("2026-11-23T14:30:05Z"), "{read}");
         assert!(read < at("2026-11-23T14:30:06Z"), "{read}");
     }
@@ -283,7 +363,8 @@ mod tests {
     fn now_falls_back_to_the_hosts_clock_until_a_sample_succeeds() {
         let clock = IbClock::new(TimeDelta::seconds(2));
         let before = Utc::now();
-        let read = clock.now(|| Err::<DateTime<Utc>, _>("no answer"));
+        clock.sync(|| Err::<DateTime<Utc>, _>("no answer"));
+        let read = clock.now();
         assert!(read >= before && read <= Utc::now());
         assert_eq!(clock.state.lock().base, None);
     }
@@ -292,10 +373,11 @@ mod tests {
     fn a_failed_resample_keeps_the_last_base() {
         let clock = IbClock::new(TimeDelta::seconds(2));
         let ahead = TimeDelta::seconds(3_600);
-        clock.now(|| Ok::<_, String>(Utc::now() + ahead));
+        clock.sync(|| Ok::<_, String>(Utc::now() + ahead));
         let base = clock.state.lock().base;
         clock.state.lock().next_sample = None;
-        let read = clock.now(|| Err::<DateTime<Utc>, _>("no answer"));
+        clock.sync(|| Err::<DateTime<Utc>, _>("no answer"));
+        let read = clock.now();
         assert_eq!(clock.state.lock().base, base);
         assert!(read > Utc::now() + ahead - TimeDelta::seconds(1));
     }

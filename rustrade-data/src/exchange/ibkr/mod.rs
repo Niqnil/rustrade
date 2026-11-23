@@ -340,9 +340,11 @@ impl Default for IbkrStreamConfig {
 ///   connection had queued but the stream never yielded is fetched again. IB limits how far back
 ///   a request may reach for each bar size, and refuses a gap past it, which ends the
 ///   subscription.
-/// - **Bar ends are timed on IB's clock.** IB's server time is sampled on the connection's first
-///   candle subscription and every ten minutes, and counted forward on the monotonic clock, so a
-///   step of the host's clock moves no deadline. An offset from the host's clock larger than half
+/// - **Bar ends are timed on IB's clock.** IB's server time is sampled when a connection with
+///   candle subscriptions opens, before they are made, and again every ten minutes on a thread of
+///   its own, so that no worker waits on it. It is counted forward on the monotonic clock, so a
+///   step of the host's clock moves no deadline. The bar forming at connect, the default start,
+///   is the one forming on IB's clock. An offset from the host's clock larger than half
 ///   of [`BAR_SETTLE`] is logged as a warning, since it points at the host's time
 ///   synchronisation. A failed sample keeps the last estimate; before the first, the host's clock
 ///   stands in.
@@ -357,8 +359,9 @@ impl Default for IbkrStreamConfig {
 /// - IB adjusts its history afterwards, so a later read may differ from a candle emitted live.
 /// - IB counts an identical request for bars of 30 seconds or less within 15 seconds as a pacing
 ///   violation, which a reconnect that quick may meet.
-/// - Between candles of a long bar the subscription is silent: a silence timeout in the
-///   [`MarketStreamOptions`] must be longer than the longest bar.
+/// - Between candles the subscription is silent for up to a bar plus [`BAR_SETTLE`], and for the
+///   whole closure while the session is closed (overnight and weekends, in regular hours only):
+///   a silence timeout in the [`MarketStreamOptions`] must allow for both.
 /// - Whether a candle subscription takes one of the account's market data lines is not stated by
 ///   IB.
 ///
@@ -798,8 +801,15 @@ where
             .map_err(|e| DataError::Socket(format!("Failed to spawn IB notice thread: {e}")))?;
 
         let mut active_subscriptions = 0;
-        // IB's time for the connection's candle subscriptions, sampled on first use.
+        // IB's time for the connection's candle subscriptions, sampled before any is made, so that
+        // each starts on IB's time and no worker waits on the sample.
         let clock = Arc::new(IbClock::new(BAR_SETTLE));
+        if subscriptions
+            .iter()
+            .any(|s| matches!(s.kind, IbkrSubscriptionKind::Candles(_)))
+        {
+            clock.sync(|| server_time(&connection.client));
+        }
 
         // Spawn a worker thread for each subscription
         for (
@@ -844,7 +854,7 @@ where
                     Self::run_option_greeks_subscription(client, contract, worker("option Greeks"))
                 }
                 IbkrSubscriptionKind::Candles(request) => {
-                    let resume = shared.candle_resume_point(index, &request, Utc::now());
+                    let resume = shared.candle_resume_point(index, &request, clock.now());
                     let job = CandleJob {
                         request,
                         index,
@@ -1081,7 +1091,7 @@ where
             } = job;
             let bar_size = BarSize::from(request.bar_size);
             let step = request.bar_size.duration();
-            let ib_now = || clock.now(|| server_time(&client));
+            let ib_now = || clock.now();
             let duration =
                 candles::history_duration(resume.first_open(step), ib_now(), request.bar_size);
             let trading_hours = if request.regular_trading_hours_only {
@@ -1104,6 +1114,8 @@ where
             let mut assembler = BarAssembler::new(step, BAR_SETTLE, resume);
             let mut out = Vec::new();
             loop {
+                let resync_client = client.clone();
+                clock.resync(move || server_time(&resync_client));
                 let wait = assembler
                     .next_deadline()
                     .map_or(CANDLE_IDLE_WAIT, |deadline| {
@@ -1113,7 +1125,13 @@ where
                             .unwrap_or(std::time::Duration::ZERO)
                             .min(CANDLE_IDLE_WAIT)
                     });
-                let item = sub.next_timeout(wait);
+                // A zero wait would return without looking at what IB has already sent, so an
+                // update queued before the deadline is taken first.
+                let item = if wait.is_zero() {
+                    sub.try_next()
+                } else {
+                    sub.next_timeout(wait)
+                };
                 let now = ib_now();
                 match item {
                     Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
@@ -1146,7 +1164,9 @@ where
     }
 }
 
-/// How long a candle worker waits for IB when no bar is forming before it looks again.
+/// How long a candle worker waits for IB when no bar is forming before it looks again. It need not
+/// be short: a close or a lost connection ends the subscription, which wakes the wait at once, and
+/// a dropped stream is seen at the next candle sent.
 const CANDLE_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a candle worker needs besides its contract and [`Worker`].

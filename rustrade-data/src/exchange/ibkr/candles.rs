@@ -115,8 +115,9 @@ impl From<IbkrLiveBarSize> for BarSize {
 /// Which prices a live candle is built from.
 ///
 /// Only the series that are price bars. IB's other kinds are not: its trading schedule, fee rates
-/// and split-adjusted series, and its volatility series. Bid/ask bars are left out too: their high
-/// comes from the ask and their low from the bid, and they carry no volume.
+/// and split-adjusted series, and its volatility series. IB's combined bid-and-ask series is left
+/// out too: its high comes from the ask and its low from the bid, and it carries no volume. The
+/// [`Bid`](Self::Bid) and [`Ask`](Self::Ask) series each take one side alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IbkrBarSource {
@@ -158,7 +159,8 @@ pub struct IbkrCandleRequest {
     /// well. Default `true`, as in a history read.
     #[serde(default = "default_regular_trading_hours_only")]
     pub regular_trading_hours_only: bool,
-    /// The open of the first candle wanted, to continue from a history read: pass the
+    /// The first candle wanted is the first opening at or after this time, to continue from a
+    /// history read: pass the
     /// [`close_time`](crate::subscription::candle::Candle::close_time) of the last completed
     /// candle that read returned. Default `None`: start with the bar forming when the stream
     /// connects, which is the first candle emitted.
@@ -198,7 +200,7 @@ impl IbkrCandleRequest {
         self
     }
 
-    /// Start with the candle that opens at `since`; see [`since`](Self::since).
+    /// Start with the first candle opening at or after `since`; see [`since`](Self::since).
     pub fn with_since(mut self, since: DateTime<Utc>) -> Self {
         self.since = Some(since);
         self
