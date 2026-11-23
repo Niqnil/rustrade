@@ -1076,7 +1076,7 @@ pub struct Lending {
 /// Also what restoring an [`AccountStateSnapshot`] that lists one id twice among its open orders,
 /// or twice among its cancelled, filled, expired or refused ones, returns.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("account snapshot lists {0} more than once among its open and cancelled orders")]
+#[error("account snapshot lists {0} more than once among its orders")]
 pub struct DuplicateSeededOrder(pub ClientOrderId);
 
 /// An [`AccountState`] as plain data, which [`AccountState::from_snapshot`] rebuilds exactly: one

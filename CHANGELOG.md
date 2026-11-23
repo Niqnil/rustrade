@@ -1210,6 +1210,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
+- **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
+  cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
+  id among the filled, expired and refused orders too, so the message now says "among its orders".
 - **IBKR `fetch_shortability` ends at once on a competing live session** (`rustrade-execution`,
   `rustrade-instrument`). IB's notice 10197, no market data on a paper account while the same
   user is logged in to a live session elsewhere, was gathered like any other notice, so the read

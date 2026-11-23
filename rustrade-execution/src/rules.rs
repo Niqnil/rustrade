@@ -296,13 +296,9 @@ impl OrderRules {
 
     /// Whether these rules check nothing.
     pub fn is_off(&self) -> bool {
-        self.price.is_off()
-            && self.quantity.is_off()
-            && self.market_quantity.is_off()
-            && self.notional.is_off()
-            && self.market_notional.is_off()
-            && self.trailing_offset_above.is_off()
-            && self.trailing_offset_below.is_off()
+        // Through `by_field`, whose destructuring makes a rule added to the struct fail to compile
+        // until it is listed, so a new rule cannot be left out of this answer.
+        self.by_field().iter().all(|(_, rule)| rule.is_off())
     }
 
     /// The largest quantity at or below `quantity` that an order of `kind` may have on the grid:
