@@ -40,6 +40,14 @@ pub const DELAYED_MARKET_DATA_NOT_ENABLED: i32 = 10168;
 /// logged in to a live session elsewhere, which takes precedence.
 pub const COMPETING_LIVE_SESSION: i32 = 10197;
 
+/// Historical data within 15 minutes of now needs a market data subscription ("Historical data
+/// requests within 15 minutes of the current time require a valid market data subscription").
+///
+/// IB sends it as a notice and keeps the request open, but a keepUpToDate bar request gets no live
+/// updates after it. It is not in [`MARKET_DATA_NOT_AVAILABLE_CODES`]: a one-off history read
+/// still returns the older bars.
+pub const RECENT_HISTORY_NOT_SUBSCRIBED: i32 = 2188;
+
 /// Codes refusing a subscription because a cap on concurrent subscriptions is reached:
 /// [`MAX_TICKERS`] and [`MAX_DEPTH_REQUESTS`].
 pub const SUBSCRIPTION_LIMIT_CODES: [i32; 2] = [MAX_TICKERS, MAX_DEPTH_REQUESTS];
