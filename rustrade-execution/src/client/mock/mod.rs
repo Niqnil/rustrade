@@ -21,6 +21,7 @@ use crate::{
         },
         state::{Open, OrderState, UnindexedOrderState},
     },
+    rules::OrderRules,
     short_option::ShortPutCollateral,
     slippage::SlippageConfig,
     trade::TradesRead,
@@ -247,6 +248,28 @@ pub struct MockExecutionConfig {
     /// Defaults to [`SplitConfig::CANCEL`]: every order on the equity is cancelled.
     #[serde(default)]
     pub split: SplitConfig,
+    /// The order rules of some instruments, by name: the tick a price must sit on, the step and
+    /// range of a quantity, and the range of a notional, as the live venue publishes them. See
+    /// [`OrderRules`].
+    ///
+    /// The venue refuses an order on an instrument with rules that breaks one, unsent to its
+    /// book, with the error a live client that loads the same rules refuses it with:
+    /// [`OrderError::InvalidPrecision`] for a value off its grid, [`OrderError::OutOfBounds`] for
+    /// one outside its range. It never rounds. Each order is checked by [`OrderRules::check`] when
+    /// it arrives, and a market order also by [`OrderRules::check_market_notional`], at the price
+    /// the venue's fill model gives it before slippage, times the quantity asked for. An amend is
+    /// checked in the same way, on the whole order as amended.
+    ///
+    /// Defaults to empty: an instrument with no entry is not checked. Rules are never derived
+    /// from an instrument's [`InstrumentSpec`](rustrade_instrument::instrument::spec::InstrumentSpec),
+    /// which holds less than they do.
+    ///
+    /// Building the venue refuses an entry for an instrument it does not trade, which would
+    /// otherwise check nothing unnoticed, and a rule whose minimum is above its maximum. See
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)'s `# Order rules` for what the
+    /// venue cannot match.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub order_rules: BTreeMap<InstrumentNameExchange, OrderRules>,
 }
 
 impl MockExecutionConfig {
@@ -282,6 +305,7 @@ impl MockExecutionConfig {
             expiry_sell_out: None,
             expiry_day_cutoff: None,
             split: SplitConfig::default(),
+            order_rules: BTreeMap::new(),
         }
     }
 
@@ -443,6 +467,30 @@ impl MockExecutionConfig {
     #[must_use]
     pub fn with_split(self, split: SplitConfig) -> Self {
         Self { split, ..self }
+    }
+
+    /// This config checking orders on `instrument` against `rules`, replacing any rules it had:
+    /// see [`order_rules`](Self::order_rules).
+    #[must_use]
+    pub fn with_order_rules(
+        mut self,
+        instrument: InstrumentNameExchange,
+        rules: OrderRules,
+    ) -> Self {
+        self.order_rules.insert(instrument, rules);
+        self
+    }
+
+    /// This config checking orders on each instrument in `rules` against its rules, replacing any
+    /// rules it had: see [`order_rules`](Self::order_rules). Takes a map as a live client's
+    /// `load_rules` returns it, or one built by hand.
+    #[must_use]
+    pub fn with_order_rules_from(
+        mut self,
+        rules: impl IntoIterator<Item = (InstrumentNameExchange, OrderRules)>,
+    ) -> Self {
+        self.order_rules.extend(rules);
+        self
     }
 }
 

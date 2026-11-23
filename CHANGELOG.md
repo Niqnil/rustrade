@@ -491,6 +491,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
     off at different offsets, or at one time of day whatever their close, cannot be modelled.
 
+- **The simulated venue refuses orders that break an instrument's order rules**
+  (`rustrade-execution`, #1023).
+  - **New `MockExecutionConfig::order_rules: BTreeMap<InstrumentNameExchange, OrderRules>`**,
+    opt-in and empty by default, set with `with_order_rules(instrument, rules)` or
+    `with_order_rules_from(map)`, which takes the map a live client's `load_rules` returns or one
+    built by hand. An instrument with no entry is not checked. Rules are never derived from an
+    instrument's spec. `SimulatedVenue::order_rules(instrument)` reads them back.
+  - **What is refused, never rounded,** with the error a live client loading the same rules
+    returns (`OrderError::InvalidPrecision` / `OrderError::OutOfBounds`): on arrival, everything
+    `OrderRules::check` checks, and a market order's notional at the price the venue's fill model
+    gives before slippage, times the quantity asked for; an amend, a client's or
+    `modify_externally`'s, on the whole order as amended, except an external amend to no more
+    than has filled, which ends the order. No exemption for a closing order.
+  - **A held market order** (`MarketOrderTiming::NextBar`, or `StaleMarketPolicy::Wait` on a stale
+    market) has its notional checked at release, at the release price. One that breaks the rule
+    releases its hold and ends as `InactiveOrderState::OpenFailed` with the same
+    `OrderError::OutOfBounds`, which an order-state lookup reports too.
+  - **New `OrderRules::check_market_notional(reference_price, quantity)`**, the market-notional
+    check for any caller holding a price it trusts, returning the same typed `OutOfBounds`.
+    `ValueRule` and `OrderRules` now derive `PartialOrd` and `Ord`.
+  - **Building or restoring the venue refuses** rules for an instrument it does not trade, and a
+    rule whose minimum is above its maximum: new `VenueConfigError::OrderRules` /
+    `VenueRestoreError::OrderRules` carrying `InvalidOrderRules` (`UnknownInstrument`,
+    `MinAboveMax` naming an `OrderRulesField`).
+  - **Known limitations:** rules are fixed for the venue's life (a live client reloads them); the
+    market notional is measured at the venue's own unslipped price, not the live venue's reference
+    price; filters `OrderRules` has no field for are not enforced; a split does not restate the
+    rules; orders seeded through `initial_state` are not checked.
+
 - **`AlpacaClient::fetch_options_late_close_underlyings`** (`rustrade-execution`, `alpaca`
   feature, #1017): the symbols of the underlyings whose options close at 16:15 ET instead of
   16:00 ET (13:15 instead of 13:00 on an early close), sorted, read from the assets Alpaca marks
