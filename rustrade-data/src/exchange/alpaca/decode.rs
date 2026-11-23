@@ -1,10 +1,11 @@
 //! A transformer for Alpaca messages that may report nothing, or that need state kept across
 //! messages to decode.
 //!
-//! The trade and quote transformers turn every message into an event. A status message may report
-//! nothing a stream yields, and its decoder remembers which undocumented codes it has already
-//! logged. [`AlpacaDecoder`] states that decoding once per channel, and [`AlpacaDecodeTransformer`]
-//! does the rest: it finds each message's instrument and stamps its event.
+//! The trade and quote transformers turn every message into an event. A status or band message may
+//! report nothing a stream yields, and the status decoder remembers which undocumented codes it has
+//! already logged. [`AlpacaDecoder`] states that decoding once per channel, and
+//! [`AlpacaDecodeTransformer`] does the rest: it finds each message's instrument and stamps its
+//! event.
 
 use crate::{
     error::DataError,

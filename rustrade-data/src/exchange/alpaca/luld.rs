@@ -9,14 +9,22 @@
 //!
 //! | Tape | `i` | Plan's meaning | [`PriceBandUpdate`] |
 //! |---|---|---|---|
-//! | C, O | `A` | opening update | [`Opening`](PriceBandUpdate::Opening) |
-//! | C, O | `B` | intraday update | [`Intraday`](PriceBandUpdate::Intraday) |
-//! | C, O | `C` | restated value | [`Restated`](PriceBandUpdate::Restated) |
-//! | C, O | `D` | suspended during a halt or pause | [`SuspendedDuringHalt`](PriceBandUpdate::SuspendedDuringHalt) |
-//! | C, O | `E` | reopening update | [`Reopening`](PriceBandUpdate::Reopening) |
-//! | C, O | `F` | outside the hours bands apply in | [`OutsideRegularHours`](PriceBandUpdate::OutsideRegularHours) |
-//! | A, B | `A` | price band, opening or intraday alike | [`Other`](PriceBandUpdate::Other) |
-//! | A, B | `B` | republished price band | [`Restated`](PriceBandUpdate::Restated) |
+//! | C, O | `A` | opening update | [`Opening`][opening] |
+//! | C, O | `B` | intraday update | [`Intraday`][intraday] |
+//! | C, O | `C` | restated value | [`Restated`][restated] |
+//! | C, O | `D` | suspended during a halt or pause | [`SuspendedDuringHalt`][suspended] |
+//! | C, O | `E` | reopening update | [`Reopening`][reopening] |
+//! | C, O | `F` | outside the hours bands apply in | [`OutsideRegularHours`][outside] |
+//! | A, B | `A` | price band, opening or intraday alike | [`Other`][other] |
+//! | A, B | `B` | republished price band | [`Restated`][restated] |
+//!
+//! [opening]: PriceBandUpdate::Opening
+//! [intraday]: PriceBandUpdate::Intraday
+//! [restated]: PriceBandUpdate::Restated
+//! [suspended]: PriceBandUpdate::SuspendedDuringHalt
+//! [reopening]: PriceBandUpdate::Reopening
+//! [outside]: PriceBandUpdate::OutsideRegularHours
+//! [other]: PriceBandUpdate::Other
 //!
 //! Any other value, and any value with no tape or an unknown one, is [`PriceBandUpdate::Other`].
 //! The band's prices are reported either way.
