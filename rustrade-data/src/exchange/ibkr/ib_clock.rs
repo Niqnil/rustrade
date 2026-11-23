@@ -273,8 +273,8 @@ mod tests {
             state.base = Some(base);
             state.next_sample = Some(Instant::now() + RESYNC);
         }
-        let read = clock
-            .now(|| -> Result<DateTime<Utc>, String> { panic!("sampled before the resync") });
+        let read =
+            clock.now(|| -> Result<DateTime<Utc>, String> { panic!("sampled before the resync") });
         assert!(read >= at("2026-11-23T14:30:05Z"), "{read}");
         assert!(read < at("2026-11-23T14:30:06Z"), "{read}");
     }
