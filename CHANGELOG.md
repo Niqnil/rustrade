@@ -1302,7 +1302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nested `blob:` prefix, so a long enough URL overflowed the stack and aborted the process. The
   Massive REST client calls it on the `next_url` a server returns while paginating, so a hostile
   or compromised server could crash the program. The workspace now requires `url` 2.5.9 (with
-  `form_urlencoded` 1.2.3, which it needs), and the client refuses any `next_url` whose scheme is
+  `form_urlencoded` 1.2.3, which it needs), so a downstream lock file moves to `url` 2.5.9 or
+  later, and the client refuses any `next_url` whose scheme is
   not http or https before resolving its origin, with `MassiveError::UntrustedNextUrl`. That
   check also refuses a `blob:` URL wrapping the API's own address, whose origin matched the
   client's before. `url` 2.5.9 also follows the URL Standard more closely: a `^` in a path is now
