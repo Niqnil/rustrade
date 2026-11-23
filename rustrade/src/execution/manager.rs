@@ -545,8 +545,12 @@ where
         }
     }
 
-    /// Indexes an account snapshot, dropping and logging the balances of assets the map does not
-    /// register.
+    /// Indexes an account snapshot, dropping the balances of assets the map does not register and
+    /// logging their names at `error!`.
+    ///
+    /// The snapshot was asked for the map's assets, and
+    /// [`ExecutionClient::account_snapshot`] returns those only, matched ignoring ASCII case as
+    /// the map matches them, so such a balance means the client broke that contract.
     fn index_snapshot(
         indexer: &AccountEventIndexer,
         snapshot: UnindexedAccountSnapshot,
@@ -558,22 +562,12 @@ where
             .map(|asset| asset.name().as_str())
             .collect();
         if !untracked.is_empty() {
-            if indexed_snapshot.balances.is_empty() {
-                // Every balance was dropped: more likely the asset names do not match the
-                // venue's than an account holding only unregistered assets, though that is
-                // possible too.
-                error!(
-                    ?untracked,
-                    "Account snapshot kept no balance: none of its assets is registered in the \
-                     ExecutionInstrumentMap"
-                );
-            } else {
-                warn!(
-                    ?untracked,
-                    "Account snapshot balances dropped for assets the ExecutionInstrumentMap \
-                     does not register"
-                );
-            }
+            error!(
+                ?untracked,
+                kept = indexed_snapshot.balances.len(),
+                "Account snapshot balances dropped for assets the ExecutionInstrumentMap does \
+                 not register: the client returned balances it was not asked for"
+            );
         }
         Ok(AccountEvent {
             exchange: indexer.map.exchange.key,
@@ -3133,7 +3127,7 @@ mod tests {
             async move {
                 while let Some(MockExchangeRequest { kind, .. }) = request_rx.recv().await {
                     match kind {
-                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
+                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx, .. } => {
                             let _ = response_tx.send(UnindexedAccountSnapshot::new(
                                 ExchangeId::Mock,
                                 vec![],
@@ -3262,9 +3256,9 @@ mod tests {
         })
     }
 
-    /// Fetch the account snapshot of a client holding balances for `held`, and index it, with the
-    /// map registering `btc` and `usdt` only: `(kept, warn, debug, error)`, the balances kept and
-    /// the logs.
+    /// Fetch the account snapshot of a client holding balances for `held` that returns them all,
+    /// whatever it is asked for, and index it, with the map registering `btc` and `usdt` only:
+    /// `(kept, warn, debug, error)`, the balances kept and the logs.
     fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
         type Manager = ExecutionManager<
             futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
@@ -3296,12 +3290,14 @@ mod tests {
         })
     }
 
+    /// A balance the client was not asked for breaks `account_snapshot`'s contract: it is dropped
+    /// and the snapshot kept, with one error naming every such asset.
     #[test]
-    fn a_snapshot_drops_an_unregistered_balance_with_one_warning() {
-        // The registered balances are kept; bnb and sol are named in a single warning.
+    fn a_snapshot_drops_an_unregistered_balance_with_one_error() {
+        // The registered balances are kept; bnb and sol are named in a single error.
         assert_eq!(
             snapshot_balances_kept(&["usdt", "bnb", "btc", "sol"]),
-            (2, 1, 0, 0)
+            (2, 0, 0, 1)
         );
         // Nothing to drop, nothing logged.
         assert_eq!(snapshot_balances_kept(&["usdt", "btc"]), (2, 0, 0, 0));
@@ -3331,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_that_keeps_no_balance_is_an_error() {
+    fn a_snapshot_that_keeps_no_balance_logs_the_same_error() {
         assert_eq!(snapshot_balances_kept(&["bnb", "sol"]), (0, 0, 0, 1));
     }
 

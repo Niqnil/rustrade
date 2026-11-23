@@ -385,8 +385,15 @@ impl MockExchange {
     /// already sees it.
     fn book(&mut self, kind: MockExchangeRequestKind, emit: &Emit) {
         match kind {
-            MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
-                emit.respond(Vec::new(), response_tx, self.venue.account_snapshot());
+            MockExchangeRequestKind::FetchAccountSnapshot {
+                assets,
+                response_tx,
+            } => {
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.account_snapshot(&assets),
+                );
             }
             MockExchangeRequestKind::FetchBalances {
                 response_tx,
@@ -1201,6 +1208,7 @@ mod tests {
         request_tx
             .send(MockExchangeRequest::fetch_account_snapshot(
                 expiry + chrono::TimeDelta::seconds(1),
+                Vec::new(),
                 snapshot_tx,
             ))
             .unwrap();

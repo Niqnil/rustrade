@@ -524,9 +524,12 @@ where
     ///
     /// # Assets
     ///
-    /// `assets` are the ones the caller registered. Return balances for those only when the venue
-    /// lets you ask, which saves bandwidth. A balance for another asset is not an error: the
-    /// `ExecutionManager` drops it and logs the asset names once per snapshot.
+    /// `assets` are the ones the caller registered. Return balances for those only, matched as
+    /// [`fetch_balances`](Self::fetch_balances) matches them: an empty slice means every asset
+    /// held, and names are compared ignoring ASCII case. Ask the venue for those alone when it
+    /// lets you, which saves bandwidth, and otherwise filter what it returns. The
+    /// `ExecutionManager` drops a balance for another asset and logs the asset names at `error!`
+    /// once per snapshot, as a client that broke this contract.
     ///
     /// Balances are stamped as [`fetch_balances`](Self::fetch_balances) describes.
     ///
