@@ -670,8 +670,8 @@ mod tests {
     #[test]
     fn validate_next_url_rejects_deeply_nested_blob_urls() {
         // Deep `blob:` nesting overflowed the stack inside `Url::origin()` before url 2.5.9.
-        // The scheme check refuses it before `origin()` runs, and on url 2.5.9 or later its
-        // origin is opaque anyway, so this test also guards the `url` floor.
+        // The scheme check refuses it before `origin()` runs. url 2.5.9 or later would also give
+        // it an opaque origin, so this test fails only if both the check and the floor are lost.
         let next_url = format!("{}https://api.massive.com/", "blob:".repeat(10_000));
         assert_untrusted(&next_url);
     }
