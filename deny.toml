@@ -27,22 +27,12 @@ all-features = true
 # the full release distance. Check the version in Cargo.lock on the branch you care about before
 # treating an alert as live.
 ignore = [
-    # rkyv is an *unenabled optional* dependency of rust_decimal (gated behind its `rkyv` feature,
-    # which nothing here enables). It is in Cargo.lock only because the lockfile is feature-agnostic
-    # and records every optional dep; `cargo tree -i rkyv --workspace --all-features --target all`
-    # finds no path to it, and cargo deny's feature-aware graph does not flag it -- only cargo audit,
-    # which reads the lockfile directly: the lockfile records a dependency the build never compiles.
-    # No upgrade exists: rust_decimal 1.42.1 pins rkyv ^0.7.46 and upstream declared 0.7 unsupported
-    # (no backport, unlike RUSTSEC-2026-0001). Drop this entry once rust_decimal drops rkyv 0.7
-    # (paupino/rust-decimal#819) or moves to rkyv >=0.8.17.
-    { id = "RUSTSEC-2026-0235", reason = "rkyv is an unenabled optional dep of rust_decimal; never compiled in this workspace" },
-
     # zip 0.6.6 archive-extraction advisories of 2026-10-09/10 (SUID/SGID bits kept, symlink
     # targets and permissions not confined to the destination), and RUSTSEC-2026-0429 of
     # 2026-10-22 (`ZipArchive::extract` aborts the process on a symlink entry with a large declared
     # size), and RUSTSEC-2026-0548 of 2026-10-17 (`ZipStreamReader` extracting under local-header
     # names) and RUSTSEC-2026-0545 of 2026-10-22 (AES entries returned without checking their
-    # authentication code). Same class as rkyv above: an
+    # authentication code). zip is an
     # *unenabled optional* dependency, two levels deep. The lockfile path is ethers 2.0.14 ->
     # ethers-solc (optional, behind ethers' `solc` feature) -> svm-rs 0.3.5 (optional, behind
     # ethers-solc's `svm-solc` feature) -> zip. Neither feature is enabled by us or by
