@@ -1173,8 +1173,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
   cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
   id among the filled, expired and refused orders too, so the message now says "among its orders".
-  `OrderRules::is_off` now reads the rules through the same exhaustive list the venue's rule
-  validation uses, so a rule added later cannot be left out of it.
 - **IBKR `fetch_shortability` ends at once on a competing live session** (`rustrade-execution`,
   `rustrade-instrument`). IB's notice 10197, no market data on a paper account while the same
   user is logged in to a live session elsewhere, was gathered like any other notice, so the read
