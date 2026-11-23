@@ -27,12 +27,14 @@
 //!
 //! # Reasons
 //! A halt's or pause's `rc` maps to a [`HaltReason`], and a code that maps to none of them is
-//! [`HaltReason::Other`]. A resumption has no reason: its `rc` says why trading resumed, which is
+//! [`HaltReason::Other`]. A missing or blank `rc` is no reason: tapes A and B send a space for
+//! "not applicable". A resumption has no reason: its `rc` says why trading resumed, which is
 //! not a [`HaltReason`].
 //!
 //! # Venue code
-//! [`TradingStatus::venue_code`] is `"<tape>:<sc>:<rc>"` as Alpaca sent them, always with three
-//! fields and an empty one for a missing code: `"C:H:T12"`, `"A:2:M"`, `"A:3:"`.
+//! [`TradingStatus::venue_code`] is `"<tape>:<sc>:<rc>"` as Alpaca sent them, trimmed of padding
+//! spaces, always with three fields and an empty one for a missing or blank code: `"C:H:T12"`,
+//! `"A:2:M"`, `"A:3:"`.
 
 use super::{
     channel::AlpacaChannel,
@@ -249,9 +251,10 @@ impl AlpacaDecoder for AlpacaStatusDecoder {
     type Event = TradingStatus;
 
     fn decode(&mut self, status: AlpacaStatus) -> Option<TradingStatus> {
-        let tape = status.tape.as_deref().unwrap_or_default();
-        let sc = status.status_code.as_deref().unwrap_or_default();
-        let rc = status.reason_code.as_deref().unwrap_or_default();
+        // Tapes A and B pad their codes with spaces: a space reason code means "not applicable".
+        let tape = status.tape.as_deref().unwrap_or_default().trim();
+        let sc = status.status_code.as_deref().unwrap_or_default().trim();
+        let rc = status.reason_code.as_deref().unwrap_or_default().trim();
 
         let Some(plan) = Plan::of(tape) else {
             self.warn_once(
@@ -360,6 +363,25 @@ mod tests {
             ("O", "T", "R4", Trading, None, "O:T:R4"),
         ];
         for (tape, sc, rc, state, reason, code) in cases {
+            assert_eq!(
+                decode(tape, sc, rc),
+                Some(expected(state, reason, code)),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_reason_is_no_reason_and_padding_spaces_are_trimmed() {
+        use TradingState::*;
+        let cases = [
+            ("B", "2", " ", Halted, "B:2:"),
+            ("A", "3", " ", Trading, "A:3:"),
+            ("C", "H", "  ", Halted, "C:H:"),
+            (" B", "2 ", "M ", Paused, "B:2:M"),
+        ];
+        for (tape, sc, rc, state, code) in cases {
+            let reason = (state == Paused).then_some(HaltReason::Volatility);
             assert_eq!(
                 decode(tape, sc, rc),
                 Some(expected(state, reason, code)),

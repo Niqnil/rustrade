@@ -31,12 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pause is `Paused`, a quotation resumption `QuoteOnly`, and a resumption `Trading` with no reason.
   Codes that report no trading state (imbalances, indications, the short sale restriction) are not
   reported, so they cannot overwrite the real state; an undocumented code or tape is dropped with
-  a warning once per connection. A band's zero limit is `None`. Alpaca does not document the band
-  indicator, so it is read as the Nasdaq-listed tapes' plan defines it on tapes C and O, and is
-  `PriceBandUpdate::Other` on tapes A and B; the raw codes are kept in `venue_code`
-  (`"<tape>:<sc>:<rc>"` for a status, `"<tape>:<i>"` for a band). The engine's
+  a warning once per connection. A blank reason code is no reason. A band's zero limit is `None`.
+  Alpaca does not document the band indicator, so it is read by tape as each plan defines it: A–F
+  on tapes C and O; on tapes A and B a republished band is `Restated`, any other band `Other`, and
+  a limit-state message, which is not a band, is not reported. The raw codes are kept in
+  `venue_code` (`"<tape>:<sc>:<rc>"` for a status, `"<tape>:<i>"` for a band). The engine's
   `DefaultInstrumentMarketData` and the simulated venue ignore price bands. Alpaca does not say
-  which stock feeds publish these channels; the IEX feed accepts the subscriptions.
+  which stock feeds publish these channels; the IEX and delayed SIP feeds send both in session.
 
 - **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
   #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`

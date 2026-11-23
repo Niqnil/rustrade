@@ -4,24 +4,30 @@
 //! tape `z`. A zero or missing limit is no limit, so it is `None`.
 //!
 //! # Indicator
-//! Alpaca does not document the indicator's values. On tapes C and O it is read as the UTP plan
-//! defines it:
+//! Alpaca does not document the indicator's values. The two US consolidated tape plans spell them
+//! differently, so it is read by its tape, as each plan defines it:
 //!
-//! | `i` | [`PriceBandUpdate`] |
-//! |---|---|
-//! | `A` | [`Opening`](PriceBandUpdate::Opening) |
-//! | `B` | [`Intraday`](PriceBandUpdate::Intraday) |
-//! | `C` | [`Restated`](PriceBandUpdate::Restated) |
-//! | `D` | [`SuspendedDuringHalt`](PriceBandUpdate::SuspendedDuringHalt) |
-//! | `E` | [`Reopening`](PriceBandUpdate::Reopening) |
-//! | `F` | [`OutsideRegularHours`](PriceBandUpdate::OutsideRegularHours) |
+//! | Tape | `i` | Plan's meaning | [`PriceBandUpdate`] |
+//! |---|---|---|---|
+//! | C, O | `A` | opening update | [`Opening`](PriceBandUpdate::Opening) |
+//! | C, O | `B` | intraday update | [`Intraday`](PriceBandUpdate::Intraday) |
+//! | C, O | `C` | restated value | [`Restated`](PriceBandUpdate::Restated) |
+//! | C, O | `D` | suspended during a halt or pause | [`SuspendedDuringHalt`](PriceBandUpdate::SuspendedDuringHalt) |
+//! | C, O | `E` | reopening update | [`Reopening`](PriceBandUpdate::Reopening) |
+//! | C, O | `F` | outside the hours bands apply in | [`OutsideRegularHours`](PriceBandUpdate::OutsideRegularHours) |
+//! | A, B | `A` | price band, opening or intraday alike | [`Other`](PriceBandUpdate::Other) |
+//! | A, B | `B` | republished price band | [`Restated`](PriceBandUpdate::Restated) |
 //!
-//! Any other value, and every value on tapes A and B, whose spelling of it is not known, is
-//! [`PriceBandUpdate::Other`]. The band's prices are reported either way.
+//! Any other value, and any value with no tape or an unknown one, is [`PriceBandUpdate::Other`].
+//! The band's prices are reported either way.
+//!
+//! On tapes A and B, `C` to `J` say that the national best bid or offer entered or left a limit
+//! state. They are not bands, and their prices are zero, which would read as the bands being
+//! removed, so no [`PriceBand`] is produced for them: each is logged at DEBUG.
 //!
 //! # Venue code
-//! [`PriceBand::venue_code`] is `"<tape>:<i>"` as Alpaca sent them, with an empty field for a
-//! missing one: `"C:B"`, `"A:B"`.
+//! [`PriceBand::venue_code`] is `"<tape>:<i>"` as Alpaca sent them, trimmed of padding spaces, with
+//! an empty field for a missing or blank one: `"C:B"`, `"A:B"`.
 
 use super::{
     channel::AlpacaChannel,
@@ -37,6 +43,7 @@ use rust_decimal::Decimal;
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Deserializer};
 use smol_str::{SmolStr, format_smolstr};
+use tracing::debug;
 
 /// Deserialize "S" (symbol) field as the associated [`SubscriptionId`] for LULD bands.
 fn de_luld_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
@@ -120,20 +127,20 @@ impl IntoIterator for AlpacaLuldMessage {
     }
 }
 
-/// Why the band was published, from indicator `i` on `tape`.
-fn update(tape: &str, indicator: &str) -> PriceBandUpdate {
-    if !matches!(tape, "C" | "O") {
-        return PriceBandUpdate::Other;
-    }
-    match indicator {
-        "A" => PriceBandUpdate::Opening,
-        "B" => PriceBandUpdate::Intraday,
-        "C" => PriceBandUpdate::Restated,
-        "D" => PriceBandUpdate::SuspendedDuringHalt,
-        "E" => PriceBandUpdate::Reopening,
-        "F" => PriceBandUpdate::OutsideRegularHours,
+/// Why the band was published, from indicator `i` on `tape`, or `None` when the message is not a
+/// band: a limit state on tapes A and B.
+fn update(tape: &str, indicator: &str) -> Option<PriceBandUpdate> {
+    Some(match (tape, indicator) {
+        ("C" | "O", "A") => PriceBandUpdate::Opening,
+        ("C" | "O", "B") => PriceBandUpdate::Intraday,
+        ("C" | "O", "C") => PriceBandUpdate::Restated,
+        ("C" | "O", "D") => PriceBandUpdate::SuspendedDuringHalt,
+        ("C" | "O", "E") => PriceBandUpdate::Reopening,
+        ("C" | "O", "F") => PriceBandUpdate::OutsideRegularHours,
+        ("A" | "B", "B") => PriceBandUpdate::Restated,
+        ("A" | "B", "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J") => return None,
         _ => PriceBandUpdate::Other,
-    }
+    })
 }
 
 /// A limit, or `None` where Alpaca published none.
@@ -141,7 +148,7 @@ fn limit(price: Option<Decimal>) -> Option<Decimal> {
     price.filter(|price| !price.is_zero())
 }
 
-/// Decodes the `lulds` channel. Every message is a band.
+/// Decodes the `lulds` channel, dropping a limit state on tapes A and B, which is not a band.
 #[derive(Debug, Default)]
 pub struct AlpacaLuldDecoder;
 
@@ -151,12 +158,21 @@ impl AlpacaDecoder for AlpacaLuldDecoder {
     type Event = PriceBand;
 
     fn decode(&mut self, luld: AlpacaLuld) -> Option<PriceBand> {
-        let tape = luld.tape.as_deref().unwrap_or_default();
-        let indicator = luld.indicator.as_deref().unwrap_or_default();
+        let tape = luld.tape.as_deref().unwrap_or_default().trim();
+        let indicator = luld.indicator.as_deref().unwrap_or_default().trim();
 
+        let Some(update) = update(tape, indicator) else {
+            debug!(
+                subscription = %luld.subscription_id,
+                tape,
+                indicator,
+                "Alpaca LULD message is a limit state, not a band; not reported"
+            );
+            return None;
+        };
         Some(
             PriceBand::new(limit(luld.limit_up), limit(luld.limit_down))
-                .with_update(update(tape, indicator))
+                .with_update(update)
                 .with_venue_code(format_smolstr!("{tape}:{indicator}")),
         )
     }
@@ -167,6 +183,8 @@ impl AlpacaDecoder for AlpacaLuldDecoder {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use rustrade_instrument::test_utils::logs::capture;
+    use tracing::Level;
 
     fn luld(input: &str) -> AlpacaLuld {
         let frame: AlpacaLuldMessage = serde_json::from_str(input).unwrap();
@@ -174,12 +192,14 @@ mod tests {
         luld
     }
 
+    fn decode(tape: &str, indicator: &str) -> Option<PriceBand> {
+        AlpacaLuldDecoder.decode(luld(&format!(
+            r#"[{{"T":"l","S":"IONM","u":3.24,"d":2.65,"i":"{indicator}","t":"2023-04-06T13:34:45Z","z":"{tape}"}}]"#
+        )))
+    }
+
     fn band(tape: &str, indicator: &str) -> PriceBand {
-        AlpacaLuldDecoder
-            .decode(luld(&format!(
-                r#"[{{"T":"l","S":"IONM","u":3.24,"d":2.65,"i":"{indicator}","t":"2023-04-06T13:34:45Z","z":"{tape}"}}]"#
-            )))
-            .unwrap()
+        decode(tape, indicator).unwrap()
     }
 
     #[test]
@@ -228,11 +248,13 @@ mod tests {
     }
 
     #[test]
-    fn every_indicator_on_tapes_a_and_b_is_other_with_its_code_and_prices_kept() {
-        for tape in ["A", "B", ""] {
-            for indicator in ["A", "B", "F"] {
+    fn reads_the_indicator_as_the_cta_plan_defines_it_on_tapes_a_and_b() {
+        use PriceBandUpdate::*;
+        let cases = [("A", Other), ("B", Restated), ("K", Other), ("", Other)];
+        for tape in ["A", "B"] {
+            for (indicator, update) in cases {
                 let band = band(tape, indicator);
-                assert_eq!(band.update, PriceBandUpdate::Other, "{tape}:{indicator}");
+                assert_eq!(band.update, update, "{tape}:{indicator}");
                 assert_eq!(
                     band.venue_code.as_deref(),
                     Some(format!("{tape}:{indicator}").as_str())
@@ -243,6 +265,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_limit_state_on_tapes_a_and_b_is_dropped_at_debug() {
+        for tape in ["A", "B"] {
+            for indicator in ["C", "D", "E", "F", "G", "H", "I", "J"] {
+                let (decoded, events) = capture(|| decode(tape, indicator));
+
+                assert_eq!(decoded, None, "{tape}:{indicator}");
+                assert_eq!(events.len(), 1, "{tape}:{indicator}: {events:?}");
+                assert_eq!(events[0].level, Level::DEBUG, "{tape}:{indicator}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_indicator_with_no_tape_or_an_unknown_one_is_other() {
+        for tape in ["", "X"] {
+            for indicator in ["A", "B", "C", "F"] {
+                let band = band(tape, indicator);
+                assert_eq!(band.update, PriceBandUpdate::Other, "{tape}:{indicator}");
+            }
+        }
+    }
+
+    #[test]
+    fn padding_spaces_are_trimmed_from_the_tape_and_indicator() {
+        let padded = band(" B ", "B ");
+        assert_eq!(padded.update, PriceBandUpdate::Restated);
+        assert_eq!(padded.venue_code.as_deref(), Some("B:B"));
+
+        let blank = band("C", " ");
+        assert_eq!(blank.update, PriceBandUpdate::Other);
+        assert_eq!(blank.venue_code.as_deref(), Some("C:"));
     }
 
     #[test]
