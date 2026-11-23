@@ -83,6 +83,7 @@
 //! [`reconnect::Event`]: crate::streams::reconnect::Event
 //! [`MarketStreamOptions`]: crate::streams::consumer::MarketStreamOptions
 
+pub mod candles;
 pub mod depth;
 // `flex` is private: its public surface is re-exported flat below (matching the `massive`
 // reconciliation module), so callers use a single `ibkr::IbkrFlex*` path rather than the
