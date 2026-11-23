@@ -1271,6 +1271,40 @@ mod tests {
         driver.await.unwrap();
     }
 
+    /// The assets a snapshot request names reach the venue, which reports only their balances.
+    #[tokio::test]
+    async fn a_snapshot_request_reports_only_the_assets_it_names() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _events) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("100", "10000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::fetch_account_snapshot(
+                Utc::now(),
+                vec![quote()],
+                response_tx,
+            ))
+            .unwrap();
+        let snapshot = response_rx.await.expect("a snapshot must be answered");
+
+        let assets = snapshot
+            .balances
+            .iter()
+            .map(|balance| balance.asset.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, [quote()]);
+
+        drop(request_tx);
+        driver.await.unwrap();
+    }
+
     /// The mock client's order-state lookup reaches the venue's ledger and back: an order that
     /// filled is reported, and one the venue never held is omitted.
     #[tokio::test]
