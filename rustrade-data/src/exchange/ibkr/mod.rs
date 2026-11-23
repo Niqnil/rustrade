@@ -83,6 +83,7 @@
 //! [`reconnect::Event`]: crate::streams::reconnect::Event
 //! [`MarketStreamOptions`]: crate::streams::consumer::MarketStreamOptions
 
+mod bar_assembler;
 pub mod candles;
 pub mod depth;
 // `flex` is private: its public surface is re-exported flat below (matching the `massive`
