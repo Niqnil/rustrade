@@ -226,8 +226,9 @@ impl MassiveRestClient {
     /// separator-less `https://api.massive.comevil.example`) shares the prefix yet
     /// is a different origin. `next_url` is parsed and its
     /// [origin](url::Url::origin) (scheme + host + port) compared against the
-    /// client's cached `base_origin`; a `next_url` that fails to parse or whose
-    /// origin differs is rejected (fail-closed) with
+    /// client's cached `base_origin`; a `next_url` that fails to parse, whose
+    /// scheme is not http or https, or whose origin differs is rejected
+    /// (fail-closed) with
     /// [`MassiveError::UntrustedNextUrl`].
     ///
     /// The trusted `base_origin` is parsed once at construction (see
@@ -243,7 +244,11 @@ impl MassiveRestClient {
         };
 
         let parsed = Url::parse(next_url).map_err(|_| untrusted())?;
-        if &parsed.origin() != base_origin {
+        // Only an http(s) URL can be fetched, and the base is http(s) by construction. Checking
+        // the scheme before `origin()` also refuses a `blob:` URL, whose origin is that of the
+        // URL nested in its path (so `blob:https://api.massive.com/..` would match the base),
+        // and keeps a server-supplied string from reaching `blob:` origin resolution at all.
+        if !matches!(parsed.scheme(), "http" | "https") || &parsed.origin() != base_origin {
             return Err(untrusted());
         }
         Ok(parsed)
@@ -601,6 +606,18 @@ mod tests {
     }
 
     #[test]
+    fn validate_next_url_accepts_http_when_the_base_is_http() {
+        // A plain-http base (a local proxy or mock server) paginates over http.
+        let base = Url::parse("http://127.0.0.1:8080")
+            .expect("valid URL")
+            .origin();
+        assert!(
+            MassiveRestClient::validate_next_url("http://127.0.0.1:8080/v2/aggs?cursor=abc", &base)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn validate_next_url_rejects_lookalike_subdomain() {
         // The reported #182 vector: shares the base URL as a string prefix
         // (so `starts_with` passed) but is a different host.
@@ -641,6 +658,22 @@ mod tests {
     fn validate_next_url_rejects_non_http_scheme() {
         // Non-http(s) schemes yield opaque origins that never compare equal.
         assert_untrusted("file:///etc/passwd");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_a_blob_url_wrapping_the_base_origin() {
+        // A `blob:` URL takes the origin of the URL in its path, so this one has the base's
+        // origin; only the scheme check refuses it.
+        assert_untrusted("blob:https://api.massive.com/v2/aggs");
+    }
+
+    #[test]
+    fn validate_next_url_rejects_deeply_nested_blob_urls() {
+        // Deep `blob:` nesting overflowed the stack inside `Url::origin()` before url 2.5.9.
+        // The scheme check refuses it before `origin()` runs. url 2.5.9 or later would also give
+        // it an opaque origin, so this test fails only if both the check and the floor are lost.
+        let next_url = format!("{}https://api.massive.com/", "blob:".repeat(10_000));
+        assert_untrusted(&next_url);
     }
 
     #[test]

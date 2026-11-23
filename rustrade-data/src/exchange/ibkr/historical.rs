@@ -1564,6 +1564,25 @@ fn bar_size_to_step(bar_size: BarSize) -> IntervalStep {
     }
 }
 
+/// The open of an ibapi `Bar`: `Bar.date`, where a daily, weekly or monthly bar's calendar date
+/// is taken as midnight UTC, and an intraday bar carries its full instant.
+///
+/// # Errors
+///
+/// `Err(DataError::Socket(...))` if the instant is outside the [`DateTime<Utc>`] range.
+pub(super) fn bar_open_time(
+    bar: &ibapi::market_data::historical::Bar,
+) -> Result<DateTime<Utc>, DataError> {
+    use ibapi::market_data::historical::BarTimestamp;
+
+    let (secs, nanos) = match bar.date {
+        BarTimestamp::DateTime(dt) => (dt.unix_timestamp(), dt.nanosecond()),
+        BarTimestamp::Date(d) => (d.midnight().assume_utc().unix_timestamp(), 0),
+    };
+    DateTime::from_timestamp(secs, nanos)
+        .ok_or_else(|| DataError::Socket(format!("IB timestamp {secs} out of DateTime<Utc> range")))
+}
+
 /// Convert an ibapi `Bar` to a rustrade [`Candle`].
 ///
 /// `Bar.date` is the bar's **open** instant; the returned [`Candle::close_time`]
@@ -1589,22 +1608,11 @@ fn bar_size_to_step(bar_size: BarSize) -> IntervalStep {
 /// Returns `Err(DataError::Socket(...))` if the open timestamp or the computed
 /// `close_time` falls outside the representable [`DateTime<Utc>`] range, or if any
 /// price/volume value cannot be converted to `Decimal` (e.g. NaN/Infinity).
-fn bar_to_candle(
+pub(super) fn bar_to_candle(
     bar: &ibapi::market_data::historical::Bar,
     bar_size: BarSize,
 ) -> Result<Candle, DataError> {
-    use ibapi::market_data::historical::BarTimestamp;
-
-    // `Bar.date` is the bar's OPEN instant: daily/weekly/monthly bars carry a
-    // calendar `Date` (anchored here to midnight UTC), intraday bars a full
-    // `OffsetDateTime`.
-    let (secs, nanos) = match bar.date {
-        BarTimestamp::DateTime(dt) => (dt.unix_timestamp(), dt.nanosecond()),
-        BarTimestamp::Date(d) => (d.midnight().assume_utc().unix_timestamp(), 0),
-    };
-    let open_time = DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
-        DataError::Socket(format!("IB timestamp {secs} out of DateTime<Utc> range"))
-    })?;
+    let open_time = bar_open_time(bar)?;
 
     // close_time is the exclusive end-of-period boundary (open + interval).
     let close_time =

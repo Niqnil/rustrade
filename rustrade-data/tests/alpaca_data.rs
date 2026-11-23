@@ -4,7 +4,7 @@
 //!
 //! # Status
 //!
-//! **Tested locally, CI planned (paper trading allowed by Alpaca):**
+//! **Run on CI with paper keys, by the Alpaca workflows:**
 //! - Crypto streaming: trades and quotes (24/7, free)
 //! - IEX equity streaming: trades and quotes (market hours, free)
 //!
@@ -50,6 +50,15 @@
 //!   exceeded". Clones of one `AlpacaSubscriber` share that connection, but each test builds its
 //!   own subscriber, so running them in parallel fails every connection but the one that wins the
 //!   race.
+//!
+//! # Logs carry no market data
+//!
+//! CI runs these tests and its logs are public, and Alpaca's market data is not ours to publish.
+//! The tests never log the values of what they receive (prices, sizes, Greeks), in a log line or a
+//! failure message: a received event is logged as what it is (`log_received`: exchange, instrument
+//! and exchange time), and snapshots only by their counts. One exception is the library's own: a
+//! frame it cannot read is reported with the frame, as an excerpt in its warning or in full in the
+//! stream error these tests log, so that the failure is observable.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
@@ -58,6 +67,7 @@
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rustrade_data::{
+    event::MarketEvent,
     exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber},
     streams::{
         Streams,
@@ -65,7 +75,9 @@ use rustrade_data::{
     },
     subscription::{quote::Quotes, trade::PublicTrades},
 };
-use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
+use rustrade_instrument::instrument::market_data::{
+    MarketDataInstrument, kind::MarketDataInstrumentKind,
+};
 use serial_test::serial;
 use std::{collections::BTreeSet, time::Duration};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -78,6 +90,18 @@ fn init_logging() {
                 .from_env_lossy(),
         )
         .try_init();
+}
+
+/// Log that `event` arrived: its exchange, instrument and exchange time, never its values.
+///
+/// See the module documentation, "Logs carry no market data".
+fn log_received<T>(what: &str, event: &MarketEvent<MarketDataInstrument, T>) {
+    tracing::info!(
+        exchange = %event.exchange,
+        instrument = %event.instrument,
+        time_exchange = %event.time_exchange,
+        "Received {what}"
+    );
 }
 
 /// Panic unless Alpaca's clock says the US regular session is open.
@@ -204,7 +228,7 @@ async fn test_crypto_trade_stream_validates_delivered_trades() {
             ),
             Ok(Some(Event::Item(trade))) => {
                 trades += 1;
-                tracing::info!(?trade, "Received crypto trade");
+                log_received("crypto trade", &trade);
                 assert_eq!(
                     trade.instrument.base.as_ref(),
                     "btc",
@@ -291,7 +315,7 @@ async fn test_crypto_quote_stream_receives_data() {
             Err(_) => continue,
             Ok(None) => panic!("Stream ended without data (non-quote events={non_quote_events})"),
             Ok(Some(Event::Item(quote))) => {
-                tracing::info!(?quote, "Received crypto quote");
+                log_received("crypto quote", &quote);
                 assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
                 assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
                 assert!(
@@ -622,7 +646,7 @@ async fn test_iex_trade_stream_receives_data() {
 
         match timeout {
             Ok(Some(Event::Item(trade))) => {
-                tracing::info!(?trade, "Received IEX trade");
+                log_received("IEX trade", &trade);
                 assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
                 assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
                 return;
@@ -677,7 +701,7 @@ async fn test_iex_quote_stream_receives_data() {
 
         match timeout {
             Ok(Some(Event::Item(quote))) => {
-                tracing::info!(?quote, "Received IEX quote");
+                log_received("IEX quote", &quote);
                 assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
                 assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
                 return;
@@ -799,7 +823,7 @@ async fn test_sip_trade_stream_receives_data() {
 
         match timeout {
             Ok(Some(Event::Item(trade))) => {
-                tracing::info!(?trade, "Received SIP trade");
+                log_received("SIP trade", &trade);
                 assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
                 assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
                 return;
@@ -855,7 +879,7 @@ async fn test_sip_quote_stream_receives_data() {
 
         match timeout {
             Ok(Some(Event::Item(quote))) => {
-                tracing::info!(?quote, "Received SIP quote (NBBO)");
+                log_received("SIP quote (NBBO)", &quote);
                 assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
                 assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
                 return;
@@ -1038,30 +1062,14 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
     // but we should get at least some
     assert!(!snapshots.is_empty(), "No snapshots received");
 
-    // Log snapshot details
+    // Count snapshots with Greeks; their values stay out of the log (see the module docs).
     let mut greeks_count = 0;
     for snapshot in &snapshots {
         if snapshot.has_greeks() {
             greeks_count += 1;
-            let greeks = snapshot.greeks();
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                delta = ?greeks.delta,
-                gamma = ?greeks.gamma,
-                theta = ?greeks.theta,
-                vega = ?greeks.vega,
-                iv = ?greeks.implied_volatility,
-                "Snapshot with Greeks"
-            );
         }
 
         if let Some(ref quote) = snapshot.latest_quote {
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                bid = %quote.bid_price,
-                ask = %quote.ask_price,
-                "Snapshot quote"
-            );
             assert!(
                 quote.bid_price >= Decimal::ZERO,
                 "Bid should be non-negative"
@@ -1152,16 +1160,6 @@ async fn test_fetch_opra_snapshots() {
     for snapshot in &snapshots {
         if snapshot.has_greeks() {
             greeks_count += 1;
-            let greeks = snapshot.greeks();
-            tracing::info!(
-                symbol = %snapshot.symbol,
-                delta = ?greeks.delta,
-                gamma = ?greeks.gamma,
-                theta = ?greeks.theta,
-                vega = ?greeks.vega,
-                iv = ?greeks.implied_volatility,
-                "OPRA snapshot with Greeks"
-            );
         }
     }
 

@@ -205,8 +205,9 @@ pub enum DataError {
     ///
     /// `code` and `message` are the venue's own. Only that subscription ends; the stream's other
     /// subscriptions continue. On IBKR: 354 (not subscribed), 10089 (the subscription does not
-    /// extend to the API), 10168 (not subscribed, and delayed data is not enabled) and 10197 (a
-    /// competing live session). An account without the live subscription may still get delayed
+    /// extend to the API), 10168 (not subscribed, and delayed data is not enabled), 10197 (a
+    /// competing live session), and for a candle subscription 2188 (the last 15 minutes of history,
+    /// and so live bars, need a market data subscription). An account without the live subscription may still get delayed
     /// data, by asking for it on the stream's configuration.
     #[error("{exchange} has no market data for {instrument} on this account ({code} {message})")]
     MarketDataNotAvailable {
@@ -214,6 +215,15 @@ pub enum DataError {
         instrument: InstrumentNameExchange,
         code: i32,
         message: String,
+    },
+
+    /// A subscription asks for something the stream cannot make, such as a parameter outside the
+    /// venue's range. The stream refuses it before connecting; `reason` says what is wrong.
+    #[error("{exchange} cannot subscribe to {instrument}: {reason}")]
+    InvalidSubscription {
+        exchange: ExchangeId,
+        instrument: InstrumentNameExchange,
+        reason: String,
     },
 }
 
