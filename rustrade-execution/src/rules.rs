@@ -5,7 +5,10 @@
 //! each must fall in. A client that loads those rules refuses an order that breaks them without
 //! sending it, so the caller gets a typed error that says which value and which limit
 //! ([`OrderError::InvalidPrecision`] for the grid, [`OrderError::OutOfBounds`] for the range)
-//! rather than a venue's text after a round trip. It never rounds: rounding would place a
+//! rather than a venue's text after a round trip. A
+//! [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) given an instrument's rules
+//! ([`MockExecutionConfig::order_rules`](crate::client::mock::MockExecutionConfig::order_rules))
+//! refuses the same orders with the same errors. Neither ever rounds: rounding would place a
 //! different order from the one asked for. A caller that sizes or prices an order puts it on the
 //! grid first, with [`ValueRule::round_down`] / [`ValueRule::round_up`], or
 //! [`OrderRules::round_quantity_down`] / [`OrderRules::round_quantity_up`] for a quantity.
@@ -30,6 +33,7 @@ use rustrade_instrument::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Whether a client checks an order against its instrument's [`OrderRules`] before sending it.
@@ -51,7 +55,9 @@ pub enum PreSendRules {
 /// Each part is optional. A venue that publishes a zero for one means the rule is off, and
 /// [`ValueRule::new`] reads zero that way.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
 pub struct ValueRule {
     /// The smallest value allowed.
     pub min: Option<Decimal>,
@@ -215,7 +221,9 @@ fn common_step(a: Decimal, b: Decimal) -> Option<Decimal> {
 /// Venue-agnostic: a client fills it from its venue's rules and calls [`check`](Self::check).
 /// [`Default`] is no rules at all, which passes every order.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
 pub struct OrderRules {
     /// The grid and range of a limit, stop and trigger price, and of a trailing order's
     /// activation price.
@@ -232,7 +240,7 @@ pub struct OrderRules {
     /// [`check`](Self::check) never applies it: a market order has no price of its own, and the
     /// venue measures its notional at a price of its own choosing, such as a reference price or
     /// an average of recent trades, that the check cannot know. A caller that holds a price it
-    /// trusts can compare that price times the quantity with this rule's `min` and `max`.
+    /// trusts checks it with [`check_market_notional`](Self::check_market_notional).
     #[serde(default)]
     pub market_notional: ValueRule,
     /// The range of a trailing order's offset, in basis points, when its trigger trails above the
@@ -288,13 +296,9 @@ impl OrderRules {
 
     /// Whether these rules check nothing.
     pub fn is_off(&self) -> bool {
-        self.price.is_off()
-            && self.quantity.is_off()
-            && self.market_quantity.is_off()
-            && self.notional.is_off()
-            && self.market_notional.is_off()
-            && self.trailing_offset_above.is_off()
-            && self.trailing_offset_below.is_off()
+        // Through `by_field`, whose destructuring makes a rule added to the struct fail to compile
+        // until it is listed, so a new rule cannot be left out of this answer.
+        self.by_field().iter().all(|(_, rule)| rule.is_off())
     }
 
     /// The largest quantity at or below `quantity` that an order of `kind` may have on the grid:
@@ -410,8 +414,9 @@ impl OrderRules {
     /// - **Notional**, `price × quantity`, only where the price is the order's own limit: a limit,
     ///   stop-limit, take-profit-limit or fixed-limit trailing order. Never a market, plain stop
     ///   or trailing-stop order: the venue prices them at a reference price this check cannot
-    ///   know, which is also why [`market_notional`](Self::market_notional) is never checked. An
-    ///   order with no `price` skips it.
+    ///   know, which is also why [`market_notional`](Self::market_notional) is not checked here
+    ///   (see [`check_market_notional`](Self::check_market_notional)). An order with no `price`
+    ///   skips it.
     ///
     /// A closing order is checked like any other: a venue that enforces a minimum notional
     /// enforces it on a close too, so an exemption would move the refusal to the venue.
@@ -474,6 +479,56 @@ impl OrderRules {
         Ok(())
     }
 
+    /// Check a market order's notional, `reference_price × quantity`, against the range of
+    /// [`market_notional`](Self::market_notional), for a caller that holds a price it trusts to
+    /// stand for the one the venue will measure the order at. The rule's `step` is not used.
+    ///
+    /// [`check`](Self::check) checks the rest of a market order. A
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) calls both, this one with the
+    /// price its fill model gives before slippage.
+    ///
+    /// # Errors
+    /// [`OrderError::OutOfBounds`] on [`OrderField::Notional`], its
+    /// [`value`](BoundsViolation::value) the reference price times the quantity, when that is
+    /// outside the range.
+    pub fn check_market_notional<AssetKey, InstrumentKey>(
+        &self,
+        reference_price: Decimal,
+        quantity: Decimal,
+    ) -> Result<(), OrderError<AssetKey, InstrumentKey>> {
+        // A product beyond `Decimal`'s range is beyond any maximum too.
+        let notional = reference_price.saturating_mul(quantity);
+        ValueRule {
+            step: None,
+            ..self.market_notional
+        }
+        .check(OrderField::Notional, notional)
+    }
+
+    /// Each rule of these rules, with which one it is.
+    pub(crate) fn by_field(&self) -> [(OrderRulesField, &ValueRule); 7] {
+        // Destructured without `..`, so a rule added to the struct fails to compile here until it
+        // is listed, rather than escaping the validation built on this.
+        let Self {
+            price,
+            quantity,
+            market_quantity,
+            notional,
+            market_notional,
+            trailing_offset_above,
+            trailing_offset_below,
+        } = self;
+        [
+            (OrderRulesField::Price, price),
+            (OrderRulesField::Quantity, quantity),
+            (OrderRulesField::MarketQuantity, market_quantity),
+            (OrderRulesField::Notional, notional),
+            (OrderRulesField::MarketNotional, market_notional),
+            (OrderRulesField::TrailingOffsetAbove, trailing_offset_above),
+            (OrderRulesField::TrailingOffsetBelow, trailing_offset_below),
+        ]
+    }
+
     /// Check a trailing order's offset against the range for its direction: see
     /// [`check`](Self::check).
     fn check_trailing_offset<AssetKey, InstrumentKey>(
@@ -527,6 +582,41 @@ impl OrderRules {
             TrailingOffsetType::Absolute => return Ok(()),
         };
         range.check(OrderField::TrailingOffset, offset)
+    }
+}
+
+/// One of the rules an [`OrderRules`] holds, as an error names it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderRulesField {
+    /// [`OrderRules::price`].
+    Price,
+    /// [`OrderRules::quantity`].
+    Quantity,
+    /// [`OrderRules::market_quantity`].
+    MarketQuantity,
+    /// [`OrderRules::notional`].
+    Notional,
+    /// [`OrderRules::market_notional`].
+    MarketNotional,
+    /// [`OrderRules::trailing_offset_above`].
+    TrailingOffsetAbove,
+    /// [`OrderRules::trailing_offset_below`].
+    TrailingOffsetBelow,
+}
+
+impl fmt::Display for OrderRulesField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Price => "price",
+            Self::Quantity => "quantity",
+            Self::MarketQuantity => "market_quantity",
+            Self::Notional => "notional",
+            Self::MarketNotional => "market_notional",
+            Self::TrailingOffsetAbove => "trailing_offset_above",
+            Self::TrailingOffsetBelow => "trailing_offset_below",
+        })
     }
 }
 
@@ -1403,6 +1493,78 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_market_notional_is_checked_at_the_reference_price_times_the_quantity() {
+        // A step of 3 that would put 6 off the grid: the step is not used.
+        let rules =
+            OrderRules::default().with_market_notional(ValueRule::new(dec!(5), dec!(10), dec!(3)));
+        let check =
+            |reference, quantity| rules.check_market_notional::<(), ()>(reference, quantity);
+
+        assert_eq!(check(dec!(2), dec!(3)), Ok(()), "6, in range, off the step");
+        assert_eq!(check(dec!(5), dec!(1)), Ok(()), "the minimum is inclusive");
+        assert_eq!(check(dec!(2), dec!(5)), Ok(()), "and so is the maximum");
+        assert_eq!(
+            check(dec!(2), dec!(2.4)),
+            Err(bounds(OrderField::Notional, Bound::Min, dec!(5), dec!(4.8)))
+        );
+        assert_eq!(
+            check(dec!(2), dec!(5.5)),
+            Err(bounds(OrderField::Notional, Bound::Max, dec!(10), dec!(11)))
+        );
+    }
+
+    #[test]
+    fn a_market_notional_beyond_the_decimal_range_is_above_the_maximum_not_a_panic() {
+        let rules =
+            OrderRules::default().with_market_notional(ValueRule::new(dec!(0), dec!(10), dec!(0)));
+
+        assert_eq!(
+            rules.check_market_notional::<(), ()>(Decimal::MAX, dec!(2)),
+            Err(bounds(
+                OrderField::Notional,
+                Bound::Max,
+                dec!(10),
+                Decimal::MAX
+            ))
+        );
+    }
+
+    #[test]
+    fn an_off_market_notional_passes_any_market_order() {
+        assert_eq!(
+            rules().check_market_notional::<(), ()>(dec!(0.0001), dec!(0.001)),
+            Ok(()),
+            "the notional rule alone does not apply to a market order"
+        );
+    }
+
+    #[test]
+    fn by_field_names_each_rule_once_in_order() {
+        let distinct = |n: u32| ValueRule::new(Decimal::from(n), Decimal::ZERO, Decimal::ZERO);
+        let rules = OrderRules::new(distinct(1), distinct(2), distinct(3), distinct(4))
+            .with_market_notional(distinct(5))
+            .with_trailing_offsets(distinct(6), distinct(7));
+
+        let named = rules
+            .by_field()
+            .map(|(field, rule)| (field.to_string(), rule.min));
+
+        assert_eq!(
+            named,
+            [
+                ("price", 1),
+                ("quantity", 2),
+                ("market_quantity", 3),
+                ("notional", 4),
+                ("market_notional", 5),
+                ("trailing_offset_above", 6),
+                ("trailing_offset_below", 7),
+            ]
+            .map(|(name, min)| (name.to_owned(), Some(Decimal::from(min))))
+        );
     }
 
     #[test]

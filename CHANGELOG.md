@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -1 is `Unknown`, 0 `Trading`, 1 `Halted` (regulatory), 2 `Paused` (volatility), delayed data
   included. IB documents 0 as sent only for a contract in a TWS watchlist, so a contract that
   trades normally may report no status at all; IB sends no Limit Up-Limit Down price bands.
+- **IBKR live candles** (`rustrade-data`, `rustrade-instrument`, #1019). `IbkrMarketStream` takes a
+  candle subscription (`IbkrSubscription::candles`, `IbkrCandleRequest`): completed bars only,
+  each emitted once and never revised, stamped with its `close_time`. It asks IB for its historical
+  bars kept up to date, the bars `IbkrHistoricalData::fetch_candles` returns, so that a live candle
+  matches a later history read for that period. A bar counts as complete on IB's update for it
+  after its end, on the first update of a later bar, or `candles::BAR_SETTLE` (2 s) after its end,
+  timed on IB's clock (IB's server time, sampled at connect and every ten minutes, counted forward
+  on the monotonic clock; an offset from the host's clock over 1 s is logged as a warning). An
+  update for a bar already emitted is dropped with a warning. After a reconnect each candle
+  subscription resumes after the last candle the stream yielded, its request reaching back over
+  the gap, deduplicated by bar open. It starts with the bar forming when the stream connects, or at
+  `since`, to continue from a history read. Sizes are 5 seconds to 30 minutes
+  (`IbkrLiveBarSize`), from trades, the midpoint, the bid, the ask or aggregated trades
+  (`IbkrBarSource`). Without a live market data subscription IB sends the history and then code
+  2188, after which no live bar comes, so the subscription ends with
+  `DataError::MarketDataNotAvailable` (`codes::RECENT_HISTORY_NOT_SUBSCRIBED`). Not yet checked
+  against a live subscription: how late IB's closing update comes, and so `BAR_SETTLE`, may change.
+- **`DataError::InvalidSubscription`** (`rustrade-data`). `IbkrMarketStream::init` refuses, before
+  connecting, a subscription built or deserialized past its constructor's check: depth rows
+  outside 1-20, or a candle `since` later than one bar from now.
 
 - **Alpaca trading status and Limit Up-Limit Down bands** (`rustrade-data`, #881). Two new
   subscription kinds read the Alpaca stock feeds' `statuses` and `lulds` channels, on the feed's
@@ -521,6 +541,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     expiry (or until a sell-out check cancels them); one anchor for every option, so classes cut
     off at different offsets, or at one time of day whatever their close, cannot be modelled.
 
+- **The simulated venue refuses orders that break an instrument's order rules**
+  (`rustrade-execution`, #1023).
+  - **New `MockExecutionConfig::order_rules: BTreeMap<InstrumentNameExchange, OrderRules>`**,
+    opt-in and empty by default, set with `with_order_rules(instrument, rules)` or
+    `with_order_rules_from(map)`, which takes the map a live client's `load_rules` returns or one
+    built by hand. An instrument with no entry is not checked. Rules are never derived from an
+    instrument's spec. `SimulatedVenue::order_rules(instrument)` reads them back.
+  - **What is refused, never rounded,** with the error a live client loading the same rules
+    returns (`OrderError::InvalidPrecision` / `OrderError::OutOfBounds`): on arrival, everything
+    `OrderRules::check` checks, and a market order's notional at the price the venue's fill model
+    gives before slippage, times the quantity asked for; an amend, a client's or
+    `modify_externally`'s, on the whole order as amended, except an external amend to no more
+    than has filled, which ends the order. No exemption for a closing order.
+  - **A held market order** (`MarketOrderTiming::NextBar`, or `StaleMarketPolicy::Wait` on a stale
+    market) has its notional checked at release, at the release price. One that breaks the rule
+    releases its hold and ends as `InactiveOrderState::OpenFailed` with the same
+    `OrderError::OutOfBounds`, which an order-state lookup reports too.
+  - **New `OrderRules::check_market_notional(reference_price, quantity)`**, the market-notional
+    check for any caller holding a price it trusts, returning the same typed `OutOfBounds`.
+    `ValueRule` and `OrderRules` now derive `PartialOrd` and `Ord`.
+  - **Building or restoring the venue refuses** rules for an instrument it does not trade, and a
+    rule whose minimum is above its maximum: new `VenueConfigError::OrderRules` /
+    `VenueRestoreError::OrderRules` carrying `InvalidOrderRules` (`UnknownInstrument`,
+    `MinAboveMax` naming an `OrderRulesField`).
+  - **Known limitations:** rules are fixed for the venue's life (a live client reloads them); the
+    market notional is measured at the venue's own unslipped price, not the live venue's reference
+    price; filters `OrderRules` has no field for are not enforced; a split does not restate the
+    rules; orders seeded through `initial_state` are not checked.
+
 - **`AlpacaClient::fetch_options_late_close_underlyings`** (`rustrade-execution`, `alpaca`
   feature, #1017): the symbols of the underlyings whose options close at 16:15 ET instead of
   16:00 ET (13:15 instead of 13:00 on an early close), sorted, read from the assets Alpaca marks
@@ -667,6 +716,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `IbkrSubscriptionKind` is `#[non_exhaustive]` and no longer `Copy`**
+  (`rustrade-data`, #1019). It gains `Candles(IbkrCandleRequest)`; a `match` on it needs a
+  wildcard arm, and a copy of it a `.clone()`. It also derives `PartialEq` and `Eq`.
 - **Breaking: `rustrade::logging::AuditSpanFilter` is renamed `ReplicaLogFilter`** (`rustrade`).
   It no longer looks at a span: it drops the log lines a `StateReplicaManager` repeats while it
   updates its replica (see Fixed). There is no deprecated alias: replace `AuditSpanFilter` with
@@ -1188,6 +1240,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
+- **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
+  cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
+  id among the filled, expired and refused orders too, so the message now says "among its orders".
 - **IBKR `fetch_shortability` ends at once on a competing live session** (`rustrade-execution`,
   `rustrade-instrument`). IB's notice 10197, no market data on a paper account while the same
   user is logged in to a live session elsewhere, was gathered like any other notice, so the read
@@ -1343,6 +1398,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** `hyperliquid::common::OpenOrder` has a new field, `terms` (the new
     `OrderTerms`: `order_type`, `trigger_condition`, `tif`, `trigger_px`), and both are
     `#[non_exhaustive]`: they are parsed from the venue, not built.
+
+- **`url` 2.5.9, and the Massive client refuses a non-http(s) `next_url`** (`rustrade-data`,
+  feature `massive`). `url` 2.5.8 carried RUSTSEC-2026-0592: `Url::origin()` recursed once per
+  nested `blob:` prefix, so a long enough URL overflowed the stack and aborted the process. The
+  Massive REST client calls it on the `next_url` a server returns while paginating, so a hostile
+  or compromised server could crash the program. The workspace now requires `url` 2.5.9 (with
+  `form_urlencoded` 1.2.3, which it needs), so a downstream lock file moves to `url` 2.5.9 or
+  later, and the client refuses any `next_url` whose scheme is
+  not http or https before resolving its origin, with `MassiveError::UntrustedNextUrl`. That
+  check also refuses a `blob:` URL wrapping the API's own address, whose origin matched the
+  client's before. `url` 2.5.9 also follows the URL Standard more closely: a `^` in a path is now
+  percent-encoded, and a `blob:` URL whose inner scheme is not http, https or file has an opaque
+  origin.
 
 - **`Cargo.lock` takes `quinn-udp` 0.5.16.** 0.5.14 carried RUSTSEC-2026-0538: on OpenBSD,
   NetBSD, Solaris, illumos and Apple platforms without `fast-apple-datapath`, a datagram larger

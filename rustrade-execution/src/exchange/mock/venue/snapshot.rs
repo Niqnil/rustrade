@@ -3,7 +3,7 @@
 use super::price_window::PriceWindow;
 use super::{
     NetPosition, SimulatedVenue, VenueRegime,
-    config::{self, AssetSpelledTwice, ExpiryRuleUnplaceable},
+    config::{self, AssetSpelledTwice, ExpiryRuleUnplaceable, InvalidOrderRules},
     liquidation::LiquidationState,
 };
 use crate::{
@@ -275,6 +275,11 @@ pub enum VenueRestoreError {
     /// option the venue lists, as [`try_new`](SimulatedVenue::try_new) refuses.
     #[error(transparent)]
     ExpiryRule(#[from] ExpiryRuleUnplaceable),
+
+    /// An entry of the configuration's [`order_rules`](MockExecutionConfig::order_rules) cannot
+    /// be enforced as given, as [`try_new`](SimulatedVenue::try_new) refuses.
+    #[error(transparent)]
+    OrderRules(#[from] InvalidOrderRules),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -430,6 +435,10 @@ impl SimulatedVenue {
     /// [`with_margin_interest`](Self::with_margin_interest), which then charge from the recorded
     /// instant.
     ///
+    /// The snapshot holds no configuration, so the restored venue checks orders against
+    /// `config`'s [`order_rules`](MockExecutionConfig::order_rules), whatever the snapshot's venue
+    /// checked them against.
+    ///
     /// # Errors
     /// - [`VenueRestoreError::UnsupportedVersion`] for a snapshot in another format version.
     /// - [`VenueRestoreError::ExchangeMismatch`] if `config` simulates another exchange.
@@ -440,7 +449,7 @@ impl SimulatedVenue {
     /// - [`VenueRestoreError::MarginMismatch`] if the snapshot is of a margin account and `config`
     ///   sets no `spot_margin`, or the other way round.
     /// - [`VenueRestoreError::DuplicateOrder`] if the snapshot lists one order id twice among its
-    ///   open orders, or among its cancelled, filled or expired ones.
+    ///   open orders, or among its cancelled, filled, expired or refused ones.
     /// - [`VenueRestoreError::DuplicateInstrument`] or [`VenueRestoreError::DuplicateAsset`] if it
     ///   lists one instrument or asset twice in a list that holds each once.
     /// - [`VenueRestoreError::RestatedStrikeOfNonOption`] if it records a restated strike for an
@@ -455,6 +464,8 @@ impl SimulatedVenue {
     ///   own.
     /// - [`VenueRestoreError::ExpiryRule`] if `config`'s expiry sell-out or expiry-day cutoff
     ///   cannot be placed for an option, as [`try_new`](Self::try_new) refuses.
+    /// - [`VenueRestoreError::OrderRules`] if `config`'s order rules cannot be enforced, as
+    ///   [`try_new`](Self::try_new) refuses.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -548,6 +559,7 @@ impl SimulatedVenue {
                 .balance_assets()
                 .chain(snapshot.reported_debt.iter().map(|(asset, _)| asset)),
         ))?;
+        config::check_order_rules(&config.order_rules, &instruments)?;
         if let Some((short, _)) = snapshot.positions.iter().find(|(name, position)| {
             matches!(
                 &instruments[name].kind,

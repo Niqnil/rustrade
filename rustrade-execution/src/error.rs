@@ -614,7 +614,9 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     UnsupportedOrderType(String),
 
     /// A quantity or price in the request has more precision than the venue accepts, so the
-    /// client refused it without sending it.
+    /// client refused it without sending it, or a
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) given the instrument's
+    /// [`OrderRules`](crate::rules::OrderRules) refused it as the venue would.
     ///
     /// Non-transient — change the request. A client that refuses this way never rounds a value
     /// itself, because rounding would place a different order than the one requested; it
@@ -623,7 +625,9 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     InvalidPrecision(PrecisionViolation),
 
     /// A value in the request is outside the range the venue accepts for the instrument, so the
-    /// client refused it without sending it.
+    /// client refused it without sending it, or a
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) given the instrument's
+    /// [`OrderRules`](crate::rules::OrderRules) refused it as the venue would.
     ///
     /// Non-transient — change the request. Unlike [`InvalidPrecision`](Self::InvalidPrecision),
     /// which says a value is badly formed, this says a well-formed value is too small or too
@@ -853,7 +857,9 @@ pub struct BoundsViolation {
     pub bound: Bound,
     /// The limit `value` broke.
     pub limit: Decimal,
-    /// The value as requested. For [`OrderField::Notional`] it is the price times the quantity.
+    /// The value as requested. For [`OrderField::Notional`] it is the price times the quantity:
+    /// for a market order, which has no price, the reference price it was measured at (see
+    /// [`OrderRules::check_market_notional`](crate::rules::OrderRules::check_market_notional)).
     pub value: Decimal,
 }
 
