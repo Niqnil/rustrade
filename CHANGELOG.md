@@ -1297,6 +1297,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `OrderTerms`: `order_type`, `trigger_condition`, `tif`, `trigger_px`), and both are
     `#[non_exhaustive]`: they are parsed from the venue, not built.
 
+- **`url` 2.5.9, and the Massive client refuses a non-http(s) `next_url`** (`rustrade-data`,
+  feature `massive`). `url` 2.5.8 carried RUSTSEC-2026-0592: `Url::origin()` recursed once per
+  nested `blob:` prefix, so a long enough URL overflowed the stack and aborted the process. The
+  Massive REST client calls it on the `next_url` a server returns while paginating, so a hostile
+  or compromised server could crash the program. The workspace now requires `url` 2.5.9 (with
+  `form_urlencoded` 1.2.3, which it needs), so a downstream lock file moves to `url` 2.5.9 or
+  later, and the client refuses any `next_url` whose scheme is
+  not http or https before resolving its origin, with `MassiveError::UntrustedNextUrl`. That
+  check also refuses a `blob:` URL wrapping the API's own address, whose origin matched the
+  client's before. `url` 2.5.9 also follows the URL Standard more closely: a `^` in a path is now
+  percent-encoded, and a `blob:` URL whose inner scheme is not http, https or file has an opaque
+  origin.
+
 - **`Cargo.lock` takes `quinn-udp` 0.5.16.** 0.5.14 carried RUSTSEC-2026-0538: on OpenBSD,
   NetBSD, Solaris, illumos and Apple platforms without `fast-apple-datapath`, a datagram larger
   than the receive buffer left the receive loop spinning instead of returning `WouldBlock`, until
