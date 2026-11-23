@@ -1074,7 +1074,7 @@ pub struct Lending {
 /// which order it holds, silently.
 ///
 /// Also what restoring an [`AccountStateSnapshot`] that lists one id twice among its open orders,
-/// or twice among its cancelled, filled or expired ones, returns.
+/// or twice among its cancelled, filled, expired or refused ones, returns.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("account snapshot lists {0} more than once among its open and cancelled orders")]
 pub struct DuplicateSeededOrder(pub ClientOrderId);
@@ -1170,7 +1170,7 @@ impl AccountState {
     ///
     /// # Errors
     /// [`DuplicateSeededOrder`] if `snapshot` lists one [`ClientOrderId`] twice among its open
-    /// orders, or twice among its cancelled, its filled or its expired orders.
+    /// orders, or twice among its cancelled, its filled, its expired or its refused orders.
     pub fn from_snapshot(snapshot: AccountStateSnapshot) -> Result<Self, DuplicateSeededOrder> {
         fn by_id<State>(
             orders: Vec<Order<ExchangeId, InstrumentNameExchange, State>>,

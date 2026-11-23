@@ -379,6 +379,145 @@ fn a_snapshot_whose_refused_order_names_an_unknown_instrument_is_refused() {
     );
 }
 
+/// A cancel for a refused order is refused as one for an order the venue does not hold: the
+/// venue has no typed "already refused" answer, as it has for a filled, cancelled or expired one.
+#[test]
+fn a_cancel_for_a_refused_order_is_refused_as_for_one_not_held() {
+    let mut venue = holding_under(notional_at_least_150());
+    let held = venue.open_order(ioc_buy("held", "1"));
+    let _ = feed_bar(&mut venue, 2, ohlc("140", "145", "135", "142"));
+
+    let outcome = venue.cancel_order(OrderRequestCancel {
+        key: held.response.key.clone(),
+        state: RequestCancel { id: None },
+    });
+
+    assert!(outcome.events.is_empty(), "{:?}", outcome.events);
+    assert_eq!(
+        outcome.response.state,
+        Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            "SimulatedVenue is not holding an open order with held".to_owned()
+        )))
+    );
+}
+
+/// A market order held on a stale market under [`StaleMarketPolicy::Wait`] is checked when the
+/// next fresh observation releases it, as one held for the next bar is.
+#[test]
+fn a_market_order_waiting_out_a_stale_market_is_refused_at_its_release() {
+    let config = spot_config("10", "10000", FeeModelConfig::default())
+        .with_stale_market(StaleMarketPolicy::Wait {
+            max_age: Duration::from_secs(10),
+        })
+        .with_order_rules(instrument_name(), notional_at_least_150());
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(observe(&mut venue, 1, traded("100")).is_empty());
+    advance(&mut venue, time(12));
+    let held = venue.open_order(gtc_buy("waiting", "1"));
+    assert!(rested_open(&held).filled_quantity.is_zero());
+    assert_eq!(free_quote(&venue), d("9900"));
+
+    let events = observe(&mut venue, 20, traded("140"));
+
+    let [released, ended] = events.as_slice() else {
+        panic!("the released hold, then the order: {events:?}");
+    };
+    assert_eq!(balance_of(released).balance.free, d("10000"));
+    assert_eq!(
+        order_of(ended).state,
+        OrderState::Inactive(InactiveOrderState::OpenFailed(out_of_bounds(
+            OrderField::Notional,
+            Bound::Min,
+            "150",
+            "140"
+        )))
+    );
+    assert!(venue.trades(time(0)).is_empty());
+}
+
+/// Of two orders one bar releases, the one that breaks the rule is refused and the other fills,
+/// each reported in full in the order they arrived.
+#[test]
+fn a_refused_held_order_leaves_the_next_in_its_batch_to_fill() {
+    let mut venue = holding_under(notional_at_least_150());
+    let _ = venue.open_order(ioc_buy("small", "1"));
+    let _ = venue.open_order(ioc_buy("large", "2"));
+    assert_eq!(free_quote(&venue), d("99700"));
+
+    let events = feed_bar(&mut venue, 2, ohlc("140", "145", "135", "142"));
+
+    assert_eq!(events.len(), 6, "{events:?}");
+    assert_eq!(balance_of(&events[0]).balance.free, d("99800"));
+    assert_eq!(order_of(&events[1]).key.cid, ClientOrderId::new("small"));
+    assert!(matches!(
+        order_of(&events[1]).state,
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::OutOfBounds(_)))
+    ));
+    assert_eq!(trade_of(&events[4]).price, d("140"));
+    assert_eq!(trade_of(&events[4]).quantity, d("2"));
+    assert_eq!(order_of(&events[5]).key.cid, ClientOrderId::new("large"));
+    assert!(matches!(
+        order_of(&events[5]).state,
+        OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+    ));
+}
+
+/// A held margin order refused at its release reports the interest its loan was charged, as a
+/// held order cancelled unfilled does: the released hold, the charge, then the order.
+#[test]
+fn a_refused_held_margin_order_reports_its_interest_before_its_refusal() {
+    let config = margin_config("0", "100", "2")
+        .with_market_order_timing(MarketOrderTiming::NextBar(NextBarPrice::Open))
+        .with_order_rules(
+            instrument_name(),
+            OrderRules::default().with_market_notional(ValueRule::new(d("200"), d("0"), d("0"))),
+        );
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
+        .with_margin_interest(Arc::new(hourly_interest(quote())));
+    advance(&mut venue, time(1));
+    assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
+    // 150 at the close of 100: 50 borrowed, charged 0.005, held for the next bar.
+    let outcome = venue.open_order(market_order(
+        "held",
+        Side::Buy,
+        "1.5",
+        TimeInForce::ImmediateOrCancel,
+    ));
+    assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+    let held_id = rested_id(&outcome);
+
+    let events = feed_bar(&mut venue, 2, ohlc("100", "100", "100", "100"));
+    let events = sans_debt(&events);
+
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(
+        *cash_flow_of(events[1]),
+        lent(
+            interest_flow(
+                quote(),
+                "50",
+                "0.005",
+                time(2),
+                InterestTiming::OnBorrow,
+                "0"
+            ),
+            time(1),
+            &held_id,
+            "held"
+        )
+    );
+    assert_eq!(
+        order_of(events[2]).state,
+        OrderState::Inactive(InactiveOrderState::OpenFailed(out_of_bounds(
+            OrderField::Notional,
+            Bound::Min,
+            "200",
+            "150"
+        )))
+    );
+}
+
 // --- Amends ------------------------------------------------------------------------------------
 
 /// A venue under `rules()` resting a buy of 1 at 90 under `resting`, the market last at 100.

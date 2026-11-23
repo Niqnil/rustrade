@@ -502,7 +502,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     returns (`OrderError::InvalidPrecision` / `OrderError::OutOfBounds`): on arrival, everything
     `OrderRules::check` checks, and a market order's notional at the price the venue's fill model
     gives before slippage, times the quantity asked for; an amend, a client's or
-    `modify_externally`'s, on the whole order as amended. No exemption for a closing order.
+    `modify_externally`'s, on the whole order as amended, except an external amend to no more
+    than has filled, which ends the order. No exemption for a closing order.
   - **A held market order** (`MarketOrderTiming::NextBar`, or `StaleMarketPolicy::Wait` on a stale
     market) has its notional checked at release, at the release price. One that breaks the rule
     releases its hold and ends as `InactiveOrderState::OpenFailed` with the same

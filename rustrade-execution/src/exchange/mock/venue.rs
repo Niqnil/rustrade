@@ -836,10 +836,14 @@ pub enum VenueRegime {
 ///   [`StaleMarketPolicy::Wait`]) has its notional checked when it is released, at the price it
 ///   is released at. One that breaks the rule then ends as
 ///   [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed) with the same
-///   [`OrderError::OutOfBounds`], after its reservation is released: a balance event, then the
-///   order. The rest of it was checked on arrival.
+///   [`OrderError::OutOfBounds`], after its reservation is released: a balance event, any interest
+///   a loan for it was charged, then the order, as when a held order is cancelled unfilled. The
+///   rest of it was checked on arrival. A later cancel for it is refused as one for an order this
+///   venue does not hold.
 /// - **An amend**, a client's or an [external](Self::modify_externally) one, is checked by
-///   [`OrderRules::check`] on the whole order as amended, and refused with the same errors.
+///   [`OrderRules::check`] on the whole order as amended, and refused with the same errors. An
+///   external amend to no more than the order has filled is not checked: it ends the order rather
+///   than leaving one on the book.
 /// - **No exemption for a closing order**: a venue that enforces a minimum enforces it on a close.
 ///
 /// Known differences from a live venue:

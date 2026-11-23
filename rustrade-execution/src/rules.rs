@@ -511,20 +511,25 @@ impl OrderRules {
 
     /// Each rule of these rules, with which one it is.
     pub(crate) fn by_field(&self) -> [(OrderRulesField, &ValueRule); 7] {
+        // Destructured without `..`, so a rule added to the struct fails to compile here until it
+        // is listed, rather than escaping the validation built on this.
+        let Self {
+            price,
+            quantity,
+            market_quantity,
+            notional,
+            market_notional,
+            trailing_offset_above,
+            trailing_offset_below,
+        } = self;
         [
-            (OrderRulesField::Price, &self.price),
-            (OrderRulesField::Quantity, &self.quantity),
-            (OrderRulesField::MarketQuantity, &self.market_quantity),
-            (OrderRulesField::Notional, &self.notional),
-            (OrderRulesField::MarketNotional, &self.market_notional),
-            (
-                OrderRulesField::TrailingOffsetAbove,
-                &self.trailing_offset_above,
-            ),
-            (
-                OrderRulesField::TrailingOffsetBelow,
-                &self.trailing_offset_below,
-            ),
+            (OrderRulesField::Price, price),
+            (OrderRulesField::Quantity, quantity),
+            (OrderRulesField::MarketQuantity, market_quantity),
+            (OrderRulesField::Notional, notional),
+            (OrderRulesField::MarketNotional, market_notional),
+            (OrderRulesField::TrailingOffsetAbove, trailing_offset_above),
+            (OrderRulesField::TrailingOffsetBelow, trailing_offset_below),
         ]
     }
 
