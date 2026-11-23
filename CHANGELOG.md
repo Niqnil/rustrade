@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IBKR live candles** (`rustrade-data`, `rustrade-instrument`, #1019). `IbkrMarketStream` takes a
+  candle subscription (`IbkrSubscription::candles`, `IbkrCandleRequest`): completed bars only,
+  each emitted once and never revised, stamped with its `close_time`. It asks IB for its historical
+  bars kept up to date, the bars `IbkrHistoricalData::fetch_candles` returns, so that a live candle
+  matches a later history read for that period. A bar counts as complete on IB's update for it
+  after its end, on the first update of a later bar, or `candles::BAR_SETTLE` (2 s) after its end,
+  timed on IB's clock (IB's server time, sampled at connect and every ten minutes, counted forward
+  on the monotonic clock; an offset from the host's clock over 1 s is logged as a warning). An
+  update for a bar already emitted is dropped with a warning. After a reconnect each candle
+  subscription resumes after the last candle the stream yielded, its request reaching back over
+  the gap, deduplicated by bar open. It starts with the bar forming when the stream connects, or at
+  `since`, to continue from a history read. Sizes are 5 seconds to 30 minutes
+  (`IbkrLiveBarSize`), from trades, the midpoint, the bid, the ask or aggregated trades
+  (`IbkrBarSource`). Without a live market data subscription IB sends the history and then code
+  2188, after which no live bar comes, so the subscription ends with
+  `DataError::MarketDataNotAvailable` (`codes::RECENT_HISTORY_NOT_SUBSCRIBED`). Not yet checked
+  against a live subscription: how late IB's closing update comes, and so `BAR_SETTLE`, may change.
+- **`DataError::InvalidSubscription`** (`rustrade-data`). `IbkrMarketStream::init` refuses, before
+  connecting, a subscription built or deserialized past its constructor's check: depth rows
+  outside 1-20, or a candle `since` later than one bar from now.
+
 - **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
   #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`
   string: `DataError::SubscriptionLimitReached` when the account's market data lines (IB code
@@ -666,6 +687,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `IbkrSubscriptionKind` is `#[non_exhaustive]` and no longer `Copy`**
+  (`rustrade-data`, #1019). It gains `Candles(IbkrCandleRequest)`; a `match` on it needs a
+  wildcard arm, and a copy of it a `.clone()`. It also derives `PartialEq` and `Eq`.
 - **Breaking: `rustrade::logging::AuditSpanFilter` is renamed `ReplicaLogFilter`** (`rustrade`).
   It no longer looks at a span: it drops the log lines a `StateReplicaManager` repeats while it
   updates its replica (see Fixed). There is no deprecated alias: replace `AuditSpanFilter` with

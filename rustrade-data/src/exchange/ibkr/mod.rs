@@ -15,6 +15,7 @@
 //! **NOT tested locally (paid subscriptions):**
 //! - Tier 2: L2 Market Depth — exchange-specific fees
 //! - Tier 3: OPRA US Options — paid subscription
+//! - Live candles: they need a real-time market data subscription for the instrument
 //!
 //! Tests are organized by subscription tier (see `ibkr_integration.rs`).
 //!
@@ -42,6 +43,8 @@
 //! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription
 //! - **Depth** ([`OrderBookEvent`]): L2 order book via `market_depth()` subscription
 //! - **Trades** ([`PublicTrade`]): Tick-by-tick trades via `tick_by_tick_all_last()` subscription
+//! - **Candles** ([`Candle`]): completed live bars via IB's historical bars kept up to date; see
+//!   [`candles`](crate::exchange::ibkr::candles)
 //! - **Historical** ([`Candle`]): OHLCV bars via `historical::IbkrHistoricalData`
 //!
 //! # Limitations
@@ -83,6 +86,8 @@
 //! [`reconnect::Event`]: crate::streams::reconnect::Event
 //! [`MarketStreamOptions`]: crate::streams::consumer::MarketStreamOptions
 
+mod bar_assembler;
+pub mod candles;
 pub mod depth;
 // `flex` is private: its public surface is re-exported flat below (matching the `massive`
 // reconciliation module), so callers use a single `ibkr::IbkrFlex*` path rather than the
@@ -90,6 +95,7 @@ pub mod depth;
 mod flex;
 pub mod greeks;
 pub mod historical;
+mod ib_clock;
 pub mod options;
 pub mod quotes;
 pub mod subscription;
@@ -111,6 +117,8 @@ use crate::{
         },
     },
 };
+use bar_assembler::{BarAssembler, Output, ResumePoint};
+use candles::{BAR_SETTLE, IbkrCandleRequest};
 use chrono::{DateTime, Utc};
 use depth::DepthAggregator;
 use futures::{
@@ -118,11 +126,16 @@ use futures::{
     stream::{self, BoxStream},
 };
 use greeks::GreeksAggregator;
+use ib_clock::IbClock;
 use ibapi::{
     Notice, RateLimiter, TRANSPORT_RECONNECT_CODE,
     client::blocking::Client,
     contracts::SecurityType,
-    market_data::{MarketDataType, realtime::MarketDepths},
+    market_data::{
+        MarketDataType, TradingHours,
+        historical::{BarSize, HistoricalBarUpdate},
+        realtime::MarketDepths,
+    },
     subscriptions::SubscriptionItem,
 };
 use quotes::QuoteAggregator;
@@ -134,6 +147,7 @@ use rustrade_instrument::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     num::NonZeroU32,
     ops::ControlFlow,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -311,6 +325,47 @@ impl Default for IbkrStreamConfig {
 /// this stream's messages. Each connection has its own, so a lost connection's requests still
 /// waiting for a slot do not delay the next connection's.
 ///
+/// # Candles
+///
+/// A candle subscription ([`IbkrSubscription::candles`]) yields completed candles only, each once,
+/// with its `close_time` as the event's `time_exchange`; [`candles`] says when a bar counts as
+/// complete. Each candle is meant to equal the one a later history read gives for that period:
+/// both come from IB's historical bar service.
+///
+/// - **Start:** the bar forming when the stream first connects, or
+///   [`since`](IbkrCandleRequest::since).
+/// - **After a reconnect** each candle subscription resumes after the last candle the stream
+///   yielded. Its request reaches back over the gap, the bars IB returns are deduplicated by
+///   open, and a bar that was forming at the loss is emitted once complete. A candle the lost
+///   connection had queued but the stream never yielded is fetched again. IB limits how far back
+///   a request may reach for each bar size, and refuses a gap past it, which ends the
+///   subscription.
+/// - **Bar ends are timed on IB's clock.** IB's server time is sampled when a connection with
+///   candle subscriptions opens, before they are made, and again every ten minutes on a thread of
+///   its own, so that no worker waits on it. It is counted forward on the monotonic clock, so a
+///   step of the host's clock moves no deadline. The bar forming at connect, the default start,
+///   is the one forming on IB's clock. An offset from the host's clock larger than half
+///   of [`BAR_SETTLE`] is logged as a warning, since it points at the host's time
+///   synchronisation. A failed sample keeps the last estimate, and is tried again ten minutes
+///   later. If the first fails, the host's clock stands in until then, the default start
+///   included.
+/// - **Without a live market data subscription** IB sends the history and then 2188, after which
+///   no live bar comes: the subscription ends with [`DataError::MarketDataNotAvailable`].
+///
+/// Known limitations:
+/// - A candle the timer emitted misses an update IB sends for it later than [`BAR_SETTLE`] after
+///   its end. That update is dropped with a warning.
+/// - A bar IB sends with a value that does not convert to a decimal (NaN) is skipped with a
+///   warning, as is one dated out of range.
+/// - IB adjusts its history afterwards, so a later read may differ from a candle emitted live.
+/// - IB counts an identical request for bars of 30 seconds or less within 15 seconds as a pacing
+///   violation, which a reconnect that quick may meet.
+/// - Between candles the subscription is silent for up to a bar plus [`BAR_SETTLE`], and for the
+///   whole closure while the session is closed (overnight and weekends, in regular hours only):
+///   a silence timeout in the [`MarketStreamOptions`] must allow for both.
+/// - Whether a candle subscription takes one of the account's market data lines is not stated by
+///   IB.
+///
 /// # Thread architecture
 ///
 /// Each connection runs one thread per subscription and one watching the connection's global
@@ -366,6 +421,9 @@ where
     ///
     /// The first connection's error:
     /// - [`DataError::SubscriptionsEmpty`] if `subscriptions` is empty.
+    /// - [`DataError::InvalidSubscription`] for the first subscription the stream cannot make:
+    ///   depth rows outside 1-20, or a candle `since` later than one bar from now
+    ///   ([`IbkrCandleRequest::since`]). Nothing is connected.
     /// - [`DataError::Socket`] if the connection to IB fails, the configured market data type
     ///   cannot be sent, or no subscription could be activated (every contract missing from the
     ///   registry).
@@ -389,6 +447,17 @@ where
     ) -> Result<Self, DataError> {
         if subscriptions.is_empty() {
             return Err(DataError::SubscriptionsEmpty);
+        }
+        let now = Utc::now();
+        if let Some((instrument, reason)) = subscriptions
+            .iter()
+            .find_map(|s| Some((&s.instrument, s.kind.refusal(now)?)))
+        {
+            return Err(DataError::InvalidSubscription {
+                exchange: ExchangeId::Ibkr,
+                instrument: instrument.clone(),
+                reason,
+            });
         }
         let shared = Shared::default();
         let backoff = options.reconnect.clone();
@@ -483,7 +552,7 @@ where
 /// watcher exits only after reporting a loss or when the client shuts down: a connection whose
 /// subscriptions have all ended stays open, silent.
 struct Connection<K> {
-    rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
+    rx: mpsc::UnboundedReceiver<Envelope<K>>,
     client: Arc<Client>,
     /// Set by [`close`](Self::close) before it closes the connection, so that a worker or the
     /// watcher can tell this stream's own close from a shutdown `ibapi` or TWS/Gateway caused:
@@ -506,7 +575,63 @@ struct Shared {
     link_down: Arc<AtomicBool>,
     pending_close: PendingClose,
     quick_ends: Arc<parking_lot::Mutex<QuickEnds>>,
+    /// Each candle subscription's [`ResumePoint`], by its index in the stream's subscriptions:
+    /// set to its start when it is first made, and to a candle's open when the stream yields that
+    /// candle. A connection made after a loss resumes each from here, so that a candle the lost
+    /// connection had queued but the stream never yielded is fetched again rather than skipped.
+    candle_resume: Arc<parking_lot::Mutex<HashMap<usize, ResumePoint>>>,
 }
+
+impl Shared {
+    /// The item `envelope` carries, as the stream yields it, recording the resume point a candle
+    /// delivers.
+    fn yield_item<K>(&self, envelope: Envelope<K>) -> Result<MarketEvent<K, DataKind>, DataError> {
+        if let Some((index, open)) = envelope.delivers {
+            self.candle_resume
+                .lock()
+                .insert(index, ResumePoint::After(open));
+        }
+        envelope.item
+    }
+
+    /// Where the candle subscription `index` making `request` starts or resumes: its resume point,
+    /// set first to `request.since`, or else the open of the bar forming at `now`.
+    fn candle_resume_point(
+        &self,
+        index: usize,
+        request: &IbkrCandleRequest,
+        now: DateTime<Utc>,
+    ) -> ResumePoint {
+        *self.candle_resume.lock().entry(index).or_insert_with(|| {
+            ResumePoint::From(
+                request
+                    .since
+                    .unwrap_or_else(|| request.bar_size.bar_open(now)),
+            )
+        })
+    }
+}
+
+/// What a connection's workers and watcher send to it: an item for the stream, and for a candle,
+/// what yielding it delivers.
+struct Envelope<K> {
+    item: Result<MarketEvent<K, DataKind>, DataError>,
+    /// For a candle: its subscription's index and its open, which become that subscription's
+    /// resume point ([`Shared::candle_resume`]) once the stream yields it.
+    delivers: Option<(usize, DateTime<Utc>)>,
+}
+
+impl<K> From<Result<MarketEvent<K, DataKind>, DataError>> for Envelope<K> {
+    fn from(item: Result<MarketEvent<K, DataKind>, DataError>) -> Self {
+        Self {
+            item,
+            delivers: None,
+        }
+    }
+}
+
+/// The sending end of a connection's channel.
+type Sender<K> = mpsc::UnboundedSender<Envelope<K>>;
 
 /// A connection that ends sooner than this after it opened counts as a quick end; see
 /// [`QuickEnds`].
@@ -613,7 +738,8 @@ impl<K> futures::Stream for Connection<K> {
     type Item = Result<MarketEvent<K, DataKind>, DataError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_recv(cx)
+        let envelope = std::task::ready!(Pin::new(&mut self.rx).poll_recv(cx));
+        Poll::Ready(envelope.map(|envelope| self.shared.yield_item(envelope)))
     }
 }
 
@@ -676,13 +802,25 @@ where
             .map_err(|e| DataError::Socket(format!("Failed to spawn IB notice thread: {e}")))?;
 
         let mut active_subscriptions = 0;
+        // IB's time for the connection's candle subscriptions, sampled before any is made, so that
+        // each starts on IB's time and no worker waits on the sample.
+        let clock = Arc::new(IbClock::new(BAR_SETTLE));
+        if subscriptions
+            .iter()
+            .any(|s| matches!(s.kind, IbkrSubscriptionKind::Candles(_)))
+        {
+            clock.sync(|| server_time(&connection.client));
+        }
 
         // Spawn a worker thread for each subscription
-        for IbkrSubscription {
-            instrument,
-            key,
-            kind,
-        } in subscriptions
+        for (
+            index,
+            IbkrSubscription {
+                instrument,
+                key,
+                kind,
+            },
+        ) in subscriptions.into_iter().enumerate()
         {
             let contract = match contracts.get_contract(&instrument) {
                 Some(c) => c,
@@ -715,6 +853,16 @@ where
                 }
                 IbkrSubscriptionKind::OptionGreeks => {
                     Self::run_option_greeks_subscription(client, contract, worker("option Greeks"))
+                }
+                IbkrSubscriptionKind::Candles(request) => {
+                    let resume = shared.candle_resume_point(index, &request, clock.now());
+                    let job = CandleJob {
+                        request,
+                        index,
+                        resume,
+                        clock: clock.clone(),
+                    };
+                    Self::run_candles_subscription(client, contract, job, worker("candles"))
                 }
             };
 
@@ -919,6 +1067,128 @@ where
     }
 }
 
+impl<K> Connection<K>
+where
+    K: Clone + Send + 'static,
+{
+    /// Run a candle subscription: a keepUpToDate bar request reaching back to `job.resume`, its
+    /// bars passed through a [`BarAssembler`] timed on IB's clock, and each completed bar sent as
+    /// a candle.
+    ///
+    /// 2188 ends it with [`DataError::MarketDataNotAvailable`]: IB keeps the request open but sends
+    /// no live bar after it.
+    fn run_candles_subscription(
+        client: Arc<Client>,
+        contract: ibapi::contracts::Contract,
+        job: CandleJob,
+        worker: Worker<K>,
+    ) -> Result<(), DataError> {
+        worker.spawn(move |worker| {
+            let CandleJob {
+                request,
+                index,
+                resume,
+                clock,
+            } = job;
+            let bar_size = BarSize::from(request.bar_size);
+            let step = request.bar_size.duration();
+            let ib_now = || clock.now();
+            let duration =
+                candles::history_duration(resume.first_open(step), ib_now(), request.bar_size);
+            let trading_hours = if request.regular_trading_hours_only {
+                TradingHours::Regular
+            } else {
+                TradingHours::Extended
+            };
+            let sub = match client
+                .historical_data(&contract, bar_size)
+                .what_to_show(request.source.into())
+                .duration(duration)
+                .trading_hours(trading_hours)
+                .stream()
+            {
+                Ok(s) => s,
+                Err(e) => return worker.fail(e),
+            };
+            debug!(instrument = %worker.instrument, ?resume, %duration, "Candle subscription made");
+
+            let mut assembler = BarAssembler::new(step, BAR_SETTLE, resume);
+            let mut out = Vec::new();
+            loop {
+                let resync_client = client.clone();
+                clock.resync(move || server_time(&resync_client));
+                let wait = assembler
+                    .next_deadline()
+                    .map_or(CANDLE_IDLE_WAIT, |deadline| {
+                        deadline
+                            .signed_duration_since(ib_now())
+                            .to_std()
+                            .unwrap_or(std::time::Duration::ZERO)
+                            .min(CANDLE_IDLE_WAIT)
+                    });
+                // What IB has already sent comes first: a wait at or near zero returns without
+                // looking, which would run a due timer ahead of a queued closing update.
+                let item = match sub.try_next() {
+                    Some(item) => Some(item),
+                    None if wait.is_zero() || sub.is_terminated() => None,
+                    None => sub.next_timeout(wait),
+                };
+                let now = ib_now();
+                match item {
+                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
+                        let bars = data.bars.into_iter().filter_map(|bar| worker.dated(bar));
+                        assembler.on_history(bars, now, &mut out);
+                    }
+                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) => {
+                        if let Some((open, bar)) = worker.dated(bar) {
+                            assembler.on_update(open, bar, now, &mut out);
+                        }
+                    }
+                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::End { .. }))) => {}
+                    Some(Ok(SubscriptionItem::Notice(notice))) => {
+                        if worker.candle_notice(&notice).is_break() {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        worker.fail(e);
+                        break;
+                    }
+                    None if sub.is_terminated() => break,
+                    None => assembler.on_tick(now, &mut out),
+                }
+                if worker.deliver(index, bar_size, &mut out).is_break() {
+                    break;
+                }
+            }
+        })
+    }
+}
+
+/// How long a candle worker waits for IB when no bar is forming before it looks again. It need not
+/// be short: a close or a lost connection ends the subscription, which wakes the wait at once, and
+/// a dropped stream is seen at the next candle sent.
+const CANDLE_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a candle worker needs besides its contract and [`Worker`].
+struct CandleJob {
+    request: IbkrCandleRequest,
+    /// The subscription's index in the stream's subscriptions: its key in
+    /// [`Shared::candle_resume`].
+    index: usize,
+    /// Where the subscription starts or resumes.
+    resume: ResumePoint,
+    /// IB's time for the connection.
+    clock: Arc<IbClock>,
+}
+
+/// IB's server time to the millisecond, as a sample for the [`IbClock`].
+fn server_time(client: &Client) -> Result<DateTime<Utc>, String> {
+    let time = client.server_time_millis().map_err(|e| e.to_string())?;
+    DateTime::from_timestamp(time.unix_timestamp(), time.nanosecond())
+        .ok_or_else(|| format!("IB server time {time} out of range"))
+}
+
 impl<K> Connection<K> {
     /// Close the connection, which ends every worker's subscription and the notice watcher, with
     /// nothing reported for it. Returns at once: the close runs on a thread of its own
@@ -944,7 +1214,7 @@ impl<K> Drop for Connection<K> {
 /// Watches one connection's global notices (those with no request ID), and reports the
 /// connection lost when a notice says so, or when the notices end because the client shut down.
 struct NoticeWatcher<K> {
-    tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+    tx: Sender<K>,
     /// The connection's close flag; see [`Connection::close`].
     closing: Arc<AtomicBool>,
     /// The stream's view of TWS/Gateway's link to IB; see [`link_notice`].
@@ -977,10 +1247,13 @@ impl<K> NoticeWatcher<K> {
             return;
         }
         warn!(%reason, "IB market data connection lost");
-        let _ = self.tx.send(Err(DataError::ConnectionLost {
-            exchange: ExchangeId::Ibkr,
-            reason,
-        }));
+        let _ = self.tx.send(
+            Err(DataError::ConnectionLost {
+                exchange: ExchangeId::Ibkr,
+                reason,
+            })
+            .into(),
+        );
     }
 }
 
@@ -1029,7 +1302,7 @@ struct Worker<K> {
     instrument: InstrumentNameExchange,
     /// The key the caller gave the subscription, put on each event.
     key: K,
-    tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+    tx: Sender<K>,
     /// The connection's close flag; see [`Connection::close`].
     closing: Arc<AtomicBool>,
 }
@@ -1058,10 +1331,13 @@ where
                             .or_else(|| panic_info.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "unknown panic".to_string());
                         error!(instrument = %self.instrument, "{stage} worker panicked: {msg}");
-                        let _ = self.tx.send(Err(DataError::Socket(format!(
-                            "{stage} subscription {} panicked: {msg}",
-                            self.instrument
-                        ))));
+                        let _ = self.tx.send(
+                            Err(DataError::Socket(format!(
+                                "{stage} subscription {} panicked: {msg}",
+                                self.instrument
+                            )))
+                            .into(),
+                        );
                     }
                 }
             })
@@ -1076,6 +1352,16 @@ where
         time_received: DateTime<Utc>,
         kind: DataKind,
     ) -> ControlFlow<()> {
+        self.send_envelope(time_exchange, time_received, kind, None)
+    }
+
+    fn send_envelope(
+        &self,
+        time_exchange: DateTime<Utc>,
+        time_received: DateTime<Utc>,
+        kind: DataKind,
+        delivers: Option<(usize, DateTime<Utc>)>,
+    ) -> ControlFlow<()> {
         let event = MarketEvent {
             time_exchange,
             time_received,
@@ -1083,9 +1369,63 @@ where
             instrument: self.key.clone(),
             kind,
         };
-        match self.tx.send(Ok(event)) {
+        match self.tx.send(Envelope {
+            item: Ok(event),
+            delivers,
+        }) {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
+        }
+    }
+
+    /// Send each completed bar in `out` as a candle of `bar_size`, stamped with its
+    /// `close_time`, which sets the candle subscription `index`'s resume point once the stream
+    /// yields it; warn of each late update. Drains `out`; `Break` once the stream has been dropped.
+    ///
+    /// A bar that does not convert (a price IB sent as NaN, say) is skipped with a warning.
+    fn deliver(
+        &self,
+        index: usize,
+        bar_size: BarSize,
+        out: &mut Vec<Output<ibapi::market_data::historical::Bar>>,
+    ) -> ControlFlow<()> {
+        for output in out.drain(..) {
+            match output {
+                Output::Final { open, bar } => match historical::bar_to_candle(&bar, bar_size) {
+                    Ok(candle) => {
+                        let close_time = candle.close_time;
+                        let kind = DataKind::Candle(candle);
+                        let delivers = Some((index, open));
+                        if self
+                            .send_envelope(close_time, Utc::now(), kind, delivers)
+                            .is_break()
+                        {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    Err(error) => {
+                        warn!(instrument = %self.instrument, %open, %error, "Skipping a candle IB sent with a value that does not convert");
+                    }
+                },
+                Output::Late { open } => {
+                    warn!(instrument = %self.instrument, %open, "Dropping an update for a candle already emitted, or older than the one forming; that candle went out without it");
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// `bar` with its open, or `None` with a warning if its time is out of range.
+    fn dated(
+        &self,
+        bar: ibapi::market_data::historical::Bar,
+    ) -> Option<(DateTime<Utc>, ibapi::market_data::historical::Bar)> {
+        match historical::bar_open_time(&bar) {
+            Ok(open) => Some((open, bar)),
+            Err(error) => {
+                warn!(instrument = %self.instrument, %error, "Skipping a bar IB sent with a time out of range");
+                None
+            }
         }
     }
 
@@ -1112,7 +1452,7 @@ where
             error!(instrument = %self.instrument, error = %error, "{stage} subscription failed");
             subscription_error(stage, &self.instrument, error)
         };
-        let _ = self.tx.send(Err(item));
+        let _ = self.tx.send(Err(item).into());
     }
 
     /// Act on a notice IB sent for this subscription without ending it: `Break` after sending a
@@ -1120,9 +1460,7 @@ where
     /// way); otherwise log it and `Continue`.
     fn notice(&self, notice: &Notice) -> ControlFlow<()> {
         if let Some(error) = notice_error(&self.instrument, notice) {
-            let stage = self.stage;
-            error!(instrument = %self.instrument, code = notice.code, message = %notice.message, "{stage} subscription refused");
-            let _ = self.tx.send(Err(error));
+            self.refuse(notice, error);
             return ControlFlow::Break(());
         }
         warn!(
@@ -1133,6 +1471,29 @@ where
             self.stage
         );
         ControlFlow::Continue(())
+    }
+
+    /// [`notice`](Self::notice) for a candle subscription, which 2188 also ends, with a
+    /// [`DataError::MarketDataNotAvailable`]: IB keeps the request open but sends no live bar.
+    fn candle_notice(&self, notice: &Notice) -> ControlFlow<()> {
+        if notice.code == codes::RECENT_HISTORY_NOT_SUBSCRIBED {
+            let error = DataError::MarketDataNotAvailable {
+                exchange: ExchangeId::Ibkr,
+                instrument: self.instrument.clone(),
+                code: notice.code,
+                message: notice.message.clone(),
+            };
+            self.refuse(notice, error);
+            return ControlFlow::Break(());
+        }
+        self.notice(notice)
+    }
+
+    /// End the worker on `notice`, which refuses the subscription: log it, and send `error`.
+    fn refuse(&self, notice: &Notice, error: DataError) {
+        let stage = self.stage;
+        error!(instrument = %self.instrument, code = notice.code, message = %notice.message, "{stage} subscription refused");
+        let _ = self.tx.send(Err(error).into());
     }
 }
 
@@ -1212,14 +1573,24 @@ pub(crate) fn decimal_from_f64(value: f64) -> Option<Decimal> {
 mod tests {
     use super::*;
 
+    /// The receiving end of a connection's channel, reading the items alone.
+    struct Items(mpsc::UnboundedReceiver<Envelope<()>>);
+
+    impl Items {
+        fn try_recv(
+            &mut self,
+        ) -> Result<Result<MarketEvent<(), DataKind>, DataError>, mpsc::error::TryRecvError>
+        {
+            self.0.try_recv().map(|envelope| envelope.item)
+        }
+
+        async fn recv(&mut self) -> Option<Result<MarketEvent<(), DataKind>, DataError>> {
+            self.0.recv().await.map(|envelope| envelope.item)
+        }
+    }
+
     /// A quotes worker for `instrument`, and the stream's receiving end.
-    fn worker(
-        instrument: &str,
-        closing: bool,
-    ) -> (
-        Worker<()>,
-        mpsc::UnboundedReceiver<Result<MarketEvent<(), DataKind>, DataError>>,
-    ) {
+    fn worker(instrument: &str, closing: bool) -> (Worker<()>, Items) {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = Worker {
             stage: "quotes",
@@ -1228,7 +1599,7 @@ mod tests {
             tx,
             closing: Arc::new(AtomicBool::new(closing)),
         };
-        (worker, rx)
+        (worker, Items(rx))
     }
 
     /// The error item a worker for AAPL sends when `error` ends it, if any.
@@ -1306,8 +1677,8 @@ mod tests {
         link_down: &Arc<AtomicBool>,
         notices: Vec<Notice>,
     ) -> Vec<DataError> {
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<Result<MarketEvent<(), DataKind>, DataError>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Envelope<()>>();
+        let mut rx = Items(rx);
         NoticeWatcher {
             tx,
             closing: Arc::new(AtomicBool::new(closing)),
@@ -1904,5 +2275,266 @@ mod tests {
             decimal_from_f64(f64::MAX).is_none(),
             "f64::MAX should not convert to Decimal"
         );
+    }
+
+    /// 14:30 UTC on 2026-11-23 plus `seconds`.
+    fn t(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_795_444_200 + seconds, 0).unwrap()
+    }
+
+    /// An intraday ibapi bar opening at `open`, closing at `close`.
+    fn ib_bar(open: DateTime<Utc>, close: f64) -> ibapi::market_data::historical::Bar {
+        ibapi::market_data::historical::Bar {
+            date: ibapi::market_data::historical::BarTimestamp::DateTime(
+                time::OffsetDateTime::from_unix_timestamp(open.timestamp()).unwrap(),
+            ),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close,
+            volume: 1_000.0,
+            wap: 100.25,
+            count: 12,
+        }
+    }
+
+    fn min1_trades() -> IbkrCandleRequest {
+        IbkrCandleRequest::new(
+            candles::IbkrLiveBarSize::Min1,
+            candles::IbkrBarSource::Trades,
+        )
+    }
+
+    #[test]
+    fn the_fixed_time_is_1430_utc() {
+        assert_eq!(t(0).to_rfc3339(), "2026-11-23T14:30:00+00:00");
+    }
+
+    #[test]
+    fn yielding_a_candle_records_its_open_as_the_resume_point() {
+        let shared = Shared::default();
+        let event = MarketEvent {
+            time_exchange: t(60),
+            time_received: t(61),
+            exchange: ExchangeId::Ibkr,
+            instrument: (),
+            kind: DataKind::Candle(
+                historical::bar_to_candle(&ib_bar(t(0), 100.5), BarSize::Min).unwrap(),
+            ),
+        };
+        let item = shared.yield_item(Envelope {
+            item: Ok(event.clone()),
+            delivers: Some((3, t(0))),
+        });
+        assert_eq!(item, Ok(event));
+        assert_eq!(
+            shared.candle_resume.lock().get(&3),
+            Some(&ResumePoint::After(t(0)))
+        );
+    }
+
+    #[test]
+    fn yielding_another_item_records_nothing() {
+        let shared = Shared::default();
+        let item = shared.yield_item::<()>(Err(DataError::SubscriptionsEmpty).into());
+        assert_eq!(item, Err(DataError::SubscriptionsEmpty));
+        assert!(shared.candle_resume.lock().is_empty());
+    }
+
+    #[test]
+    fn a_candle_subscription_starts_with_the_forming_bar_and_keeps_its_start() {
+        let shared = Shared::default();
+        let request = min1_trades();
+        assert_eq!(
+            shared.candle_resume_point(0, &request, t(75)),
+            ResumePoint::From(t(60))
+        );
+        // A later connection resumes from the same start, not the bar forming then.
+        assert_eq!(
+            shared.candle_resume_point(0, &request, t(500)),
+            ResumePoint::From(t(60))
+        );
+        // Each subscription has its own.
+        assert_eq!(
+            shared.candle_resume_point(1, &request, t(500)),
+            ResumePoint::From(t(480))
+        );
+    }
+
+    #[test]
+    fn a_candle_subscription_starts_at_since_and_resumes_after_the_last_candle_yielded() {
+        let shared = Shared::default();
+        let request = min1_trades().with_since(t(-600));
+        assert_eq!(
+            shared.candle_resume_point(2, &request, t(75)),
+            ResumePoint::From(t(-600))
+        );
+        let _ = shared.yield_item::<()>(Envelope {
+            item: Err(DataError::SubscriptionsEmpty),
+            delivers: Some((2, t(-120))),
+        });
+        assert_eq!(
+            shared.candle_resume_point(2, &request, t(75)),
+            ResumePoint::After(t(-120))
+        );
+    }
+
+    #[test]
+    fn deliver_sends_each_completed_bar_as_a_candle_stamped_with_its_close() {
+        let (worker, mut rx) = worker("AAPL", false);
+        let mut out = vec![
+            Output::Final {
+                open: t(0),
+                bar: ib_bar(t(0), 100.5),
+            },
+            Output::Late { open: t(0) },
+        ];
+
+        let flow = worker.deliver(4, BarSize::Min, &mut out);
+
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(out.is_empty());
+        let envelope = rx.0.try_recv().unwrap();
+        assert_eq!(envelope.delivers, Some((4, t(0))));
+        let event = envelope.item.unwrap();
+        assert_eq!(event.time_exchange, t(60));
+        let DataKind::Candle(candle) = event.kind else {
+            panic!("expected a candle: {:?}", event.kind);
+        };
+        assert_eq!(candle.close_time, t(60));
+        assert_eq!(candle.close, rust_decimal_macros::dec!(100.5));
+        assert_eq!(candle.trade_count, Some(12));
+        assert!(rx.try_recv().is_err(), "a late update sends nothing");
+    }
+
+    #[test]
+    fn deliver_skips_a_bar_that_does_not_convert() {
+        let (worker, mut rx) = worker("AAPL", false);
+        let mut out = vec![
+            Output::Final {
+                open: t(0),
+                bar: ib_bar(t(0), f64::NAN),
+            },
+            Output::Final {
+                open: t(60),
+                bar: ib_bar(t(60), 100.0),
+            },
+        ];
+
+        assert_eq!(
+            worker.deliver(0, BarSize::Min, &mut out),
+            ControlFlow::Continue(())
+        );
+
+        let envelope = rx.0.try_recv().unwrap();
+        assert_eq!(envelope.delivers, Some((0, t(60))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deliver_stops_once_the_stream_is_dropped() {
+        let (worker, rx) = worker("AAPL", false);
+        drop(rx);
+        let mut out = vec![Output::Final {
+            open: t(0),
+            bar: ib_bar(t(0), 100.0),
+        }];
+
+        assert_eq!(
+            worker.deliver(0, BarSize::Min, &mut out),
+            ControlFlow::Break(())
+        );
+    }
+
+    #[test]
+    fn a_bar_is_dated_by_its_open() {
+        let (worker, _rx) = worker("AAPL", false);
+        let (open, _) = worker.dated(ib_bar(t(120), 100.0)).unwrap();
+        assert_eq!(open, t(120));
+    }
+
+    #[test]
+    fn notice_2188_ends_a_candle_subscription_as_market_data_not_available() {
+        let (worker, mut rx) = worker("AAPL", false);
+        let message = "Historical data requests within 15 minutes of the current time require a \
+                       valid market data subscription";
+
+        assert_eq!(
+            worker.candle_notice(&notice(2188, message)),
+            ControlFlow::Break(())
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Err(DataError::MarketDataNotAvailable {
+                exchange: ExchangeId::Ibkr,
+                instrument: InstrumentNameExchange::new("AAPL"),
+                code: 2188,
+                message: message.to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_candle_subscription_takes_other_notices_as_any_subscription_does() {
+        let (worker, mut rx) = worker("AAPL", false);
+        // A farm warning ends nothing.
+        assert_eq!(
+            worker.candle_notice(&notice(2107, "HMDS data farm connection is inactive")),
+            ControlFlow::Continue(())
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            worker.candle_notice(&notice(
+                10089,
+                "Requested market data requires additional subscription"
+            )),
+            ControlFlow::Break(())
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(DataError::MarketDataNotAvailable { code: 10089, .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_an_invalid_subscription_is_refused_before_connecting() {
+        // A struct literal skips the constructor's check; the stream makes it.
+        let depth = IbkrSubscription {
+            key: (),
+            instrument: InstrumentNameExchange::new("AAPL"),
+            kind: IbkrSubscriptionKind::Depth { rows: 0 },
+        };
+        let candles = IbkrSubscription::candles(
+            (),
+            InstrumentNameExchange::new("MSFT"),
+            min1_trades().with_since(Utc::now() + chrono::TimeDelta::hours(1)),
+        );
+        for (subscription, instrument, needle) in [
+            (depth, "AAPL", "got 0"),
+            (candles, "MSFT", "later than one bar"),
+        ] {
+            let result = IbkrMarketStream::<()>::init(
+                IbkrStreamConfig::new("127.0.0.1", 1, 1),
+                Arc::new(ContractRegistry::new()),
+                vec![
+                    IbkrSubscription::quotes((), InstrumentNameExchange::new("SPY")),
+                    subscription,
+                ],
+                MarketStreamOptions::default(),
+            )
+            .await;
+
+            let Err(DataError::InvalidSubscription {
+                exchange,
+                instrument: refused,
+                reason,
+            }) = result
+            else {
+                panic!("expected an invalid subscription: {:?}", result.err());
+            };
+            assert_eq!(exchange, ExchangeId::Ibkr);
+            assert_eq!(refused, InstrumentNameExchange::new(instrument));
+            assert!(reason.contains(needle), "{reason}");
+        }
     }
 }
