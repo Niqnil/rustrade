@@ -1729,8 +1729,6 @@ mod tests {
         assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
     }
 
-    /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the
-    /// exchange gave it, or that the exchange is offline once it has stopped.
     /// The client sends the assets it was asked for in its snapshot request, for the venue to
     /// filter the balances by.
     #[tokio::test]
@@ -1765,6 +1763,8 @@ mod tests {
         assert_eq!(exchange.await.unwrap(), requested);
     }
 
+    /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the
+    /// exchange gave it, or that the exchange is offline once it has stopped.
     #[tokio::test]
     async fn request_checkpoint_answers_with_the_exchange_s_id() {
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
