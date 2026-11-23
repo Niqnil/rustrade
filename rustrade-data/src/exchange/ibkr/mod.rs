@@ -1112,55 +1112,12 @@ where
             };
             debug!(instrument = %worker.instrument, ?resume, %duration, "Candle subscription made");
 
-            let mut assembler = BarAssembler::new(step, BAR_SETTLE, resume);
-            let mut out = Vec::new();
-            loop {
+            let assembler = BarAssembler::new(step, BAR_SETTLE, resume);
+            let resync = || {
                 let resync_client = client.clone();
                 clock.resync(move || server_time(&resync_client));
-                let wait = assembler
-                    .next_deadline()
-                    .map_or(CANDLE_IDLE_WAIT, |deadline| {
-                        deadline
-                            .signed_duration_since(ib_now())
-                            .to_std()
-                            .unwrap_or(std::time::Duration::ZERO)
-                            .min(CANDLE_IDLE_WAIT)
-                    });
-                // What IB has already sent comes first: a wait at or near zero returns without
-                // looking, which would run a due timer ahead of a queued closing update.
-                let item = match sub.try_next() {
-                    Some(item) => Some(item),
-                    None if wait.is_zero() || sub.is_terminated() => None,
-                    None => sub.next_timeout(wait),
-                };
-                let now = ib_now();
-                match item {
-                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
-                        let bars = data.bars.into_iter().filter_map(|bar| worker.dated(bar));
-                        assembler.on_history(bars, now, &mut out);
-                    }
-                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) => {
-                        if let Some((open, bar)) = worker.dated(bar) {
-                            assembler.on_update(open, bar, now, &mut out);
-                        }
-                    }
-                    Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::End { .. }))) => {}
-                    Some(Ok(SubscriptionItem::Notice(notice))) => {
-                        if worker.candle_notice(&notice).is_break() {
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        worker.fail(e);
-                        break;
-                    }
-                    None if sub.is_terminated() => break,
-                    None => assembler.on_tick(now, &mut out),
-                }
-                if worker.deliver(index, bar_size, &mut out).is_break() {
-                    break;
-                }
-            }
+            };
+            worker.run_candles(&sub, assembler, index, bar_size, ib_now, resync);
         })
     }
 }
@@ -1169,6 +1126,59 @@ where
 /// be short: a close or a lost connection ends the subscription, which wakes the wait at once, and
 /// a dropped stream is seen at the next candle sent.
 const CANDLE_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a candle worker reads from its subscription in one look.
+enum Next {
+    /// An item IB sent.
+    Item(Result<SubscriptionItem<HistoricalBarUpdate>, ibapi::Error>),
+    /// Nothing yet: nothing was queued, or the wait passed without an item.
+    Nothing,
+    /// The subscription ended: it delivered its end or a terminal error.
+    Ended,
+    /// The subscription's channel closed without an end or an error, which `ibapi` reports as
+    /// nothing at all, so that a worker reading it as [`Nothing`](Self::Nothing) would look again
+    /// at once, and again, without end.
+    Closed,
+}
+
+/// The candle worker's view of its subscription, so that [`Worker::run_candles`] can be driven
+/// by a scripted feed in tests.
+trait BarFeed {
+    /// What is queued now, without waiting. It cannot tell a closed channel from an empty one;
+    /// [`next_within`](Self::next_within) can.
+    fn next_now(&self) -> Next;
+
+    /// The next item, waiting up to `wait`; a zero `wait` returns [`Next::Nothing`] at once.
+    fn next_within(&self, wait: std::time::Duration) -> Next;
+}
+
+impl BarFeed for ibapi::subscriptions::sync::Subscription<HistoricalBarUpdate> {
+    fn next_now(&self) -> Next {
+        next_from(self.try_next(), self.is_terminated(), true)
+    }
+
+    fn next_within(&self, wait: std::time::Duration) -> Next {
+        let started = std::time::Instant::now();
+        let item = self.next_timeout(wait);
+        next_from(item, self.is_terminated(), started.elapsed() >= wait)
+    }
+}
+
+/// What a look at a subscription returned, as a [`Next`]: `item`, else whether the subscription
+/// is `terminated`, else whether the look `waited_out` its wait. `ibapi` returns nothing before
+/// the wait is out, from a subscription it has not ended, only when the channel has closed.
+fn next_from(
+    item: Option<Result<SubscriptionItem<HistoricalBarUpdate>, ibapi::Error>>,
+    terminated: bool,
+    waited_out: bool,
+) -> Next {
+    match item {
+        Some(item) => Next::Item(item),
+        None if terminated => Next::Ended,
+        None if waited_out => Next::Nothing,
+        None => Next::Closed,
+    }
+}
 
 /// What a candle worker needs besides its contract and [`Worker`].
 struct CandleJob {
@@ -1187,6 +1197,80 @@ fn server_time(client: &Client) -> Result<DateTime<Utc>, String> {
     let time = client.server_time_millis().map_err(|e| e.to_string())?;
     DateTime::from_timestamp(time.unix_timestamp(), time.nanosecond())
         .ok_or_else(|| format!("IB server time {time} out of range"))
+}
+
+impl<K> Worker<K>
+where
+    K: Clone + Send + 'static,
+{
+    /// The candle subscription's loop: read `feed`, pass its bars through `assembler` at IB's time
+    /// `ib_now`, and send each completed bar as a candle of `bar_size` for the subscription
+    /// `index`, calling `resync` before each look. It ends when the subscription does, when a
+    /// notice or an error ends it (sent as the worker's terminal error), when the channel closes
+    /// without an end ([`DataError::ConnectionLost`]), or once the stream has been dropped.
+    ///
+    /// Between bars it waits for IB until the forming bar's timer, or at most
+    /// [`CANDLE_IDLE_WAIT`].
+    fn run_candles(
+        &self,
+        feed: &impl BarFeed,
+        mut assembler: BarAssembler<ibapi::market_data::historical::Bar>,
+        index: usize,
+        bar_size: BarSize,
+        ib_now: impl Fn() -> DateTime<Utc>,
+        resync: impl Fn(),
+    ) {
+        let mut out = Vec::new();
+        loop {
+            resync();
+            let wait = assembler
+                .next_deadline()
+                .map_or(CANDLE_IDLE_WAIT, |deadline| {
+                    deadline
+                        .signed_duration_since(ib_now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO)
+                        .min(CANDLE_IDLE_WAIT)
+                });
+            // What IB has already sent comes first, so that a due timer never runs ahead of a
+            // queued closing update.
+            let next = match feed.next_now() {
+                Next::Nothing => feed.next_within(wait),
+                next => next,
+            };
+            let now = ib_now();
+            match next {
+                Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
+                    let bars = data.bars.into_iter().filter_map(|bar| self.dated(bar));
+                    assembler.on_history(bars, now, &mut out);
+                }
+                Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) => {
+                    if let Some((open, bar)) = self.dated(bar) {
+                        assembler.on_update(open, bar, now, &mut out);
+                    }
+                }
+                Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::End { .. }))) => {}
+                Next::Item(Ok(SubscriptionItem::Notice(notice))) => {
+                    if self.candle_notice(&notice).is_break() {
+                        break;
+                    }
+                }
+                Next::Item(Err(e)) => {
+                    self.fail(e);
+                    break;
+                }
+                Next::Ended => break,
+                Next::Closed => {
+                    self.channel_closed();
+                    break;
+                }
+                Next::Nothing => assembler.on_tick(now, &mut out),
+            }
+            if self.deliver(index, bar_size, &mut out).is_break() {
+                break;
+            }
+        }
+    }
 }
 
 impl<K> Connection<K> {
@@ -1437,22 +1521,51 @@ where
     /// error is logged at debug and nothing is sent: `ibapi` reports that close as more than one
     /// error, depending on how far the worker got, and the stream is ending the connection anyway.
     fn fail(&self, error: ibapi::Error) {
-        let stage = self.stage;
-        if self.closing.load(Ordering::Acquire) {
-            debug!(instrument = %self.instrument, error = %error, "{stage} subscription ended by the connection's close");
+        if self.closed_by_connection(&error) {
             return;
         }
-        let item = if ends_connection(&error) {
-            warn!(instrument = %self.instrument, error = %error, "{stage} subscription ended by a lost connection");
-            DataError::ConnectionLost {
+        if ends_connection(&error) {
+            self.report_lost(&error);
+            return;
+        }
+        let stage = self.stage;
+        error!(instrument = %self.instrument, error = %error, "{stage} subscription failed");
+        let _ = self
+            .tx
+            .send(Err(subscription_error(stage, &self.instrument, error)).into());
+    }
+
+    /// End the worker because its subscription's channel closed without an end or an error
+    /// ([`Next::Closed`]): send [`DataError::ConnectionLost`], so that the stream makes a new
+    /// connection, unless the connection's own close has begun, as for [`fail`](Self::fail).
+    fn channel_closed(&self) {
+        let reason = "the subscription's channel closed without an end or an error";
+        if !self.closed_by_connection(&reason) {
+            self.report_lost(&reason);
+        }
+    }
+
+    /// Whether the connection's own [`close`](Connection::close) has begun, which explains
+    /// `error`: if so, log it at debug.
+    fn closed_by_connection(&self, error: &dyn std::fmt::Display) -> bool {
+        let closing = self.closing.load(Ordering::Acquire);
+        if closing {
+            debug!(instrument = %self.instrument, error = %error, "{} subscription ended by the connection's close", self.stage);
+        }
+        closing
+    }
+
+    /// Send [`DataError::ConnectionLost`] naming the subscription and `error`, with a warning.
+    fn report_lost(&self, error: &dyn std::fmt::Display) {
+        let stage = self.stage;
+        warn!(instrument = %self.instrument, error = %error, "{stage} subscription ended by a lost connection");
+        let _ = self.tx.send(
+            Err(DataError::ConnectionLost {
                 exchange: ExchangeId::Ibkr,
                 reason: format!("{stage} subscription {}: {error}", self.instrument),
-            }
-        } else {
-            error!(instrument = %self.instrument, error = %error, "{stage} subscription failed");
-            subscription_error(stage, &self.instrument, error)
-        };
-        let _ = self.tx.send(Err(item).into());
+            })
+            .into(),
+        );
     }
 
     /// Act on a notice IB sent for this subscription without ending it: `Break` after sending a
@@ -2494,6 +2607,397 @@ mod tests {
             rx.try_recv(),
             Ok(Err(DataError::MarketDataNotAvailable { code: 10089, .. }))
         ));
+    }
+
+    /// A candle worker for `instrument`, and the stream's receiving end.
+    fn candle_worker(instrument: &str, closing: bool) -> (Worker<()>, Items) {
+        let (mut worker, rx) = worker(instrument, closing);
+        worker.stage = "candles";
+        (worker, rx)
+    }
+
+    /// One look a [`ScriptedFeed`] expects, and what it returns: `Next::Nothing` from `next_now`
+    /// for a look that needs a wait.
+    struct Look {
+        /// Whether the look is a wait ([`BarFeed::next_within`]) rather than a queued item.
+        waits: bool,
+        /// IB's time once the look returns.
+        at: DateTime<Utc>,
+        next: Next,
+    }
+
+    fn queued(at: DateTime<Utc>, next: Next) -> Look {
+        Look {
+            waits: false,
+            at,
+            next,
+        }
+    }
+
+    fn waited(at: DateTime<Utc>, next: Next) -> Look {
+        Look {
+            waits: true,
+            at,
+            next,
+        }
+    }
+
+    /// A candle subscription that plays a script of looks, then ends; it moves IB's time, and
+    /// records each wait it is asked for.
+    struct ScriptedFeed {
+        script: std::cell::RefCell<std::collections::VecDeque<Look>>,
+        clock: std::cell::Cell<DateTime<Utc>>,
+        waits: std::cell::RefCell<Vec<std::time::Duration>>,
+        looks: std::cell::Cell<usize>,
+    }
+
+    impl ScriptedFeed {
+        fn new(start: DateTime<Utc>, script: Vec<Look>) -> Self {
+            Self {
+                script: std::cell::RefCell::new(script.into()),
+                clock: std::cell::Cell::new(start),
+                waits: std::cell::RefCell::new(Vec::new()),
+                looks: std::cell::Cell::new(0),
+            }
+        }
+
+        /// Count a look, failing a worker that spins.
+        fn look(&self) {
+            self.looks.set(self.looks.get() + 1);
+            assert!(self.looks.get() < 100, "the worker is spinning");
+        }
+
+        fn play(&self) -> Next {
+            let look = self.script.borrow_mut().pop_front().unwrap();
+            self.clock.set(look.at);
+            look.next
+        }
+
+        fn remaining(&self) -> usize {
+            self.script.borrow().len()
+        }
+
+        /// Run `worker`'s candle loop for one-minute bars of subscription 4 from `resume` on this
+        /// feed.
+        fn run(&self, worker: &Worker<()>, resume: ResumePoint) {
+            let assembler = BarAssembler::new(chrono::TimeDelta::minutes(1), BAR_SETTLE, resume);
+            worker.run_candles(self, assembler, 4, BarSize::Min, || self.clock.get(), || {});
+        }
+    }
+
+    impl BarFeed for ScriptedFeed {
+        fn next_now(&self) -> Next {
+            self.look();
+            match self.script.borrow().front() {
+                None => return Next::Ended,
+                Some(look) if look.waits => return Next::Nothing,
+                Some(_) => {}
+            }
+            self.play()
+        }
+
+        fn next_within(&self, wait: std::time::Duration) -> Next {
+            self.look();
+            self.waits.borrow_mut().push(wait);
+            if wait.is_zero() {
+                return Next::Nothing;
+            }
+            let front = self.script.borrow().front().map(|look| look.waits);
+            assert_eq!(front, Some(true), "a wait the script does not expect");
+            self.play()
+        }
+    }
+
+    fn history(bars: Vec<ibapi::market_data::historical::Bar>) -> Next {
+        Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(
+            ibapi::market_data::historical::HistoricalData {
+                start: time::OffsetDateTime::UNIX_EPOCH,
+                end: time::OffsetDateTime::UNIX_EPOCH,
+                bars,
+            },
+        ))))
+    }
+
+    fn update(bar: ibapi::market_data::historical::Bar) -> Next {
+        Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar))))
+    }
+
+    fn candle_notice_item(code: i32, message: &str) -> Next {
+        Next::Item(Ok(SubscriptionItem::Notice(notice(code, message))))
+    }
+
+    /// The candles a worker sent, by open and close price; panics on an error item.
+    fn candles_sent(rx: &mut Items) -> Vec<(DateTime<Utc>, Decimal)> {
+        let mut candles = Vec::new();
+        while let Ok(envelope) = rx.0.try_recv() {
+            let (index, open) = envelope.delivers.expect("a candle");
+            assert_eq!(index, 4);
+            let DataKind::Candle(candle) = envelope.item.unwrap().kind else {
+                panic!("expected a candle");
+            };
+            candles.push((open, candle.close));
+        }
+        candles
+    }
+
+    fn secs(seconds: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_due_timer_emits_the_forming_bar_after_waiting_until_it() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(20),
+            vec![
+                queued(t(30), history(vec![ib_bar(t(0), 100.0)])),
+                waited(t(62), Next::Nothing),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        // The bar opening at t(0) is due at its end plus the settle: 32 s after t(30).
+        assert_eq!(*feed.waits.borrow(), vec![secs(32)]);
+        assert_eq!(
+            candles_sent(&mut rx),
+            vec![(t(0), rust_decimal_macros::dec!(100))]
+        );
+    }
+
+    #[test]
+    fn a_queued_closing_update_is_read_before_the_due_timer_runs() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(20),
+            vec![
+                queued(t(30), history(vec![ib_bar(t(0), 100.0)])),
+                // A notice ends the wait at the bar's timer, and runs no timer itself.
+                waited(
+                    t(62),
+                    candle_notice_item(2107, "HMDS data farm connection is inactive"),
+                ),
+                queued(t(62), update(ib_bar(t(0), 100.7))),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        // The timer was due, but the closing update queued behind the notice went in first.
+        assert_eq!(
+            candles_sent(&mut rx),
+            vec![(t(0), rust_decimal_macros::dec!(100.7))]
+        );
+        // The only wait was the one the notice ended.
+        assert_eq!(*feed.waits.borrow(), vec![secs(32)]);
+    }
+
+    #[test]
+    fn a_timer_already_past_waits_nothing() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(20),
+            vec![
+                queued(t(30), history(vec![ib_bar(t(0), 100.0)])),
+                waited(
+                    t(65),
+                    candle_notice_item(2107, "HMDS data farm connection is inactive"),
+                ),
+                // Nothing queued when the timer is past; a zero wait does not play this look.
+                waited(t(200), Next::Nothing),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert_eq!(
+            *feed.waits.borrow(),
+            vec![secs(32), std::time::Duration::ZERO, CANDLE_IDLE_WAIT]
+        );
+        assert_eq!(
+            candles_sent(&mut rx),
+            vec![(t(0), rust_decimal_macros::dec!(100))]
+        );
+    }
+
+    #[test]
+    fn the_wait_is_at_most_the_idle_wait() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(0),
+            vec![
+                // No bar forming yet.
+                waited(t(60), Next::Nothing),
+                queued(t(61), history(vec![ib_bar(t(60), 100.0)])),
+                // A bar forming 61 s from its timer.
+                waited(t(121), Next::Nothing),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(60)));
+
+        assert_eq!(*feed.waits.borrow(), vec![CANDLE_IDLE_WAIT; 2]);
+        assert!(candles_sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn an_ended_subscription_ends_the_worker_without_waiting_or_emitting() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(20),
+            vec![
+                queued(t(30), history(vec![ib_bar(t(0), 100.0)])),
+                queued(t(31), Next::Ended),
+                queued(t(90), update(ib_bar(t(0), 100.7))),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert!(feed.waits.borrow().is_empty());
+        assert_eq!(feed.remaining(), 1, "the worker read past the end");
+        assert!(rx.try_recv().is_err(), "the forming bar is not emitted");
+    }
+
+    #[test]
+    fn a_closed_channel_ends_the_worker_with_the_connection_lost() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(0),
+            vec![
+                waited(t(1), Next::Closed),
+                queued(t(2), history(vec![ib_bar(t(0), 100.0)])),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert_eq!(feed.remaining(), 1, "the worker looked again");
+        let Ok(Err(DataError::ConnectionLost { exchange, reason })) = rx.try_recv() else {
+            panic!("expected the connection lost");
+        };
+        assert_eq!(exchange, ExchangeId::Ibkr);
+        assert!(
+            reason.starts_with("candles subscription AAPL: ") && reason.contains("channel closed"),
+            "{reason}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_closed_channel_during_the_connections_close_reports_nothing() {
+        let (worker, mut rx) = candle_worker("AAPL", true);
+        let feed = ScriptedFeed::new(t(0), vec![waited(t(1), Next::Closed)]);
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_error_ends_the_worker_with_it() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(0),
+            vec![
+                queued(t(1), Next::Item(Err(ibapi::Error::Shutdown))),
+                queued(t(2), history(vec![ib_bar(t(0), 100.0)])),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert_eq!(feed.remaining(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(DataError::ConnectionLost { .. }))
+        ));
+    }
+
+    #[test]
+    fn notice_2188_ends_the_worker_and_other_notices_and_the_end_marker_do_not() {
+        let (worker, mut rx) = candle_worker("AAPL", false);
+        let feed = ScriptedFeed::new(
+            t(0),
+            vec![
+                queued(
+                    t(1),
+                    candle_notice_item(2107, "HMDS data farm connection is inactive"),
+                ),
+                queued(
+                    t(2),
+                    Next::Item(Ok(SubscriptionItem::Data(HistoricalBarUpdate::End {
+                        start: time::OffsetDateTime::UNIX_EPOCH,
+                        end: time::OffsetDateTime::UNIX_EPOCH,
+                    }))),
+                ),
+                queued(
+                    t(3),
+                    candle_notice_item(2188, "requires a market data subscription"),
+                ),
+                queued(t(4), history(vec![ib_bar(t(0), 100.0)])),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert_eq!(feed.remaining(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(DataError::MarketDataNotAvailable { code: 2188, .. }))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_dropped_stream_ends_the_worker_at_the_next_candle() {
+        let (worker, rx) = candle_worker("AAPL", false);
+        drop(rx);
+        let feed = ScriptedFeed::new(
+            t(0),
+            vec![
+                queued(
+                    t(70),
+                    history(vec![ib_bar(t(0), 100.0), ib_bar(t(60), 101.0)]),
+                ),
+                queued(t(71), update(ib_bar(t(60), 101.5))),
+            ],
+        );
+
+        feed.run(&worker, ResumePoint::From(t(0)));
+
+        assert_eq!(
+            feed.remaining(),
+            1,
+            "the worker read on after the stream was dropped"
+        );
+    }
+
+    #[test]
+    fn a_look_reads_an_item_then_the_end_then_whether_it_waited_out() {
+        let item = || Some(Err(ibapi::Error::Shutdown));
+        for (terminated, waited_out) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            assert!(matches!(
+                next_from(item(), terminated, waited_out),
+                Next::Item(Err(ibapi::Error::Shutdown))
+            ));
+            let expected = match (terminated, waited_out) {
+                (true, _) => "ended",
+                (false, true) => "nothing",
+                (false, false) => "closed",
+            };
+            let actual = match next_from(None, terminated, waited_out) {
+                Next::Ended => "ended",
+                Next::Nothing => "nothing",
+                Next::Closed => "closed",
+                Next::Item(_) => "item",
+            };
+            assert_eq!(
+                actual, expected,
+                "terminated {terminated}, waited out {waited_out}"
+            );
+        }
     }
 
     #[tokio::test]
