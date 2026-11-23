@@ -1166,7 +1166,8 @@ impl BarFeed for ibapi::subscriptions::sync::Subscription<HistoricalBarUpdate> {
 
 /// What a look at a subscription returned, as a [`Next`]: `item`, else whether the subscription
 /// is `terminated`, else whether the look `waited_out` its wait. `ibapi` returns nothing before
-/// the wait is out, from a subscription it has not ended, only when the channel has closed.
+/// the wait is out, from a subscription it has not ended, only when the channel has closed (as
+/// read in `ibapi` 5.7's source: recheck on an upgrade).
 fn next_from(
     item: Option<Result<SubscriptionItem<HistoricalBarUpdate>, ibapi::Error>>,
     terminated: bool,
