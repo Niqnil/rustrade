@@ -346,8 +346,9 @@ impl Default for IbkrStreamConfig {
 ///   step of the host's clock moves no deadline. The bar forming at connect, the default start,
 ///   is the one forming on IB's clock. An offset from the host's clock larger than half
 ///   of [`BAR_SETTLE`] is logged as a warning, since it points at the host's time
-///   synchronisation. A failed sample keeps the last estimate; before the first, the host's clock
-///   stands in.
+///   synchronisation. A failed sample keeps the last estimate, and is tried again ten minutes
+///   later. If the first fails, the host's clock stands in until then, the default start
+///   included.
 /// - **Without a live market data subscription** IB sends the history and then 2188, after which
 ///   no live bar comes: the subscription ends with [`DataError::MarketDataNotAvailable`].
 ///
@@ -1125,12 +1126,12 @@ where
                             .unwrap_or(std::time::Duration::ZERO)
                             .min(CANDLE_IDLE_WAIT)
                     });
-                // A zero wait would return without looking at what IB has already sent, so an
-                // update queued before the deadline is taken first.
-                let item = if wait.is_zero() {
-                    sub.try_next()
-                } else {
-                    sub.next_timeout(wait)
+                // What IB has already sent comes first: a wait at or near zero returns without
+                // looking, which would run a due timer ahead of a queued closing update.
+                let item = match sub.try_next() {
+                    Some(item) => Some(item),
+                    None if wait.is_zero() || sub.is_terminated() => None,
+                    None => sub.next_timeout(wait),
                 };
                 let now = ib_now();
                 match item {

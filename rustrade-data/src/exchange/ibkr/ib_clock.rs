@@ -118,7 +118,8 @@ impl IbClock {
     /// Sample IB's time with `server_time` now, on this thread, if a sample is due: once when the
     /// connection opens, before any subscription is made, so that each starts on IB's time.
     ///
-    /// A failed sample is logged, and the host's clock stands in until a later one succeeds.
+    /// A failed sample is logged and tried again [`RESYNC`] later, by [`resync`](Self::resync);
+    /// the host's clock stands in until one succeeds.
     pub(super) fn sync<E: std::fmt::Display>(
         &self,
         server_time: impl FnOnce() -> Result<DateTime<Utc>, E>,
