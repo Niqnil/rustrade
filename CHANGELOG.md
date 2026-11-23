@@ -696,7 +696,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract said a client may return others; every client in the workspace now filters (see
   Fixed), so an implementation outside it must too. The `ExecutionManager` still drops a balance
   for an unregistered asset, but logs it at `error!` instead of `warn!`, as a client that broke
-  the contract. To carry the assets to the simulated venue, `SimulatedVenue::account_snapshot`
+  the contract (or, when the map registers no asset for the exchange, as a map that asked for
+  every balance). To carry the assets to the simulated venue, `SimulatedVenue::account_snapshot`
   and `MockExchangeRequest::fetch_account_snapshot` take them, and
   `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new `assets` field; pass
   `&[]` or an empty `Vec` to keep every balance.

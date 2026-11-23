@@ -550,7 +550,10 @@ where
     ///
     /// The snapshot was asked for the map's assets, and
     /// [`ExecutionClient::account_snapshot`] returns those only, matched ignoring ASCII case as
-    /// the map matches them, so such a balance means the client broke that contract.
+    /// the map matches them, so such a balance means the client broke that contract. The one
+    /// exception is a map that registers no asset for the exchange, such as one built for a venue
+    /// that only prices another venue's instruments: the snapshot then asked for every balance,
+    /// and the error names the map instead.
     fn index_snapshot(
         indexer: &AccountEventIndexer,
         snapshot: UnindexedAccountSnapshot,
@@ -562,12 +565,22 @@ where
             .map(|asset| asset.name().as_str())
             .collect();
         if !untracked.is_empty() {
-            error!(
-                ?untracked,
-                kept = indexed_snapshot.balances.len(),
-                "Account snapshot balances dropped for assets the ExecutionInstrumentMap does \
-                 not register: the client returned balances it was not asked for"
-            );
+            if indexer.map.exchange_assets().next().is_none() {
+                // The snapshot was asked for an empty list, which means every asset held, so the
+                // client kept the contract: the map is what registers nothing.
+                error!(
+                    ?untracked,
+                    "Account snapshot balances dropped: the ExecutionInstrumentMap registers no \
+                     asset for this exchange, so the snapshot asked for every balance"
+                );
+            } else {
+                error!(
+                    ?untracked,
+                    kept = indexed_snapshot.balances.len(),
+                    "Account snapshot balances dropped for assets the ExecutionInstrumentMap does \
+                     not register: the client returned balances it was not asked for"
+                );
+            }
         }
         Ok(AccountEvent {
             exchange: indexer.map.exchange.key,
@@ -3257,21 +3270,23 @@ mod tests {
     }
 
     /// Fetch the account snapshot of a client holding balances for `held` that returns them all,
-    /// whatever it is asked for, and index it, with the map registering `btc` and `usdt` only:
-    /// `(kept, warn, debug, error)`, the balances kept and the logs.
-    fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+    /// whatever it is asked for, and index it against `instruments`' map for `EXCHANGE`: the
+    /// balances kept and the events logged.
+    fn index_held_snapshot(
+        instruments: &IndexedInstruments,
+        held: &[&str],
+    ) -> (usize, Vec<rustrade_instrument::test_utils::logs::Logged>) {
         type Manager = ExecutionManager<
             futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
             FlakyAccountClient,
         >;
-        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
-        let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
+        let map = generate_execution_instrument_map(instruments, EXCHANGE).unwrap();
         let indexer = AccountEventIndexer::new(Arc::new(map));
         let client = Arc::new(FlakyAccountClient {
             snapshot_balances: held.iter().map(|a| AssetNameExchange::new(*a)).collect(),
             ..Default::default()
         });
-        with_log_counts(|| {
+        rustrade_instrument::test_utils::logs::capture(|| {
             let event = futures::executor::block_on(Manager::fetch_account_snapshot(
                 &client,
                 &indexer,
@@ -3288,6 +3303,20 @@ mod tests {
             };
             snapshot.balances.len()
         })
+    }
+
+    /// [`index_held_snapshot`] with the map registering `btc` and `usdt` only:
+    /// `(kept, warn, debug, error)`, the balances kept and the logs.
+    fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let (kept, logged) = index_held_snapshot(&instruments, held);
+        let count = |level| logged.iter().filter(|event| event.level == level).count();
+        (
+            kept,
+            count(tracing::Level::WARN),
+            count(tracing::Level::DEBUG),
+            count(tracing::Level::ERROR),
+        )
     }
 
     /// A balance the client was not asked for breaks `account_snapshot`'s contract: it is dropped
@@ -3329,6 +3358,39 @@ mod tests {
     #[test]
     fn a_snapshot_that_keeps_no_balance_logs_the_same_error() {
         assert_eq!(snapshot_balances_kept(&["bnb", "sol"]), (0, 0, 0, 1));
+    }
+
+    /// A map that registers no asset for the exchange asks the snapshot for every balance, so the
+    /// error names the map, not the client, as the cause of the dropped balances.
+    #[test]
+    fn a_snapshot_against_a_map_with_no_assets_blames_the_map() {
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+
+        // `EXCHANGE` only prices another venue's instrument, so it has an index but no asset.
+        let instruments = IndexedInstruments::new(vec![
+            instrument(ExchangeId::Kraken, "btc", "usdt")
+                .with_data_venue(DataVenue::new(EXCHANGE, None)),
+        ]);
+        let (kept, logged) = index_held_snapshot(&instruments, &["usdt"]);
+
+        let errors = logged
+            .iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .map(|event| event.message())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, 0);
+        assert_eq!(errors.len(), 1, "{logged:?}");
+        assert!(errors[0].contains("registers no asset"), "{errors:?}");
+
+        // A map that registers assets blames the client instead.
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let (_, logged) = index_held_snapshot(&instruments, &["bnb"]);
+        assert!(
+            logged
+                .iter()
+                .any(|event| event.message().contains("not asked for")),
+            "{logged:?}"
+        );
     }
 
     #[test]
