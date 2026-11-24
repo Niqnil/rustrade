@@ -179,6 +179,26 @@ impl<'a> ClientInstrument<'a> {
 // implementation would fail to compile.
 /// A venue's account and order API, as the engine's `ExecutionManager` drives it.
 ///
+/// # Instrument names
+///
+/// Each client matches a requested [`InstrumentNameExchange`] by one rule, given below, and never
+/// rewrites it: it does not turn one spelling into another, such as `BTCUSD` into `BTC/USD`. A
+/// requested instrument the client cannot match is meant to be refused with
+/// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid), never left out
+/// or reported flat or empty, since nothing was read about it. The rows below that still leave
+/// such a name out say so.
+///
+/// | Client | A name matches | What a read finds is reported under | A name it cannot match |
+/// |---|---|---|---|
+/// | Alpaca | Alpaca's symbol, ignoring case; a crypto pair as `BASE/QUOTE` | Alpaca's symbol; an `account_snapshot` entry takes the requested name | Refused |
+/// | Binance spot, cross margin | Binance's symbol exactly, as Binance enforces | The requested name | Binance's error: `InstrumentInvalid` for an unlisted symbol |
+/// | Binance isolated margin | A name in `isolated_symbols`, exactly | The requested name | Left out, with a warning |
+/// | Hyperliquid perpetuals, spot | Hyperliquid's spelling exactly | Hyperliquid's spelling | Refused |
+/// | IBKR | A name in the client's contract registry, exactly | The registered name | Left out of a filtered read |
+/// | Simulated (`MockExecution`) | A name the venue trades, exactly | The name traded | Left out of a read; refused by `open_order` |
+///
+/// Each client's own documentation gives the detail.
+///
 /// # Wrapping a client
 ///
 /// To add behaviour around a venue client without reimplementing it, wrap it in a generic
