@@ -39,7 +39,8 @@
 //! named from the pair's tokens (`"@107"` is `HYPE-USDC-SPOT`, `"@207"` is `HYPE-USDT0-SPOT`).
 //!
 //! A spot coin missing from `spotMeta`, such as a pair listed after the client was created, makes
-//! it read `spotMeta` again, at most once every ten seconds, each read abandoned after five. A coin still missing after that is:
+//! it read `spotMeta` again, at most once every ten seconds, each read abandoned after five. A
+//! coin still missing after that is:
 //! - an error from [`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_open_orders`]
 //!   and [`ExecutionClient::fetch_trades`], whose lists would otherwise be short with nothing to
 //!   say so. This holds whichever instruments were asked for: the coin's instrument is unknown,
@@ -51,15 +52,18 @@
 //! Since every report names a pair from its tokens as Hyperliquid spells them, an order's
 //! instrument must spell them the same way: `kPEPE-USDC-SPOT`, not `KPEPE-USDC-SPOT`.
 //! [`ExecutionClient::open_order`] refuses an order under another spelling unsent, with
-//! [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) naming the one to
-//! use. An order is then reported under the name it was placed under, and the reads that take
-//! `instruments`, which match names exactly, find it. The perpetuals client matches names
-//! exactly too.
+//! [`ApiError::InstrumentInvalid`] naming the one to use. An order is then reported under the name
+//! it was placed under, and the reads that take `instruments`, which match names exactly, find it.
 //!
-//! Neither the reads nor `cancel_order` check the spelling. An `instruments` filter naming a pair
-//! in another spelling, or no listed pair, matches nothing, so the read returns nothing for it
-//! without an error. [`ExecutionClient::cancel_order`] sends the coin as the instrument spells it, so a
-//! cancel under another spelling fails in the SDK.
+//! Those reads, [`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_open_orders`] and
+//! [`ExecutionClient::fetch_trades`], refuse an instrument the same way before reading anything,
+//! as the perpetuals client does: under another spelling, or naming no listed pair, it would
+//! match nothing, and a snapshot would list it with no open orders, complete, without having
+//! looked. A pair the client holds no record of makes it read `spotMeta` again as above; when
+//! that read fails, the call fails with its error, since the pair may have been listed since.
+//!
+//! [`ExecutionClient::cancel_order`] does not check the spelling: it sends the coin as the
+//! instrument spells it, so a cancel under another spelling fails in the SDK.
 //!
 //! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
 //! created, and is never refreshed. So a pair listed after the client was created can be reported
@@ -111,8 +115,8 @@ use crate::{
     client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
-        ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-        UnindexedOrderError,
+        ApiError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
+        UnindexedClientError, UnindexedOrderError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
@@ -235,7 +239,8 @@ impl HyperliquidSpotClient {
     ///
     /// `None` when `instrument` is not of that form, or Hyperliquid lists no such pair. A pair
     /// missing from the pairs this client holds is looked for in `spotMeta` again first, at most
-    /// once every 10 seconds, so a pair listed since the client connected is found.
+    /// once every 10 seconds, so a pair listed since the client connected is found. `None` also
+    /// when that read fails, though the pair may be listed.
     ///
     /// `None` too when `instrument` spells the pair's tokens differently from Hyperliquid, even
     /// only in ASCII case (`KPEPE-USDC-SPOT` for `kPEPE/USDC`). Every order report names the
@@ -257,12 +262,41 @@ impl HyperliquidSpotClient {
             .spot_coins
             .find(base, quote)
             .await
+            .map_err(UntradedPair::Unchecked)?
             .ok_or(UntradedPair::Unlisted)?;
         if pair.base() == base && pair.quote() == quote {
             Ok(pair)
         } else {
             Err(UntradedPair::Misspelled(pair))
         }
+    }
+
+    /// Fail on the first of `instruments` that names no spot pair this client trades, spelled as
+    /// Hyperliquid spells it. A read filtered to it would otherwise report it empty without having
+    /// looked; under another spelling of a listed pair, it would miss the pair's orders, which are
+    /// reported under Hyperliquid's.
+    ///
+    /// Costs no request while the pairs held list every instrument; see
+    /// [`order_precision`](Self::order_precision) for when `spotMeta` is read again.
+    async fn check_instruments(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<(), UnindexedClientError> {
+        for instrument in instruments {
+            let Some((base, quote)) = spot_base_quote(instrument) else {
+                return Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    format!(
+                        "{instrument} is not a Hyperliquid spot pair: expected BASE-QUOTE-SPOT, \
+                         such as HYPE-USDC-SPOT"
+                    ),
+                )));
+            };
+            if let Err(untraded) = self.traded_pair(base, quote).await {
+                return Err(untraded.into_client_error(instrument, base, quote));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the wallet address as ethers H160.
@@ -280,6 +314,57 @@ enum UntradedPair {
     /// Every report names the pair as Hyperliquid spells it, so an order placed under this
     /// spelling would be reported under another name, and left out of reads filtered by this one.
     Misspelled(SpotPair),
+    /// The pairs held lack it, and `spotMeta` could not be read again to look for it: that
+    /// read's error. Whether Hyperliquid lists the pair is unknown.
+    Unchecked(UnindexedClientError),
+}
+
+impl UntradedPair {
+    /// The error for `instrument`, naming `base` quoted in `quote`: a refusal of a pair that is
+    /// unlisted or misspelled, or the error that left its listing unknown.
+    fn into_client_error(
+        self,
+        instrument: &InstrumentNameExchange,
+        base: &str,
+        quote: &str,
+    ) -> UnindexedClientError {
+        let reason = match self {
+            Self::Unchecked(error) => return error,
+            Self::Unlisted => format!("Hyperliquid's spotMeta lists no spot pair {base}/{quote}"),
+            Self::Misspelled(pair) => format!(
+                "Hyperliquid spells this spot pair {}/{}, and reports its orders under {}; name \
+                 the instrument that way",
+                pair.base(),
+                pair.quote(),
+                spot_pair_to_instrument(&pair)
+            ),
+        };
+        UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument.clone(), reason))
+    }
+
+    /// [`into_client_error`](Self::into_client_error) for an open request, which was not sent.
+    /// A connectivity failure leaves the request [`NotPlacedReason::NotSent`]; any other error,
+    /// such as a `spotMeta` response that does not parse, refuses the instrument with it.
+    fn into_order_error(
+        self,
+        instrument: &InstrumentNameExchange,
+        base: &str,
+        quote: &str,
+    ) -> UnindexedOrderError {
+        match self.into_client_error(instrument, base, quote) {
+            UnindexedClientError::Api(error) => OrderError::Rejected(error),
+            UnindexedClientError::Connectivity(error) => {
+                OrderError::NotPlaced(NotPlacedReason::NotSent(error))
+            }
+            error => OrderError::Rejected(ApiError::InstrumentInvalid(
+                instrument.clone(),
+                format!(
+                    "Hyperliquid's spotMeta could not be read again to look for the spot pair \
+                     {base}/{quote}: {error}"
+                ),
+            )),
+        }
+    }
 }
 
 impl ExecutionClient for HyperliquidSpotClient {
@@ -346,11 +431,21 @@ impl ExecutionClient for HyperliquidSpotClient {
         }
     }
 
+    /// Lists every requested instrument, with its open orders; spot has no positions.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for an instrument in `instruments` that names no spot pair
+    /// this client trades: not `BASE-QUOTE-SPOT`, not listed in `spotMeta`, or spelled otherwise
+    /// than Hyperliquid spells it (see [Spot coins](self#spot-coins)). When the pairs held lack
+    /// it and `spotMeta` cannot be read again, that read's error, such as
+    /// [`ConnectivityError::Timeout`]: whether the pair is listed is then unknown.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        self.check_instruments(instruments).await?;
         let address = self.wallet_h160();
 
         // The balances' time: the read describes the account no earlier than this.
@@ -894,25 +989,9 @@ impl ExecutionClient for HyperliquidSpotClient {
         let pair = match self.traded_pair(base, quote).await {
             Ok(pair) => pair,
             Err(untraded) => {
-                let reason = match untraded {
-                    UntradedPair::Unlisted => {
-                        format!("Hyperliquid's spotMeta lists no spot pair {base}/{quote}")
-                    }
-                    UntradedPair::Misspelled(pair) => format!(
-                        "Hyperliquid spells this spot pair {}/{}, and reports its orders under \
-                         {}; name the instrument that way",
-                        pair.base(),
-                        pair.quote(),
-                        spot_pair_to_instrument(&pair)
-                    ),
-                };
-                warn!(instrument = %request.key.instrument, %reason, "Spot order refused unsent");
-                return make_inactive(OrderError::Rejected(
-                    crate::error::ApiError::InstrumentInvalid(
-                        request.key.instrument.clone(),
-                        reason,
-                    ),
-                ));
+                let error = untraded.into_order_error(request.key.instrument, base, quote);
+                warn!(instrument = %request.key.instrument, %error, "Spot order refused unsent");
+                return make_inactive(error);
             }
         };
         let precision = OrderPrecision::spot(pair.base_sz_decimals());
@@ -1033,10 +1112,18 @@ impl ExecutionClient for HyperliquidSpotClient {
             .collect())
     }
 
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for an instrument in `instruments` that names no spot pair
+    /// this client trades: not `BASE-QUOTE-SPOT`, not listed in `spotMeta`, or spelled otherwise
+    /// than Hyperliquid spells it (see [Spot coins](self#spot-coins)). When the pairs held lack
+    /// it and `spotMeta` cannot be read again, that read's error, such as
+    /// [`ConnectivityError::Timeout`]: whether the pair is listed is then unknown.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        self.check_instruments(instruments).await?;
         let address = self.wallet_h160();
 
         let open_orders = open_orders(&self.info_client, address).await?;
@@ -1054,12 +1141,21 @@ impl ExecutionClient for HyperliquidSpotClient {
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
     /// so a span reaching further back is read only as far as those go, and
     /// [`held_since`](TradesRead::held_since) says where that is.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for an instrument in `instruments` that names no spot pair
+    /// this client trades: not `BASE-QUOTE-SPOT`, not listed in `spotMeta`, or spelled otherwise
+    /// than Hyperliquid spells it (see [Spot coins](self#spot-coins)). When the pairs held lack
+    /// it and `spotMeta` cannot be read again, that read's error, such as
+    /// [`ConnectivityError::Timeout`]: whether the pair is listed is then unknown.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        self.check_instruments(instruments).await?;
         let Some((start_ms, end_ms)) = span_millis(start, end) else {
             return Ok(TradesRead::complete(Vec::new()));
         };
@@ -2164,6 +2260,235 @@ mod tests {
                         "Hyperliquid's spotMeta lists no spot pair HYPE/PURR".to_owned(),
                     )
                 )))
+            );
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        /// [`resting_client`], whose reads of `spotMeta` after the one at creation get `later`.
+        async fn client_reading_spot_meta_again(
+            later: ResponseTemplate,
+        ) -> (MockServer, HyperliquidSpotClient) {
+            use wiremock::matchers::body_string_contains;
+            let (server, client) = resting_client().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .and(body_string_contains("spotMeta"))
+                .respond_with(later)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            (server, client)
+        }
+
+        /// Answer the account reads with an account holding nothing.
+        async fn serve_empty_account(server: &MockServer) {
+            use wiremock::matchers::body_partial_json;
+            for (kind, answer) in [
+                (
+                    "spotClearinghouseState",
+                    serde_json::json!({"balances": []}),
+                ),
+                ("frontendOpenOrders", serde_json::json!([])),
+                ("userFillsByTime", serde_json::json!([])),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path("/info"))
+                    .and(body_partial_json(serde_json::json!({"type": kind})))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                    .with_priority(1)
+                    .mount(server)
+                    .await;
+            }
+        }
+
+        /// The requests that read the account, rather than `spotMeta`.
+        async fn account_reads(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.url.path() == "/info"
+                        && !String::from_utf8_lossy(&request.body).contains("spotMeta")
+                })
+                .count()
+        }
+
+        /// Each read that takes `instruments`, by name, with what it returned.
+        async fn each_read(
+            client: &HyperliquidSpotClient,
+            instruments: &[&str],
+        ) -> [(&'static str, Result<(), UnindexedClientError>); 3] {
+            let instruments: Vec<_> = instruments
+                .iter()
+                .map(|name| InstrumentNameExchange::new(*name))
+                .collect();
+            let end = Utc::now();
+            let start = end - chrono::TimeDelta::hours(1);
+            [
+                (
+                    "account_snapshot",
+                    client.account_snapshot(&[], &instruments).await.map(drop),
+                ),
+                (
+                    "fetch_open_orders",
+                    client.fetch_open_orders(&instruments).await.map(drop),
+                ),
+                (
+                    "fetch_trades",
+                    client
+                        .fetch_trades(start, end, &instruments)
+                        .await
+                        .map(drop),
+                ),
+            ]
+        }
+
+        /// A name that is not a spot pair's, names no listed pair, or spells a listed pair's
+        /// tokens otherwise than Hyperliquid fails each read before it reads the account, even
+        /// after a name that passes: a snapshot would otherwise list it with no open orders,
+        /// complete, without having looked.
+        #[tokio::test]
+        async fn reads_refuse_an_instrument_naming_no_spot_pair_before_reading() {
+            let (server, client) = resting_client().await;
+            serve_empty_account(&server).await;
+
+            for (instrument, reason) in [
+                (
+                    "HYPE-PURR-SPOT",
+                    "Hyperliquid's spotMeta lists no spot pair HYPE/PURR",
+                ),
+                (
+                    "hype-usdc-SPOT",
+                    "Hyperliquid spells this spot pair HYPE/USDC, and reports its orders under \
+                     HYPE-USDC-SPOT; name the instrument that way",
+                ),
+                (
+                    "HYPE-USDC",
+                    "HYPE-USDC is not a Hyperliquid spot pair: expected BASE-QUOTE-SPOT, such as \
+                     HYPE-USDC-SPOT",
+                ),
+            ] {
+                for (read, result) in each_read(&client, &["HYPE-USDC-SPOT", instrument]).await {
+                    assert_eq!(
+                        result,
+                        Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                            InstrumentNameExchange::new(instrument),
+                            reason.to_owned(),
+                        ))),
+                        "{read} {instrument}"
+                    );
+                }
+            }
+            assert_eq!(account_reads(&server).await, 0);
+        }
+
+        #[tokio::test]
+        async fn reads_take_listed_pairs_and_a_snapshot_lists_each_complete() {
+            let (server, client) = resting_client().await;
+            serve_empty_account(&server).await;
+            let instruments = ["HYPE-USDC-SPOT", "PURR-USDC-SPOT"];
+
+            for (read, result) in each_read(&client, &instruments).await {
+                assert_eq!(result, Ok(()), "{read}");
+            }
+            let requested = instruments.map(InstrumentNameExchange::new);
+            let snapshot = client.account_snapshot(&[], &requested).await.unwrap();
+            let mut listed: Vec<_> = snapshot
+                .instruments
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.instrument.as_ref(),
+                        entry.orders.len(),
+                        entry.orders_complete,
+                    )
+                })
+                .collect();
+            listed.sort();
+            assert_eq!(
+                listed,
+                [("HYPE-USDC-SPOT", 0, true), ("PURR-USDC-SPOT", 0, true)]
+            );
+        }
+
+        #[tokio::test]
+        async fn reads_take_a_pair_listed_since_the_client_was_created() {
+            let (server, client) =
+                client_reading_spot_meta_again(ResponseTemplate::new(200).set_body_raw(
+                    super::super::super::spot_coins::spot_meta_with_new_pair(),
+                    "application/json",
+                ))
+                .await;
+            serve_empty_account(&server).await;
+
+            for (read, result) in each_read(&client, &["HYPE-PURR-SPOT"]).await {
+                assert_eq!(result, Ok(()), "{read}");
+            }
+        }
+
+        /// A pair the client holds no record of may have been listed since it read `spotMeta`,
+        /// so when `spotMeta` cannot be read again, whether the pair is listed is unknown: each
+        /// read fails with the connectivity error, and an order is not sent, rather than either
+        /// refusing the name. A pair held still passes.
+        #[tokio::test]
+        async fn a_pair_unchecked_for_want_of_spot_meta_fails_with_the_reads_error() {
+            let (server, client) = client_reading_spot_meta_again(ResponseTemplate::new(503)).await;
+            serve_empty_account(&server).await;
+
+            for (read, result) in each_read(&client, &["HYPE-PURR-SPOT"]).await {
+                assert!(
+                    matches!(&result, Err(UnindexedClientError::Connectivity(_))),
+                    "{read}: {result:?}"
+                );
+            }
+            let order = place(&client, "HYPE-PURR-SPOT", dec!(25), dec!(1)).await;
+            assert!(
+                matches!(
+                    &order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::NotPlaced(
+                        NotPlacedReason::NotSent(_)
+                    )))
+                ),
+                "{:?}",
+                order.state
+            );
+            for (read, result) in each_read(&client, &["HYPE-USDC-SPOT"]).await {
+                assert_eq!(result, Ok(()), "{read}");
+            }
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        /// A `spotMeta` that no longer parses is no connectivity fault: the reads fail with it,
+        /// and an order on a pair it was needed for is refused, saying why.
+        #[tokio::test]
+        async fn a_pair_unchecked_for_a_spot_meta_that_does_not_parse_is_refused_with_it() {
+            let (server, client) = client_reading_spot_meta_again(
+                ResponseTemplate::new(200).set_body_raw("not json", "application/json"),
+            )
+            .await;
+            serve_empty_account(&server).await;
+
+            for (read, result) in each_read(&client, &["HYPE-PURR-SPOT"]).await {
+                assert!(
+                    matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("spotMeta")),
+                    "{read}: {result:?}"
+                );
+            }
+            let order = place(&client, "HYPE-PURR-SPOT", dec!(25), dec!(1)).await;
+            assert!(
+                matches!(
+                    &order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                        ApiError::InstrumentInvalid(instrument, reason)
+                    ))) if instrument.as_ref() == "HYPE-PURR-SPOT" && reason.starts_with(
+                        "Hyperliquid's spotMeta could not be read again to look for the spot \
+                         pair HYPE/PURR: "
+                    )
+                ),
+                "{:?}",
+                order.state
             );
             assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
         }
