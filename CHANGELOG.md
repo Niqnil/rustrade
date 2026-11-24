@@ -32,8 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`IbkrLiveBarSize`), from trades, the midpoint, the bid, the ask or aggregated trades
   (`IbkrBarSource`). Without a live market data subscription IB sends the history and then code
   2188, after which no live bar comes, so the subscription ends with
-  `DataError::MarketDataNotAvailable` (`codes::RECENT_HISTORY_NOT_SUBSCRIBED`). Not yet checked
-  against a live subscription: how late IB's closing update comes, and so `BAR_SETTLE`, may change.
+  `DataError::MarketDataNotAvailable` (`codes::RECENT_HISTORY_NOT_SUBSCRIBED`). A candle
+  subscription whose channel `ibapi` closes without an end or an error ends with
+  `DataError::ConnectionLost`, so the stream reconnects, rather than looking again at once without
+  end. Not yet checked against a live subscription: how late IB's closing update comes, and so
+  `BAR_SETTLE`, may change.
 - **`DataError::InvalidSubscription`** (`rustrade-data`). `IbkrMarketStream::init` refuses, before
   connecting, a subscription built or deserialized past its constructor's check: depth rows
   outside 1-20, or a candle `since` later than one bar from now.
@@ -1445,6 +1448,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (it was the SDK's 1 s), as the spot cancel-replace does. A lost answer, cut short or later
   than 5 s, leaves the outcome unknown (`OrderError::Connectivity`), as any other transport
   failure does. Reads keep the retries and the 1 s bound.
+
+- **The audit ignore lists cover the `parquet` 60.1.0 encrypted-write advisory.** RUSTSEC-2026-0595
+  (bloom filters left in plaintext when writing an encrypted Parquet file) does not apply here:
+  `rustrade-data` only decodes Parquet, and does not enable parquet's `encryption` feature. It is
+  ignored in `deny.toml` and the CI audit job until the bump to the fixed `parquet` 60.2.0.
 
 ## [0.22.0] - 2026-11-09
 
