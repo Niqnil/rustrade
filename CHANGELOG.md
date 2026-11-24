@@ -732,6 +732,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: Hyperliquid spot reads refuse an instrument naming no spot pair the client trades**
+  (`rustrade-execution`, #1043). `HyperliquidSpotClient::account_snapshot` listed every requested
+  instrument with no open orders, complete, even one naming no listed pair, so it reported an
+  instrument it had not looked at; under another spelling of a listed pair (`hype-usdc-SPOT` for
+  `HYPE-USDC-SPOT`) it did so while the pair had open orders, reported under Hyperliquid's
+  spelling. `account_snapshot`, `fetch_open_orders` and `fetch_trades` now fail with
+  `ApiError::InstrumentInvalid` before reading anything, as the perpetuals client does, for a name
+  that is not `BASE-QUOTE-SPOT`, names no pair in `spotMeta`, or spells a listed pair's tokens
+  otherwise than Hyperliquid; the reason names the spelling to use, as `open_order`'s refusal
+  does. A pair the client holds no record of makes it read `spotMeta` again first, as before.
+  When that read fails, the pair may have been listed since, so the reads fail with the read's
+  error (a `ConnectivityError` for a network fault), and `open_order` leaves the order
+  `NotPlaced(NotSent)` for a network fault, or rejects it with a rate limit, instead of refusing
+  the instrument. An empty `instruments` slice is not checked.
 - **Breaking: `ExecutionClient::account_snapshot` must return balances for the requested assets
   only** (`rustrade-execution`, `rustrade`, #998). They are matched as `fetch_balances` matches
   them: an empty slice means every asset held, and names are compared ignoring ASCII case. The

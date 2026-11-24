@@ -29,9 +29,27 @@ pub(super) struct SpotCoins(Arc<Inner>);
 struct Inner {
     info_client: Arc<InfoClient>,
     pairs: RwLock<Arc<SpotPairs>>,
-    /// When `spotMeta` was last read again, if it has been. Held across that read, so concurrent
-    /// misses read it once.
-    refetched: tokio::sync::Mutex<Option<Instant>>,
+    /// The last read of `spotMeta` again, if there has been one. Held across that read, so
+    /// concurrent misses read it once.
+    refetched: tokio::sync::Mutex<Option<Refetch>>,
+}
+
+/// A read of `spotMeta` again.
+#[derive(Debug)]
+struct Refetch {
+    /// When it started.
+    at: Instant,
+    /// Why it did not answer, `None` once it did. Set to a timeout before the read starts, so a
+    /// read abandoned part way counts as one that did not answer.
+    unanswered: Option<UnindexedClientError>,
+}
+
+/// The pairs a lookup found, and why they may lack a pair listed since they were read.
+struct Lookup {
+    pairs: Arc<SpotPairs>,
+    /// The error of the last read of `spotMeta` again, when the pairs lacked what was looked for
+    /// and that read did not answer.
+    unanswered: Option<UnindexedClientError>,
 }
 
 impl SpotCoins {
@@ -67,48 +85,87 @@ impl SpotCoins {
                 .all(|coin| CoinKind::of(coin) != CoinKind::Spot || pairs.get(coin).is_some())
         })
         .await
+        .pairs
     }
 
     /// The pair of `base` quoted in `quote`, as [`SpotPairs::find`] matches it (so possibly
     /// spelled differently in ASCII case), read again first if the pairs lack it, as
-    /// [`covering`](Self::covering) does.
-    pub(super) async fn find(&self, base: &str, quote: &str) -> Option<SpotPair> {
-        self.read_again_unless(|pairs| pairs.find(base, quote).is_some())
-            .await
-            .find(base, quote)
-            .cloned()
+    /// [`covering`](Self::covering) does. `None` when a read of `spotMeta` that answered lists no
+    /// such pair.
+    ///
+    /// # Errors
+    ///
+    /// The error of the last read of `spotMeta` again, when the pairs lack the pair and that read
+    /// failed, timed out or was abandoned part way, whether this call made it or it started less
+    /// than [`REFETCH_INTERVAL`] ago. Whether Hyperliquid lists the pair is then unknown: it may
+    /// have been listed since the pairs were read.
+    pub(super) async fn find(
+        &self,
+        base: &str,
+        quote: &str,
+    ) -> Result<Option<SpotPair>, UnindexedClientError> {
+        let Lookup { pairs, unanswered } = self
+            .read_again_unless(|pairs| pairs.find(base, quote).is_some())
+            .await;
+        match (pairs.find(base, quote), unanswered) {
+            (Some(pair), _) => Ok(Some(pair.clone())),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
     }
 
     /// The pairs, read again first unless they are `complete`, at most once per
     /// [`REFETCH_INTERVAL`].
-    async fn read_again_unless(&self, complete: impl Fn(&SpotPairs) -> bool) -> Arc<SpotPairs> {
+    async fn read_again_unless(&self, complete: impl Fn(&SpotPairs) -> bool) -> Lookup {
+        let answered = |pairs| Lookup {
+            pairs,
+            unanswered: None,
+        };
         let pairs = self.current();
         if complete(&pairs) {
-            return pairs;
+            return answered(pairs);
         }
 
         let mut refetched = self.0.refetched.lock().await;
         // Another caller may have read `spotMeta` while this one waited for the lock.
         let pairs = self.current();
-        if complete(&pairs) || refetched.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
-            return pairs;
+        if complete(&pairs) {
+            return answered(pairs);
+        }
+        if let Some(last) = refetched
+            .as_ref()
+            .filter(|last| last.at.elapsed() < REFETCH_INTERVAL)
+        {
+            return Lookup {
+                pairs,
+                unanswered: last.unanswered.clone(),
+            };
         }
 
-        // Stamped before the read, so a caller dropped part way through still spends the interval.
-        *refetched = Some(Instant::now());
+        // Stamped before the read, so a caller dropped part way through still spends the interval,
+        // and the read counts as unanswered until it answers.
+        let last = refetched.insert(Refetch {
+            at: Instant::now(),
+            unanswered: Some(ConnectivityError::Timeout.into()),
+        });
         match fetch_spot_pairs(&self.0.info_client).await {
             Ok(fetched) => {
                 info!(
                     pairs = fetched.len(),
                     "Read Hyperliquid spotMeta again for a spot pair it lacked"
                 );
+                last.unanswered = None;
                 let fetched = Arc::new(fetched);
                 *self.0.pairs.write() = Arc::clone(&fetched);
-                fetched
+                answered(fetched)
             }
             Err(error) => {
                 warn!(%error, "Hyperliquid spotMeta could not be read again");
-                pairs
+                last.unanswered = Some(error.clone());
+                Lookup {
+                    pairs,
+                    unanswered: Some(error),
+                }
             }
         }
     }
@@ -175,6 +232,22 @@ pub(super) fn test_spot_pairs() -> SpotPairs {
     serde_json::from_str(TEST_SPOT_META).expect("TEST_SPOT_META parses")
 }
 
+/// [`TEST_SPOT_META`] with HYPE/PURR listed as `@300`, as after a new listing.
+#[cfg(test)]
+// Test code: a fixture that does not parse is a test bug.
+#[allow(clippy::expect_used)]
+pub(super) fn spot_meta_with_new_pair() -> String {
+    let mut meta: serde_json::Value =
+        serde_json::from_str(TEST_SPOT_META).expect("TEST_SPOT_META parses");
+    meta["universe"]
+        .as_array_mut()
+        .expect("TEST_SPOT_META has a universe")
+        .push(serde_json::json!(
+            {"name": "@300", "tokens": [150, 1], "index": 300, "isCanonical": false}
+        ));
+    meta.to_string()
+}
+
 #[cfg(test)]
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
@@ -183,18 +256,6 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// [`TEST_SPOT_META`] with HYPE/PURR listed as `@300`, as after a new listing.
-    fn spot_meta_with_new_pair() -> String {
-        let mut meta: serde_json::Value = serde_json::from_str(TEST_SPOT_META).unwrap();
-        meta["universe"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!(
-                {"name": "@300", "tokens": [150, 1], "index": 300, "isCanonical": false}
-            ));
-        meta.to_string()
-    }
 
     /// A server answering `spotMeta` first with [`TEST_SPOT_META`], then with `later`.
     async fn serve(later: ResponseTemplate) -> MockServer {
@@ -329,6 +390,73 @@ mod tests {
             2,
             "no second read within the interval"
         );
+    }
+
+    #[tokio::test]
+    async fn find_gives_the_pair_none_for_an_unlisted_one_and_reads_again_for_a_new_one() {
+        let server = serve(new_pair()).await;
+        let coins = spot_coins(&server).await;
+
+        assert_eq!(
+            coins.find("hype", "usdc").await.unwrap().unwrap().base(),
+            "HYPE"
+        );
+        assert_eq!(requests(&server).await, 1, "held, so not read again");
+        assert_eq!(
+            coins.find("HYPE", "PURR").await.unwrap().unwrap().quote(),
+            "PURR"
+        );
+        assert_eq!(requests(&server).await, 2, "read again for the new pair");
+        // Within the interval of a read that answered, a pair it lacks is unlisted.
+        assert_eq!(coins.find("FOO", "USDC").await.unwrap(), None);
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    /// A pair the pairs lack, when `spotMeta` cannot be read again, may have been listed since,
+    /// so `find` gives the read's error rather than `None`, within the interval too. A pair held
+    /// is still found.
+    #[tokio::test]
+    async fn find_gives_the_error_of_a_read_again_that_failed() {
+        let server = serve(ResponseTemplate::new(503)).await;
+        let coins = spot_coins(&server).await;
+
+        let first = coins.find("HYPE", "PURR").await;
+        let within_interval = coins.find("HYPE", "PURR").await;
+
+        assert!(
+            matches!(&first, Err(UnindexedClientError::Connectivity(_))),
+            "{first:?}"
+        );
+        assert_eq!(within_interval, first);
+        assert_eq!(requests(&server).await, 2, "one read again");
+        assert_eq!(
+            coins.find("HYPE", "USDC").await.unwrap().unwrap().base(),
+            "HYPE"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_after_a_read_abandoned_part_way_gives_a_timeout_within_the_interval() {
+        let server = serve(hung()).await;
+        let coins = spot_coins(&server).await;
+
+        let reading = tokio::spawn({
+            let coins = coins.clone();
+            async move { coins.find("HYPE", "PURR").await }
+        });
+        while requests(&server).await < 2 {
+            tokio::task::yield_now().await;
+        }
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            coins.find("HYPE", "PURR").await,
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::Timeout
+            ))
+        );
+        assert_eq!(requests(&server).await, 2);
     }
 
     #[test]
