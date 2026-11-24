@@ -7,6 +7,7 @@ use crate::{
         greeks::OptionGreeks,
         liquidation::Liquidation,
         trade::PublicTrade,
+        trading_status::TradingStatus,
     },
 };
 use chrono::{DateTime, Utc};
@@ -130,6 +131,14 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    /// This event with a reference to its [`TradingStatus`], if it is one.
+    pub fn as_trading_status(&self) -> Option<MarketEvent<&InstrumentKey, &TradingStatus>> {
+        match &self.kind {
+            DataKind::TradingStatus(status) => Some(self.as_event(status)),
+            _ => None,
+        }
+    }
+
     fn as_event<'a, K>(&'a self, kind: &'a K) -> MarketEvent<&'a InstrumentKey, &'a K> {
         MarketEvent {
             time_exchange: self.time_exchange,
@@ -152,6 +161,9 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
 ///   [`Subscription`](crate::subscription::Subscription)s directly, it is only used to
 ///   make ergonomic [`Streams`](crate::streams::Streams) containing many
 ///   [`MarketEvent<T>`](MarketEvent) kinds.
+/// - New kinds are added as venues publish them, so a `match` outside this crate needs a wildcard
+///   arm.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize, From)]
 pub enum DataKind {
     Trade(PublicTrade),
@@ -160,6 +172,7 @@ pub enum DataKind {
     Candle(Candle),
     Liquidation(Liquidation),
     OptionGreeks(OptionGreeks),
+    TradingStatus(TradingStatus),
 }
 
 impl DataKind {
@@ -171,6 +184,7 @@ impl DataKind {
             DataKind::Candle(_) => "candle",
             DataKind::Liquidation(_) => "liquidation",
             DataKind::OptionGreeks(_) => "option_greeks",
+            DataKind::TradingStatus(_) => "trading_status",
         }
     }
 }
@@ -268,5 +282,53 @@ impl<InstrumentKey> From<MarketEvent<InstrumentKey, Liquidation>>
 {
     fn from(value: MarketEvent<InstrumentKey, Liquidation>) -> Self {
         value.map_kind(Liquidation::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscription::trading_status::TradingState;
+
+    fn event(kind: DataKind) -> MarketEvent<u8, DataKind> {
+        MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MIN_UTC,
+            exchange: ExchangeId::Ibkr,
+            instrument: 7,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_trading_status_event_reads_as_one_and_nothing_else() {
+        let status = TradingStatus::new(TradingState::Halted);
+        let event = event(DataKind::TradingStatus(status.clone()));
+
+        let read = event.as_trading_status();
+
+        assert_eq!(
+            read.map(|read| (read.instrument, read.kind)),
+            Some((&7, &status))
+        );
+        assert!(event.as_option_greeks().is_none());
+    }
+
+    #[test]
+    fn another_kind_is_not_a_trading_status() {
+        let event = event(DataKind::OptionGreeks(OptionGreeks::default()));
+
+        assert!(event.as_trading_status().is_none());
+    }
+
+    #[test]
+    fn kind_names() {
+        let names = [
+            DataKind::OptionGreeks(OptionGreeks::default()),
+            DataKind::TradingStatus(TradingStatus::new(TradingState::Trading)),
+        ]
+        .map(|kind| kind.kind_name().to_owned());
+
+        assert_eq!(names, ["option_greeks", "trading_status"]);
     }
 }

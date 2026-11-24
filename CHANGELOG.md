@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
+  `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
+  `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,
+  `Unknown`), an optional `HaltReason`, and the venue's own code. The IBKR stream's quote
+  subscriptions report IB's Halted tick this way, on change only, with no extra market data line:
+  -1 is `Unknown`, 0 `Trading`, 1 `Halted` (regulatory), 2 `Paused` (volatility), delayed data
+  included. IB documents 0 as sent only for a contract in a TWS watchlist, so a contract that
+  trades normally may report no status at all; IB sends no Limit Up-Limit Down price bands.
 - **IBKR live candles** (`rustrade-data`, `rustrade-instrument`, #1019). `IbkrMarketStream` takes a
   candle subscription (`IbkrSubscription::candles`, `IbkrCandleRequest`): completed bars only,
   each emitted once and never revised, stamped with its `close_time`. It asks IB for its historical
@@ -736,6 +744,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IbkrStreamConfig::new(host, port, client_id)` (or `Default`) and the `with_*` methods rather
   than a struct literal; a serialized configuration without `market_data_type` still loads, as
   live. The security type decides which prices mean "no quote" (see Fixed).
+- **Breaking: `DataKind` is `#[non_exhaustive]`** (`rustrade-data`, #881). It gains
+  `TradingStatus` (see Added), and kinds will keep being added as venues publish them, so a `match`
+  on it outside `rustrade-data` needs a wildcard arm. The engine's `DefaultInstrumentMarketData` and
+  the simulated venue ignore `TradingStatus`; a kind added later that reaches their wildcard arm is
+  logged (a rate-limited warning naming it) rather than ignored silently.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
@@ -1197,6 +1210,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
+  IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
+  subscription passed on as a `PublicTrade` at price 0. It is now skipped.
 - **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
   cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
   id among the filled, expired and refused orders too, so the message now says "among its orders".

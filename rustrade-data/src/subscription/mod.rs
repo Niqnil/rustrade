@@ -34,6 +34,9 @@ pub mod quote;
 /// Public trade [`SubscriptionKind`] and the associated output data model.
 pub mod trade;
 
+/// Trading status data model: halts, pauses and resumptions a venue reports.
+pub mod trading_status;
+
 /// Defines kind of a [`Subscription`], and the output [`Self::Event`] that it yields.
 pub trait SubscriptionKind
 where

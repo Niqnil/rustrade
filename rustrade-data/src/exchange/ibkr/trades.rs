@@ -17,7 +17,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 // Process-global counters aggregated across all instruments. Never reset, so
 // rate-limiting persists even after instrument reconnects. The `total_bad_*`
@@ -34,8 +34,16 @@ static BAD_SIZE_COUNT: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Returns
 ///
-/// Returns `None` if price or size is NaN/Inf (invalid trade data from IB).
+/// Returns `None` if price or size is NaN/Inf (invalid trade data from IB), or both are zero:
+/// IB marks halts in tick-by-tick data with such a tick, which is not a trade.
 pub fn from_ib_trade(trade: &Trade) -> Option<PublicTrade> {
+    if trade.price == 0.0 && trade.size == 0.0 {
+        debug!(
+            past_limit = trade.trade_attribute.past_limit,
+            "IB tick-by-tick tick with zero price and size (a halt marker), skipping"
+        );
+        return None;
+    }
     if !trade.price.is_finite() {
         let count = BAD_PRICE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if count == 1 || count.is_multiple_of(1000) {
@@ -154,6 +162,22 @@ mod tests {
         assert_eq!(trade.amount, dec!(100));
         assert!(trade.side.is_none());
         assert!(!trade.id.is_empty());
+    }
+
+    #[test]
+    fn skips_a_halt_marker_with_zero_price_and_size() {
+        let mut marker = make_trade(1700000000, 0.0, 0.0);
+        marker.trade_attribute.past_limit = true;
+        assert!(from_ib_trade(&marker).is_none());
+
+        // Whatever its flags.
+        assert!(from_ib_trade(&make_trade(1700000000, 0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn keeps_a_trade_with_only_one_of_price_and_size_zero() {
+        assert!(from_ib_trade(&make_trade(1700000000, 0.0, 5.0)).is_some());
+        assert!(from_ib_trade(&make_trade(1700000000, 1.5, 0.0)).is_some());
     }
 
     #[test]
