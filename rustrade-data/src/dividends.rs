@@ -9,7 +9,10 @@
 //! An issuer **declares** a dividend, saying the amount and the dates. The stock trades without
 //! the right to it from the **ex-dividend date**, and its price falls by about the amount at that
 //! day's open. Holders on the **record date** are paid on the **payment date**. Since US
-//! settlement moved to one business day (May 2024), the record date is usually the ex-date.
+//! settlement moved to one business day (May 2024), the record date is usually the ex-date;
+//! before that the ex-date was a business day before the record date. Do not assume the order
+//! ex, record, payment: in the US a distribution worth a quarter or more of the share price goes
+//! ex on the business day after its payment date. Only the declaration comes before the rest.
 //!
 //! An option pricer needs the ex-date and the amount (see the `rustrade-pricing` crate's
 //! `CashDividend`, whose time is the ex-date's open). Only the ex-date is always present.
@@ -46,6 +49,10 @@ mod store;
 pub use store::DividendStore;
 
 /// One provider's statement about one cash dividend. See the [module documentation](self).
+///
+/// The record every provider's dividend read returns, with the instant it became public. Not to
+/// be confused with a provider's own response types, or with the `rustrade-pricing` crate's
+/// `CashDividend`, which is a pricing input built from one of these.
 ///
 /// `#[non_exhaustive]`: fields may be added without a major-version bump. Build one with
 /// [`Dividend::new`] and the `with_*` setters.

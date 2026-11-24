@@ -37,7 +37,8 @@ struct Row {
 /// day); one without is known from the start of its ex-date (00:00 New York). Either is clamped
 /// to `observed_at`, so no record is known later than it was fetched. A row whose amount is zero
 /// is skipped and logged at DEBUG: Alpha Vantage lists such rows with full dates, and they pay
-/// nothing.
+/// nothing. A row declared after its ex-date is kept as given and logged at WARN: it is known
+/// only once it has gone ex, so it is never the next dividend.
 ///
 /// # Errors
 /// [`AlphaVantageError::Decode`] for a body without `data`, a row without an ex-date, a date that
@@ -59,6 +60,14 @@ pub(crate) fn dividends(
             continue;
         }
         let declaration_date = optional_date(row.declaration_date.as_deref(), "declaration_date")?;
+        if let Some(declared) = declaration_date.filter(|declared| *declared > ex_date) {
+            warn!(
+                %symbol,
+                %ex_date,
+                %declared,
+                "Alpha Vantage dividend declared after its ex-date; it is known only once it has gone ex"
+            );
+        }
         let known_at = match declaration_date {
             Some(declared) => midnight(declared.succ_opt().ok_or_else(|| {
                 AlphaVantageError::decode(format!("declaration_date {declared} has no next day"))
@@ -286,6 +295,29 @@ mod tests {
                 .contains("two dividends on one ex-date"),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn a_dividend_declared_after_its_ex_date_is_kept_with_a_warning() {
+        let body = r#"{"data": [{"ex_dividend_date": "2026-02-03",
+            "declaration_date": "2026-02-05", "amount": "0.5"}]}"#;
+        let (dividends, events) = capture(|| dividends(body, "XYZ", observed()));
+        let dividends = dividends.unwrap();
+        assert_eq!(
+            (dividends[0].declaration_date, dividends[0].known_at),
+            (Some(day(2026, 2, 5)), ny_midnight(2026, 2, 6))
+        );
+        let warnings: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert!(
+            warnings[0].message().contains("declared after its ex-date"),
+            "{events:?}"
+        );
+        // Declared on its ex-date: no warning.
+        let same_day = r#"{"data": [{"ex_dividend_date": "2026-02-03",
+            "declaration_date": "2026-02-03", "amount": "0.5"}]}"#;
+        let (_, events) = capture(|| super::dividends(same_day, "XYZ", observed()));
+        assert!(!events.iter().any(|e| e.level == Level::WARN), "{events:?}");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use smol_str::SmolStr;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
 };
 
 /// Cash dividends as they were known at any given time: the next and the previous dividend of a
@@ -48,9 +48,15 @@ use std::{
 ///   caller whose provider lists them apart sums them first.
 /// - **A moved ex-date is a second dividend.** A record whose ex-date changed does not supersede
 ///   the record of the old date.
+/// - **A revision counts from the record's `known_at`, not from its fetch.** A corrected amount
+///   fetched later, for a dividend whose declaration date did not change, has the same `known_at`
+///   as the record it corrects and stands from then: a backtest at that instant sees the
+///   correction before it was published.
 /// - Every record put in is kept, so memory grows with each fetch. Only a record equal in every
 ///   field to one already held is dropped; the same dividend fetched twice differs in
 ///   [`observed_at`](super::DividendProvenance::observed_at) and is kept twice.
+/// - A query reads each dividend it touches, and within each skips the records not yet public at
+///   `as_of` to reach the one standing, so its cost grows with the records kept.
 ///
 /// ```
 /// use chrono::{NaiveDate, TimeZone, Utc};
@@ -177,14 +183,20 @@ impl DividendStore {
     /// Every dividend of `symbol` known as of `as_of` whose ex-date is in `ex_dates`, by ex-date:
     /// the standing record of each. An option pricer valuing at `as_of` asks for the ex-dates
     /// after today up to the expiry. See the [contract](Self#contract).
+    ///
+    /// A range that holds no date, such as one starting after it ends (an expiry already past),
+    /// yields nothing. The cost grows with the ex-dates in the range, so a query made per bar
+    /// should bound it at both ends. The iterator borrows the store only, not `symbol`.
     pub fn known<R: RangeBounds<NaiveDate>>(
         &self,
         symbol: &str,
         as_of: DateTime<Utc>,
         ex_dates: R,
-    ) -> impl DoubleEndedIterator<Item = &Dividend> {
+    ) -> impl DoubleEndedIterator<Item = &Dividend> + use<'_, R> {
+        let holds_dates = holds_dates(&ex_dates);
         self.dividends
             .get(symbol)
+            .filter(|_| holds_dates)
             .map(|by_date| by_date.range(ex_dates))
             .into_iter()
             .flatten()
@@ -193,12 +205,12 @@ impl DividendStore {
 
     /// Every record held of `symbol`'s dividend going ex on `ex_date`, public or not, in
     /// supersession order with the strongest last: the last is the one standing once all of them
-    /// are public.
+    /// are public. The iterator borrows the store only, not `symbol`.
     pub fn observations(
         &self,
         symbol: &str,
         ex_date: NaiveDate,
-    ) -> impl Iterator<Item = &Dividend> {
+    ) -> impl Iterator<Item = &Dividend> + use<'_> {
         self.dividends
             .get(symbol)
             .and_then(|by_date| by_date.get(&ex_date))
@@ -228,6 +240,19 @@ impl Extend<Dividend> for DividendStore {
         for dividend in dividends {
             self.insert(dividend);
         }
+    }
+}
+
+/// Whether `range` holds any date. [`BTreeMap::range`] panics on one that starts after it ends,
+/// or that excludes both of two equal bounds, so [`DividendStore::known`] asks this first.
+fn holds_dates(range: &impl RangeBounds<NaiveDate>) -> bool {
+    match (range.start_bound(), range.end_bound()) {
+        (
+            Bound::Included(start) | Bound::Excluded(start),
+            Bound::Included(end) | Bound::Excluded(end),
+        ) if start > end => false,
+        (Bound::Excluded(start), Bound::Excluded(end)) => start != end,
+        _ => true,
     }
 }
 
@@ -404,6 +429,67 @@ mod tests {
         let after_november = utc(2025, 12, 1, 0, 0);
         assert_eq!(store.next("XYZ", after_november), Some(&february));
         assert_eq!(store.previous("XYZ", after_november), Some(&november));
+    }
+
+    #[test]
+    fn a_range_that_holds_no_date_yields_nothing_rather_than_panicking() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let known_at = utc(2025, 10, 1, 0, 0);
+        let november = record(day(2025, 11, 7), dec!(0.25), known_at);
+        let mut store = new_york();
+        store.insert(november.clone());
+        let (before, on, after) = (day(2025, 11, 6), day(2025, 11, 7), day(2025, 11, 8));
+
+        // Starting after it ends, or excluding both of two equal bounds: no date.
+        for range in [
+            (Included(after), Included(before)),
+            (Excluded(after), Excluded(before)),
+            (Included(after), Excluded(before)),
+            (Excluded(after), Included(before)),
+            (Excluded(on), Excluded(on)),
+        ] {
+            assert_eq!(store.known("XYZ", known_at, range).count(), 0, "{range:?}");
+        }
+        // Equal bounds that include the date, or one-sided and open ranges, hold it.
+        for range in [
+            (Included(on), Included(on)),
+            (Included(on), Unbounded),
+            (Unbounded, Included(on)),
+            (Excluded(before), Excluded(after)),
+            (Unbounded, Unbounded),
+        ] {
+            assert_eq!(
+                store.known("XYZ", known_at, range).collect::<Vec<_>>(),
+                [&november],
+                "{range:?}"
+            );
+        }
+        // Equal bounds excluding one side hold no date, without panicking.
+        assert_eq!(store.known("XYZ", known_at, on..on).count(), 0);
+        assert_eq!(
+            store
+                .known("XYZ", known_at, (Excluded(on), Included(on)))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn the_iterators_outlive_the_symbol_they_were_asked_for() {
+        let known_at = utc(2025, 10, 1, 0, 0);
+        let row = record(day(2025, 11, 7), dec!(0.25), known_at);
+        let mut store = new_york();
+        store.insert(row.clone());
+        let known = {
+            let symbol = String::from("XYZ");
+            store.known(&symbol, known_at, ..)
+        };
+        let observed = {
+            let symbol = String::from("XYZ");
+            store.observations(&symbol, row.ex_date)
+        };
+        assert_eq!(known.collect::<Vec<_>>(), [&row]);
+        assert_eq!(observed.collect::<Vec<_>>(), [&row]);
     }
 
     #[test]

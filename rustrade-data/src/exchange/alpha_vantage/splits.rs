@@ -22,7 +22,8 @@ impl StockSplitSource for AlphaVantageClient {
     type Error = AlphaVantageError;
 
     /// Fetch the stock splits of `filter`'s symbols whose effective date is within its range, one
-    /// request per symbol, each symbol's oldest first.
+    /// request per symbol (a symbol named twice is fetched once), each symbol's oldest first. A
+    /// range that starts after it ends matches nothing.
     ///
     /// `effective_date` provenance: this impl maps it onto Alpha Vantage's `effective_date`, the
     /// first day the shares trade on the split basis, satisfying the
@@ -48,8 +49,14 @@ impl StockSplitSource for AlphaVantageClient {
         &self,
         filter: &CorporateActionFilter,
     ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send {
-        // Owned copies, so the returned stream borrows only `self`, not `filter`.
-        let symbols = filter.symbols.clone();
+        // Owned copies, so the returned stream borrows only `self`, not `filter`. A symbol named
+        // twice is fetched once: each request spends the key's daily allowance.
+        let mut symbols: Vec<SmolStr> = Vec::with_capacity(filter.symbols.len());
+        for symbol in &filter.symbols {
+            if !symbols.iter().any(|kept| kept.trim() == symbol.trim()) {
+                symbols.push(symbol.clone());
+            }
+        }
         let (start, end) = (filter.start, filter.end);
         try_stream! {
             if symbols.is_empty() {
@@ -122,19 +129,24 @@ fn splits(body: &str, symbol: &str) -> Result<Vec<CorporateAction<SmolStr>>, Alp
 
 /// The split `factor` (new shares per old, rounded to [`FACTOR_DECIMALS`]) as new and old share
 /// counts: the whole numbers with the smallest denominator up to [`MAX_DENOMINATOR`] whose ratio
-/// rounds to `factor`, else `factor` over one.
+/// lies within half a unit of the factor's last decimal, else `factor` over one.
 ///
 /// Within that bound the ratio is unique: two ratios with denominators of at most 100 differ by
-/// more than 1/10,000, wider than the half a unit of rounding either side of a factor.
+/// more than 1/10,000, wider than the half a unit either side of a factor. The test is a distance,
+/// not a re-rounding, so it holds whichever way a tie was rounded (1/32 is 0.03125, written
+/// `0.0312` or `0.0313`). A factor with more decimals than that is taken as exact.
 ///
 /// A factor of zero or below needs no check of its own: it comes back over one, as zero or the
 /// same negative factor, for [`CorporateActionKind::stock_split`] to refuse.
 fn ratio(factor: Decimal) -> (Decimal, Decimal) {
-    for denominator in 1..=MAX_DENOMINATOR {
-        let denominator = Decimal::from(denominator);
-        let numerator = (factor * denominator).round();
-        if (numerator / denominator).round_dp(FACTOR_DECIMALS) == factor {
-            return (numerator, denominator);
+    if factor.scale() <= FACTOR_DECIMALS {
+        let half_unit = Decimal::new(5, FACTOR_DECIMALS + 1);
+        for denominator in 1..=MAX_DENOMINATOR {
+            let denominator = Decimal::from(denominator);
+            let numerator = (factor * denominator).round();
+            if (numerator / denominator - factor).abs() <= half_unit {
+                return (numerator, denominator);
+            }
         }
     }
     (factor, Decimal::ONE)
@@ -215,6 +227,13 @@ mod tests {
         // 1-for-150 rounds to 0.0067, which no denominator up to 100 reaches.
         assert_eq!(ratio(dec!(0.0067)), (dec!(0.0067), dec!(1)));
         assert_eq!(ratio(dec!(0.0005)), (dec!(0.0005), dec!(1)));
+        // 1/32 is 0.03125: either rounding of the tie is 1/32.
+        assert_eq!(ratio(dec!(0.0313)), (dec!(1), dec!(32)));
+        assert_eq!(ratio(dec!(0.0312)), (dec!(1), dec!(32)));
+        // Short decimals are their own ratio, not a nearby one: 0.3 is 3/10, not 1/3.
+        assert_eq!(ratio(dec!(0.3)), (dec!(3), dec!(10)));
+        // More decimals than Alpha Vantage writes: exact, not snapped to 100/81 (1.234568).
+        assert_eq!(ratio(dec!(1.23456)), (dec!(1.23456), dec!(1)));
         assert_eq!(ratio(Decimal::ZERO), (Decimal::ZERO, Decimal::ONE));
         assert_eq!(ratio(dec!(-2)), (dec!(-2), Decimal::ONE));
     }

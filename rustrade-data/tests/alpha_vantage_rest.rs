@@ -453,7 +453,12 @@ async fn splits_with_no_bounds_return_every_split_and_an_empty_filter_is_refused
         .await;
     let client = client(&server);
     let all: Vec<_> = client
-        .fetch_splits(&CorporateActionFilter::new(vec!["AAA".into()], None, None))
+        // Named twice (once with spaces): one request, each split once.
+        .fetch_splits(&CorporateActionFilter::new(
+            vec!["AAA".into(), " AAA ".into()],
+            None,
+            None,
+        ))
         .map(|item| item.unwrap().effective_date)
         .collect()
         .await;

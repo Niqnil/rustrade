@@ -219,13 +219,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Alpha Vantage lists with full dates, are skipped and logged at DEBUG.
   - **`AlphaVantageClient` implements `StockSplitSource`**, one request per symbol, the filter's
     dates applied to each split's `effective_date`. Alpha Vantage rounds the factor to four
-    decimals, so a ratio of whole numbers with a denominator up to 100 that rounds to it is taken
-    as the split (a one-for-three reverse split's `0.3333` is exactly 1/3). A filter with no
-    symbol is refused with `InvalidInput`.
+    decimals, so a ratio of whole numbers with a denominator up to 100 within half a unit of its
+    last decimal is taken as the split (a one-for-three reverse split's `0.3333` is exactly 1/3).
+    A filter with no symbol is refused with `InvalidInput`; a symbol named twice is fetched once.
   - **Known limitations:** Alpha Vantage answers an unknown symbol like one with no dividends or
     splits, with an empty list. It gives no currency and does not mark a dividend as regular or
     special. Splits carry no declaration date. Two dividends on one ex-date are one dividend in
-    the store, and a withdrawn dividend stays.
+    the store, a withdrawn dividend stays, and a corrected amount counts from the original
+    record's `known_at`.
   - **Alpha Vantage's data is for personal, non-commercial use only:** use by or for a firm, or
     giving others access, needs a commercial licence. See
     <https://www.alphavantage.co/terms_of_service/>. A free key's 25 requests a day cover
