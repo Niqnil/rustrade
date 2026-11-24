@@ -1292,6 +1292,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or not, as `ExecutionClient::account_snapshot` now requires. Names are matched exactly, as the
   venue's other reads match them, so a requested name that differs from the venue's only in case
   is now left out, where the instrument map's case-insensitive lookup used to index it.
+- **The Databento DBN file loaders no longer tie their iterator to the path**
+  (`rustrade-data`). `load_trades_from_dbn` and `load_quotes_from_dbn` return an iterator that
+  owns the open file, but its type borrowed `path`, so a caller could not drop the path, such as
+  a temporary `PathBuf`, while iterating. It now borrows nothing.
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.

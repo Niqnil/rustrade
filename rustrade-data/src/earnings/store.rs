@@ -198,8 +198,12 @@ impl EarningsStore {
     }
 
     /// Every record held of the release `key`, public or not, in supersession order with the
-    /// strongest last: the last is the one standing once all of them are public.
-    pub fn observations(&self, key: &EarningsKey) -> impl Iterator<Item = &EarningsRelease> {
+    /// strongest last: the last is the one standing once all of them are public. The iterator
+    /// borrows the store only, not `key`.
+    pub fn observations(
+        &self,
+        key: &EarningsKey,
+    ) -> impl Iterator<Item = &EarningsRelease> + use<'_> {
         self.releases
             .get(key.symbol())
             .and_then(|periods| periods.get(&key.period()))
@@ -333,6 +337,19 @@ mod tests {
             store.current(&EarningsKey::new("XYZ", day(2026, 3, 31)), known_at),
             None
         );
+    }
+
+    #[test]
+    fn observations_outlive_the_key_they_were_asked_for() {
+        let known_at = utc(2026, 1, 5, 12, 0);
+        let row = record(Q4, day(2026, 1, 28), ReleaseStatus::Confirmed, known_at);
+        let mut store = new_york();
+        store.insert(row.clone());
+        let observed = {
+            let key = row.key();
+            store.observations(&key)
+        };
+        assert_eq!(observed.collect::<Vec<_>>(), [&row]);
     }
 
     #[test]
