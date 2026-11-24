@@ -744,8 +744,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does. A pair the client holds no record of makes it read `spotMeta` again first, as before.
   When that read fails, the pair may have been listed since, so the reads fail with the read's
   error (a `ConnectivityError` for a network fault), and `open_order` leaves the order
-  `NotPlaced(NotSent)` instead of refusing the instrument. An empty `instruments` slice is not
-  checked.
+  `NotPlaced(NotSent)` for a network fault, or rejects it with a rate limit, instead of refusing
+  the instrument. An empty `instruments` slice is not checked.
 - **Breaking: `ExecutionClient::account_snapshot` must return balances for the requested assets
   only** (`rustrade-execution`, `rustrade`, #998). They are matched as `fetch_balances` matches
   them: an empty slice means every asset held, and names are compared ignoring ASCII case. The

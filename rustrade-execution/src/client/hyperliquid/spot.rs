@@ -116,7 +116,7 @@ use crate::{
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
-        UnindexedClientError, UnindexedOrderError,
+        UnindexedApiError, UnindexedClientError, UnindexedOrderError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForceKind, UnindexedInactiveOrder, UnindexedOrderKey,
@@ -320,16 +320,16 @@ enum UntradedPair {
 }
 
 impl UntradedPair {
-    /// The error for `instrument`, naming `base` quoted in `quote`: a refusal of a pair that is
-    /// unlisted or misspelled, or the error that left its listing unknown.
-    fn into_client_error(
+    /// The refusal of `instrument`, naming `base` quoted in `quote`, when its pair is unlisted or
+    /// misspelled; otherwise the error that left its listing unknown.
+    fn refusal(
         self,
         instrument: &InstrumentNameExchange,
         base: &str,
         quote: &str,
-    ) -> UnindexedClientError {
+    ) -> Result<UnindexedApiError, UnindexedClientError> {
         let reason = match self {
-            Self::Unchecked(error) => return error,
+            Self::Unchecked(error) => return Err(error),
             Self::Unlisted => format!("Hyperliquid's spotMeta lists no spot pair {base}/{quote}"),
             Self::Misspelled(pair) => format!(
                 "Hyperliquid spells this spot pair {}/{}, and reports its orders under {}; name \
@@ -339,24 +339,40 @@ impl UntradedPair {
                 spot_pair_to_instrument(&pair)
             ),
         };
-        UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument.clone(), reason))
+        Ok(ApiError::InstrumentInvalid(instrument.clone(), reason))
     }
 
-    /// [`into_client_error`](Self::into_client_error) for an open request, which was not sent.
-    /// A connectivity failure leaves the request [`NotPlacedReason::NotSent`]; any other error,
-    /// such as a `spotMeta` response that does not parse, refuses the instrument with it.
+    /// The error for a read naming `instrument`: its [`refusal`](Self::refusal), or the error
+    /// that left its listing unknown.
+    fn into_client_error(
+        self,
+        instrument: &InstrumentNameExchange,
+        base: &str,
+        quote: &str,
+    ) -> UnindexedClientError {
+        self.refusal(instrument, base, quote)
+            .map_or_else(|error| error, UnindexedClientError::Api)
+    }
+
+    /// The error for an open request on `instrument`, which was not sent: its
+    /// [`refusal`](Self::refusal), or, when the pair's listing is unknown, an error from the
+    /// failed read of `spotMeta`. A connectivity failure leaves the request
+    /// [`NotPlacedReason::NotSent`]. An API error, such as a rate limit, rejects it with that
+    /// error, so a rate limit stays transient. Any other error, such as a `spotMeta` response
+    /// that does not parse, refuses the instrument, saying why.
     fn into_order_error(
         self,
         instrument: &InstrumentNameExchange,
         base: &str,
         quote: &str,
     ) -> UnindexedOrderError {
-        match self.into_client_error(instrument, base, quote) {
-            UnindexedClientError::Api(error) => OrderError::Rejected(error),
-            UnindexedClientError::Connectivity(error) => {
+        match self.refusal(instrument, base, quote) {
+            Ok(refusal) => OrderError::Rejected(refusal),
+            Err(UnindexedClientError::Connectivity(error)) => {
                 OrderError::NotPlaced(NotPlacedReason::NotSent(error))
             }
-            error => OrderError::Rejected(ApiError::InstrumentInvalid(
+            Err(UnindexedClientError::Api(error)) => OrderError::Rejected(error),
+            Err(error) => OrderError::Rejected(ApiError::InstrumentInvalid(
                 instrument.clone(),
                 format!(
                     "Hyperliquid's spotMeta could not be read again to look for the spot pair \
@@ -2381,6 +2397,18 @@ mod tests {
                     );
                 }
             }
+            // Checked even over an empty span (ending before it starts), which reads nothing.
+            let start = Utc::now();
+            let end = start - chrono::TimeDelta::hours(1);
+            let instrument = InstrumentNameExchange::new("HYPE-PURR-SPOT");
+            assert!(
+                matches!(
+                    client.fetch_trades(start, end, std::slice::from_ref(&instrument)).await,
+                    Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(name, _)))
+                        if name == instrument
+                ),
+                "an empty span skipped the check"
+            );
             assert_eq!(account_reads(&server).await, 0);
         }
 
@@ -2489,6 +2517,32 @@ mod tests {
                 ),
                 "{:?}",
                 order.state
+            );
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        /// A rate limit on the read of `spotMeta` is that read's own error, and stays transient:
+        /// the reads fail with it, and an order on a pair it was needed for is rejected with it,
+        /// unsent, rather than the name refused.
+        #[tokio::test]
+        async fn a_pair_unchecked_for_a_rate_limited_spot_meta_fails_with_the_rate_limit() {
+            let (server, client) = client_reading_spot_meta_again(ResponseTemplate::new(429)).await;
+            serve_empty_account(&server).await;
+            let rate_limited = ApiError::rate_limited(None);
+
+            for (read, result) in each_read(&client, &["HYPE-PURR-SPOT"]).await {
+                assert_eq!(
+                    result,
+                    Err(UnindexedClientError::Api(rate_limited.clone())),
+                    "{read}"
+                );
+            }
+            let order = place(&client, "HYPE-PURR-SPOT", dec!(25), dec!(1)).await;
+            assert_eq!(
+                order.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    rate_limited
+                )))
             );
             assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
         }

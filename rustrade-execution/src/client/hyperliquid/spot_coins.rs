@@ -96,9 +96,9 @@ impl SpotCoins {
     /// # Errors
     ///
     /// The error of the last read of `spotMeta` again, when the pairs lack the pair and that read
-    /// failed, timed out or was abandoned part way, within [`REFETCH_INTERVAL`] of now or just
-    /// now. Whether Hyperliquid lists the pair is then unknown: it may have been listed since the
-    /// pairs were read.
+    /// failed, timed out or was abandoned part way, whether this call made it or it started less
+    /// than [`REFETCH_INTERVAL`] ago. Whether Hyperliquid lists the pair is then unknown: it may
+    /// have been listed since the pairs were read.
     pub(super) async fn find(
         &self,
         base: &str,
