@@ -39,7 +39,8 @@
 //! holds until a resume. A blank-reason halt for a symbol already held is a repeat: no
 //! [`TradingStatus`] is produced, and it is logged at DEBUG. A blank-reason halt for a symbol not
 //! held is reported as [`Halted`](TradingState::Halted) with no reason. On a connection opened
-//! during a pause, that is how the first repeat is reported.
+//! during a pause, that is how the first repeat is reported. A real change, while a symbol is
+//! held, to a halt with a blank reason cannot be told from a repeat, so it is not reported either.
 //!
 //! # Venue code
 //! [`TradingStatus::venue_code`] is `"<tape>:<sc>:<rc>"` as Alpaca sent them, trimmed of padding
@@ -246,9 +247,9 @@ pub struct AlpacaStatusDecoder {
 }
 
 impl AlpacaStatusDecoder {
-    /// Whether a tape A or B `status` with reason code `rc` repeats a halt or pause already in
-    /// force for `subscription_id`, keeping track of which symbols are held.
-    fn cta_repeats(
+    /// Records a tape A or B `status` with reason code `rc` for `subscription_id` in the held
+    /// symbols, and returns whether it repeats a halt or pause already in force.
+    fn record_cta_status(
         &mut self,
         subscription_id: &SubscriptionId,
         status: &TradingStatus,
@@ -306,9 +307,11 @@ impl AlpacaDecoder for AlpacaStatusDecoder {
         };
 
         match read(plan, sc, rc) {
+            // The guard records every tape A or B state, so a resume releases the symbol even
+            // though it falls through to the next arm.
             Reading::State(trading_status)
                 if plan == Plan::Cta
-                    && self.cta_repeats(&status.subscription_id, &trading_status, rc) =>
+                    && self.record_cta_status(&status.subscription_id, &trading_status, rc) =>
             {
                 debug!(
                     subscription = %status.subscription_id,
@@ -499,8 +502,14 @@ mod tests {
             // A halt with a reason is reported while the symbol is held.
             ("AAPL", "A", "2", "C"),
             ("AAPL", "A", "2", " "),
-            // Another symbol is not held.
+            // Another symbol is not held, and its resume leaves AAPL held.
             ("MSFT", "B", "2", " "),
+            ("MSFT", "B", "3", " "),
+            ("AAPL", "A", "2", " "),
+            ("MSFT", "B", "2", " "),
+            // A code that reports no state neither releases a held symbol nor is reported.
+            ("AAPL", "A", "9", " "),
+            ("AAPL", "A", "2", " "),
             // UTP tapes do not repeat halts this way: each is reported.
             ("QQQ", "C", "H", ""),
             ("QQQ", "C", "H", ""),
@@ -514,6 +523,11 @@ mod tests {
                 Some("Halted Some(Regulatory) A:2:C".into()),
                 None,
                 Some("Halted None B:2:".into()),
+                Some("Trading None B:3:".into()),
+                None,
+                Some("Halted None B:2:".into()),
+                None,
+                None,
                 Some("Halted None C:H:".into()),
                 Some("Halted None C:H:".into()),
             ]
