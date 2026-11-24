@@ -359,3 +359,7 @@ required-features = ["sec-edgar"]
 [[example]]
 name = "alpha_vantage_earnings"
 required-features = ["alpha-vantage"]
+
+[[example]]
+name = "alpha_vantage_dividends"
+required-features = ["alpha-vantage"]

@@ -2,17 +2,22 @@
 //! here is synthetic.
 //!
 //! The tests pin what the client requests (path, function, symbol, horizon, the API key) and how
-//! it reads data, notices and error statuses.
+//! it reads data, notices and error statuses, for earnings, dividends and splits.
 
 #![cfg(feature = "alpha-vantage")]
 // Tests use unwrap/expect for concise failure messages; panics are the intended failure mode.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use chrono::NaiveDate;
+use futures::StreamExt;
+use rust_decimal_macros::dec;
 use rustrade_data::{
+    dividends::DividendProvider,
     earnings::{EarningsProvider, ReleaseStatus, ReleaseTiming},
     exchange::alpha_vantage::{AlphaVantageClient, AlphaVantageError, CalendarHorizon},
 };
+use rustrade_instrument::corporate_action::CorporateActionKind;
+use rustrade_integration::corporate_action::{CorporateActionFilter, StockSplitSource};
 use std::num::NonZeroU32;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -291,4 +296,185 @@ async fn an_empty_symbol_is_refused_before_any_request() {
             .await,
         Err(AlphaVantageError::InvalidInput { .. })
     ));
+    assert!(matches!(
+        client.dividends("").await,
+        Err(AlphaVantageError::InvalidInput { .. })
+    ));
+}
+
+const DIVIDENDS: &str = r#"{"symbol": "XYZ", "data": [
+    {"ex_dividend_date": "2026-02-05", "declaration_date": "2026-01-28",
+     "record_date": "2026-02-05", "payment_date": "2026-02-12", "amount": "0.26"},
+    {"ex_dividend_date": "2025-12-23", "declaration_date": "2025-12-19",
+     "record_date": "2025-12-23", "payment_date": "2025-12-30", "amount": "0.0"},
+    {"ex_dividend_date": "2015-02-05", "declaration_date": "None",
+     "record_date": "None", "payment_date": "None", "amount": "0.47"}
+]}"#;
+
+#[tokio::test]
+async fn dividends_send_the_function_and_symbol_and_read_each_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/query"))
+        .and(query_param("function", "DIVIDENDS"))
+        .and(query_param("symbol", "XYZ"))
+        .and(query_param("apikey", KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIVIDENDS))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dividends = client(&server).dividends(" XYZ ").await.unwrap();
+    let rows: Vec<_> = dividends
+        .iter()
+        .map(|d| (d.ex_date, d.amount, d.declaration_date, d.payment_date))
+        .collect();
+    // Oldest first, the zero row skipped.
+    assert_eq!(
+        rows,
+        vec![
+            (date(2015, 2, 5), dec!(0.47), None, None),
+            (
+                date(2026, 2, 5),
+                dec!(0.26),
+                Some(date(2026, 1, 28)),
+                Some(date(2026, 2, 12))
+            ),
+        ]
+    );
+    assert!(dividends.iter().all(|d| d.symbol == "XYZ"
+        && d.source.provider == DividendProvider::AlphaVantage
+        && d.known_at <= d.source.observed_at));
+}
+
+#[tokio::test]
+async fn dividend_and_split_reads_turn_a_notice_into_its_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/query"))
+        .and(query_param("symbol", "LIMIT"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"Information": "25 requests per day."}"#),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let error = client.dividends("LIMIT").await.unwrap_err();
+    assert!(
+        matches!(&error, AlphaVantageError::Refused { message } if message.contains("25 requests")),
+        "{error:?}"
+    );
+    let filter = CorporateActionFilter::new(vec!["LIMIT".into()], None, None);
+    let items: Vec<_> = client.fetch_splits(&filter).collect().await;
+    assert!(
+        matches!(items.as_slice(), [Err(AlphaVantageError::Refused { .. })]),
+        "{items:?}"
+    );
+}
+
+#[tokio::test]
+async fn splits_fan_out_per_symbol_and_keep_the_filters_dates() {
+    let server = MockServer::start().await;
+    let respond = |symbol: &str, body: &str| {
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .and(query_param("function", "SPLITS"))
+            .and(query_param("symbol", symbol))
+            .and(query_param("apikey", KEY))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_owned()))
+            .expect(1)
+    };
+    respond(
+        "AAA",
+        r#"{"symbol": "AAA", "data": [
+            {"effective_date": "2024-06-10", "split_factor": "10.0000"},
+            {"effective_date": "2021-07-20", "split_factor": "4.0000"},
+            {"effective_date": "2000-06-27", "split_factor": "2.0000"}
+        ]}"#,
+    )
+    .mount(&server)
+    .await;
+    respond(
+        "BBB",
+        r#"{"symbol": "BBB", "data": [{"effective_date": "2022-01-03", "split_factor": "0.3333"}]}"#,
+    )
+    .mount(&server)
+    .await;
+
+    let filter = CorporateActionFilter::new(
+        vec!["AAA".into(), "BBB".into()],
+        Some(date(2021, 7, 20)),
+        Some(date(2024, 6, 9)),
+    );
+    let actions: Vec<_> = client(&server)
+        .fetch_splits(&filter)
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let rows: Vec<_> = actions
+        .iter()
+        .map(|a| (a.instrument.as_str(), a.effective_date, a.kind.clone()))
+        .collect();
+    // The bounds are inclusive: 2021-07-20 is kept, 2024-06-10 is after the end.
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "AAA",
+                Some(date(2021, 7, 20)),
+                CorporateActionKind::stock_split(dec!(4), dec!(1)).unwrap()
+            ),
+            (
+                "BBB",
+                Some(date(2022, 1, 3)),
+                CorporateActionKind::stock_split(dec!(1), dec!(3)).unwrap()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn splits_with_no_bounds_return_every_split_and_an_empty_filter_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/query"))
+        .and(query_param("function", "SPLITS"))
+        .and(query_param("symbol", "AAA"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"symbol": "AAA", "data": [
+                {"effective_date": "2024-06-10", "split_factor": "10.0000"},
+                {"effective_date": "2000-06-27", "split_factor": "2.0000"}
+            ]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let all: Vec<_> = client
+        // Named twice (once with spaces): one request, each split once.
+        .fetch_splits(&CorporateActionFilter::new(
+            vec!["AAA".into(), " AAA ".into()],
+            None,
+            None,
+        ))
+        .map(|item| item.unwrap().effective_date)
+        .collect()
+        .await;
+    assert_eq!(all, [Some(date(2000, 6, 27)), Some(date(2024, 6, 10))]);
+
+    for filter in [
+        CorporateActionFilter::default(),
+        CorporateActionFilter::new(vec![" ".into(), "AAA".into()], None, None),
+    ] {
+        let items: Vec<_> = client.fetch_splits(&filter).collect().await;
+        assert!(
+            matches!(
+                items.as_slice(),
+                [Err(AlphaVantageError::InvalidInput { .. })]
+            ),
+            "{filter:?}: {items:?}"
+        );
+    }
 }
