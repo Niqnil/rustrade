@@ -1289,12 +1289,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
 - **Databento's historical streams no longer borrow the client or the request**
   (`rustrade-data`). `DatabentoHistorical::fetch_candles_stream`, `fetch_trades_stream` and
   `fetch_quotes_stream` return a stream that owns its decoder, but its type borrowed the client
   (mutably) and the request parameters, so a caller could not make a second request with the same
   client, or drop the parameters, while reading the stream. It now borrows neither.
-
 - **The simulated venue's account snapshot reports only the requested instruments**
   (`rustrade-execution`, #1041). `MockExecution` dropped the instruments it was asked for, and the
   venue reported every instrument with an order and every CFD and option, so a venue trading more

@@ -123,7 +123,9 @@ pub trait StockSplitSource {
     /// # Borrowing
     ///
     /// The stream borrows `self` only, not `filter`, so the filter can be a temporary: an
-    /// implementation copies what it needs from `filter` before returning.
+    /// implementation copies what it needs from `filter` before returning. An implementation's
+    /// return type must end `+ use<'_>` to match, or its stream captures `filter`'s lifetime too
+    /// and the implementation does not compile.
     fn fetch_splits(
         &self,
         filter: &CorporateActionFilter,
