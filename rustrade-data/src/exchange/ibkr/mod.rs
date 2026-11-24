@@ -40,7 +40,10 @@
 //!
 //! # Supported Data Types
 //!
-//! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription
+//! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription. The same
+//!   subscription reports halts as [`TradingStatus`] events (IB's Halted tick), on change only,
+//!   and again as the first after a reconnect; IB sends no reason beyond regulatory or volatility,
+//!   and no Limit Up-Limit Down price bands
 //! - **Depth** ([`OrderBookEvent`]): L2 order book via `market_depth()` subscription
 //! - **Trades** ([`PublicTrade`]): Tick-by-tick trades via `tick_by_tick_all_last()` subscription
 //! - **Candles** ([`Candle`]): completed live bars via IB's historical bars kept up to date; see
@@ -76,6 +79,7 @@
 //! [`OrderBookL1`]: crate::subscription::book::OrderBookL1
 //! [`OrderBookEvent`]: crate::subscription::book::OrderBookEvent
 //! [`PublicTrade`]: crate::subscription::trade::PublicTrade
+//! [`TradingStatus`]: crate::subscription::trading_status::TradingStatus
 //! [`Candle`]: crate::subscription::candle::Candle
 //! [`DataError::SubscriptionLimitReached`]: crate::error::DataError::SubscriptionLimitReached
 //! [`DataError::MarketDataNotAvailable`]: crate::error::DataError::MarketDataNotAvailable
@@ -98,6 +102,7 @@ pub mod historical;
 mod ib_clock;
 pub mod options;
 pub mod quotes;
+mod status;
 pub mod subscription;
 pub mod trades;
 
@@ -134,7 +139,7 @@ use ibapi::{
     market_data::{
         MarketDataType, TradingHours,
         historical::{BarSize, HistoricalBarUpdate},
-        realtime::MarketDepths,
+        realtime::{MarketDepths, TickTypes},
     },
     subscriptions::SubscriptionItem,
 };
@@ -684,6 +689,41 @@ impl QuickEnds {
     }
 }
 
+/// What a quote subscription's ticks report: the quote, and the trading status from IB's Halted
+/// tick.
+struct QuoteTicks {
+    aggregator: QuoteAggregator,
+    statuses: status::StatusChanges,
+}
+
+impl QuoteTicks {
+    fn new(security_type: &SecurityType) -> Self {
+        Self {
+            aggregator: QuoteAggregator::new(security_type),
+            statuses: status::StatusChanges::default(),
+        }
+    }
+
+    /// The event `tick`, received at `now`, makes, with its exchange time, if it makes one.
+    fn update(
+        &mut self,
+        tick: &TickTypes,
+        now: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, DataKind)> {
+        // The quote aggregator reads no generic tick, so a generic tick is only ever a status.
+        if let TickTypes::Generic(generic) = tick {
+            // IB's tick carries no time of its own.
+            return self
+                .statuses
+                .change(generic)
+                .map(|status| (now, DataKind::TradingStatus(status)));
+        }
+        self.aggregator
+            .update(tick, now)
+            .map(|l1| (l1.last_update_time, DataKind::OrderBookL1(l1)))
+    }
+}
+
 /// The close of a stream's last connection, which runs on a thread of its own, since
 /// `ibapi`'s disconnect blocks until the client's threads have exited: dropping a connection must
 /// not block the async task that drops it. The next connection waits for it, so that it does not
@@ -896,7 +936,7 @@ where
                 Err(e) => return worker.fail(e),
             };
 
-            let mut aggregator = QuoteAggregator::new(&contract.security_type);
+            let mut ticks = QuoteTicks::new(&contract.security_type);
 
             for item in sub.iter() {
                 let tick = match item {
@@ -911,14 +951,10 @@ where
                     }
                 };
                 let now = Utc::now();
-                if let Some(l1) = aggregator.update(&tick, now) {
-                    let time_exchange = l1.last_update_time;
-                    if worker
-                        .send(time_exchange, now, DataKind::OrderBookL1(l1))
-                        .is_break()
-                    {
-                        break;
-                    }
+                if let Some((time_exchange, kind)) = ticks.update(&tick, now)
+                    && worker.send(time_exchange, now, kind).is_break()
+                {
+                    break;
                 }
             }
         })
@@ -1686,6 +1722,77 @@ pub(crate) fn decimal_from_f64(value: f64) -> Option<Decimal> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    mod quote_ticks {
+        use super::*;
+        use crate::subscription::trading_status::TradingState;
+        use ibapi::{
+            contracts::tick_types::TickType,
+            market_data::realtime::{TickAttribute, TickGeneric, TickPrice},
+        };
+
+        fn halted(value: f64) -> TickTypes {
+            TickTypes::Generic(TickGeneric {
+                tick_type: TickType::Halted,
+                value,
+            })
+        }
+
+        fn bid(price: f64) -> TickTypes {
+            TickTypes::Price(TickPrice {
+                tick_type: TickType::Bid,
+                price,
+                attributes: TickAttribute::default(),
+            })
+        }
+
+        fn at(seconds: i64) -> DateTime<Utc> {
+            DateTime::from_timestamp(seconds, 0).unwrap()
+        }
+
+        #[test]
+        fn a_halted_tick_is_a_status_stamped_when_received() {
+            let mut ticks = QuoteTicks::new(&SecurityType::Stock);
+
+            let event = ticks.update(&halted(1.0), at(5));
+
+            let (time_exchange, kind) = event.unwrap();
+            assert_eq!(time_exchange, at(5));
+            let DataKind::TradingStatus(status) = kind else {
+                panic!("not a status: {kind:?}");
+            };
+            assert_eq!(status.state, TradingState::Halted);
+        }
+
+        #[test]
+        fn a_repeated_halted_tick_makes_no_event() {
+            let mut ticks = QuoteTicks::new(&SecurityType::Stock);
+            ticks.update(&halted(1.0), at(5));
+
+            assert_eq!(ticks.update(&halted(1.0), at(6)), None);
+        }
+
+        #[test]
+        fn a_price_tick_is_a_quote_and_a_halted_tick_leaves_it_alone() {
+            let mut ticks = QuoteTicks::new(&SecurityType::Stock);
+            ticks.update(&halted(0.0), at(5));
+
+            let (_, kind) = ticks.update(&bid(100.5), at(6)).unwrap();
+
+            let DataKind::OrderBookL1(l1) = kind else {
+                panic!("not a quote: {kind:?}");
+            };
+            assert_eq!(
+                l1.best_bid.map(|level| level.price),
+                Some(Decimal::new(1005, 1))
+            );
+            assert_eq!(
+                ticks.update(&halted(0.0), at(7)),
+                None,
+                "the quote does not reset the status"
+            );
+        }
+    }
 
     /// The receiving end of a connection's channel, reading the items alone.
     struct Items(mpsc::UnboundedReceiver<Envelope<()>>);
