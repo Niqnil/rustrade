@@ -119,8 +119,49 @@ pub trait StockSplitSource {
     /// individual fact. Each implementation MUST therefore document, in its own `fetch_splits`
     /// rustdoc, which provider field it maps onto `effective_date`, and SHOULD pin that mapping with
     /// a unit test against a known fixture so a later refactor cannot change it unnoticed.
+    ///
+    /// # Borrowing
+    ///
+    /// The stream borrows `self` only, not `filter`, so the filter can be a temporary: an
+    /// implementation copies what it needs from `filter` before returning. An implementation's
+    /// return type must end `+ use<'_>` to match, or its stream captures `filter`'s lifetime too
+    /// and the implementation does not compile.
     fn fetch_splits(
         &self,
         filter: &CorporateActionFilter,
-    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_, Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{FutureExt, StreamExt};
+
+    /// The splits of `source` for a filter dropped before they are read, which compiles only if
+    /// the stream borrows the source alone.
+    fn splits_outliving_their_filter<S: StockSplitSource>(
+        source: &S,
+    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, S::Error>> + '_ {
+        source.fetch_splits(&CorporateActionFilter::default())
+    }
+
+    #[test]
+    fn the_stream_borrows_only_the_source() {
+        struct NoSplits;
+        impl StockSplitSource for NoSplits {
+            type Error = std::convert::Infallible;
+            fn fetch_splits(
+                &self,
+                _filter: &CorporateActionFilter,
+            ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_>
+            {
+                futures::stream::empty()
+            }
+        }
+
+        let splits = splits_outliving_their_filter(&NoSplits)
+            .collect::<Vec<_>>()
+            .now_or_never();
+        assert_eq!(splits.map(|splits| splits.len()), Some(0));
+    }
 }

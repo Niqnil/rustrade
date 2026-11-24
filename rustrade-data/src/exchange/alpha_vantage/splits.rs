@@ -48,7 +48,7 @@ impl StockSplitSource for AlphaVantageClient {
     fn fetch_splits(
         &self,
         filter: &CorporateActionFilter,
-    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_> {
         // Owned copies, so the returned stream borrows only `self`, not `filter`. A symbol named
         // twice is fetched once: each request spends the key's daily allowance.
         let mut symbols: Vec<SmolStr> = Vec::with_capacity(filter.symbols.len());

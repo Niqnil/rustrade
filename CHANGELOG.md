@@ -732,6 +732,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `StockSplitSource::fetch_splits` returns a stream that borrows only the source**
+  (`rustrade-integration`). The stream's type captured `filter` too, though every implementation
+  copies what it needs from the filter first, so a caller could not pass a temporary filter and
+  keep the stream. The signature now ends `+ use<'_, Self>`, and the trait documents that the
+  stream borrows `self` only. An implementation outside this repo must add `+ use<'_>` to its
+  `fetch_splits` return type; callers need no change.
 - **Breaking: Hyperliquid spot reads refuse an instrument naming no spot pair the client trades**
   (`rustrade-execution`, #1043). `HyperliquidSpotClient::account_snapshot` listed every requested
   instrument with no open orders, complete, even one naming no listed pair, so it reported an
@@ -1284,6 +1290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Databento's historical streams no longer borrow the client or the request**
+  (`rustrade-data`). `DatabentoHistorical::fetch_candles_stream`, `fetch_trades_stream` and
+  `fetch_quotes_stream` return a stream that owns its decoder, but its type borrowed the client
+  (mutably) and the request parameters, so a caller could not make a second request with the same
+  client, or drop the parameters, while reading the stream. It now borrows neither.
 - **The simulated venue's account snapshot reports only the requested instruments**
   (`rustrade-execution`, #1041). `MockExecution` dropped the instruments it was asked for, and the
   venue reported every instrument with an order and every CFD and option, so a venue trading more
