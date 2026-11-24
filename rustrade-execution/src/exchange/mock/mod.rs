@@ -1273,9 +1273,10 @@ mod tests {
         driver.await.unwrap();
     }
 
-    /// The assets a snapshot request names reach the venue, which reports only their balances.
+    /// The assets and instruments a snapshot request names reach the venue, which reports only
+    /// their balances and entries: here the spot instrument, listed though it has no order.
     #[tokio::test]
-    async fn a_snapshot_request_reports_only_the_assets_it_names() {
+    async fn a_snapshot_request_reports_only_the_assets_and_instruments_it_names() {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (event_tx, _events) = broadcast::channel(16);
         let exchange = MockExchange::new(
@@ -1291,7 +1292,7 @@ mod tests {
             .send(MockExchangeRequest::fetch_account_snapshot(
                 Utc::now(),
                 vec![quote()],
-                Vec::new(),
+                vec![instrument_name()],
                 response_tx,
             ))
             .unwrap();
@@ -1303,6 +1304,12 @@ mod tests {
             .map(|balance| balance.asset.clone())
             .collect::<Vec<_>>();
         assert_eq!(assets, [quote()]);
+        let instruments = snapshot
+            .instruments
+            .iter()
+            .map(|entry| entry.instrument.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(instruments, [instrument_name()]);
 
         drop(request_tx);
         driver.await.unwrap();

@@ -9205,6 +9205,10 @@ mod tests {
         );
         let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
         assert_eq!(venue.orders_open(&[]).len(), 1, "the order rests");
+        assert!(
+            venue.orders_open(std::slice::from_ref(&cfd)).is_empty(),
+            "an open-order read filters by instrument as the snapshot does"
+        );
 
         assert_eq!(
             snapshot_entries(&venue, &[]),
