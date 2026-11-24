@@ -387,12 +387,13 @@ impl MockExchange {
         match kind {
             MockExchangeRequestKind::FetchAccountSnapshot {
                 assets,
+                instruments,
                 response_tx,
             } => {
                 emit.respond(
                     Vec::new(),
                     response_tx,
-                    self.venue.account_snapshot(&assets),
+                    self.venue.account_snapshot(&assets, &instruments),
                 );
             }
             MockExchangeRequestKind::FetchBalances {
@@ -1209,6 +1210,7 @@ mod tests {
             .send(MockExchangeRequest::fetch_account_snapshot(
                 expiry + chrono::TimeDelta::seconds(1),
                 Vec::new(),
+                Vec::new(),
                 snapshot_tx,
             ))
             .unwrap();
@@ -1289,6 +1291,7 @@ mod tests {
             .send(MockExchangeRequest::fetch_account_snapshot(
                 Utc::now(),
                 vec![quote()],
+                Vec::new(),
                 response_tx,
             ))
             .unwrap();

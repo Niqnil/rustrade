@@ -7,7 +7,9 @@ use crate::{
         ClientError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
         UnindexedClientError, UnindexedOrderError,
     },
-    exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
+    exchange::mock::{
+        CorporateActionResponse, request::MockExchangeRequest, venue::is_requested_instrument,
+    },
     expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
@@ -963,7 +965,7 @@ where
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
-        _: &[InstrumentNameExchange],
+        instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -971,6 +973,7 @@ where
             .send(MockExchangeRequest::fetch_account_snapshot(
                 self.time_request(),
                 assets.to_vec(),
+                instruments.to_vec(),
                 response_tx,
             ))
             .map_err(|_| {
@@ -1234,9 +1237,7 @@ where
                 self.mocked_exchange,
             ))
         })?;
-        if !instruments.is_empty() {
-            trades.retain(|trade| instruments.contains(&trade.instrument));
-        }
+        trades.retain(|trade| is_requested_instrument(instruments, &trade.instrument));
         Ok(TradesRead::complete(trades))
     }
 }
@@ -1729,10 +1730,10 @@ mod tests {
         assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
     }
 
-    /// The client sends the assets it was asked for in its snapshot request, for the venue to
-    /// filter the balances by.
+    /// The client sends the assets and instruments it was asked for in its snapshot request, for
+    /// the venue to filter the balances and the instruments by.
     #[tokio::test]
-    async fn account_snapshot_asks_the_venue_for_the_requested_assets() {
+    async fn account_snapshot_asks_the_venue_for_the_requested_assets_and_instruments() {
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
         let (_event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
         let client = MockExecution::new(
@@ -1746,6 +1747,7 @@ mod tests {
             let request = request_rx.recv().await.expect("a request");
             let crate::exchange::mock::request::MockExchangeRequestKind::FetchAccountSnapshot {
                 assets,
+                instruments,
                 response_tx,
             } = request.kind
             else {
@@ -1754,13 +1756,20 @@ mod tests {
             response_tx
                 .send(empty_snapshot())
                 .expect("the caller awaits the answer");
-            assets
+            (assets, instruments)
         });
 
-        let requested = [AssetNameExchange::new("usdt")];
-        client.account_snapshot(&requested, &[]).await.unwrap();
+        let assets = [AssetNameExchange::new("usdt")];
+        let instruments = [InstrumentNameExchange::new("BTCUSDT")];
+        client
+            .account_snapshot(&assets, &instruments)
+            .await
+            .unwrap();
 
-        assert_eq!(exchange.await.unwrap(), requested);
+        assert_eq!(
+            exchange.await.unwrap(),
+            (assets.to_vec(), instruments.to_vec())
+        );
     }
 
     /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the

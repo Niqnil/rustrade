@@ -4728,10 +4728,9 @@ impl SimulatedVenue {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Vec<Order<ExchangeId, InstrumentNameExchange, Open>> {
-        // Empty slice means "return all" (consistent with account_snapshot behavior).
         self.account
             .orders_open()
-            .filter(|order| instruments.is_empty() || instruments.contains(&order.key.instrument))
+            .filter(|order| is_requested_instrument(instruments, &order.key.instrument))
             .cloned()
             .collect()
     }
@@ -5534,8 +5533,21 @@ impl SimulatedVenue {
     }
 
     /// The account's balances of `assets`, matched as [`balances`](Self::balances) matches them
-    /// (an empty slice for every asset held), and its orders and positions.
-    pub fn account_snapshot(&self, assets: &[AssetNameExchange]) -> UnindexedAccountSnapshot {
+    /// (an empty slice for every asset held), and its orders and positions in `instruments`, as
+    /// [`ExecutionClient::account_snapshot`](crate::client::ExecutionClient::account_snapshot)
+    /// defines them.
+    ///
+    /// Instrument names are matched exactly, as [`orders_open`](Self::orders_open) matches them.
+    /// Each requested instrument this venue trades gets an entry, orders or not, so a consumer can
+    /// tell that an order it no longer lists is gone. A requested instrument it neither trades nor
+    /// holds an order on is left out: unknown, never flat. With `instruments` empty, the entries
+    /// are those with something to report: every instrument with an order, and every CFD and
+    /// option, flat or not.
+    pub fn account_snapshot(
+        &self,
+        assets: &[AssetNameExchange],
+        instruments: &[InstrumentNameExchange],
+    ) -> UnindexedAccountSnapshot {
         let balances = self.balances(assets);
 
         let orders_open = self
@@ -5556,7 +5568,10 @@ impl SimulatedVenue {
             .cloned()
             .map(UnindexedOrder::from);
 
-        let orders_all = orders_open.chain(orders_cancelled).chain(orders_expired);
+        let orders_all = orders_open
+            .chain(orders_cancelled)
+            .chain(orders_expired)
+            .filter(|order| is_requested_instrument(instruments, &order.key.instrument));
         // Sorted on `(instrument, cid)` rather than `instrument` alone: the sort is unstable, so a
         // key shared by several orders leaves their relative order unspecified, and a snapshot that
         // lists the same account's orders in a different order on each run is not comparable
@@ -5570,16 +5585,20 @@ impl SimulatedVenue {
             .map(|(instrument, orders)| (instrument, orders.map(booked_report).collect()))
             .collect();
 
-        // Every instrument with an order, and every CFD and option whether or not it has one: a
-        // position is reported even while it is flat, which is what lets a consumer tell "holds
-        // none" from "not reported".
-        let mut instruments: Vec<_> = self
+        // Every requested instrument; asked for all, every instrument with an order, and every CFD
+        // and option whether or not it has one: a position is reported even while it is flat,
+        // which is what lets a consumer tell "holds none" from "not reported".
+        let mut snapshots: Vec<_> = self
             .instruments
             .iter()
+            .filter(|(name, _)| is_requested_instrument(instruments, name))
             .filter_map(|(name, instrument)| {
                 let orders = orders_by_instrument.remove(name);
                 let position = self.position_report(name, instrument);
-                if orders.is_none() && position == PositionReport::Unreported {
+                if instruments.is_empty()
+                    && orders.is_none()
+                    && position == PositionReport::Unreported
+                {
                     return None;
                 }
                 Some(InstrumentAccountSnapshot {
@@ -5596,8 +5615,8 @@ impl SimulatedVenue {
             .collect();
 
         // Orders a configured `initial_state` seeded on an instrument this venue does not trade,
-        // which it still holds and so still reports.
-        instruments.extend(
+        // which it still holds and so still reports when asked.
+        snapshots.extend(
             orders_by_instrument
                 .into_iter()
                 .map(|(instrument, orders)| InstrumentAccountSnapshot {
@@ -5608,12 +5627,12 @@ impl SimulatedVenue {
                     isolated: None,
                 }),
         );
-        instruments.sort_unstable_by(|a, b| a.instrument.cmp(&b.instrument));
+        snapshots.sort_unstable_by(|a, b| a.instrument.cmp(&b.instrument));
 
         UnindexedAccountSnapshot {
             exchange: self.exchange,
             balances,
-            instruments,
+            instruments: snapshots,
         }
     }
 
@@ -7931,6 +7950,18 @@ fn invalid_config(error: &VenueConfigError) -> ! {
 }
 
 /// What `balance` owes: its loan and the interest on it, zero on a cash account.
+/// Whether `instrument` is among those a read of `instruments` asks for: every instrument when
+/// `instruments` is empty, the "return all" sentinel of the [`ExecutionClient`] reads, and
+/// otherwise one named exactly.
+///
+/// [`ExecutionClient`]: crate::client::ExecutionClient
+pub(crate) fn is_requested_instrument(
+    instruments: &[InstrumentNameExchange],
+    instrument: &InstrumentNameExchange,
+) -> bool {
+    instruments.is_empty() || instruments.contains(instrument)
+}
+
 fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
     balance
         .balance
@@ -9095,7 +9126,7 @@ mod tests {
         let venue = make_venue("1", "1000");
         let names = |assets: &[AssetNameExchange]| {
             let mut names = venue
-                .account_snapshot(assets)
+                .account_snapshot(assets, &[])
                 .balances
                 .into_iter()
                 .map(|balance| balance.asset.name().to_string())
@@ -9110,6 +9141,94 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(names(&[]), ["BTC", "USDT"]);
+    }
+
+    /// A venue trading spot BTCUSDT and the CFD, fed by a driver so a limit order can rest.
+    fn spot_and_cfd_venue() -> SimulatedVenue {
+        let mut instruments = spot_instruments();
+        instruments.extend(instruments_of(cfd_instrument()));
+        SimulatedVenue::new_market_driven(
+            &config_from_balances(
+                vec![funded(quote(), d("100000")), funded(usd(), d("100000"))],
+                maker_taker_fee(),
+            ),
+            instruments,
+        )
+    }
+
+    /// Each instrument of `venue`'s snapshot of `instruments`, with the client ids of its orders.
+    fn snapshot_entries(
+        venue: &SimulatedVenue,
+        instruments: &[InstrumentNameExchange],
+    ) -> Vec<(String, Vec<String>)> {
+        venue
+            .account_snapshot(&[], instruments)
+            .instruments
+            .into_iter()
+            .map(|entry| {
+                let cids = entry
+                    .orders
+                    .iter()
+                    .map(|order| order.order.key.cid.to_string())
+                    .collect();
+                (entry.instrument.to_string(), cids)
+            })
+            .collect()
+    }
+
+    /// An account snapshot reports the instruments asked for, each one this venue trades whether
+    /// or not it has anything to report, and leaves out one it does not trade or names otherwise.
+    /// Asked for none, it reports those with something to report: an instrument with an order,
+    /// and the CFD's position, flat or not.
+    #[test]
+    fn account_snapshot_reports_only_the_requested_instruments() {
+        let mut venue = spot_and_cfd_venue();
+        let (spot, cfd) = (instrument_name(), cfd_instrument_name());
+        let entry = |name: &InstrumentNameExchange, cids: &[&str]| {
+            (
+                name.to_string(),
+                cids.iter().map(|cid| cid.to_string()).collect::<Vec<_>>(),
+            )
+        };
+
+        // Nothing to report on the spot instrument yet, but asked for, it is listed.
+        assert_eq!(snapshot_entries(&venue, &[]), [entry(&cfd, &[])]);
+        assert_eq!(
+            snapshot_entries(&venue, std::slice::from_ref(&spot)),
+            [entry(&spot, &[])]
+        );
+
+        let _ = venue.apply_market(
+            &spot,
+            MarketObservation::new(book("49000", "49100")),
+            time(1),
+        );
+        let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+        assert_eq!(venue.orders_open(&[]).len(), 1, "the order rests");
+
+        assert_eq!(
+            snapshot_entries(&venue, &[]),
+            [entry(&spot, &["resting"]), entry(&cfd, &[])]
+        );
+        assert_eq!(
+            snapshot_entries(&venue, std::slice::from_ref(&spot)),
+            [entry(&spot, &["resting"])]
+        );
+        assert_eq!(
+            snapshot_entries(&venue, std::slice::from_ref(&cfd)),
+            [entry(&cfd, &[])],
+            "the spot instrument's order is not reported when only the CFD is asked for"
+        );
+        assert_eq!(
+            snapshot_entries(&venue, &[InstrumentNameExchange::new("ETHUSDT")]),
+            [],
+            "an instrument the venue does not trade is unknown, not listed empty"
+        );
+        assert_eq!(
+            snapshot_entries(&venue, &[InstrumentNameExchange::new("btcusdt")]),
+            [],
+            "names are matched exactly, as the venue's other reads match them"
+        );
     }
 
     fn make_venue_with_fee(btc: &str, usdt: &str, fee_model: FeeModelConfig) -> SimulatedVenue {
@@ -9592,7 +9711,7 @@ mod tests {
 
         // Nothing was cancelled, so nothing may appear in the ledger either.
         assert!(
-            venue.account_snapshot(&[]).instruments.is_empty(),
+            venue.account_snapshot(&[], &[]).instruments.is_empty(),
             "a rejected cancel must not enter the ledger"
         );
     }
@@ -9808,7 +9927,7 @@ mod tests {
 
     /// The venue's reported CFD position as `(quantity, entry)`, or `None` while flat.
     fn cfd_position(venue: &SimulatedVenue) -> Option<(Decimal, Option<Decimal>)> {
-        let snapshot = venue.account_snapshot(&[]);
+        let snapshot = venue.account_snapshot(&[], &[]);
         let Some(instrument) = snapshot
             .instruments
             .iter()
@@ -9944,7 +10063,7 @@ mod tests {
             market_prices("50000"),
         ));
 
-        let snapshot = venue.account_snapshot(&[]);
+        let snapshot = venue.account_snapshot(&[], &[]);
         assert!(
             snapshot
                 .instruments
@@ -11785,7 +11904,7 @@ mod tests {
         let venue = SimulatedVenue::new(&config, spot_instruments());
 
         let reports = venue
-            .account_snapshot(&[])
+            .account_snapshot(&[], &[])
             .instruments
             .into_iter()
             .flat_map(|instrument| instrument.orders)
@@ -12947,7 +13066,7 @@ mod tests {
             state: RequestCancel { id: None },
         });
 
-        let snapshot = venue.account_snapshot(&[]);
+        let snapshot = venue.account_snapshot(&[], &[]);
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -13576,7 +13695,7 @@ mod tests {
         ));
         assert_eq!(venue.advance_time(time(5)).len(), 2);
 
-        let snapshot = venue.account_snapshot(&[]);
+        let snapshot = venue.account_snapshot(&[], &[]);
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -14394,7 +14513,7 @@ mod tests {
             venue.orders_ended(&[key_of("resting")]).is_empty(),
             "the order under the id is working, whatever became of the one before it"
         );
-        let snapshot = venue.account_snapshot(&[]);
+        let snapshot = venue.account_snapshot(&[], &[]);
         let listed = snapshot
             .instruments
             .iter()
