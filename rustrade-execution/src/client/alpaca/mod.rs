@@ -12245,7 +12245,12 @@ mod tests {
 
         #[test]
         fn a_contract_expires_before_a_day_only_if_its_expiry_is_earlier() {
-            let day = |d| NaiveDate::from_ymd_opt(2021, 1, d).unwrap_or_default();
+            let day = |d| {
+                let Some(day) = NaiveDate::from_ymd_opt(2021, 1, d) else {
+                    panic!("2021-01-{d} exists");
+                };
+                day
+            };
             assert!(expires_before("AAPL210115C00150000", day(16)));
             // Expiring that day is not before it: such a contract is still looked up.
             assert!(!expires_before("AAPL210115C00150000", day(15)));
