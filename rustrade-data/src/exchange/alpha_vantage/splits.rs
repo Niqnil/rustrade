@@ -126,16 +126,15 @@ fn splits(body: &str, symbol: &str) -> Result<Vec<CorporateAction<SmolStr>>, Alp
 ///
 /// Within that bound the ratio is unique: two ratios with denominators of at most 100 differ by
 /// more than 1/10,000, wider than the half a unit of rounding either side of a factor.
+///
+/// A factor of zero or below needs no check of its own: it comes back over one, as zero or the
+/// same negative factor, for [`CorporateActionKind::stock_split`] to refuse.
 fn ratio(factor: Decimal) -> (Decimal, Decimal) {
-    if factor > Decimal::ZERO {
-        for denominator in 1..=MAX_DENOMINATOR {
-            let denominator = Decimal::from(denominator);
-            let numerator = (factor * denominator).round();
-            if numerator > Decimal::ZERO
-                && (numerator / denominator).round_dp(FACTOR_DECIMALS) == factor
-            {
-                return (numerator, denominator);
-            }
+    for denominator in 1..=MAX_DENOMINATOR {
+        let denominator = Decimal::from(denominator);
+        let numerator = (factor * denominator).round();
+        if (numerator / denominator).round_dp(FACTOR_DECIMALS) == factor {
+            return (numerator, denominator);
         }
     }
     (factor, Decimal::ONE)

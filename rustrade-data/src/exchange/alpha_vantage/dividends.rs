@@ -115,6 +115,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use rust_decimal_macros::dec;
+    use rustrade_instrument::test_utils::logs::capture;
+    use tracing::Level;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -262,15 +264,39 @@ mod tests {
     }
 
     #[test]
-    fn two_rows_on_one_ex_date_are_both_returned() {
+    fn two_rows_on_one_ex_date_are_both_returned_with_a_warning() {
         let body = r#"{"data": [
             {"ex_dividend_date": "2026-02-03", "amount": "0.5"},
             {"ex_dividend_date": "2026-02-03", "amount": "1.0"}
         ]}"#;
-        let dividends = dividends(body, "XYZ", observed()).unwrap();
+        let (dividends, events) = capture(|| dividends(body, "XYZ", observed()));
         assert_eq!(
-            dividends.iter().map(|d| d.amount).collect::<Vec<_>>(),
+            dividends
+                .unwrap()
+                .iter()
+                .map(|d| d.amount)
+                .collect::<Vec<_>>(),
             [dec!(0.5), dec!(1.0)]
         );
+        let warnings: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert!(
+            warnings[0]
+                .message()
+                .contains("two dividends on one ex-date"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_ex_dates_warn_nothing_and_a_zero_row_is_logged_at_debug() {
+        let (dividends, events) = capture(|| dividends(BODY, "XYZ", observed()));
+        assert_eq!(dividends.unwrap().len(), 3);
+        assert!(!events.iter().any(|e| e.level == Level::WARN), "{events:?}");
+        let skipped: Vec<_> = events
+            .iter()
+            .filter(|e| e.level == Level::DEBUG && e.message().contains("pays nothing"))
+            .collect();
+        assert_eq!(skipped.len(), 1, "{events:?}");
     }
 }
