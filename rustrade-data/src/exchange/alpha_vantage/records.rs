@@ -197,7 +197,7 @@ fn cut_notice(record: &csv::StringRecord) -> Option<AlphaVantageError> {
     }
 }
 
-fn date(text: &str, field: &str) -> Result<NaiveDate, AlphaVantageError> {
+pub(super) fn date(text: &str, field: &str) -> Result<NaiveDate, AlphaVantageError> {
     NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .map_err(|_| AlphaVantageError::decode(format!("{field} {text:?} is not a date")))
 }

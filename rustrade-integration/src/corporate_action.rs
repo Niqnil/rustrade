@@ -13,10 +13,14 @@
 //! There is deliberately **no unified `CorporateActionSource` with a `kinds` filter**. Reference
 //! providers expose a *separate endpoint per action type* (splits vs dividends), so the action kind
 //! is encoded in the trait itself: [`StockSplitSource`](crate::corporate_action::StockSplitSource)
-//! fetches splits. A `DividendSource` sibling trait is the natural future addition when dividends
-//! are needed — each fully typed, with no
-//! discriminant enum to keep in lockstep with
+//! fetches splits, fully typed, with no discriminant enum to keep in lockstep with
 //! [`CorporateActionKind`](rustrade_instrument::corporate_action::CorporateActionKind).
+//!
+//! Dividends have no source trait here. A dividend is read point in time, from the instant it was
+//! declared, and an option pricer needs its amount and dates rather than an engine adjustment, so
+//! `rustrade-data` models dividends as data with a store that answers what was known when (its
+//! `dividends` module). A `DividendSource` sibling trait can be added once a second provider's
+//! dividend read would share it.
 //!
 //! # What is intentionally out of scope
 //!

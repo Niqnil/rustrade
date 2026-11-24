@@ -198,6 +198,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `with_requests_per_minute` for a premium plan), keeps the API key out of `Debug`, and
       removes it from every error.
 
+- **Cash dividends known as of any instant, and stock splits, from Alpha Vantage**
+  (`rustrade-data`, #1036).
+  - **New `dividends` module** with one record for every provider: `Dividend` carries the
+    symbol, the ex-date, the amount per share as paid (`Decimal`, not adjusted for later splits),
+    the declaration, record and payment dates where given, `known_at` and a `DividendProvenance`
+    (`DividendProvider`, `record_id`, `observed_at`). Both structs are `#[non_exhaustive]`: build
+    them with `new` and the `with_*` setters. A dividend is identified by its symbol and ex-date.
+  - **New `DividendStore`: the next and the previous dividend of a symbol as of an instant, and
+    every one known by then** (`known(symbol, as_of, ex_dates)`, the question an option pricer
+    asks for the ex-dates up to an expiry). A query as of T uses only records known by T. Of one
+    dividend's records the later `known_at` stands, then the later `observed_at`, then the later
+    insertion. A dividend has gone ex from the start of its ex-date in the store's time zone.
+    `current` gives a dividend's standing record and `observations` all of its records. The store
+    does not project undeclared dividends or restate amounts for splits.
+  - **`AlphaVantageClient::dividends`** reads a company's past and declared coming dividends. Each
+    is known at the end of its declaration date (00:00 New York the next day), or, with no
+    declaration date (most dividends before 2016), from the start of its ex-date, so a backtest
+    does not see it coming; never later than it was fetched. Rows with an amount of zero, which
+    Alpha Vantage lists with full dates, are skipped and logged at DEBUG.
+  - **`AlphaVantageClient` implements `StockSplitSource`**, one request per symbol, the filter's
+    dates applied to each split's `effective_date`. Alpha Vantage rounds the factor to four
+    decimals, so a ratio of whole numbers with a denominator up to 100 that rounds to it is taken
+    as the split (a one-for-three reverse split's `0.3333` is exactly 1/3). A filter with no
+    symbol is refused with `InvalidInput`.
+  - **Known limitations:** Alpha Vantage answers an unknown symbol like one with no dividends or
+    splits, with an empty list. It gives no currency and does not mark a dividend as regular or
+    special. Splits carry no declaration date. Two dividends on one ex-date are one dividend in
+    the store, and a withdrawn dividend stays.
+  - **Alpha Vantage's data is for personal, non-commercial use only:** use by or for a firm, or
+    giving others access, needs a commercial licence. See
+    <https://www.alphavantage.co/terms_of_service/>. A free key's 25 requests a day cover
+    dividends and splits for about 12 companies.
+
 - **Cancel an order's unfilled remainder after a set time** (`rustrade-execution`, `rustrade`,
   #919).
   - **New `RequestOpen::cancel_after: Option<Duration>`**, set with `with_cancel_after`. It is an

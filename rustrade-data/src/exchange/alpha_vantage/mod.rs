@@ -1,15 +1,22 @@
 //! Alpha Vantage (behind the `alpha-vantage` feature): earnings releases, coming and past, as
-//! [`EarningsRelease`]s. **Its data is for personal, non-commercial use only**; see
+//! [`EarningsRelease`]s; cash dividends as [`Dividend`]s; and stock splits through
+//! [`StockSplitSource`]. **Its data is for personal, non-commercial use only**; see
 //! ["Data use"](#data-use).
 //!
 //! Alpha Vantage is a market data provider with a free API key
-//! (<https://www.alphavantage.co/support/#api-key>). [`AlphaVantageClient`] reads two of its
+//! (<https://www.alphavantage.co/support/#api-key>). [`AlphaVantageClient`] reads four of its
 //! endpoints:
 //!
 //! - **The earnings calendar** ([`AlphaVantageClient::earnings_calendar`]): the releases it
 //!   expects in the next three, six or twelve months, for one company or for all it covers.
 //! - **The earnings history** ([`AlphaVantageClient::earnings_history`]): one company's past
 //!   quarterly releases, back to the 1990s for long-listed companies.
+//! - **Dividends** ([`AlphaVantageClient::dividends`]): one company's cash dividends, past ones
+//!   and those declared and still to come, with their declaration dates from about 2016.
+//! - **Splits** ([`StockSplitSource::fetch_splits`]): one company's past stock splits.
+//!
+//! A free key allows 25 requests a day across all four. Each read is one request per company,
+//! so dividends and splits for a pool of 100 companies take 200 requests, eight days' allowance.
 //!
 //! # Data use
 //! Alpha Vantage's terms of service (<https://www.alphavantage.co/terms_of_service/>) grant the
@@ -32,6 +39,13 @@
 //! - **Point in time.** A calendar record is known when fetched. A past release is known by its
 //!   session bound (see [`AlphaVantageClient::earnings_history`]), never earlier than it was
 //!   public; its exact time is not known. One whose bound has not passed is known when fetched.
+//! - **Dividend amounts are as paid**, not adjusted for later splits. A dividend is known at the
+//!   end of its declaration date, or, with none given, only from its ex-date. Alpha Vantage gives
+//!   no currency and does not mark a dividend as regular or special.
+//! - **Splits carry no declaration date**, so they are known only once they take effect.
+//! - **An unknown symbol reads as one with no dividends or splits**: Alpha Vantage answers both
+//!   with an empty list. Its earnings history, by contrast, tells an unknown symbol apart
+//!   ([`AlphaVantageError::NotFound`]).
 //! - **Symbols** are Alpha Vantage's: it writes share classes with either `.` or `-`.
 //!
 //! # Refusals
@@ -58,10 +72,16 @@
 //! ```
 //!
 //! [`EarningsRelease`]: crate::earnings::EarningsRelease
+//! [`Dividend`]: crate::dividends::Dividend
+//! [`StockSplitSource`]: rustrade_integration::corporate_action::StockSplitSource
+//! [`StockSplitSource::fetch_splits`]: rustrade_integration::corporate_action::StockSplitSource::fetch_splits
 
 mod client;
+mod dividends;
 mod error;
 mod records;
+// Side-effect-only module: provides `impl StockSplitSource for AlphaVantageClient`.
+mod splits;
 
 pub use client::{AlphaVantageClient, CalendarHorizon, DEFAULT_BASE_URL};
 pub use error::AlphaVantageError;

@@ -26,7 +26,8 @@ pub enum AlphaVantageError {
 
     /// Alpha Vantage reports no earnings for the symbol: it does not know the symbol, or the
     /// symbol has no earnings (a fund, for example). Alpha Vantage gives the same empty answer
-    /// for both.
+    /// for both. Only the earnings history returns it: the dividend and split reads cannot tell
+    /// an unknown symbol from one with none, and return an empty list for both.
     #[error("Alpha Vantage has no earnings for {symbol:?}")]
     NotFound { symbol: String },
 
