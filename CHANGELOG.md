@@ -738,6 +738,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep the stream. The signature now ends `+ use<'_, Self>`, and the trait documents that the
   stream borrows `self` only. An implementation outside this repo must add `+ use<'_>` to its
   `fetch_splits` return type; callers need no change.
+- **Breaking: Hyperliquid perpetual reads refuse a coin no DEX listed, or one spelled otherwise**
+  (`rustrade-execution`, #1047). `HyperliquidClient` checked a requested perpetual's form, DEX and
+  collateral, but not that the DEX lists its coin, so `account_snapshot` listed an unlisted
+  perpetual (`FOOBAR-USDC-PERP`) with no open orders, complete, without having looked; under
+  another spelling of a listed coin (`btc-USDC-PERP` for `BTC`) it did so while the perpetual had
+  open orders, reported under Hyperliquid's spelling. `account_snapshot`, `fetch_open_orders` and
+  `fetch_trades` now fail with `ApiError::InstrumentInvalid` before reading anything for a coin
+  no DEX traded listed when the client connected, or one spelled otherwise than Hyperliquid, even
+  only in ASCII case. A delisted perpetual stays listed, so its history can still be read.
+  `open_order` refused both already, but told a misspelled coin to reconnect; its reason now names
+  the spelling to use. The client reads each DEX's perpetuals once, at `connect`, so a perpetual
+  listed since is refused until the client connects again, as for orders. An empty `instruments`
+  slice is not checked.
 - **Breaking: Hyperliquid spot reads refuse an instrument naming no spot pair the client trades**
   (`rustrade-execution`, #1043). `HyperliquidSpotClient::account_snapshot` listed every requested
   instrument with no open orders, complete, even one naming no listed pair, so it reported an
