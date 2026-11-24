@@ -1157,8 +1157,10 @@ struct AlpacaOrderWs<'a> {
 /// - **Lookups.** A name not yet known is looked up upper-cased, as Alpaca's lookups match case:
 ///   an OCC symbol with `GET /v2/options/contracts/{symbol}`, any other with
 ///   `GET /v2/assets/{symbol}`, up to 8 at a time. Each costs one request against the account's
-///   rate limit shared with orders, so a first read of many instruments can hold orders back
-///   (see "Rate limits").
+///   rate limit, which orders share (200 a minute by default). A first read naming more names
+///   than the window has left uses it up: the rest of its lookups, and every order, then wait for
+///   the window to reset (see "Rate limits"). A caller with a large universe can spread its first
+///   reads, or read with fewer instruments at a time.
 /// - **Not listed.** A 404, or a listing under another symbol: `GET /v2/assets/BTCUSD` finds
 ///   `BTC/USD`, but orders and trades on that pair are reported as `BTC/USD`, so `BTCUSD` is
 ///   refused, and the error names the symbol to use. A failed lookup fails the read.
@@ -1166,6 +1168,10 @@ struct AlpacaOrderWs<'a> {
 ///   or an expired contract can still be read. A listed name is remembered for the client's
 ///   life, by every clone, and not looked up again; one not listed is looked up again on each
 ///   read naming it.
+/// - **Long-expired contracts.** Alpaca does not keep every expired contract: in November 2026
+///   it still found one that expired in January 2024, but not one that expired in January 2023.
+///   A filtered read naming a contract Alpaca no longer keeps is refused; a read with
+///   `instruments` empty still returns that contract's trades.
 ///
 /// # Fees, interest and borrow fees
 /// Every [`Trade`] this client reports carries zero fees. Equities and options trade without
@@ -1318,6 +1324,14 @@ impl AlpacaClient {
         instrument: InstrumentNameExchange,
         symbol: SmolStr,
     ) -> Result<(), UnindexedClientError> {
+        // A URL path drops a `.` or `..` segment and keeps an empty one, so the lookup would read
+        // another endpoint, such as the list of every asset. Alpaca lists nothing under these.
+        if matches!(symbol.as_str(), "" | "." | "..") {
+            return Err(instrument_invalid(
+                &instrument,
+                "Alpaca lists nothing under an empty name, `.` or `..`",
+            ));
+        }
         let url = if occ_contract(&symbol).is_some() {
             rest_url(self.base_url(), &["v2", "options", "contracts", &symbol])
         } else {
@@ -12729,6 +12743,47 @@ mod tests {
                 ],
                 "SPY is looked up once; NOPE, upper-cased, on every read; nothing else is read"
             );
+        }
+
+        /// An OCC symbol Alpaca does not list is refused on the options-contracts lookup's 404,
+        /// without asking the asset lookup, where options are not listed.
+        #[tokio::test]
+        async fn an_unlisted_option_contract_is_refused() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let (instrument, reason) = refused(
+                client_for(&server)
+                    .fetch_open_orders(&[InstrumentNameExchange::new("zzz250620c00100000")])
+                    .await,
+            );
+
+            assert_eq!(instrument, "zzz250620c00100000");
+            assert!(reason.contains("lists no asset"), "{reason}");
+            assert_eq!(
+                request_paths(&server).await,
+                ["/v2/options/contracts/ZZZ250620C00100000"]
+            );
+        }
+
+        /// An empty name, `.` or `..` is refused without a request: a URL path keeps an empty
+        /// segment and drops a dot segment, so the lookup would read another endpoint.
+        #[tokio::test]
+        async fn a_name_no_path_segment_can_carry_is_refused_unasked() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+            for name in ["", ".", ".."] {
+                let (instrument, reason) = refused(
+                    client
+                        .fetch_open_orders(&[InstrumentNameExchange::new(name)])
+                        .await,
+                );
+                assert_eq!(instrument, name);
+                assert!(reason.contains("lists nothing"), "{reason}");
+            }
+            assert!(request_paths(&server).await.is_empty());
         }
 
         /// A crypto pair named without its `/` is refused, though Alpaca's lookup finds the pair,
