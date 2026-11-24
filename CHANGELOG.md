@@ -219,6 +219,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `with_requests_per_minute` for a premium plan), keeps the API key out of `Debug`, and
       removes it from every error.
 
+- **Cash dividends known as of any instant, and stock splits, from Alpha Vantage**
+  (`rustrade-data`, #1036).
+  - **New `dividends` module** with one record for every provider: `Dividend` carries the
+    symbol, the ex-date, the amount per share as paid (`Decimal`, not adjusted for later splits),
+    the declaration, record and payment dates where given, `known_at` and a `DividendProvenance`
+    (`DividendProvider`, `record_id`, `observed_at`). Both structs are `#[non_exhaustive]`: build
+    them with `new` and the `with_*` setters. A dividend is identified by its symbol and ex-date.
+  - **New `DividendStore`: the next and the previous dividend of a symbol as of an instant, and
+    every one known by then** (`known(symbol, as_of, ex_dates)`, the question an option pricer
+    asks for the ex-dates up to an expiry). A query as of T uses only records known by T. Of one
+    dividend's records the later `known_at` stands, then the later `observed_at`, then the later
+    insertion. A dividend has gone ex from the start of its ex-date in the store's time zone.
+    `current` gives a dividend's standing record and `observations` all of its records. The store
+    does not project undeclared dividends or restate amounts for splits.
+  - **`AlphaVantageClient::dividends`** reads a company's past and declared coming dividends. Each
+    is known at the end of its declaration date (00:00 New York the next day), or, with no
+    declaration date (most dividends before 2016), from the start of its ex-date, so a backtest
+    does not see it coming; never later than it was fetched. Rows with an amount of zero, which
+    Alpha Vantage lists with full dates, are skipped and logged at DEBUG.
+  - **`AlphaVantageClient` implements `StockSplitSource`**, one request per symbol, the filter's
+    dates applied to each split's `effective_date`. Alpha Vantage rounds the factor to four
+    decimals, so a ratio of whole numbers with a denominator up to 100 within half a unit of its
+    last decimal is taken as the split (a one-for-three reverse split's `0.3333` is exactly 1/3).
+    A filter with no symbol is refused with `InvalidInput`; a symbol named twice is fetched once.
+  - **Known limitations:** Alpha Vantage answers an unknown symbol like one with no dividends or
+    splits, with an empty list. It gives no currency and does not mark a dividend as regular or
+    special. Splits carry no declaration date. Two dividends on one ex-date are one dividend in
+    the store, a withdrawn dividend stays, and a corrected amount counts from the original
+    record's `known_at`.
+  - **Alpha Vantage's data is for personal, non-commercial use only:** use by or for a firm, or
+    giving others access, needs a commercial licence. See
+    <https://www.alphavantage.co/terms_of_service/>. A free key's 25 requests a day cover
+    dividends and splits for about 12 companies.
+
 - **Cancel an order's unfilled remainder after a set time** (`rustrade-execution`, `rustrade`,
   #919).
   - **New `RequestOpen::cancel_after: Option<Duration>`**, set with `with_cancel_after`. It is an
@@ -719,6 +753,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `StockSplitSource::fetch_splits` returns a stream that borrows only the source**
+  (`rustrade-integration`). The stream's type captured `filter` too, though every implementation
+  copies what it needs from the filter first, so a caller could not pass a temporary filter and
+  keep the stream. The signature now ends `+ use<'_, Self>`, and the trait documents that the
+  stream borrows `self` only. An implementation outside this repo must add `+ use<'_>` to its
+  `fetch_splits` return type; callers need no change.
+- **Breaking: Hyperliquid perpetual reads refuse a coin no DEX listed, or one spelled otherwise**
+  (`rustrade-execution`, #1047). `HyperliquidClient` checked a requested perpetual's form, DEX and
+  collateral, but not that the DEX lists its coin, so `account_snapshot` listed an unlisted
+  perpetual (`FOOBAR-USDC-PERP`) with no open orders, complete, without having looked; under
+  another spelling of a listed coin (`btc-USDC-PERP` for `BTC`) it did so while the perpetual had
+  open orders, reported under Hyperliquid's spelling. `account_snapshot`, `fetch_open_orders` and
+  `fetch_trades` now fail with `ApiError::InstrumentInvalid` before reading anything for a coin
+  no DEX traded listed when the client connected, or one spelled otherwise than Hyperliquid, even
+  only in ASCII case. A delisted perpetual stays listed, so its history can still be read.
+  `open_order` refused both already, but told a misspelled coin to reconnect; its reason now names
+  the spelling to use. The client reads each DEX's perpetuals once, at `connect`, so a perpetual
+  listed since is refused until the client connects again, as for orders. An empty `instruments`
+  slice is not checked.
+- **Breaking: Hyperliquid spot reads refuse an instrument naming no spot pair the client trades**
+  (`rustrade-execution`, #1043). `HyperliquidSpotClient::account_snapshot` listed every requested
+  instrument with no open orders, complete, even one naming no listed pair, so it reported an
+  instrument it had not looked at; under another spelling of a listed pair (`hype-usdc-SPOT` for
+  `HYPE-USDC-SPOT`) it did so while the pair had open orders, reported under Hyperliquid's
+  spelling. `account_snapshot`, `fetch_open_orders` and `fetch_trades` now fail with
+  `ApiError::InstrumentInvalid` before reading anything, as the perpetuals client does, for a name
+  that is not `BASE-QUOTE-SPOT`, names no pair in `spotMeta`, or spells a listed pair's tokens
+  otherwise than Hyperliquid; the reason names the spelling to use, as `open_order`'s refusal
+  does. A pair the client holds no record of makes it read `spotMeta` again first, as before.
+  When that read fails, the pair may have been listed since, so the reads fail with the read's
+  error (a `ConnectivityError` for a network fault), and `open_order` leaves the order
+  `NotPlaced(NotSent)` for a network fault, or rejects it with a rate limit, instead of refusing
+  the instrument. An empty `instruments` slice is not checked.
+- **Breaking: `ExecutionClient::account_snapshot` must return balances for the requested assets
+  only** (`rustrade-execution`, `rustrade`, #998). They are matched as `fetch_balances` matches
+  them: an empty slice means every asset held, and names are compared ignoring ASCII case. The
+  contract said a client may return others; every client in the workspace now filters (see
+  Fixed), so an implementation outside it must too. The `ExecutionManager` still drops a balance
+  for an unregistered asset, but logs it at `error!` instead of `warn!`, as a client that broke
+  the contract (or, when the map registers no asset for the exchange, as a map that asked for
+  every balance). To carry the assets to the simulated venue, `SimulatedVenue::account_snapshot`
+  and `MockExchangeRequest::fetch_account_snapshot` take them, and
+  `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new `assets` field; pass
+  `&[]` or an empty `Vec` to keep every balance.
+- **Breaking: `ExecutionClient::account_snapshot` states its contract for `instruments`**
+  (`rustrade-execution`, `rustrade`, #1041). A client returns entries for the requested
+  instruments only, each one it read listed whether or not it has orders; an instrument it could
+  not read is left out, listed incomplete and `Unreported`, or fails the call, never listed with
+  an empty, complete order list; an empty slice means every instrument with something to report
+  (Binance spot and cross margin need instruments and read none). The `ExecutionManager` now
+  drops an entry for an instrument the map does not register and logs the names at `error!` once
+  per snapshot, as it does a stray balance, instead of failing the whole snapshot (and with it
+  every account-stream open); that holds for every snapshot it indexes, a `Snapshot` event on the
+  account stream included. `AccountEventIndexer::snapshot_partitioned` skips such an entry too:
+  `PartitionedSnapshot::untracked` is renamed `untracked_assets`, beside a new
+  `untracked_instruments`. `AccountEventIndexer::snapshot` still fails on either.
+  `SimulatedVenue::account_snapshot` and `MockExchangeRequest::fetch_account_snapshot` take the
+  instruments, and `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new
+  `instruments` field; pass `&[]` or an empty `Vec` for every instrument.
 - **Breaking: `IbkrSubscriptionKind` is `#[non_exhaustive]` and no longer `Copy`**
   (`rustrade-data`, #1019). It gains `Candles(IbkrCandleRequest)`; a `match` on it needs a
   wildcard arm, and a copy of it a `.clone()`. It also derives `PartialEq` and `Eq`.
@@ -1240,9 +1333,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Alpaca's trade and open-order reads match instrument names ignoring case**
+  (`rustrade-execution`, `alpaca`). `AlpacaClient::fetch_trades` matched requested names exactly,
+  so a name in another case than Alpaca's symbol (`spy` for `SPY`) read no trades, and
+  `fetch_open_orders` sent the name to Alpaca as spelled. Both now match ignoring case, as
+  `account_snapshot` already did, and send Alpaca's spelling once per symbol. What they find keeps
+  Alpaca's symbol, as the account stream reports it, so a fill read again after a reconnect is
+  still recognised as one the stream delivered. The account stream's own fill recovery after a
+  reconnect matches the same way.
+- **Databento's historical streams no longer borrow the client or the request**
+  (`rustrade-data`). `DatabentoHistorical::fetch_candles_stream`, `fetch_trades_stream` and
+  `fetch_quotes_stream` return a stream that owns its decoder, but its type borrowed the client
+  (mutably) and the request parameters, so a caller could not make a second request with the same
+  client, or drop the parameters, while reading the stream. It now borrows neither.
+- **The simulated venue's account snapshot reports only the requested instruments**
+  (`rustrade-execution`, #1041). `MockExecution` dropped the instruments it was asked for, and the
+  venue reported every instrument with an order and every CFD and option, so a venue trading more
+  instruments than the engine registered failed its snapshot at startup and on every reconnect,
+  where a live client succeeded. Each requested instrument the venue trades is now listed, orders
+  or not, as `ExecutionClient::account_snapshot` now requires. Names are matched exactly, as the
+  venue's other reads match them, so a requested name that differs from the venue's only in case
+  is now left out, where the instrument map's case-insensitive lookup used to index it.
+- **The Databento DBN file loaders no longer tie their iterator to the path**
+  (`rustrade-data`). `load_trades_from_dbn` and `load_quotes_from_dbn` return an iterator that
+  owns the open file, but its type borrowed `path`, so a caller could not drop the path, such as
+  a temporary `PathBuf`, while iterating. It now borrows nothing.
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
+- **Hyperliquid and simulated-venue account snapshots report only the requested assets'
+  balances** (`rustrade-execution`, #998). Hyperliquid perp and spot, and `MockExecution`, ignored
+  `account_snapshot`'s `assets` and returned every balance, though their `fetch_balances` filtered.
+  An account holding an asset the caller did not register made the `ExecutionManager` warn at
+  startup and on every account-stream reconnect, and a backtest saw balances a live venue would
+  not have reported.
 - **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
   cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
   id among the filled, expired and refused orders too, so the message now says "among its orders".

@@ -95,7 +95,11 @@
 //!   `{coin}-{collateral}-PERP`, such as `BTC-USDC-PERP`, `xyz:TSLA-USDC-PERP` and
 //!   `flx:TSLA-USDH-PERP`. An order, cancel or filtered read on any other name, a perpetual on an
 //!   unconfigured DEX included, is refused with
-//!   [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid).
+//!   [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid). An order or
+//!   filtered read is refused too on a coin no DEX traded listed at connect, or one spelled
+//!   differently from Hyperliquid, if only in ASCII case (`btc-USDC-PERP` for `BTC`): every report
+//!   names a coin as Hyperliquid spells it. A cancel on such a coin is refused unsent too, with
+//!   the same error, though with a terser reason.
 //! - **Unconfigured DEXs.** Their fills and orders still arrive on the account stream and in the
 //!   venue's listings, but without the DEX's metadata they cannot be named, so they are left out,
 //!   logged at `warn` once per DEX.
@@ -414,12 +418,13 @@ impl HyperliquidClient {
     /// [`OrderError::InvalidPrecision`] and sends nothing. Round with these rules first. See
     /// [`OrderPrecision`].
     ///
-    /// `None` when `instrument` names no perpetual this client trades, or one listed after the
+    /// `None` when `instrument` names no perpetual this client trades, spells its coin
+    /// differently from Hyperliquid (even only in ASCII case), or names one listed after the
     /// client connected: the client reads each DEX's perpetuals once, at
     /// [`connect`](Self::connect), so a perpetual listed since needs a new client.
     pub fn order_precision(&self, instrument: &InstrumentNameExchange) -> Option<OrderPrecision> {
-        let coin = self.dexes.coin(instrument).ok()?;
-        self.dexes.sz_decimals(coin).map(OrderPrecision::perp)
+        let (_, sz_decimals) = self.dexes.listed(instrument).ok()?;
+        Some(OrderPrecision::perp(sz_decimals))
     }
 
     /// Returns the wallet address as ethers H160.
@@ -428,14 +433,16 @@ impl HyperliquidClient {
     }
 
     /// Fail with [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) on
-    /// the first of `instruments` that names no perpetual this client trades. A read filtered to
-    /// it would otherwise report it empty without having looked.
+    /// the first of `instruments` that names no perpetual this client trades, spelled as
+    /// Hyperliquid spells it, and listed when the client connected. A read filtered to it would
+    /// otherwise report it empty without having looked; under another spelling of a listed
+    /// perpetual, it would miss the perpetual's orders, which are reported under Hyperliquid's.
     fn check_instruments(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<(), UnindexedClientError> {
         for instrument in instruments {
-            self.dexes.coin(instrument).map_err(|reason| {
+            self.dexes.listed(instrument).map_err(|reason| {
                 UnindexedClientError::Api(crate::error::ApiError::InstrumentInvalid(
                     instrument.clone(),
                     reason,
@@ -511,7 +518,8 @@ impl ExecutionClient for HyperliquidClient {
     ///
     /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for a requested
     /// instrument that names no perpetual this client trades, such as one on a HIP-3 DEX it is not
-    /// configured with: it was not read, so nothing can be said about it.
+    /// configured with, one no DEX listed when the client connected, or one spelling a listed coin
+    /// differently, if only in ASCII case: it was not read, so nothing can be said about it.
     ///
     /// # Cost
     ///
@@ -522,7 +530,7 @@ impl ExecutionClient for HyperliquidClient {
     /// address.
     async fn account_snapshot(
         &self,
-        _assets: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         self.check_instruments(instruments)?;
@@ -538,9 +546,11 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::open_orders(info_client, address, dexes),
         )?;
         let now = Utc::now();
-        let balances =
+        let mut balances =
             perp_account::snapshot_balances(info_client, address, dexes, mode, &states, sent)
                 .await?;
+        // Hyperliquid has no per-asset read, so the requested assets are kept here.
+        balances.retain(|balance| is_requested(assets, &balance.asset));
 
         let instrument_filter = InstrumentFilter::new(instruments);
 
@@ -1152,8 +1162,8 @@ impl ExecutionClient for HyperliquidClient {
             }
         };
 
-        let coin = match self.dexes.coin(request.key.instrument) {
-            Ok(coin) => coin.to_owned(),
+        let (coin, sz_decimals) = match self.dexes.listed(request.key.instrument) {
+            Ok((coin, sz_decimals)) => (coin.to_owned(), sz_decimals),
             Err(reason) => return make_invalid_instrument(reason),
         };
         let is_buy = request.state.side == Side::Buy;
@@ -1164,14 +1174,8 @@ impl ExecutionClient for HyperliquidClient {
             return make_rejected(CLOID_REQUIRED.to_string());
         };
 
-        let Some(precision) = self.order_precision(request.key.instrument) else {
-            return make_invalid_instrument(format!(
-                "{coin} was not listed when the client connected; reconnect to trade a perpetual \
-                 listed since"
-            ));
-        };
         let wire = match wire_order(
-            &precision,
+            &OrderPrecision::perp(sz_decimals),
             wire_kind,
             request.state.price,
             request.state.quantity,
@@ -1271,7 +1275,8 @@ impl ExecutionClient for HyperliquidClient {
     /// # Errors
     ///
     /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
-    /// in `instruments` that names no perpetual this client trades.
+    /// in `instruments` that names no perpetual this client trades, as for
+    /// [`account_snapshot`](HyperliquidClient#method.account_snapshot).
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -1310,7 +1315,8 @@ impl ExecutionClient for HyperliquidClient {
     /// # Errors
     ///
     /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
-    /// in `instruments` that names no perpetual this client trades.
+    /// in `instruments` that names no perpetual this client trades, as for
+    /// [`account_snapshot`](HyperliquidClient#method.account_snapshot).
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -1908,6 +1914,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An account snapshot reports the balances of the assets asked for, matched ignoring ASCII
+    /// case, and every balance for an empty list, as `fetch_balances` does.
+    #[tokio::test]
+    async fn account_snapshot_balances_are_filtered_by_asset_ignoring_case() {
+        let server = perp_account::tests::balance_server_answering_after(
+            "unifiedAccount",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let assets = |names: &[&str]| -> Vec<AssetNameExchange> {
+            names
+                .iter()
+                .map(|name| AssetNameExchange::new(*name))
+                .collect()
+        };
+
+        let names = |balances: &[AssetBalance<AssetNameExchange>]| -> Vec<String> {
+            balances
+                .iter()
+                .map(|b| b.asset.name().to_string())
+                .collect()
+        };
+        let all = client.account_snapshot(&[], &[]).await.unwrap().balances;
+        assert!(names(&all).len() > 1 && names(&all).contains(&"USDC".to_owned()));
+
+        for (requested, expected) in [(vec!["usdc"], vec!["USDC"]), (vec!["eth"], vec![])] {
+            let requested = assets(&requested);
+            let snapshot = client.account_snapshot(&requested, &[]).await.unwrap();
+            let fetched = client.fetch_balances(&requested).await.unwrap();
+            assert_eq!(names(&snapshot.balances), expected, "{requested:?}");
+            // The two reads agree on which balances they report.
+            assert_eq!(names(&fetched), expected, "{requested:?}");
+        }
+        assert_eq!(
+            names(&client.fetch_balances(&[]).await.unwrap()),
+            names(&all)
+        );
     }
 
     mod open_order {
@@ -2621,6 +2667,10 @@ mod tests {
             "HYPE-USDC-SPOT",
         ];
 
+        /// Names a perpetual the client trades, but one no DEX listed when it connected, or
+        /// spelled differently from Hyperliquid's listing (`BTC`, `xyz:TSLA`).
+        const UNLISTED: [&str; 3] = ["FOOBAR-USDC-PERP", "btc-USDC-PERP", "xyz:tsla-USDC-PERP"];
+
         fn is_invalid(
             error: &ApiError<AssetNameExchange, InstrumentNameExchange>,
             name: &str,
@@ -2631,7 +2681,7 @@ mod tests {
         #[tokio::test]
         async fn an_order_on_a_name_the_client_does_not_trade_is_refused_unsent() {
             let (_server, client) = offline_client().await;
-            for name in REFUSED {
+            for name in REFUSED.into_iter().chain(UNLISTED) {
                 let instrument = InstrumentNameExchange::from(name);
                 let order = client
                     .open_order(OrderEvent {
@@ -2685,10 +2735,39 @@ mod tests {
             }
         }
 
+        /// The SDK addresses a cancel by the coin's asset id, read at connect from the same
+        /// listings, so it refuses an unlisted or misspelled coin before sending.
+        #[tokio::test]
+        async fn a_cancel_on_an_unlisted_coin_is_refused_unsent() {
+            let (server, client) = offline_client().await;
+            for name in UNLISTED {
+                let instrument = InstrumentNameExchange::from(name);
+                let response = client
+                    .cancel_order(OrderEvent {
+                        key: OrderKey {
+                            exchange: ExchangeId::HyperliquidPerp,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("strategy"),
+                            cid: ClientOrderId::uuid(),
+                        },
+                        state: RequestCancel {
+                            id: Some(VenueOrderId::Assigned(OrderId::new("1"))),
+                        },
+                    })
+                    .await;
+                let Err(UnindexedOrderError::Rejected(error)) = &response.state else {
+                    panic!("{name}: expected a rejection, got {:?}", response.state);
+                };
+                assert!(is_invalid(error, name), "{name}: {error:?}");
+            }
+            let sent = server.received_requests().await.unwrap_or_default();
+            assert!(sent.is_empty(), "nothing sent: {sent:?}");
+        }
+
         #[tokio::test]
         async fn a_read_filtered_to_a_name_the_client_does_not_trade_fails_unsent() {
             let (_server, client) = offline_client().await;
-            for name in REFUSED {
+            for name in REFUSED.into_iter().chain(UNLISTED) {
                 let instruments = [InstrumentNameExchange::from(name)];
                 let snapshot = client.account_snapshot(&[], &instruments).await;
                 let open = client.fetch_open_orders(&instruments).await;

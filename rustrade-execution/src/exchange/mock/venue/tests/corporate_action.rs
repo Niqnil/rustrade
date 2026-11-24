@@ -1049,7 +1049,7 @@ mod options_on_the_equity {
     /// The entry price of the option position the venue reports, `None` while flat.
     fn option_entry(venue: &SimulatedVenue) -> Option<Decimal> {
         venue
-            .account_snapshot()
+            .account_snapshot(&[], &[])
             .instruments
             .iter()
             .find(|instrument| instrument.instrument == option_name())

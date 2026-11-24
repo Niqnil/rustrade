@@ -385,8 +385,16 @@ impl MockExchange {
     /// already sees it.
     fn book(&mut self, kind: MockExchangeRequestKind, emit: &Emit) {
         match kind {
-            MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
-                emit.respond(Vec::new(), response_tx, self.venue.account_snapshot());
+            MockExchangeRequestKind::FetchAccountSnapshot {
+                assets,
+                instruments,
+                response_tx,
+            } => {
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.account_snapshot(&assets, &instruments),
+                );
             }
             MockExchangeRequestKind::FetchBalances {
                 response_tx,
@@ -1201,6 +1209,8 @@ mod tests {
         request_tx
             .send(MockExchangeRequest::fetch_account_snapshot(
                 expiry + chrono::TimeDelta::seconds(1),
+                Vec::new(),
+                Vec::new(),
                 snapshot_tx,
             ))
             .unwrap();
@@ -1258,6 +1268,48 @@ mod tests {
             response.state.is_err(),
             "this venue rests no orders, so a cancel must be rejected: {response:?}"
         );
+
+        drop(request_tx);
+        driver.await.unwrap();
+    }
+
+    /// The assets and instruments a snapshot request names reach the venue, which reports only
+    /// their balances and entries: here the spot instrument, listed though it has no order.
+    #[tokio::test]
+    async fn a_snapshot_request_reports_only_the_assets_and_instruments_it_names() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _events) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("100", "10000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::fetch_account_snapshot(
+                Utc::now(),
+                vec![quote()],
+                vec![instrument_name()],
+                response_tx,
+            ))
+            .unwrap();
+        let snapshot = response_rx.await.expect("a snapshot must be answered");
+
+        let assets = snapshot
+            .balances
+            .iter()
+            .map(|balance| balance.asset.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, [quote()]);
+        let instruments = snapshot
+            .instruments
+            .iter()
+            .map(|entry| entry.instrument.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(instruments, [instrument_name()]);
 
         drop(request_tx);
         driver.await.unwrap();

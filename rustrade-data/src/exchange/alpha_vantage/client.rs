@@ -1,7 +1,8 @@
-//! The HTTP client for Alpha Vantage's earnings endpoints.
+//! The HTTP client for Alpha Vantage's earnings, dividend and split endpoints.
 
-use super::{error::AlphaVantageError, records};
+use super::{dividends, error::AlphaVantageError, records};
 use crate::{
+    dividends::Dividend,
     earnings::EarningsRelease,
     exchange::{
         http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, http_base_url, read_body_capped},
@@ -49,7 +50,8 @@ impl CalendarHorizon {
     }
 }
 
-/// A client for Alpha Vantage's earnings calendar and earnings history.
+/// A client for Alpha Vantage's earnings calendar and history, dividends and splits (as a
+/// [`StockSplitSource`](rustrade_integration::corporate_action::StockSplitSource)).
 ///
 /// See the [module documentation](super) for what each returns and the terms the data comes
 /// under.
@@ -184,12 +186,44 @@ impl AlphaVantageClient {
         records::calendar(&body, observed_at)
     }
 
+    /// `symbol`'s cash dividends, past and declared coming ones, by ex-date. One request.
+    ///
+    /// Each amount is per share as paid, not adjusted for later splits. A dividend is known at the
+    /// end of its declaration date (00:00 New York the next day), or, where Alpha Vantage gives no
+    /// declaration date (as for most dividends before 2016), from the start of its ex-date, so a
+    /// backtest does not see it coming. No record is known later than it was fetched. See
+    /// ["Point in time"](crate::dividends#point-in-time).
+    ///
+    /// Alpha Vantage lists some dividends with an amount of zero and full dates; they pay
+    /// nothing, and are skipped and logged at DEBUG. The records keep `symbol` as given.
+    ///
+    /// An unknown symbol reads as one that has paid no dividends: Alpha Vantage answers both
+    /// with an empty list.
+    ///
+    /// # Errors
+    /// - [`AlphaVantageError::InvalidInput`] if `symbol` is empty.
+    /// - [`AlphaVantageError::Refused`] if Alpha Vantage refused the request.
+    /// - [`AlphaVantageError::Decode`] if a row lacks its ex-date or has an amount that is not a
+    ///   non-negative number.
+    /// - Any other request error.
+    pub async fn dividends(&self, symbol: &str) -> Result<Vec<Dividend>, AlphaVantageError> {
+        let symbol = checked_symbol(symbol)?;
+        let body = self
+            .get(&[("function", "DIVIDENDS"), ("symbol", symbol)])
+            .await?;
+        let observed_at = Utc::now();
+        if let Some(error) = records::notice(&body) {
+            return Err(error);
+        }
+        dividends::dividends(&body, symbol, observed_at)
+    }
+
     /// The body of a successful `GET /query` with `params` and the API key, without the key.
     ///
     /// Every error message is built from this body, or from an error body or transport error
     /// scrubbed here, so none holds the key. Scrubbing comes before any message is capped, which
     /// could otherwise cut the key and leave a part of it that no longer matches.
-    async fn get(&self, params: &[(&str, &str)]) -> Result<String, AlphaVantageError> {
+    pub(super) async fn get(&self, params: &[(&str, &str)]) -> Result<String, AlphaVantageError> {
         self.pacer.wait().await;
         // `without_url`: the URL carries the API key in its query.
         let transport = |e: reqwest::Error| AlphaVantageError::Http {
@@ -236,7 +270,7 @@ impl std::fmt::Debug for AlphaVantageClient {
     }
 }
 
-fn checked_symbol(symbol: &str) -> Result<&str, AlphaVantageError> {
+pub(super) fn checked_symbol(symbol: &str) -> Result<&str, AlphaVantageError> {
     let symbol = symbol.trim();
     if symbol.is_empty() {
         return Err(AlphaVantageError::invalid_input("the symbol is empty"));

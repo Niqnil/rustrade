@@ -192,12 +192,6 @@ impl PerpDexes {
         );
     }
 
-    /// The `szDecimals` of the perpetual `coin`, `None` if no DEX traded listed it when the
-    /// client connected.
-    pub(super) fn sz_decimals(&self, coin: &str) -> Option<u32> {
-        self.sz_decimals.get(coin).copied()
-    }
-
     /// The configured HIP-3 DEXs, by name.
     pub(super) fn hip3(&self) -> impl Iterator<Item = &str> {
         self.collateral.keys().map(SmolStr::as_str)
@@ -280,6 +274,54 @@ impl PerpDexes {
                 dex.unwrap_or_default()
             )),
         }
+    }
+
+    /// The coin `instrument` names, with its `szDecimals`, when a DEX traded listed the coin when
+    /// the client connected, spelled exactly as Hyperliquid spells it. Every report names a coin
+    /// as Hyperliquid spells it, so under any other spelling a read would miss its orders.
+    ///
+    /// A delisted perpetual stays listed: Hyperliquid keeps it in its DEX's `meta`, flagged.
+    ///
+    /// # Errors
+    ///
+    /// Why `instrument` names no listed perpetual: [`coin`](Self::coin)'s reasons; that it spells
+    /// a listed coin differently, if only in ASCII case, naming the instrument to use; or that
+    /// its coin was not listed when the client connected.
+    pub(super) fn listed<'a>(
+        &self,
+        instrument: &'a InstrumentNameExchange,
+    ) -> Result<(&'a str, u32), String> {
+        let coin = self.coin(instrument)?;
+        if let Some(sz_decimals) = self.sz_decimals.get(coin) {
+            return Ok((coin, *sz_decimals));
+        }
+        Err(
+            match self
+                .spelling_of(coin)
+                .and_then(|listed| Some((listed, self.instrument(listed)?)))
+            {
+                Some((listed, named)) => format!(
+                    "Hyperliquid spells this perpetual {listed}, and reports its orders under \
+                     {named}; name the instrument that way"
+                ),
+                None => format!(
+                    "{coin} was not listed when the client connected; reconnect to trade a \
+                     perpetual listed since"
+                ),
+            },
+        )
+    }
+
+    /// The coin on `coin`'s DEX that differs from `coin` only in ASCII case, `None` when no coin
+    /// does, or several do: one picked arbitrarily could name the wrong market.
+    fn spelling_of(&self, coin: &str) -> Option<&str> {
+        let dex = dex_of(coin);
+        let mut spellings = self
+            .sz_decimals
+            .keys()
+            .filter(|listed| dex_of(listed) == dex && listed.eq_ignore_ascii_case(coin));
+        let spelling = spellings.next()?;
+        spellings.next().is_none().then_some(spelling.as_str())
     }
 }
 
@@ -471,6 +513,86 @@ pub(super) mod tests {
         assert!(coin("BTC").is_err());
         assert!(coin("HYPE-USDC-SPOT").is_err());
         assert!(coin("@107-USDC-PERP").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_listed_perpetual_must_be_spelled_as_hyperliquid_spells_it() {
+        let mut dexes = xyz_and_flx().await;
+        let default_perp = |name: &str, sz_decimals| hyperliquid_rust_sdk::AssetMeta {
+            name: name.to_owned(),
+            sz_decimals,
+        };
+        dexes.add_default_perps(&[
+            default_perp("BTC", 5),
+            default_perp("kPEPE", 0),
+            // Two coins differing only in case: neither is suggested for a third spelling.
+            default_perp("ABC", 1),
+            default_perp("abc", 1),
+        ]);
+        let listed = |name: &str| {
+            dexes
+                .listed(&InstrumentNameExchange::from(name))
+                .map(|(coin, sz_decimals)| (coin.to_owned(), sz_decimals))
+        };
+
+        assert_eq!(listed("BTC-USDC-PERP").unwrap(), ("BTC".to_owned(), 5));
+        assert_eq!(listed("kPEPE-USDC-PERP").unwrap(), ("kPEPE".to_owned(), 0));
+        assert_eq!(listed("abc-USDC-PERP").unwrap(), ("abc".to_owned(), 1));
+        assert_eq!(
+            listed("xyz:NVDA-USDC-PERP").unwrap(),
+            ("xyz:NVDA".to_owned(), 2)
+        );
+
+        let suggests = |name: &str, spelling: &str| {
+            let reason = listed(name).unwrap_err();
+            assert!(
+                reason.contains(&format!("reports its orders under {spelling};")),
+                "{name}: {reason}"
+            );
+        };
+        suggests("btc-USDC-PERP", "BTC-USDC-PERP");
+        suggests("KPEPE-USDC-PERP", "kPEPE-USDC-PERP");
+        suggests("xyz:tsla-USDC-PERP", "xyz:TSLA-USDC-PERP");
+
+        let unlisted = |name: &str| {
+            let reason = listed(name).unwrap_err();
+            assert!(
+                reason.contains("was not listed when the client connected"),
+                "{name}: {reason}"
+            );
+        };
+        unlisted("FOOBAR-USDC-PERP");
+        unlisted("Abc-USDC-PERP");
+        // `xyz` lists NVDA, but `flx` does not: a coin is not looked for on another DEX.
+        unlisted("flx:NVDA-USDH-PERP");
+        unlisted("flx:nvda-USDH-PERP");
+
+        // The name's own faults come first.
+        assert!(
+            listed("btc-USD-PERP")
+                .unwrap_err()
+                .contains("settles in USDC")
+        );
+    }
+
+    #[test]
+    fn a_coin_on_a_dex_named_alike_is_not_suggested() {
+        // Testnet lists both `volmex` and `VOLMEX`: a client may trade both.
+        let dexes = PerpDexes {
+            collateral: BTreeMap::from([
+                ("volmex".into(), "USDC".into()),
+                ("VOLMEX".into(), "USDC".into()),
+            ]),
+            asset_ids: HashMap::new(),
+            sz_decimals: HashMap::from([("VOLMEX:ABC".to_owned(), 1)]),
+        };
+        let reason = dexes
+            .listed(&InstrumentNameExchange::from("volmex:abc-USDC-PERP"))
+            .unwrap_err();
+        assert!(
+            reason.contains("was not listed when the client connected"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]

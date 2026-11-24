@@ -524,11 +524,34 @@ where
     ///
     /// # Assets
     ///
-    /// `assets` are the ones the caller registered. Return balances for those only when the venue
-    /// lets you ask, which saves bandwidth. A balance for another asset is not an error: the
-    /// `ExecutionManager` drops it and logs the asset names once per snapshot.
+    /// `assets` are the ones the caller registered. Return balances for those only, matched as
+    /// [`fetch_balances`](Self::fetch_balances) matches them: an empty slice means every asset
+    /// held, and names are compared ignoring ASCII case. Ask the venue for those alone when it
+    /// lets you, which saves bandwidth, and otherwise filter what it returns. The
+    /// `ExecutionManager` drops a balance for another asset and logs the asset names at `error!`
+    /// once per snapshot, as a client that broke this contract.
     ///
     /// Balances are stamped as [`fetch_balances`](Self::fetch_balances) describes.
+    ///
+    /// # Instruments
+    ///
+    /// `instruments` are the ones the caller registered. Return entries for those only, with
+    /// names matched as the venue matches them (the caller passes the names it registered). Ask
+    /// the venue for those alone when it lets you, and otherwise filter what it returns. The
+    /// `ExecutionManager` drops an entry for another instrument and logs the instrument names at
+    /// `error!` once per snapshot, as a client that broke this contract.
+    ///
+    /// - **Every requested instrument the client read gets an entry**, orders or not: an entry is
+    ///   what lets the engine retire an order it no longer lists (see `# Order completeness`).
+    ///   The position follows [`InstrumentAccountSnapshot::position`](crate::InstrumentAccountSnapshot::position).
+    /// - **A requested instrument the client could not read** is left out, or listed with
+    ///   `orders_complete: false` and [`PositionReport::Unreported`](crate::position::PositionReport::Unreported),
+    ///   or fails the call, as each client documents. It is never listed with an empty, complete
+    ///   order list, which would claim the venue holds no order on it.
+    /// - **An empty slice is the "return all" sentinel**, as for
+    ///   [`fetch_open_orders`](Self::fetch_open_orders): an entry for every instrument with
+    ///   something to report. Binance spot and cross margin need instruments, so an empty slice
+    ///   reads none there.
     ///
     /// # Order completeness
     ///

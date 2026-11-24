@@ -204,6 +204,9 @@ pub mod event;
 // resolve the file's inner links in this module's scope rather than the child's.
 pub mod earnings;
 
+// No `///` here, for the same reason as `earnings`.
+pub mod dividends;
+
 /// [`Connector`] implementations for each exchange.
 pub mod exchange;
 

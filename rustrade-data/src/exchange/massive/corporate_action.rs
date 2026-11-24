@@ -36,7 +36,7 @@ impl StockSplitSource for MassiveRestClient {
     fn fetch_splits(
         &self,
         filter: &CorporateActionFilter,
-    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_> {
         // Build owned queries eagerly so the returned stream borrows only `self`, not `filter`.
         let queries = build_split_queries(filter);
 
@@ -184,7 +184,7 @@ mod tests {
             fn fetch_splits(
                 &self,
                 _filter: &CorporateActionFilter,
-            ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send
+            ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_>
             {
                 futures::stream::iter([Ok(CorporateAction::new(
                     SmolStr::new("TSLA"),

@@ -30,7 +30,7 @@ use rustrade_execution::{
         AccountReinitFailure, AccountStreamInitError, AmendRefusal, ConnectivityError,
         NotPlacedReason, OrderError,
     },
-    indexer::{AccountEventIndexer, AccountIndexError},
+    indexer::{AccountEventIndexer, AccountIndexError, PartitionedSnapshot},
     map::ExecutionInstrumentMap,
     order::{
         Order, OrderEvent, OrderKey, UnindexedOrderKey,
@@ -545,36 +545,72 @@ where
         }
     }
 
-    /// Indexes an account snapshot, dropping and logging the balances of assets the map does not
-    /// register.
+    /// Indexes an account snapshot, dropping the balances of assets and the entries of instruments
+    /// the map does not register, and logging their names at `error!`.
+    ///
+    /// The snapshot was asked for the map's assets and instruments, and
+    /// [`ExecutionClient::account_snapshot`] returns those only, so such a balance or entry means
+    /// the client broke that contract. The one exception is a map that registers no asset, or no
+    /// instrument, for the exchange, such as one built for a venue that only prices another
+    /// venue's instruments: the snapshot then asked for every balance, or every instrument with
+    /// something to report, and the error names the map instead.
     fn index_snapshot(
         indexer: &AccountEventIndexer,
         snapshot: UnindexedAccountSnapshot,
     ) -> Result<AccountEvent, IndexError> {
-        let partitioned = indexer.snapshot_partitioned(snapshot)?;
-        let (indexed_snapshot, untracked) = (partitioned.snapshot, partitioned.untracked);
-        let untracked: Vec<&str> = untracked
+        let PartitionedSnapshot {
+            snapshot: indexed_snapshot,
+            untracked_assets,
+            untracked_instruments,
+            ..
+        } = indexer.snapshot_partitioned(snapshot)?;
+
+        let untracked: Vec<&str> = untracked_assets
             .iter()
             .map(|asset| asset.name().as_str())
             .collect();
         if !untracked.is_empty() {
-            if indexed_snapshot.balances.is_empty() {
-                // Every balance was dropped: more likely the asset names do not match the
-                // venue's than an account holding only unregistered assets, though that is
-                // possible too.
+            if indexer.map.exchange_assets().next().is_none() {
+                // The snapshot was asked for an empty list, which means every asset held, so the
+                // client kept the contract: the map is what registers nothing.
                 error!(
                     ?untracked,
-                    "Account snapshot kept no balance: none of its assets is registered in the \
-                     ExecutionInstrumentMap"
+                    "Account snapshot balances dropped: the ExecutionInstrumentMap registers no \
+                     asset for this exchange, so the snapshot asked for every balance"
                 );
             } else {
-                warn!(
+                error!(
                     ?untracked,
-                    "Account snapshot balances dropped for assets the ExecutionInstrumentMap \
-                     does not register"
+                    kept = indexed_snapshot.balances.len(),
+                    "Account snapshot balances dropped for assets the ExecutionInstrumentMap does \
+                     not register: the client returned balances it was not asked for"
                 );
             }
         }
+
+        let untracked: Vec<&str> = untracked_instruments
+            .iter()
+            .map(|instrument| instrument.name().as_str())
+            .collect();
+        if !untracked.is_empty() {
+            if indexer.map.exchange_instruments().next().is_none() {
+                // As for the assets: an empty list asked for every instrument.
+                error!(
+                    ?untracked,
+                    "Account snapshot instruments dropped: the ExecutionInstrumentMap registers \
+                     no instrument for this exchange, so the snapshot asked for every instrument"
+                );
+            } else {
+                error!(
+                    ?untracked,
+                    kept = indexed_snapshot.instruments.len(),
+                    "Account snapshot instruments dropped for instruments the \
+                     ExecutionInstrumentMap does not register: the client returned instruments \
+                     it was not asked for"
+                );
+            }
+        }
+
         Ok(AccountEvent {
             exchange: indexer.map.exchange.key,
             kind: AccountEventKind::Snapshot(indexed_snapshot),
@@ -1900,7 +1936,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use rustrade_execution::{
         AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
-        UnindexedAccountEvent, UnindexedAccountSnapshot,
+        InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
         balance::AssetBalance,
         error::{AmendField, ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
         map::generate_execution_instrument_map,
@@ -1911,6 +1947,7 @@ mod tests {
             request::{RequestCancel, RequestOpen},
             state::{ActiveOrderState, Cancelled, InactiveOrderState, Open},
         },
+        position::PositionReport,
         trade::{AssetFees, Trade, TradeId, TradesRead},
     };
     use rustrade_instrument::{
@@ -2176,6 +2213,8 @@ mod tests {
         snapshot_fail_on: &'static [usize],
         /// The assets the account snapshot holds a balance for.
         snapshot_balances: Vec<AssetNameExchange>,
+        /// The instruments the account snapshot lists, each with no order.
+        snapshot_instruments: Vec<InstrumentNameExchange>,
         snapshots: Arc<std::sync::atomic::AtomicUsize>,
         /// The answers `fetch_trades` gives, in turn; an empty read once they run out.
         reads: Arc<
@@ -2244,7 +2283,18 @@ mod tests {
                         )
                     })
                     .collect(),
-                vec![],
+                self.snapshot_instruments
+                    .iter()
+                    .map(|instrument| {
+                        InstrumentAccountSnapshot::new(
+                            instrument.clone(),
+                            vec![],
+                            true,
+                            PositionReport::Unreported,
+                            None,
+                        )
+                    })
+                    .collect(),
             ))
         }
 
@@ -3133,7 +3183,7 @@ mod tests {
             async move {
                 while let Some(MockExchangeRequest { kind, .. }) = request_rx.recv().await {
                     match kind {
-                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
+                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx, .. } => {
                             let _ = response_tx.send(UnindexedAccountSnapshot::new(
                                 ExchangeId::Mock,
                                 vec![],
@@ -3262,22 +3312,43 @@ mod tests {
         })
     }
 
-    /// Fetch the account snapshot of a client holding balances for `held`, and index it, with the
-    /// map registering `btc` and `usdt` only: `(kept, warn, debug, error)`, the balances kept and
-    /// the logs.
-    fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+    /// Fetch the account snapshot of a client holding balances for `held` that returns them all,
+    /// whatever it is asked for, and index it against `instruments`' map for `EXCHANGE`: the
+    /// balances kept and the events logged.
+    fn index_held_snapshot(
+        instruments: &IndexedInstruments,
+        held: &[&str],
+    ) -> (usize, Vec<rustrade_instrument::test_utils::logs::Logged>) {
+        let (snapshot, logged) = index_held_account(instruments, held, &[]);
+        (snapshot.balances.len(), logged)
+    }
+
+    /// Fetch the account snapshot of a client holding balances for `held` and listing
+    /// `listed`, all returned whatever it is asked for, and index it against `instruments`' map
+    /// for `EXCHANGE`: the snapshot kept and the events logged.
+    fn index_held_account(
+        instruments: &IndexedInstruments,
+        held: &[&str],
+        listed: &[&str],
+    ) -> (
+        AccountSnapshot,
+        Vec<rustrade_instrument::test_utils::logs::Logged>,
+    ) {
         type Manager = ExecutionManager<
             futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
             FlakyAccountClient,
         >;
-        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
-        let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
+        let map = generate_execution_instrument_map(instruments, EXCHANGE).unwrap();
         let indexer = AccountEventIndexer::new(Arc::new(map));
         let client = Arc::new(FlakyAccountClient {
             snapshot_balances: held.iter().map(|a| AssetNameExchange::new(*a)).collect(),
+            snapshot_instruments: listed
+                .iter()
+                .map(|name| InstrumentNameExchange::new(*name))
+                .collect(),
             ..Default::default()
         });
-        with_log_counts(|| {
+        rustrade_instrument::test_utils::logs::capture(|| {
             let event = futures::executor::block_on(Manager::fetch_account_snapshot(
                 &client,
                 &indexer,
@@ -3292,16 +3363,32 @@ mod tests {
             let AccountEventKind::Snapshot(snapshot) = indexed.kind else {
                 panic!("expected a snapshot");
             };
-            snapshot.balances.len()
+            snapshot
         })
     }
 
+    /// [`index_held_snapshot`] with the map registering `btc` and `usdt` only:
+    /// `(kept, warn, debug, error)`, the balances kept and the logs.
+    fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let (kept, logged) = index_held_snapshot(&instruments, held);
+        let count = |level| logged.iter().filter(|event| event.level == level).count();
+        (
+            kept,
+            count(tracing::Level::WARN),
+            count(tracing::Level::DEBUG),
+            count(tracing::Level::ERROR),
+        )
+    }
+
+    /// A balance the client was not asked for breaks `account_snapshot`'s contract: it is dropped
+    /// and the snapshot kept, with one error naming every such asset.
     #[test]
-    fn a_snapshot_drops_an_unregistered_balance_with_one_warning() {
-        // The registered balances are kept; bnb and sol are named in a single warning.
+    fn a_snapshot_drops_an_unregistered_balance_with_one_error() {
+        // The registered balances are kept; bnb and sol are named in a single error.
         assert_eq!(
             snapshot_balances_kept(&["usdt", "bnb", "btc", "sol"]),
-            (2, 1, 0, 0)
+            (2, 0, 0, 1)
         );
         // Nothing to drop, nothing logged.
         assert_eq!(snapshot_balances_kept(&["usdt", "btc"]), (2, 0, 0, 0));
@@ -3330,9 +3417,111 @@ mod tests {
         );
     }
 
+    /// An instrument the client was not asked for breaks `account_snapshot`'s contract as a
+    /// balance does: its entry is dropped and the snapshot kept, with one error naming every such
+    /// instrument. A map that registers no instrument for the exchange asked for every one, so
+    /// the error names the map instead.
     #[test]
-    fn a_snapshot_that_keeps_no_balance_is_an_error() {
+    fn a_snapshot_drops_an_unregistered_instrument_with_one_error() {
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+
+        let errors = |logged: &[rustrade_instrument::test_utils::logs::Logged]| {
+            logged
+                .iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .map(|event| event.message().to_string())
+                .collect::<Vec<_>>()
+        };
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let registered = generate_execution_instrument_map(&instruments, EXCHANGE)
+            .unwrap()
+            .exchange_instruments()
+            .next()
+            .expect("the map registers the instrument")
+            .clone();
+
+        let (snapshot, logged) = index_held_account(
+            &instruments,
+            &["usdt"],
+            &["ETHUSDT", registered.name().as_str(), "SOLUSDT"],
+        );
+        assert_eq!(snapshot.balances.len(), 1, "the balance is kept");
+        assert_eq!(
+            snapshot.instruments.len(),
+            1,
+            "the registered entry is kept"
+        );
+        let errors_logged = errors(&logged);
+        assert_eq!(errors_logged.len(), 1, "{logged:?}");
+        assert!(
+            errors_logged[0].contains("not asked for"),
+            "{errors_logged:?}"
+        );
+        let named = logged
+            .iter()
+            .find(|event| event.level == tracing::Level::ERROR)
+            .and_then(|event| event.fields.iter().find(|(name, _)| *name == "untracked"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        assert_eq!(named, r#"["ETHUSDT", "SOLUSDT"]"#);
+
+        // Nothing to drop, nothing logged.
+        let (snapshot, logged) =
+            index_held_account(&instruments, &[], &[registered.name().as_str()]);
+        assert_eq!(snapshot.instruments.len(), 1);
+        assert!(errors(&logged).is_empty(), "{logged:?}");
+
+        // `EXCHANGE` only prices another venue's instrument, so it registers no instrument.
+        let pricing_only = IndexedInstruments::new(vec![
+            instrument(ExchangeId::Kraken, "btc", "usdt")
+                .with_data_venue(DataVenue::new(EXCHANGE, None)),
+        ]);
+        let (snapshot, logged) = index_held_account(&pricing_only, &[], &["ETHUSDT"]);
+        assert!(snapshot.instruments.is_empty());
+        let errors_logged = errors(&logged);
+        assert_eq!(errors_logged.len(), 1, "{logged:?}");
+        assert!(
+            errors_logged[0].contains("registers no instrument"),
+            "{errors_logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_keeps_no_balance_logs_the_same_error() {
         assert_eq!(snapshot_balances_kept(&["bnb", "sol"]), (0, 0, 0, 1));
+    }
+
+    /// A map that registers no asset for the exchange asks the snapshot for every balance, so the
+    /// error names the map, not the client, as the cause of the dropped balances.
+    #[test]
+    fn a_snapshot_against_a_map_with_no_assets_blames_the_map() {
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+
+        // `EXCHANGE` only prices another venue's instrument, so it has an index but no asset.
+        let instruments = IndexedInstruments::new(vec![
+            instrument(ExchangeId::Kraken, "btc", "usdt")
+                .with_data_venue(DataVenue::new(EXCHANGE, None)),
+        ]);
+        let (kept, logged) = index_held_snapshot(&instruments, &["usdt"]);
+
+        let errors = logged
+            .iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .map(|event| event.message())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, 0);
+        assert_eq!(errors.len(), 1, "{logged:?}");
+        assert!(errors[0].contains("registers no asset"), "{errors:?}");
+
+        // A map that registers assets blames the client instead.
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let (_, logged) = index_held_snapshot(&instruments, &["bnb"]);
+        assert!(
+            logged
+                .iter()
+                .any(|event| event.message().contains("not asked for")),
+            "{logged:?}"
+        );
     }
 
     #[test]

@@ -312,7 +312,8 @@ impl DatabentoHistorical {
         params: &DatabentoOhlcvParams,
         exchange: ExchangeId,
         instrument: K,
-    ) -> Result<impl Stream<Item = Result<MarketEvent<K, Candle>, DataError>>, DataError> {
+    ) -> Result<impl Stream<Item = Result<MarketEvent<K, Candle>, DataError>> + use<K>, DataError>
+    {
         let schema = ensure_databento_ohlcv_supports(exchange, params.interval)?;
         let get_range = build_ohlcv_get_range(params, schema);
 
@@ -385,7 +386,10 @@ impl DatabentoHistorical {
         params: &GetRangeParams,
         exchange: ExchangeId,
         instrument: K,
-    ) -> Result<impl Stream<Item = Result<MarketEvent<K, PublicTrade>, DataError>>, DataError> {
+    ) -> Result<
+        impl Stream<Item = Result<MarketEvent<K, PublicTrade>, DataError>> + use<K>,
+        DataError,
+    > {
         debug!(?params, "Streaming historical trades from Databento");
 
         let decoder = self
@@ -458,7 +462,8 @@ impl DatabentoHistorical {
         params: &GetRangeParams,
         exchange: ExchangeId,
         instrument: K,
-    ) -> Result<impl Stream<Item = Result<MarketEvent<K, Quote>, DataError>>, DataError> {
+    ) -> Result<impl Stream<Item = Result<MarketEvent<K, Quote>, DataError>> + use<K>, DataError>
+    {
         debug!(?params, "Streaming historical quotes from Databento");
 
         let decoder = self
@@ -574,7 +579,8 @@ fn assert_ohlcv_rtype_matches(rtype: u8, schema: Schema) -> Result<(), DataError
 /// Load trades from a pre-downloaded DBN file.
 ///
 /// Returns an iterator to avoid loading entire file into memory.
-/// Useful for backtesting with previously downloaded data.
+/// Useful for backtesting with previously downloaded data. The iterator owns
+/// the open file and does not borrow `path`.
 ///
 /// # Arguments
 ///
@@ -599,7 +605,8 @@ pub fn load_trades_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
-) -> Result<impl Iterator<Item = Result<MarketEvent<K, PublicTrade>, DataError>>, DataError> {
+) -> Result<impl Iterator<Item = Result<MarketEvent<K, PublicTrade>, DataError>> + use<K>, DataError>
+{
     let decoder =
         DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
@@ -611,6 +618,9 @@ pub fn load_trades_from_dbn<K: Clone>(
 }
 
 /// Load quotes from a pre-downloaded DBN file.
+///
+/// Returns an iterator, like [`load_trades_from_dbn`], that owns the open file
+/// and does not borrow `path`.
 ///
 /// # Arguments
 ///
@@ -635,7 +645,7 @@ pub fn load_quotes_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
-) -> Result<impl Iterator<Item = Result<MarketEvent<K, Quote>, DataError>>, DataError> {
+) -> Result<impl Iterator<Item = Result<MarketEvent<K, Quote>, DataError>> + use<K>, DataError> {
     let decoder =
         DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
@@ -746,6 +756,20 @@ mod tests {
     use databento::dbn::enums::rtype;
 
     #[test]
+    fn the_dbn_loaders_do_not_borrow_the_path() {
+        // Compiles only if the returned iterators outlive the path they were given.
+        let (trades, quotes) = {
+            let path = std::env::temp_dir().join("rustrade-no-such-file.dbn");
+            (
+                load_trades_from_dbn(&path, ExchangeId::DatabentoGlbx, "ES"),
+                load_quotes_from_dbn(&path, ExchangeId::DatabentoGlbx, "ES"),
+            )
+        };
+        assert!(trades.is_err());
+        assert!(quotes.is_err());
+    }
+
+    #[test]
     fn assert_ohlcv_rtype_matches_accepts_match_and_surfaces_mismatch() {
         // Matching rtype/schema pair: Ok.
         assert!(assert_ohlcv_rtype_matches(rtype::OHLCV_1M, Schema::Ohlcv1M).is_ok());
@@ -772,5 +796,37 @@ mod tests {
         let get_range = build_ohlcv_get_range(&params, Schema::Ohlcv1M);
         assert_eq!(get_range.schema, Schema::Ohlcv1M);
         assert_eq!(get_range.dataset, "GLBX.MDP3");
+    }
+
+    #[test]
+    fn the_streams_borrow_neither_the_client_nor_the_params() {
+        // Compiles only if each stream outlives the client and the params it was made from. The
+        // future is never polled, so nothing reaches Databento.
+        let streams = async {
+            let exchange = ExchangeId::DatabentoGlbx;
+            let streams = {
+                let mut client = DatabentoHistorical::new("db-test-key")?;
+                let time_range = (
+                    "2024-01-01T00:00:00Z".parse().unwrap(),
+                    "2024-01-02T00:00:00Z".parse().unwrap(),
+                );
+                let candles = DatabentoOhlcvParams {
+                    dataset: "GLBX.MDP3".to_string(),
+                    symbols: vec!["ESM5".to_string()],
+                    time_range,
+                    interval: CandleInterval::Min1,
+                };
+                let ticks = build_ohlcv_get_range(&candles, Schema::Trades);
+                (
+                    client
+                        .fetch_candles_stream(&candles, exchange, "ES")
+                        .await?,
+                    client.fetch_trades_stream(&ticks, exchange, "ES").await?,
+                    client.fetch_quotes_stream(&ticks, exchange, "ES").await?,
+                )
+            };
+            Ok::<_, DataError>(streams)
+        };
+        drop(streams);
     }
 }
