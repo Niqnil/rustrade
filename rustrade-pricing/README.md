@@ -30,7 +30,8 @@ can be used on its own.
 - **Bring your own model.** Implement the `OptionModel` trait, and the implied-volatility solver
   and the default vega and rho work with it.
 - **Deterministic.** Results are bit-identical on every platform for a given version of the
-  pure-Rust `libm` crate, which supplies every transcendental function.
+  pure-Rust `libm` crate, which supplies every transcendental function. CI checks a set of
+  results bit for bit on x86-64 and aarch64 Linux.
 
 ## Quick start
 
