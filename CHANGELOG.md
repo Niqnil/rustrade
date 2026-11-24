@@ -1305,11 +1305,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Binance reads refuse a miscased or empty symbol as `InstrumentInvalid`**
   (`rustrade-execution`, `binance`). Binance refuses a symbol in lower case (`-1100`) or empty
-  (`-1105`, or `-1102` on margin `myTrades`), and a read naming one instrument reported that as
-  `ApiError::RequestRejected`, while an unlisted symbol (`-1121`) was already
-  `ApiError::InstrumentInvalid`. The filtered `fetch_open_orders` and `fetch_trades`,
-  `account_snapshot`'s open orders, `fetch_commission_rates` and the margin pair reads now report
-  all three as `InstrumentInvalid`, naming the instrument. Order lookups by key
+  (`-1105`, or `-1102` on margin `myTrades`), as its open-order and trade reads answer, and a read
+  naming one instrument reported that as `ApiError::RequestRejected`, while an unlisted symbol
+  (`-1121`) was already `ApiError::InstrumentInvalid`. Every read filtered to an instrument (the
+  filtered `fetch_open_orders` and `fetch_trades`, `account_snapshot`'s open orders,
+  `fetch_commission_rates` and the margin pair reads) now reports any of these codes refusing the
+  symbol as `InstrumentInvalid`, naming the instrument. Order lookups by key
   (`fetch_ended_orders`, `fetch_order_status`) leave such an order out as unknown, as they already
   did for an unlisted symbol. Margin's refusal texts do not name the parameter, so on a lookup,
   which also sends a client order id, they count as the symbol's only when the symbol is

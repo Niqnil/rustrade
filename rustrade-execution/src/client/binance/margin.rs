@@ -6372,6 +6372,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn margin_filtered_reads_of_a_miscased_or_empty_symbol_refuse_it() {
+        // Binance's margin texts name no parameter: the symbol is the read's only text.
+        let cases = [
+            (
+                "/sapi/v1/margin/openOrders",
+                "btcusdt",
+                -1100,
+                "Illegal characters found in a parameter.",
+            ),
+            (
+                "/sapi/v1/margin/openOrders",
+                "",
+                -1105,
+                "A parameter was empty.",
+            ),
+            (
+                "/sapi/v1/margin/myTrades",
+                "",
+                -1102,
+                "Mandatory parameter 'symbol' was not sent, was empty/null, or malformed.",
+            ),
+        ];
+        for (endpoint, name, code, msg) in cases {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path(endpoint))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"code": code, "msg": msg})),
+                )
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let asked = InstrumentNameExchange::new(name);
+            let instruments = std::slice::from_ref(&asked);
+            let read = if endpoint.ends_with("openOrders") {
+                client.fetch_open_orders(instruments).await.map(drop)
+            } else {
+                let end = Utc::now();
+                client
+                    .fetch_trades(end - chrono::Duration::hours(1), end, instruments)
+                    .await
+                    .map(drop)
+            };
+            match read {
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                    assert_eq!(instrument, asked, "{endpoint} {name:?}");
+                }
+                other => panic!("{endpoint} {name:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_order_id_lookup_fails_on_an_error_that_does_not_refuse_the_order() {
+        // Another parameter's fault, and a fault that is not a parameter's, are not "no order".
+        for (code, msg) in [
+            (
+                -1102,
+                "Mandatory parameter 'orderId' was not sent, was empty/null, or malformed.",
+            ),
+            (-1022, "Signature for this request is not valid."),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .and(wiremock::matchers::query_param("orderId", "7"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"code": code, "msg": msg})),
+                )
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let found = fetch_margin_order_cid(
+                &client.rest,
+                &client.rate_limiter,
+                &InstrumentNameExchange::new("BTCUSDT"),
+                7,
+                false,
+            )
+            .await;
+            assert!(found.is_err(), "{code}: got {found:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn margin_fetch_ended_orders_asks_the_configured_account_and_omits_the_rest() {
         use crate::order::state::InactiveOrderState;
         for (is_isolated, flag) in [(false, "FALSE"), (true, "TRUE")] {
