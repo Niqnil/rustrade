@@ -574,7 +574,8 @@ fn assert_ohlcv_rtype_matches(rtype: u8, schema: Schema) -> Result<(), DataError
 /// Load trades from a pre-downloaded DBN file.
 ///
 /// Returns an iterator to avoid loading entire file into memory.
-/// Useful for backtesting with previously downloaded data.
+/// Useful for backtesting with previously downloaded data. The iterator owns
+/// the open file and does not borrow `path`.
 ///
 /// # Arguments
 ///
@@ -599,7 +600,8 @@ pub fn load_trades_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
-) -> Result<impl Iterator<Item = Result<MarketEvent<K, PublicTrade>, DataError>>, DataError> {
+) -> Result<impl Iterator<Item = Result<MarketEvent<K, PublicTrade>, DataError>> + use<K>, DataError>
+{
     let decoder =
         DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
@@ -611,6 +613,9 @@ pub fn load_trades_from_dbn<K: Clone>(
 }
 
 /// Load quotes from a pre-downloaded DBN file.
+///
+/// Returns an iterator, like [`load_trades_from_dbn`], that owns the open file
+/// and does not borrow `path`.
 ///
 /// # Arguments
 ///
@@ -635,7 +640,7 @@ pub fn load_quotes_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
-) -> Result<impl Iterator<Item = Result<MarketEvent<K, Quote>, DataError>>, DataError> {
+) -> Result<impl Iterator<Item = Result<MarketEvent<K, Quote>, DataError>> + use<K>, DataError> {
     let decoder =
         DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
@@ -744,6 +749,20 @@ impl<K: Clone> Iterator for DbnQuoteIterator<K> {
 mod tests {
     use super::*;
     use databento::dbn::enums::rtype;
+
+    #[test]
+    fn the_dbn_loaders_do_not_borrow_the_path() {
+        // Compiles only if the returned iterators outlive the path they were given.
+        let (trades, quotes) = {
+            let path = std::env::temp_dir().join("rustrade-no-such-file.dbn");
+            (
+                load_trades_from_dbn(&path, ExchangeId::DatabentoGlbx, "ES"),
+                load_quotes_from_dbn(&path, ExchangeId::DatabentoGlbx, "ES"),
+            )
+        };
+        assert!(trades.is_err());
+        assert!(quotes.is_err());
+    }
 
     #[test]
     fn assert_ohlcv_rtype_matches_accepts_match_and_surfaces_mismatch() {
