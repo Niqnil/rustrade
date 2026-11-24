@@ -3659,14 +3659,15 @@ pub(crate) fn parse_binance_order_rejection(
 ///   afresh, and with server-time sync the client reads Binance's time again before returning
 ///   ([`RateLimitTracker::after_failure`]), so a retry can succeed. A clock that stays wrong
 ///   keeps failing, so callers should bound retries.
-/// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
-///   there is no instrument to attach, so it falls through.
+/// - a refusal of the symbol ([`refuses_symbol`]) → [`ApiError::InstrumentInvalid`] when the
+///   request named one instrument; otherwise there is no instrument to attach, so it falls
+///   through.
 /// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
 ///   named one instrument, as Binance's text often does not say which, such as `-11001 Isolated
 ///   margin account does not exist.`
 fn parse_binance_query_rejection(
     msg: String,
-    instrument: Option<&InstrumentNameExchange>,
+    instrument: Option<(&InstrumentNameExchange, CallerText)>,
 ) -> UnindexedClientError {
     let api = if is_auth_failure(&msg) {
         ApiError::Unauthenticated(msg)
@@ -3674,9 +3675,11 @@ fn parse_binance_query_rejection(
         ApiError::rate_limited(None)
     } else if has_venue_failure_code(&msg) || contains_error_code(&msg, "-1021") {
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
-    } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
+    } else if let Some((instrument, _)) =
+        instrument.filter(|&(instrument, text)| refuses_symbol(&msg, instrument, text))
+    {
         ApiError::InstrumentInvalid(instrument.clone(), msg)
-    } else if let Some(instrument) = instrument {
+    } else if let Some((instrument, _)) = instrument {
         ApiError::RequestRejected(format!("{}: {msg}", instrument.name()))
     } else {
         ApiError::RequestRejected(msg)
@@ -3684,13 +3687,57 @@ fn parse_binance_query_rejection(
     UnindexedClientError::Api(api)
 }
 
+/// What text the caller put into a request that names one symbol, which decides whether
+/// Binance's refusal of a malformed parameter can be read as a refusal of the symbol (see
+/// [`refuses_symbol`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallerText {
+    /// The symbol is the only text from the caller. Every other parameter is a number, a time,
+    /// a flag, or text Binance gave.
+    SymbolOnly,
+    /// The request also carries other text from the caller, such as a client order id.
+    SymbolAndOther,
+}
+
+/// Whether Binance's refusal `msg` (carrying its code) of a request naming `symbol` refuses the
+/// symbol itself, so that no order, trade or rate can exist under it:
+///
+/// - `-1121` ("Invalid symbol."): Binance does not list it.
+/// - `-1100` (illegal characters): it is not spelled as Binance spells symbols, which never
+///   holds a lower-case letter.
+/// - `-1105` (a parameter was empty): it is empty.
+/// - `-1102` (a mandatory parameter was not sent, was empty or malformed), when the text names
+///   `'symbol'`: margin `myTrades` answers an empty symbol this way.
+///
+/// Spot's texts for `-1100` and `-1105` name the parameter, as `parameter 'symbol'`; margin's do
+/// not. A text naming a parameter counts only when it names the symbol. A text naming none
+/// counts with [`CallerText::SymbolOnly`]. With [`CallerText::SymbolAndOther`] other text from
+/// the caller could have drawn it, so it counts only when the symbol shows the fault itself: a
+/// lower-case letter for `-1100`, or empty for `-1105`. `-1102` always needs the text to name
+/// the symbol, as on a request this client builds it otherwise means a parameter the client
+/// left out.
+fn refuses_symbol(msg: &str, symbol: &InstrumentNameExchange, text: CallerText) -> bool {
+    let names_symbol = contains_ignore_case(msg, "parameter 'symbol'");
+    let names_none = !contains_ignore_case(msg, "parameter '");
+    let symbol = symbol.name().as_str();
+    let symbols_fault =
+        |shown: bool| names_symbol || (names_none && (text == CallerText::SymbolOnly || shown));
+    contains_error_code(msg, "-1121")
+        || (contains_error_code(msg, "-1100")
+            && symbols_fault(symbol.bytes().any(|b| b.is_ascii_lowercase())))
+        || (contains_error_code(msg, "-1105") && symbols_fault(symbol.is_empty()))
+        || (contains_error_code(msg, "-1102") && names_symbol)
+}
+
 /// Classify an `anyhow::Error` from a REST *query* (a non-order request, sent through
 /// [`rest_call_with_retry`]) into an [`UnindexedClientError`], so that
 /// [`is_transient`](crate::error::ClientError::is_transient) is true only for failures a retry
 /// can cure.
 ///
-/// Pass `instrument` when the request named a single instrument, so a `-1121` invalid-symbol
-/// rejection can say which.
+/// Pass `instrument` when the request named a single instrument, so a refusal of its symbol
+/// ([`refuses_symbol`]) can say which. The symbol must be the only text from the caller in the
+/// request ([`CallerText::SymbolOnly`]); for a request that may carry other text, such as a
+/// client order id, use [`classify_rest_symbol_query_error`].
 ///
 /// - [`CooldownActive`] (held back unsent) → [`ApiError::RateLimit`], with the cooldown's time
 ///   left as the wait.
@@ -3709,6 +3756,23 @@ fn parse_binance_query_rejection(
 pub(crate) fn classify_rest_query_error(
     e: &anyhow::Error,
     instrument: Option<&InstrumentNameExchange>,
+) -> UnindexedClientError {
+    classify_rest_query_error_naming(e, instrument.map(|i| (i, CallerText::SymbolOnly)))
+}
+
+/// [`classify_rest_query_error`] for a request naming `instrument`, with `text` saying what else
+/// from the caller it carried.
+pub(crate) fn classify_rest_symbol_query_error(
+    e: &anyhow::Error,
+    instrument: &InstrumentNameExchange,
+    text: CallerText,
+) -> UnindexedClientError {
+    classify_rest_query_error_naming(e, Some((instrument, text)))
+}
+
+fn classify_rest_query_error_naming(
+    e: &anyhow::Error,
+    instrument: Option<(&InstrumentNameExchange, CallerText)>,
 ) -> UnindexedClientError {
     if let Some(cooldown) = e.downcast_ref::<CooldownActive>() {
         return UnindexedClientError::Api(ApiError::rate_limited(Some(cooldown.remaining)));
@@ -3740,27 +3804,40 @@ pub(crate) fn classify_rest_query_error(
 }
 
 /// Whether a REST query for one order failed because Binance does not know the order under the
-/// symbol it named: `-2013` (the order does not exist) or `-1121` (the symbol does not). Either way
-/// the venue has answered, and its answer is that there is no such order.
-pub(crate) fn is_unknown_order(e: &anyhow::Error) -> bool {
-    matches!(
-        e.downcast_ref::<ConnectorError>(),
+/// symbol it named: `-2013` (the order does not exist), or a refusal of the symbol
+/// ([`refuses_symbol`]: Binance does not list it, or it is miscased or empty), under which no
+/// order can exist. Either way the venue has answered, and its answer is that there is no such
+/// order. `text` says what else from the caller the request naming `instrument` carried.
+pub(crate) fn is_unknown_order(
+    e: &anyhow::Error,
+    instrument: &InstrumentNameExchange,
+    text: CallerText,
+) -> bool {
+    match e.downcast_ref::<ConnectorError>() {
         Some(
             ConnectorError::BadRequestError {
-                code: Some(-2013 | -1121),
-                ..
-            } | ConnectorError::NotFoundError {
-                code: Some(-2013 | -1121),
-                ..
-            } | ConnectorError::ConflictError {
-                code: Some(-2013 | -1121),
-                ..
-            } | ConnectorError::ConnectorClientError {
-                code: Some(-2013 | -1121),
+                code: Some(code),
+                msg,
                 ..
             }
-        )
-    )
+            | ConnectorError::NotFoundError {
+                code: Some(code),
+                msg,
+                ..
+            }
+            | ConnectorError::ConflictError {
+                code: Some(code),
+                msg,
+                ..
+            }
+            | ConnectorError::ConnectorClientError {
+                code: Some(code),
+                msg,
+                ..
+            },
+        ) => *code == -2013 || refuses_symbol(&with_code(msg, Some(*code)), instrument, text),
+        _ => false,
+    }
 }
 
 /// Map a failed `RestApiResponse::data()` into [`UnindexedClientError::Internal`].
@@ -6490,6 +6567,109 @@ mod tests {
             panic!("expected RequestRejected, got {err:?}");
         };
         assert!(!msg.contains("BTCUSDT"), "{msg:?}");
+    }
+
+    /// Binance's answers to a miscased or empty symbol, as spot testnet and production cross
+    /// margin gave them for `openOrders` and `myTrades` (2026-11-24).
+    const SPOT_MISCASED: (i64, &str) = (
+        -1100,
+        "Illegal characters found in parameter 'symbol'; legal range is \
+         '^[\\w\\-._&&[^a-z]]{1,50}$'.",
+    );
+    const SPOT_EMPTY: (i64, &str) = (-1105, "Parameter 'symbol' was empty.");
+    const MARGIN_MISCASED: (i64, &str) = (-1100, "Illegal characters found in a parameter.");
+    const MARGIN_EMPTY: (i64, &str) = (-1105, "A parameter was empty.");
+    const MARGIN_TRADES_EMPTY: (i64, &str) = (
+        -1102,
+        "Mandatory parameter 'symbol' was not sent, was empty/null, or malformed.",
+    );
+
+    #[test]
+    fn a_query_refusing_the_symbols_spelling_is_an_invalid_instrument() {
+        use CallerText::{SymbolAndOther, SymbolOnly};
+        let classify = |name: &str, (code, msg): (i64, &str), text| {
+            classify_rest_symbol_query_error(
+                &anyhow::Error::new(bad_request(code, msg)),
+                &InstrumentNameExchange::new(name),
+                text,
+            )
+        };
+        let is_invalid = |name: &str, err: &UnindexedClientError| {
+            matches!(
+                err,
+                UnindexedClientError::Api(ApiError::InstrumentInvalid(i, msg))
+                    if i.name().as_str() == name && msg.starts_with('-')
+            )
+        };
+        let is_rejected = |name: &str, err: &UnindexedClientError| {
+            matches!(
+                err,
+                UnindexedClientError::Api(ApiError::RequestRejected(msg))
+                    if msg.starts_with(&format!("{name}: "))
+            )
+        };
+
+        // Texts that name the symbol count whatever else the caller sent.
+        for (name, refusal) in [
+            ("btcusdt", SPOT_MISCASED),
+            ("", SPOT_EMPTY),
+            ("", MARGIN_TRADES_EMPTY),
+        ] {
+            for text in [SymbolOnly, SymbolAndOther] {
+                let err = classify(name, refusal, text);
+                assert!(is_invalid(name, &err), "{refusal:?} {text:?}: got {err:?}");
+            }
+        }
+        // Margin's texts name no parameter. They count when the symbol is the caller's only
+        // text, or when the symbol shows the fault itself; otherwise a client order id could
+        // have drawn them.
+        for (name, refusal, shows_fault) in [
+            ("btcusdt", MARGIN_MISCASED, true),
+            ("BTC/USDT", MARGIN_MISCASED, false),
+            ("", MARGIN_MISCASED, false),
+            ("", MARGIN_EMPTY, true),
+            ("btcusdt", MARGIN_EMPTY, false),
+        ] {
+            let err = classify(name, refusal, SymbolOnly);
+            assert!(is_invalid(name, &err), "{name:?} {refusal:?}: got {err:?}");
+            let err = classify(name, refusal, SymbolAndOther);
+            if shows_fault {
+                assert!(is_invalid(name, &err), "{name:?} {refusal:?}: got {err:?}");
+            } else {
+                assert!(is_rejected(name, &err), "{name:?} {refusal:?}: got {err:?}");
+            }
+        }
+        // Another parameter refused is not the symbol, even a miscased one.
+        for text in [SymbolOnly, SymbolAndOther] {
+            let refusal = (
+                -1100,
+                "Illegal characters found in parameter 'origClientOrderId'.",
+            );
+            let err = classify("btcusdt", refusal, text);
+            assert!(is_rejected("btcusdt", &err), "{text:?}: got {err:?}");
+            let refusal = (-1105, "Parameter 'origClientOrderId' was empty.");
+            let err = classify("", refusal, text);
+            assert!(is_rejected("", &err), "{text:?}: got {err:?}");
+            // -1102 is a parameter this client left out unless it names the symbol.
+            let refusal = (-1102, "Mandatory parameter 'orderId' was not sent.");
+            let err = classify("", refusal, text);
+            assert!(is_rejected("", &err), "{text:?}: got {err:?}");
+        }
+
+        // `classify_rest_query_error` reads its instrument as the caller's only text.
+        let err = classify_rest_query_error(
+            &anyhow::Error::new(bad_request(MARGIN_MISCASED.0, MARGIN_MISCASED.1)),
+            Some(&InstrumentNameExchange::new("BTC/USDT")),
+        );
+        assert!(is_invalid("BTC/USDT", &err), "got {err:?}");
+        // With no single instrument in the request there is none to name.
+        for (code, msg) in [SPOT_MISCASED, SPOT_EMPTY, MARGIN_TRADES_EMPTY] {
+            let err = classify_rest_query_error(&anyhow::Error::new(bad_request(code, msg)), None);
+            assert!(
+                matches!(err, UnindexedClientError::Api(ApiError::RequestRejected(_))),
+                "{code}: got {err:?}"
+            );
+        }
     }
 
     #[test]
