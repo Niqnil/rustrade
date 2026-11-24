@@ -2110,9 +2110,8 @@ impl ExecutionClient for AlpacaClient {
 
     /// # Instruments
     ///
-    /// A requested name matches Alpaca's symbol ignoring case, and its orders are reported under
-    /// the name as requested. Of two requested names that differ only in case, the first gets
-    /// the orders. With `instruments` empty, each order is reported under Alpaca's symbol.
+    /// A requested name matches Alpaca's symbol ignoring case. Each order is keyed by Alpaca's
+    /// symbol, as the account stream reports it, whatever case it was requested in.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -2124,33 +2123,20 @@ impl ExecutionClient for AlpacaClient {
             fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
 
         let requested = RequestedSymbols::new(instruments);
-        let listed: Vec<_> = open_orders
+        let result: Vec<_> = open_orders
             .iter()
-            .filter_map(|o| {
-                let name = requested.report_as(&o.symbol)?;
-                Some((name, convert_open_order(o)?.order))
-            })
+            .filter(|o| requested.admits(&o.symbol))
+            .filter_map(|o| convert_open_order(o).map(|listed| listed.order))
             .collect();
-        // Held under Alpaca's symbol, as the stream and fill recovery report the order, before
-        // the order is renamed to the requested spelling.
-        self.remember_live(listed.iter().map(|(_, order)| order));
-        let result = listed
-            .into_iter()
-            .map(|(name, mut order)| {
-                if let Some(name) = name {
-                    order.key.instrument = name.clone();
-                }
-                order
-            })
-            .collect();
+        self.remember_live(&result);
         Ok(result)
     }
 
     /// # Instruments
     ///
-    /// A requested name matches Alpaca's symbol ignoring case, and its trades are reported under
-    /// the name as requested. Of two requested names that differ only in case, the first gets
-    /// the trades. With `instruments` empty, each trade is reported under Alpaca's symbol.
+    /// A requested name matches Alpaca's symbol ignoring case. Each trade is reported under
+    /// Alpaca's symbol, as the account stream reports the same fill, whatever case it was
+    /// requested in.
     ///
     /// # Cost
     ///
@@ -2201,22 +2187,14 @@ impl ExecutionClient for AlpacaClient {
         let trades = page
             .activities
             .iter()
-            .filter_map(|a| {
-                let name = requested.report_as(&a.symbol)?;
-                // Alpaca's bounds are not exact (see `paginate_activities`), so the span is
-                // applied here. An activity whose time does not parse is kept: Alpaca placed it
-                // in the span.
-                if parse_timestamp(&a.transaction_time)
-                    .is_some_and(|time| !(start..=end).contains(&time))
-                {
-                    return None;
-                }
-                let mut trade = convert_activity_to_trade(a)?;
-                if let Some(name) = name {
-                    trade.instrument = name.clone();
-                }
-                Some(trade)
+            .filter(|a| requested.admits(&a.symbol))
+            // Alpaca's bounds are not exact (see `paginate_activities`), so the span is applied
+            // here. An activity whose time does not parse is kept: Alpaca placed it in the span.
+            .filter(|a| {
+                parse_timestamp(&a.transaction_time)
+                    .is_none_or(|time| (start..=end).contains(&time))
             })
+            .filter_map(convert_activity_to_trade)
             .collect();
 
         Ok(TradesRead::new(trades, resume))
@@ -4129,8 +4107,7 @@ async fn recover_fills(
     // Empty `instruments` means "recover for all subscribed symbols" (same convention as
     // `fetch_trades` / `fetch_open_orders`). Skip the set allocation when not filtering.
     info!(%after, instruments = instruments.len(), "Alpaca recovering fills after reconnect");
-    // Matched ignoring case, as Alpaca's symbols are upper case. A recovered fill keeps Alpaca's
-    // spelling, as the stream's own fills do.
+    // Matched ignoring case, as Alpaca's symbols are upper case.
     let requested = RequestedSymbols::new(instruments);
 
     let page = match paginate_activities::<AlpacaActivity>(
@@ -4196,7 +4173,7 @@ async fn recover_fills(
     let mut cumulative_qty: FnvHashMap<&str, Decimal> = FnvHashMap::default();
 
     for activity in &activities {
-        if requested.report_as(&activity.symbol).is_none() {
+        if !requested.admits(&activity.symbol) {
             // Safe to skip without advancing cumulative_qty: each Alpaca order is bound
             // to exactly one symbol, so no fill for a different symbol can ever share
             // the same order_id as a fill we're tracking.
@@ -4901,36 +4878,27 @@ fn upper_symbol(symbol: &str) -> Cow<'_, str> {
     }
 }
 
-/// The instruments a filtered read asked for, by the symbol Alpaca names each, so a read matches
-/// Alpaca's symbols ignoring case and reports what it finds under the caller's spelling.
-///
-/// When two requested names differ only in case, the first is the one reported, so each order or
-/// fill is reported once.
+/// The symbols a filtered read asked for, as Alpaca spells them, so the read matches Alpaca's
+/// symbols ignoring case. What it finds keeps Alpaca's symbol, as the account stream reports it,
+/// so a fill read here and the same fill from the stream are one fill to a deduplicator.
 struct RequestedSymbols<'a> {
-    by_symbol: FnvHashMap<Cow<'a, str>, &'a InstrumentNameExchange>,
+    symbols: fnv::FnvHashSet<Cow<'a, str>>,
 }
 
 impl<'a> RequestedSymbols<'a> {
     fn new(instruments: &'a [InstrumentNameExchange]) -> Self {
-        let mut by_symbol = FnvHashMap::default();
-        for instrument in instruments {
-            by_symbol
-                .entry(upper_symbol(instrument.name().as_str()))
-                .or_insert(instrument);
+        Self {
+            symbols: instruments
+                .iter()
+                .map(|instrument| upper_symbol(instrument.name().as_str()))
+                .collect(),
         }
-        Self { by_symbol }
     }
 
-    /// Whether the read takes what Alpaca lists under `symbol`, and under which name: `None` when
-    /// it was not requested, `Some(None)` to keep Alpaca's spelling, which an unfiltered read
-    /// (nothing requested) does, and `Some(Some(name))` for the name the caller requested it by.
-    fn report_as(&self, symbol: &str) -> Option<Option<&'a InstrumentNameExchange>> {
-        if self.by_symbol.is_empty() {
-            return Some(None);
-        }
-        self.by_symbol
-            .get(upper_symbol(symbol).as_ref())
-            .map(|name| Some(*name))
+    /// Whether the read takes what Alpaca lists under `symbol`: every symbol when nothing was
+    /// requested, otherwise a requested one, ignoring case.
+    fn admits(&self, symbol: &str) -> bool {
+        self.symbols.is_empty() || self.symbols.contains(upper_symbol(symbol).as_ref())
     }
 }
 
@@ -8186,17 +8154,16 @@ mod tests {
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
     }
 
-    /// A requested name and Alpaca's symbol match whichever of them is in another case, and the
-    /// name reported is the one requested. With nothing requested, every symbol is taken under
-    /// Alpaca's spelling.
+    /// A requested name and Alpaca's symbol match whichever of them is in another case. With
+    /// nothing requested, every symbol is taken.
     #[test]
     fn requested_symbols_match_ignoring_either_sides_case() {
         let requested = [InstrumentNameExchange::new("spy")];
         let symbols = RequestedSymbols::new(&requested);
-        assert_eq!(symbols.report_as("Spy"), Some(Some(&requested[0])));
-        assert_eq!(symbols.report_as("SPY"), Some(Some(&requested[0])));
-        assert_eq!(symbols.report_as("QQQ"), None);
-        assert_eq!(RequestedSymbols::new(&[]).report_as("spy"), Some(None));
+        assert!(symbols.admits("Spy"));
+        assert!(symbols.admits("SPY"));
+        assert!(!symbols.admits("QQQ"));
+        assert!(RequestedSymbols::new(&[]).admits("spy"));
     }
 
     #[test]
@@ -12427,11 +12394,11 @@ mod tests {
             assert_eq!(read.resume, Some(time("2025-04-18T14:30:00Z")));
         }
 
-        /// A requested name matches Alpaca's symbol ignoring case, and its trades are reported
-        /// under the name as requested, once even when two requested names differ only in case.
-        /// An unfiltered read keeps Alpaca's symbols.
+        /// A requested name matches Alpaca's symbol ignoring case, and each trade is reported once,
+        /// under Alpaca's symbol as the stream reports it, even when two requested names differ
+        /// only in case.
         #[tokio::test]
-        async fn fetch_trades_matches_names_ignoring_case_and_reports_them_as_requested() {
+        async fn fetch_trades_matches_names_ignoring_case_and_keeps_alpacas_symbol() {
             use crate::client::ExecutionClient;
 
             let at = time("2025-04-18T14:30:00Z");
@@ -12466,11 +12433,11 @@ mod tests {
                     InstrumentNameExchange::new("SPY"),
                 ])
                 .await,
-                [pair("a", "spy"), pair("c", "spy")],
+                [pair("a", "SPY"), pair("c", "SPY")],
             );
             assert_eq!(
                 names(&[InstrumentNameExchange::new("Qqq")]).await,
-                [pair("b", "Qqq")]
+                [pair("b", "QQQ")]
             );
             assert_eq!(
                 names(&[]).await,
@@ -12479,10 +12446,10 @@ mod tests {
         }
 
         /// The names sent in `symbols=` are Alpaca's spelling, each once, and the orders listed
-        /// are reported under the name as requested. An order on a symbol not asked for is left
-        /// out.
+        /// keep Alpaca's symbol, as the stream reports them. An order on a symbol not asked for
+        /// is left out.
         #[tokio::test]
-        async fn fetch_open_orders_asks_for_alpacas_symbols_and_reports_the_names_as_requested() {
+        async fn fetch_open_orders_asks_for_alpacas_symbols_and_keeps_them() {
             use crate::client::ExecutionClient;
 
             let server = MockServer::start().await;
@@ -12528,7 +12495,7 @@ mod tests {
                     )
                 })
                 .collect();
-            assert_eq!(listed, [("a", "spy"), ("b", "btc/usd")]);
+            assert_eq!(listed, [("a", "SPY"), ("b", "BTC/USD")]);
             let queries = query_pairs(&server).await;
             let [query] = queries.as_slice() else {
                 panic!("one request: {queries:?}");
