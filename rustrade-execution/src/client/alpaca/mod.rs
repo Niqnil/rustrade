@@ -2124,18 +2124,25 @@ impl ExecutionClient for AlpacaClient {
             fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
 
         let requested = RequestedSymbols::new(instruments);
-        let result: Vec<_> = open_orders
+        let listed: Vec<_> = open_orders
             .iter()
             .filter_map(|o| {
                 let name = requested.report_as(&o.symbol)?;
-                let mut order = convert_open_order(o)?.order;
+                Some((name, convert_open_order(o)?.order))
+            })
+            .collect();
+        // Held under Alpaca's symbol, as the stream and fill recovery report the order, before
+        // the order is renamed to the requested spelling.
+        self.remember_live(listed.iter().map(|(_, order)| order));
+        let result = listed
+            .into_iter()
+            .map(|(name, mut order)| {
                 if let Some(name) = name {
                     order.key.instrument = name.clone();
                 }
-                Some(order)
+                order
             })
             .collect();
-        self.remember_live(&result);
         Ok(result)
     }
 
@@ -12494,9 +12501,23 @@ mod tests {
                 InstrumentNameExchange::new("btc/usd"),
                 InstrumentNameExchange::new("Spy"),
             ];
-            let Ok(orders) = client_for(&server).fetch_open_orders(&requested).await else {
+            let client = client_for(&server);
+            let Ok(orders) = client.fetch_open_orders(&requested).await else {
                 panic!("the read succeeds");
             };
+            let mut held: Vec<_> = client
+                .known_live
+                .lock()
+                .instruments()
+                .iter()
+                .map(|instrument| instrument.name().to_string())
+                .collect();
+            held.sort();
+            assert_eq!(
+                held,
+                ["BTC/USD", "SPY"],
+                "the orders are held under Alpaca's symbols, as the stream reports them"
+            );
 
             let listed: Vec<_> = orders
                 .iter()
