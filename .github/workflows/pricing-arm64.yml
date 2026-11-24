@@ -16,6 +16,8 @@ on:
       - "rustrade-instrument/**"
       # A `libm` bump, or any other dependency change, lands here.
       - "Cargo.lock"
+      # Workspace dependencies and build profiles.
+      - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".cargo/**"
       - ".github/workflows/pricing-arm64.yml"
@@ -26,6 +28,7 @@ on:
       - "rustrade-pricing/**"
       - "rustrade-instrument/**"
       - "Cargo.lock"
+      - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".cargo/**"
       - ".github/workflows/pricing-arm64.yml"
@@ -54,8 +57,10 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Show the target
-        run: rustc -vV | grep '^host:'
+      # Fails rather than passing on another architecture, should the label ever resolve to one.
+      - name: Check the host is aarch64
+        run: |
+          rustc -vV | grep -x 'host: aarch64-unknown-linux-gnu'
 
       - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
         with:
@@ -67,3 +72,12 @@ jobs:
 
       - name: Test (release)
         run: cargo test -p rustrade-pricing --all-features --lib --tests --release
+
+      # A filter matching nothing still passes, so check the golden test ran: renamed, moved or
+      # ignored, it would otherwise drop out of the steps above unnoticed.
+      - name: Check the golden test ran
+        run: |
+          out=$(cargo test -p rustrade-pricing --all-features --lib -- --color never --exact \
+            finite_difference::tests::results_are_pinned_to_the_bit)
+          printf '%s\n' "$out"
+          grep -q 'test result: ok. 1 passed' <<< "$out"
