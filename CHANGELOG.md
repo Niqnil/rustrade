@@ -1303,6 +1303,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Alpaca's trade and open-order reads match instrument names ignoring case**
+  (`rustrade-execution`, `alpaca`). `AlpacaClient::fetch_trades` matched requested names exactly,
+  so a name in another case than Alpaca's symbol (`spy` for `SPY`) read no trades, and
+  `fetch_open_orders` sent the name to Alpaca as spelled. Both now match ignoring case, as
+  `account_snapshot` already did, send Alpaca's spelling once per symbol, and report what they find
+  under the name as requested. Of two requested names that differ only in case, the first gets
+  the trades or orders. The account stream's fill recovery after a reconnect matches the same way,
+  keeping Alpaca's symbol as the stream does.
 - **Databento's historical streams no longer borrow the client or the request**
   (`rustrade-data`). `DatabentoHistorical::fetch_candles_stream`, `fetch_trades_stream` and
   `fetch_quotes_stream` return a stream that owns its decoder, but its type borrowed the client
