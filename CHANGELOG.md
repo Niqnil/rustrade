@@ -743,10 +743,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symbol. Each name not yet known costs one request, `GET /v2/options/contracts/{symbol}` for an
   OCC symbol and `GET /v2/assets/{symbol}` for any other, against the rate limit shared with
   orders; a listed name is remembered for the client's life, by every clone. An inactive asset
-  or an expired contract is still listed, so its history can be read, but Alpaca does not keep
-  every expired contract (one that expired in January 2023 is no longer found), so a filtered
-  read naming a long-expired contract is refused; read it with `instruments` empty. An empty
-  `instruments` slice is not checked. An empty name, `.` or `..` is refused without a request. The `ExecutionClient` documentation now tabulates how each client
+  or an expired contract is still listed, so its history can be read. Alpaca does not keep
+  every expired contract (one that expired in January 2023 is no longer found), so
+  `fetch_trades` does not look up an OCC symbol whose expiry, read from the symbol, is before
+  today (UTC): it reads that contract's trades, and a misspelt past contract reads as having
+  none. `account_snapshot` and `fetch_open_orders` look up every name, so they refuse a contract
+  Alpaca no longer keeps. An empty `instruments` slice is not checked. An empty name, `.` or `..`
+  is refused without a request. The `ExecutionClient` documentation now tabulates how each client
   matches instrument names, what spelling it reports, and what it does with a name it cannot
   match, and `CONTRIBUTING.md` states the rule new clients follow.
 - **Breaking: `StockSplitSource::fetch_splits` returns a stream that borrows only the source**

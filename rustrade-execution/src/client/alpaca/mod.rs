@@ -1168,10 +1168,15 @@ struct AlpacaOrderWs<'a> {
 ///   or an expired contract can still be read. A listed name is remembered for the client's
 ///   life, by every clone, and not looked up again; one not listed is looked up again on each
 ///   read naming it.
-/// - **Long-expired contracts.** Alpaca does not keep every expired contract: in November 2026
-///   it still found one that expired in January 2024, but not one that expired in January 2023.
-///   A filtered read naming a contract Alpaca no longer keeps is refused; a read with
-///   `instruments` empty still returns that contract's trades.
+/// - **Expired contracts in [`fetch_trades`](ExecutionClient::fetch_trades).** Alpaca does not
+///   keep every expired contract: in November 2026 it still found one that expired in January
+///   2024, but not one that expired in January 2023. So `fetch_trades` does not look up an OCC
+///   symbol whose expiry, read from the symbol, is before today (UTC): it reads that contract's
+///   trades, matched ignoring case, as for any other name. A misspelt past contract therefore
+///   reads as having no trades rather than being refused. A contract expiring today or later is
+///   looked up, and [`account_snapshot`](ExecutionClient::account_snapshot) and
+///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders) look up every name, so they refuse
+///   a contract Alpaca no longer keeps.
 ///
 /// # Fees, interest and borrow fees
 /// Every [`Trade`] this client reports carries zero fees. Equities and options trade without
@@ -1291,9 +1296,14 @@ impl AlpacaClient {
     /// listed. So is a listing under another symbol, as `GET /v2/assets/BTCUSD` finds `BTC/USD`.
     /// A listed asset or contract counts whatever its status, an expired contract included, as
     /// orders and trades on it can still be read. A lookup that fails fails the read.
+    ///
+    /// With `expired_before` set, an OCC symbol whose expiry is before that date is not looked up,
+    /// nor remembered as listed: Alpaca drops long-expired contracts, and a read that must not
+    /// refuse them passes the day it is read (see the struct docs, "Instrument lookups").
     async fn check_listed(
         &self,
         instruments: &[InstrumentNameExchange],
+        expired_before: Option<NaiveDate>,
     ) -> Result<(), UnindexedClientError> {
         let unknown: Vec<(InstrumentNameExchange, SmolStr)> = {
             let listed = self.listed.lock();
@@ -1302,7 +1312,8 @@ impl AlpacaClient {
                 .iter()
                 .filter_map(|instrument| {
                     let symbol = SmolStr::from(upper_symbol(instrument.name().as_str()));
-                    (!listed.contains(&symbol) && asked.insert(symbol.clone()))
+                    let exempt = expired_before.is_some_and(|day| expires_before(&symbol, day));
+                    (!exempt && !listed.contains(&symbol) && asked.insert(symbol.clone()))
                         .then(|| (instrument.clone(), symbol))
                 })
                 .collect()
@@ -1750,7 +1761,7 @@ impl ExecutionClient for AlpacaClient {
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
-        self.check_listed(instruments).await?;
+        self.check_listed(instruments, None).await?;
         let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
@@ -2243,7 +2254,7 @@ impl ExecutionClient for AlpacaClient {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-        self.check_listed(instruments).await?;
+        self.check_listed(instruments, None).await?;
         let base = self.base_url();
         let http = self.http.clone();
 
@@ -2283,14 +2294,17 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// [`ApiError::InstrumentInvalid`] for a requested instrument Alpaca does not list under that
     /// name, as for [`account_snapshot`](ExecutionClient::account_snapshot), even over an empty
-    /// span.
+    /// span. An OCC contract whose expiry, read from its symbol, is before today (UTC) is not
+    /// looked up, as Alpaca drops long-expired contracts: its trades are read, and a misspelt one
+    /// reads as having none (see [`AlpacaClient`], "Instrument lookups").
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
-        self.check_listed(instruments).await?;
+        self.check_listed(instruments, Some(Utc::now().date_naive()))
+            .await?;
         // An empty span, or one ending before the epoch, holds nothing Alpaca has.
         if start > end || end < DateTime::UNIX_EPOCH {
             return Ok(TradesRead::complete(Vec::new()));
@@ -6119,6 +6133,21 @@ fn occ_contract(symbol: &str) -> Option<(&str, bool, Decimal)> {
     }
     let strike = std::str::from_utf8(&tail[7..]).ok()?.parse::<i64>().ok()?;
     Some((root, is_call, Decimal::new(strike, 3)))
+}
+
+/// The expiry of a contract from its OCC symbol (see [`occ_contract`]): `YYMMDD` read as a date in
+/// 2000–2099, or `None` when the symbol is not an OCC symbol or the date does not exist.
+fn occ_expiry(symbol: &str) -> Option<NaiveDate> {
+    occ_contract(symbol)?;
+    let yymmdd = symbol.get(symbol.len() - 15..symbol.len() - 9)?;
+    let field = |range: std::ops::Range<usize>| yymmdd.get(range)?.parse::<u32>().ok();
+    let year = i32::try_from(2000 + field(0..2)?).ok()?;
+    NaiveDate::from_ymd_opt(year, field(2..4)?, field(4..6)?)
+}
+
+/// Whether `symbol` is an OCC symbol whose contract expired before `day`.
+fn expires_before(symbol: &str, day: NaiveDate) -> bool {
+    occ_expiry(symbol).is_some_and(|expiry| expiry < day)
 }
 
 /// Whether `contract`, an exercise or assignment, is the one `shares`, an `OPTRD`, is the share
@@ -12202,6 +12231,28 @@ mod tests {
             }
         }
 
+        #[test]
+        fn occ_expiry_reads_the_date_after_the_root() {
+            let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d);
+            assert_eq!(occ_expiry("AAPL210115C00150000"), date(2021, 1, 15));
+            assert_eq!(occ_expiry("QS991231P00006500"), date(2099, 12, 31));
+            // An OCC root padded to six characters, as the OCC's own symbology spells it.
+            assert_eq!(occ_expiry("QS    240301C00006500"), date(2024, 3, 1));
+            for no_date in ["SPY", "BTC/USD", "QS241301C00006500", "QS240230C00006500"] {
+                assert_eq!(occ_expiry(no_date), None, "{no_date}");
+            }
+        }
+
+        #[test]
+        fn a_contract_expires_before_a_day_only_if_its_expiry_is_earlier() {
+            let day = |d| NaiveDate::from_ymd_opt(2021, 1, d).unwrap_or_default();
+            assert!(expires_before("AAPL210115C00150000", day(16)));
+            // Expiring that day is not before it: such a contract is still looked up.
+            assert!(!expires_before("AAPL210115C00150000", day(15)));
+            assert!(!expires_before("AAPL210115C00150000", day(14)));
+            assert!(!expires_before("SPY", day(16)));
+        }
+
         #[tokio::test]
         async fn fetch_option_events_maps_each_activity_and_pairs_the_share_legs() {
             let day = "2024-03-01";
@@ -12763,6 +12814,104 @@ mod tests {
             assert_eq!(
                 request_paths(&server).await,
                 ["/v2/options/contracts/ZZZ250620C00100000"]
+            );
+        }
+
+        /// `fetch_trades` reads a contract whose expiry, from its symbol, is past without looking
+        /// it up, as Alpaca drops long-expired contracts, and matches its fills ignoring case.
+        #[tokio::test]
+        async fn fetch_trades_reads_a_past_contract_without_looking_it_up() {
+            use crate::client::ExecutionClient;
+
+            let at = time("2025-04-18T14:30:00Z");
+            let server = serve_activities(vec![
+                fill_at("a", "AAPL210115C00150000", at),
+                fill_at("b", "SPY", at),
+            ])
+            .await;
+
+            let Ok(read) = client_for(&server)
+                .fetch_trades(
+                    recovery_after(),
+                    Utc::now(),
+                    &[InstrumentNameExchange::new("aapl210115c00150000")],
+                )
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+
+            let trades: Vec<_> = read
+                .trades
+                .iter()
+                .map(|trade| (trade.id.0.to_string(), trade.instrument.name().to_string()))
+                .collect();
+            assert_eq!(trades, [("a".to_owned(), "AAPL210115C00150000".to_owned())]);
+            assert_eq!(request_paths(&server).await, ["/v2/account/activities"]);
+        }
+
+        /// `fetch_trades` still looks up a contract that has not expired, and refuses it when
+        /// Alpaca does not list it.
+        #[tokio::test]
+        async fn fetch_trades_refuses_an_unlisted_contract_not_yet_expired() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let (instrument, reason) = refused(
+                client_for(&server)
+                    .fetch_trades(
+                        recovery_after(),
+                        Utc::now(),
+                        &[InstrumentNameExchange::new("zzz991231c00100000")],
+                    )
+                    .await,
+            );
+
+            assert_eq!(instrument, "zzz991231c00100000");
+            assert!(reason.contains("lists no asset"), "{reason}");
+            assert_eq!(
+                request_paths(&server).await,
+                ["/v2/options/contracts/ZZZ991231C00100000"]
+            );
+        }
+
+        /// `account_snapshot` and `fetch_open_orders` look up a past contract and refuse it when
+        /// Alpaca no longer lists it, even after `fetch_trades` read it unlooked-up: that read
+        /// does not remember it as listed.
+        #[tokio::test]
+        async fn snapshot_and_open_orders_refuse_a_past_contract_alpaca_dropped() {
+            use crate::client::ExecutionClient;
+
+            let server = serve_activities(Vec::new()).await;
+            let client = client_for(&server);
+            let requested = [InstrumentNameExchange::new("AAPL210115C00150000")];
+            assert!(
+                client
+                    .fetch_trades(recovery_after(), Utc::now(), &requested)
+                    .await
+                    .is_ok()
+            );
+
+            let refusals = [
+                refused(
+                    client
+                        .account_snapshot(&[AssetNameExchange::new("USD")], &requested)
+                        .await,
+                ),
+                refused(client.fetch_open_orders(&requested).await),
+            ];
+
+            for (instrument, reason) in refusals {
+                assert_eq!(instrument, "AAPL210115C00150000");
+                assert!(reason.contains("lists no asset"), "{reason}");
+            }
+            assert_eq!(
+                request_paths(&server).await,
+                [
+                    "/v2/account/activities",
+                    "/v2/options/contracts/AAPL210115C00150000",
+                    "/v2/options/contracts/AAPL210115C00150000",
+                ]
             );
         }
 
