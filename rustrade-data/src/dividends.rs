@@ -10,9 +10,10 @@
 //! the right to it from the **ex-dividend date**, and its price falls by about the amount at that
 //! day's open. Holders on the **record date** are paid on the **payment date**. Since US
 //! settlement moved to one business day (May 2024), the record date is usually the ex-date;
-//! before that the ex-date was a business day before the record date. Do not assume the order
-//! ex, record, payment: in the US a distribution worth a quarter or more of the share price goes
-//! ex on the business day after its payment date. Only the declaration comes before the rest.
+//! before that the ex-date came one business day (two before September 2017) before the record
+//! date. Do not assume the order ex, record, payment: in the US a distribution worth a quarter
+//! or more of the share price goes ex on the business day after its payment date. Only the
+//! declaration comes before the rest.
 //!
 //! An option pricer needs the ex-date and the amount (see the `rustrade-pricing` crate's
 //! `CashDividend`, whose time is the ex-date's open). Only the ex-date is always present.
