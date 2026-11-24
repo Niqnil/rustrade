@@ -5549,29 +5549,32 @@ impl SimulatedVenue {
         instruments: &[InstrumentNameExchange],
     ) -> UnindexedAccountSnapshot {
         let balances = self.balances(assets);
+        // Filtered before each order is cloned, so an unrequested instrument's orders cost nothing.
+        let requested =
+            |instrument: &InstrumentNameExchange| is_requested_instrument(instruments, instrument);
 
         let orders_open = self
             .account
             .orders_open()
+            .filter(|order| requested(&order.key.instrument))
             .cloned()
             .map(UnindexedOrder::from);
 
         let orders_cancelled = self
             .account
             .orders_cancelled()
+            .filter(|order| requested(&order.key.instrument))
             .cloned()
             .map(UnindexedOrder::from);
 
         let orders_expired = self
             .account
             .orders_expired()
+            .filter(|order| requested(&order.key.instrument))
             .cloned()
             .map(UnindexedOrder::from);
 
-        let orders_all = orders_open
-            .chain(orders_cancelled)
-            .chain(orders_expired)
-            .filter(|order| is_requested_instrument(instruments, &order.key.instrument));
+        let orders_all = orders_open.chain(orders_cancelled).chain(orders_expired);
         // Sorted on `(instrument, cid)` rather than `instrument` alone: the sort is unstable, so a
         // key shared by several orders leaves their relative order unspecified, and a snapshot that
         // lists the same account's orders in a different order on each run is not comparable
@@ -5591,7 +5594,7 @@ impl SimulatedVenue {
         let mut snapshots: Vec<_> = self
             .instruments
             .iter()
-            .filter(|(name, _)| is_requested_instrument(instruments, name))
+            .filter(|(name, _)| requested(name))
             .filter_map(|(name, instrument)| {
                 let orders = orders_by_instrument.remove(name);
                 let position = self.position_report(name, instrument);
@@ -9232,6 +9235,88 @@ mod tests {
             snapshot_entries(&venue, &[InstrumentNameExchange::new("btcusdt")]),
             [],
             "names are matched exactly, as the venue's other reads match them"
+        );
+    }
+
+    /// A venue trading an instrument the engine does not register, asked for the assets and
+    /// instruments the engine's map registers (as the execution manager asks), returns a snapshot
+    /// that indexes in full, even on the strict path. Asked for every instrument, it reports the
+    /// unregistered CFD as well, which the strict path refuses.
+    #[test]
+    fn a_snapshot_of_the_registered_instruments_indexes_though_the_venue_trades_more() {
+        use crate::{indexer::AccountEventIndexer, map::generate_execution_instrument_map};
+        use rustrade_instrument::{
+            index::{IndexedInstruments, error::IndexError},
+            test_utils::asset,
+        };
+
+        let venue = spot_and_cfd_venue();
+        let spot = Instrument::new(
+            EXCHANGE,
+            InstrumentNameInternal::new("btcusdt"),
+            instrument_name(),
+            Underlying::new(asset("btc"), asset("usdt")),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Spot,
+            None,
+        );
+        let map = generate_execution_instrument_map(&IndexedInstruments::new(vec![spot]), EXCHANGE)
+            .unwrap();
+        let assets = map.exchange_assets().cloned().collect::<Vec<_>>();
+        let instruments = map.exchange_instruments().cloned().collect::<Vec<_>>();
+        let indexer = AccountEventIndexer::new(std::sync::Arc::new(map));
+
+        let indexed = indexer
+            .snapshot(venue.account_snapshot(&assets, &instruments))
+            .expect("a snapshot of the registered instruments indexes");
+        assert_eq!(indexed.instruments.len(), 1, "{indexed:?}");
+
+        assert!(matches!(
+            indexer.snapshot(venue.account_snapshot(&assets, &[])),
+            Err(IndexError::InstrumentIndex(_))
+        ));
+    }
+
+    /// An order seeded on an instrument the venue does not trade is still held, so a request
+    /// naming that instrument lists it, and one naming another instrument does not.
+    #[test]
+    fn a_seeded_order_on_an_instrument_the_venue_does_not_trade_is_listed_when_asked_for() {
+        let untraded = InstrumentNameExchange::new("ETHUSDT");
+        let seeded = Order {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: untraded.clone(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("seeded"),
+            },
+            side: Side::Buy,
+            price: Some(d("2000")),
+            quantity: d("1"),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state: OrderState::active(Open {
+                id: VenueOrderId::Assigned(OrderId::new("seeded")),
+                time_exchange: Default::default(),
+                filled_quantity: Decimal::ZERO,
+            }),
+        };
+        let mut config = spot_config("10", "10000000", FeeModelConfig::default());
+        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+            instrument: untraded.clone(),
+            orders: vec![OrderReport::state_only(seeded)],
+            orders_complete: true,
+            position: PositionReport::Unreported,
+            isolated: None,
+        }];
+        let venue = SimulatedVenue::new(&config, spot_instruments());
+
+        assert_eq!(
+            snapshot_entries(&venue, std::slice::from_ref(&untraded)),
+            [("ETHUSDT".to_string(), vec!["seeded".to_string()])]
+        );
+        assert_eq!(
+            snapshot_entries(&venue, &[instrument_name()]),
+            [("BTCUSDT".to_string(), Vec::<String>::new())]
         );
     }
 

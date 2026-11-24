@@ -167,10 +167,11 @@ impl AccountEventIndexer {
     /// register.
     ///
     /// Use [`Self::snapshot_partitioned`] to skip an unregistered balance or instrument instead.
-    /// This is also
-    /// the path of an [`AccountEventKind::Snapshot`] event on an account stream, which stays
-    /// strict: it replaces the engine's whole view of the account, so losing part of it is not
-    /// tolerated.
+    /// This is the path [`Self::account_event`] takes for an [`AccountEventKind::Snapshot`], which
+    /// stays strict: the snapshot replaces the engine's whole view of the account, so losing part
+    /// of it is not tolerated there. The rustrade `ExecutionManager` indexes every snapshot it
+    /// receives, the account stream's included, with [`Self::snapshot_partitioned`] instead, and
+    /// logs what it skipped.
     ///
     /// # Errors
     ///
@@ -251,57 +252,51 @@ impl AccountEventIndexer {
         }
 
         let mut untracked_instruments = Vec::new();
-        let instruments = instruments
-            .into_iter()
-            .filter_map(
-                |snapshot| match self.map.find_instrument_index(&snapshot.instrument) {
-                    Ok(instrument) => Some(Ok((instrument, snapshot))),
-                    Err(IndexError::InstrumentIndex(_)) => {
-                        untracked_instruments.push(snapshot.instrument);
-                        None
-                    }
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .map(|indexed| {
-                let (
-                    instrument,
-                    InstrumentAccountSnapshot {
-                        instrument: _,
-                        orders,
-                        orders_complete,
-                        position,
-                        isolated,
-                    },
-                ) = indexed?;
+        let mut indexed_instruments = Vec::with_capacity(instruments.len());
+        for snapshot in instruments {
+            let InstrumentAccountSnapshot {
+                instrument,
+                orders,
+                orders_complete,
+                position,
+                isolated,
+            } = snapshot;
 
-                let orders = orders
-                    .into_iter()
-                    .map(|report| self.order_report(report))
-                    .collect::<Result<Vec<_>, _>>()?;
+            let instrument = match self.map.find_instrument_index(&instrument) {
+                Ok(index) => index,
+                Err(IndexError::InstrumentIndex(_)) => {
+                    untracked_instruments.push(instrument);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
-                // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
-                // their base/quote asset names must be mapped to indices. A pair whose asset is
-                // unregistered fails the snapshot index, matching top-level-balance behaviour.
-                let isolated = isolated
-                    .map(|state| self.isolated_instrument_state(state))
-                    .transpose()?;
+            let orders = orders
+                .into_iter()
+                .map(|report| self.order_report(report))
+                .collect::<Result<Vec<_>, _>>()?;
 
-                Ok(InstrumentAccountSnapshot {
-                    instrument,
-                    orders,
-                    orders_complete,
-                    position,
-                    isolated,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
+            // their base/quote asset names must be mapped to indices. A pair whose asset is
+            // unregistered fails the snapshot index, matching top-level-balance behaviour.
+            let isolated = isolated
+                .map(|state| self.isolated_instrument_state(state))
+                .transpose()?;
+
+            indexed_instruments.push(InstrumentAccountSnapshot {
+                instrument,
+                orders,
+                orders_complete,
+                position,
+                isolated,
+            });
+        }
 
         Ok(PartitionedSnapshot {
             snapshot: AccountSnapshot {
                 exchange,
                 balances: indexed_balances,
-                instruments,
+                instruments: indexed_instruments,
             },
             untracked_assets,
             untracked_instruments,

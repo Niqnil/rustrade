@@ -714,10 +714,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instruments only, each one it read listed whether or not it has orders; an instrument it could
   not read is left out, listed incomplete and `Unreported`, or fails the call, never listed with
   an empty, complete order list; an empty slice means every instrument with something to report
-  (Binance spot and cross margin need instruments and read none). The `ExecutionManager` now drops an entry for an
-  instrument the map does not register and logs the names at `error!` once per snapshot, as it
-  does a stray balance, instead of failing the whole snapshot (and with it every account-stream
-  open). `AccountEventIndexer::snapshot_partitioned` skips such an entry too:
+  (Binance spot and cross margin need instruments and read none). The `ExecutionManager` now
+  drops an entry for an instrument the map does not register and logs the names at `error!` once
+  per snapshot, as it does a stray balance, instead of failing the whole snapshot (and with it
+  every account-stream open); that holds for every snapshot it indexes, a `Snapshot` event on the
+  account stream included. `AccountEventIndexer::snapshot_partitioned` skips such an entry too:
   `PartitionedSnapshot::untracked` is renamed `untracked_assets`, beside a new
   `untracked_instruments`. `AccountEventIndexer::snapshot` still fails on either.
   `SimulatedVenue::account_snapshot` and `MockExchangeRequest::fetch_account_snapshot` take the
@@ -1240,8 +1241,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   venue reported every instrument with an order and every CFD and option, so a venue trading more
   instruments than the engine registered failed its snapshot at startup and on every reconnect,
   where a live client succeeded. Each requested instrument the venue trades is now listed, orders
-  or not, as the live clients list them; names are matched exactly, as the venue's other reads
-  match them.
+  or not, as `ExecutionClient::account_snapshot` now requires. Names are matched exactly, as the
+  venue's other reads match them, so a requested name that differs from the venue's only in case
+  is now left out, where the instrument map's case-insensitive lookup used to index it.
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
