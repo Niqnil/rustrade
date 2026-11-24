@@ -1433,6 +1433,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than 5 s, leaves the outcome unknown (`OrderError::Connectivity`), as any other transport
   failure does. Reads keep the retries and the 1 s bound.
 
+- **The audit ignore lists cover the `parquet` 60.1.0 encrypted-write advisory.** RUSTSEC-2026-0595
+  (bloom filters left in plaintext when writing an encrypted Parquet file) does not apply here:
+  `rustrade-data` only decodes Parquet, and does not enable parquet's `encryption` feature. It is
+  ignored in `deny.toml` and the CI audit job until the bump to the fixed `parquet` 60.2.0.
+
 ## [0.22.0] - 2026-11-09
 
 ### Added
