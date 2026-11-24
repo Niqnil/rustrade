@@ -522,7 +522,7 @@ impl ExecutionClient for HyperliquidClient {
     /// address.
     async fn account_snapshot(
         &self,
-        _assets: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         self.check_instruments(instruments)?;
@@ -538,9 +538,11 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::open_orders(info_client, address, dexes),
         )?;
         let now = Utc::now();
-        let balances =
+        let mut balances =
             perp_account::snapshot_balances(info_client, address, dexes, mode, &states, sent)
                 .await?;
+        // Hyperliquid has no per-asset read, so the requested assets are kept here.
+        balances.retain(|balance| is_requested(assets, &balance.asset));
 
         let instrument_filter = InstrumentFilter::new(instruments);
 
@@ -1908,6 +1910,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An account snapshot reports the balances of the assets asked for, matched ignoring ASCII
+    /// case, and every balance for an empty list, as `fetch_balances` does.
+    #[tokio::test]
+    async fn account_snapshot_balances_are_filtered_by_asset_ignoring_case() {
+        let server = perp_account::tests::balance_server_answering_after(
+            "unifiedAccount",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client = client_against(&server, HashMap::new()).await;
+        let assets = |names: &[&str]| -> Vec<AssetNameExchange> {
+            names
+                .iter()
+                .map(|name| AssetNameExchange::new(*name))
+                .collect()
+        };
+
+        let names = |balances: &[AssetBalance<AssetNameExchange>]| -> Vec<String> {
+            balances
+                .iter()
+                .map(|b| b.asset.name().to_string())
+                .collect()
+        };
+        let all = client.account_snapshot(&[], &[]).await.unwrap().balances;
+        assert!(names(&all).len() > 1 && names(&all).contains(&"USDC".to_owned()));
+
+        for (requested, expected) in [(vec!["usdc"], vec!["USDC"]), (vec!["eth"], vec![])] {
+            let requested = assets(&requested);
+            let snapshot = client.account_snapshot(&requested, &[]).await.unwrap();
+            let fetched = client.fetch_balances(&requested).await.unwrap();
+            assert_eq!(names(&snapshot.balances), expected, "{requested:?}");
+            // The two reads agree on which balances they report.
+            assert_eq!(names(&fetched), expected, "{requested:?}");
+        }
+        assert_eq!(
+            names(&client.fetch_balances(&[]).await.unwrap()),
+            names(&all)
+        );
     }
 
     mod open_order {

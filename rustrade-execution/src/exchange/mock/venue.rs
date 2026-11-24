@@ -4616,7 +4616,7 @@ impl SimulatedVenue {
     }
 
     pub fn balances(&self, assets: &[AssetNameExchange]) -> Vec<AssetBalance<AssetNameExchange>> {
-        // Empty slice means "return all" (consistent with account_snapshot behavior).
+        // An empty slice means every asset held; names are compared ignoring ASCII case.
         self.account
             .balances()
             .filter(|balance| is_requested(assets, &balance.asset))
@@ -5533,8 +5533,10 @@ impl SimulatedVenue {
         }
     }
 
-    pub fn account_snapshot(&self) -> UnindexedAccountSnapshot {
-        let balances = self.account.balances().cloned().collect();
+    /// The account's balances of `assets`, matched as [`balances`](Self::balances) matches them
+    /// (an empty slice for every asset held), and its orders and positions.
+    pub fn account_snapshot(&self, assets: &[AssetNameExchange]) -> UnindexedAccountSnapshot {
+        let balances = self.balances(assets);
 
         let orders_open = self
             .account
@@ -9086,6 +9088,30 @@ mod tests {
         assert_eq!(names(&[]), ["BTC", "USDT"]);
     }
 
+    /// An account snapshot reports the balances of the assets asked for, as a balance read does:
+    /// in any spelling, under the configured one, and every asset held for an empty list.
+    #[test]
+    fn account_snapshot_balances_are_filtered_by_asset_ignoring_case() {
+        let venue = make_venue("1", "1000");
+        let names = |assets: &[AssetNameExchange]| {
+            let mut names = venue
+                .account_snapshot(assets)
+                .balances
+                .into_iter()
+                .map(|balance| balance.asset.name().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        assert_eq!(names(&[AssetNameExchange::new("usdt")]), ["USDT"]);
+        assert_eq!(
+            names(&[AssetNameExchange::new("eth")]),
+            Vec::<String>::new()
+        );
+        assert_eq!(names(&[]), ["BTC", "USDT"]);
+    }
+
     fn make_venue_with_fee(btc: &str, usdt: &str, fee_model: FeeModelConfig) -> SimulatedVenue {
         SimulatedVenue::new(&spot_config(btc, usdt, fee_model), spot_instruments())
     }
@@ -9566,7 +9592,7 @@ mod tests {
 
         // Nothing was cancelled, so nothing may appear in the ledger either.
         assert!(
-            venue.account_snapshot().instruments.is_empty(),
+            venue.account_snapshot(&[]).instruments.is_empty(),
             "a rejected cancel must not enter the ledger"
         );
     }
@@ -9782,7 +9808,7 @@ mod tests {
 
     /// The venue's reported CFD position as `(quantity, entry)`, or `None` while flat.
     fn cfd_position(venue: &SimulatedVenue) -> Option<(Decimal, Option<Decimal>)> {
-        let snapshot = venue.account_snapshot();
+        let snapshot = venue.account_snapshot(&[]);
         let Some(instrument) = snapshot
             .instruments
             .iter()
@@ -9918,7 +9944,7 @@ mod tests {
             market_prices("50000"),
         ));
 
-        let snapshot = venue.account_snapshot();
+        let snapshot = venue.account_snapshot(&[]);
         assert!(
             snapshot
                 .instruments
@@ -11759,7 +11785,7 @@ mod tests {
         let venue = SimulatedVenue::new(&config, spot_instruments());
 
         let reports = venue
-            .account_snapshot()
+            .account_snapshot(&[])
             .instruments
             .into_iter()
             .flat_map(|instrument| instrument.orders)
@@ -12921,7 +12947,7 @@ mod tests {
             state: RequestCancel { id: None },
         });
 
-        let snapshot = venue.account_snapshot();
+        let snapshot = venue.account_snapshot(&[]);
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -13550,7 +13576,7 @@ mod tests {
         ));
         assert_eq!(venue.advance_time(time(5)).len(), 2);
 
-        let snapshot = venue.account_snapshot();
+        let snapshot = venue.account_snapshot(&[]);
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -14368,7 +14394,7 @@ mod tests {
             venue.orders_ended(&[key_of("resting")]).is_empty(),
             "the order under the id is working, whatever became of the one before it"
         );
-        let snapshot = venue.account_snapshot();
+        let snapshot = venue.account_snapshot(&[]);
         let listed = snapshot
             .instruments
             .iter()

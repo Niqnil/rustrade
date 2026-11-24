@@ -39,11 +39,15 @@ impl MockExchangeRequest {
 
     pub fn fetch_account_snapshot(
         time_request: DateTime<Utc>,
+        assets: Vec<AssetNameExchange>,
         response_tx: oneshot::Sender<UnindexedAccountSnapshot>,
     ) -> Self {
         Self::new(
             time_request,
-            MockExchangeRequestKind::FetchAccountSnapshot { response_tx },
+            MockExchangeRequestKind::FetchAccountSnapshot {
+                assets,
+                response_tx,
+            },
         )
     }
 
@@ -223,6 +227,8 @@ impl MockExchangeRequest {
 #[non_exhaustive]
 pub enum MockExchangeRequestKind {
     FetchAccountSnapshot {
+        /// The assets whose balances to report; empty for every asset held.
+        assets: Vec<AssetNameExchange>,
         response_tx: oneshot::Sender<UnindexedAccountSnapshot>,
     },
     FetchBalances {

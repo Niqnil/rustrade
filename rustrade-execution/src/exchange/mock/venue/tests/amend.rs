@@ -1526,7 +1526,7 @@ fn a_rename_onto_an_ended_orders_id_forgets_how_that_one_ended() {
 
     assert!(venue.orders_ended(&[key]).is_empty());
     let listed: Vec<_> = venue
-        .account_snapshot()
+        .account_snapshot(&[])
         .instruments
         .iter()
         .flat_map(|instrument| &instrument.orders)

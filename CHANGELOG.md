@@ -698,6 +698,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `ExecutionClient::account_snapshot` must return balances for the requested assets
+  only** (`rustrade-execution`, `rustrade`, #998). They are matched as `fetch_balances` matches
+  them: an empty slice means every asset held, and names are compared ignoring ASCII case. The
+  contract said a client may return others; every client in the workspace now filters (see
+  Fixed), so an implementation outside it must too. The `ExecutionManager` still drops a balance
+  for an unregistered asset, but logs it at `error!` instead of `warn!`, as a client that broke
+  the contract (or, when the map registers no asset for the exchange, as a map that asked for
+  every balance). To carry the assets to the simulated venue, `SimulatedVenue::account_snapshot`
+  and `MockExchangeRequest::fetch_account_snapshot` take them, and
+  `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new `assets` field; pass
+  `&[]` or an empty `Vec` to keep every balance.
 - **Breaking: `IbkrSubscriptionKind` is `#[non_exhaustive]` and no longer `Copy`**
   (`rustrade-data`, #1019). It gains `Candles(IbkrCandleRequest)`; a `match` on it needs a
   wildcard arm, and a copy of it a `.clone()`. It also derives `PartialEq` and `Eq`.
@@ -1213,6 +1224,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An IBKR tick-by-tick halt marker is no longer reported as a trade** (`rustrade-data`, #881).
   IB marks halts in tick-by-tick data with a tick of zero price and zero size, which the trades
   subscription passed on as a `PublicTrade` at price 0. It is now skipped.
+- **Hyperliquid and simulated-venue account snapshots report only the requested assets'
+  balances** (`rustrade-execution`, #998). Hyperliquid perp and spot, and `MockExecution`, ignored
+  `account_snapshot`'s `assets` and returned every balance, though their `fetch_balances` filtered.
+  An account holding an asset the caller did not register made the `ExecutionManager` warn at
+  startup and on every account-stream reconnect, and a backtest saw balances a live venue would
+  not have reported.
 - **`DuplicateSeededOrder`'s message no longer says the id was listed twice "among its open and
   cancelled orders"** (`rustrade-execution`). Restoring a venue snapshot raises it for a repeated
   id among the filled, expired and refused orders too, so the message now says "among its orders".

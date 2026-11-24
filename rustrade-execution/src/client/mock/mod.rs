@@ -962,7 +962,7 @@ where
 
     async fn account_snapshot(
         &self,
-        _: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
         _: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -970,6 +970,7 @@ where
         self.request_tx
             .send(MockExchangeRequest::fetch_account_snapshot(
                 self.time_request(),
+                assets.to_vec(),
                 response_tx,
             ))
             .map_err(|_| {
@@ -1726,6 +1727,40 @@ mod tests {
             .unwrap();
         exchange.await.unwrap();
         assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
+    }
+
+    /// The client sends the assets it was asked for in its snapshot request, for the venue to
+    /// filter the balances by.
+    #[tokio::test]
+    async fn account_snapshot_asks_the_venue_for_the_requested_assets() {
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
+        let (_event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
+        let exchange = tokio::spawn(async move {
+            let request = request_rx.recv().await.expect("a request");
+            let crate::exchange::mock::request::MockExchangeRequestKind::FetchAccountSnapshot {
+                assets,
+                response_tx,
+            } = request.kind
+            else {
+                panic!("expected FetchAccountSnapshot, got {:?}", request.kind);
+            };
+            response_tx
+                .send(empty_snapshot())
+                .expect("the caller awaits the answer");
+            assets
+        });
+
+        let requested = [AssetNameExchange::new("usdt")];
+        client.account_snapshot(&requested, &[]).await.unwrap();
+
+        assert_eq!(exchange.await.unwrap(), requested);
     }
 
     /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the

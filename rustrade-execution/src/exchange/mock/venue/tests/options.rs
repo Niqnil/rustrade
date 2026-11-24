@@ -167,7 +167,7 @@ pub(super) fn balance(venue: &SimulatedVenue, asset: AssetNameExchange) -> Balan
 
 /// The option position the venue reports, `None` while flat.
 pub(super) fn option_position(venue: &SimulatedVenue) -> Option<Decimal> {
-    let snapshot = venue.account_snapshot();
+    let snapshot = venue.account_snapshot(&[]);
     let instrument = snapshot
         .instruments
         .iter()

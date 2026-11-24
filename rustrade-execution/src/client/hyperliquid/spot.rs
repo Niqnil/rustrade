@@ -348,7 +348,7 @@ impl ExecutionClient for HyperliquidSpotClient {
 
     async fn account_snapshot(
         &self,
-        _assets: &[AssetNameExchange],
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         let address = self.wallet_h160();
@@ -366,7 +366,10 @@ impl ExecutionClient for HyperliquidSpotClient {
             open_orders(&self.info_client, address)
         )?;
 
-        let balances = spot_balances(&token_balances.balances, sent).collect();
+        // Hyperliquid has no per-asset read, so the requested assets are kept here.
+        let balances = spot_balances(&token_balances.balances, sent)
+            .filter(|balance| is_requested(assets, &balance.asset))
+            .collect();
 
         let coins = open_orders.iter().map(|order| order.coin.as_str());
         let pairs = self.spot_coins.covering(coins.clone()).await;
@@ -1787,6 +1790,51 @@ mod tests {
                         "{balance:?} not within {from} ..= {to} - {ANSWER_DELAY:?}"
                     );
                 }
+            }
+        }
+
+        /// An account snapshot reports the balances of the assets asked for, matched ignoring
+        /// ASCII case, and every balance for an empty list, as `fetch_balances` does.
+        #[tokio::test]
+        async fn account_snapshot_balances_are_filtered_by_asset_ignoring_case() {
+            use wiremock::matchers::body_partial_json;
+            let (server, client) = resting_client().await;
+            for (request, answer) in [
+                (
+                    serde_json::json!({"type": "spotClearinghouseState"}),
+                    serde_json::json!({"balances": [
+                        {"coin": "USDC", "token": 0, "total": "10", "hold": "0", "entryNtl": "0"},
+                        {"coin": "HYPE", "token": 150, "total": "2", "hold": "0", "entryNtl": "0"}
+                    ]}),
+                ),
+                (
+                    serde_json::json!({"type": "frontendOpenOrders"}),
+                    serde_json::json!([]),
+                ),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path("/info"))
+                    .and(body_partial_json(request))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            for (requested, expected) in [
+                (vec!["usdc"], vec!["USDC"]),
+                (vec!["eth"], vec![]),
+                (vec![], vec!["USDC", "HYPE"]),
+            ] {
+                let requested: Vec<AssetNameExchange> =
+                    requested.into_iter().map(AssetNameExchange::new).collect();
+                let snapshot = client.account_snapshot(&requested, &[]).await.unwrap();
+                let names: Vec<&str> = snapshot
+                    .balances
+                    .iter()
+                    .map(|balance| balance.asset.name().as_str())
+                    .collect();
+                assert_eq!(names, expected, "{requested:?}");
             }
         }
 
