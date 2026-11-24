@@ -54,7 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pause is `Paused`, a quotation resumption `QuoteOnly`, and a resumption `Trading` with no reason.
   Codes that report no trading state (imbalances, indications, the short sale restriction) are not
   reported, so they cannot overwrite the real state; an undocumented code or tape is dropped with
-  a warning once per connection. A blank reason code is no reason. A band's zero limit is `None`.
+  a warning once per connection. A blank reason code is no reason. Tape B re-sends a halt every
+  few seconds with a blank reason while it lasts, so a tape A or B halt with a blank reason for a
+  symbol already halted or paused on that connection is a repeat and is not reported: without
+  this, each repeat would turn a Limit Up-Limit Down pause into a halt. A band's zero limit is
+  `None`.
   Alpaca does not document the band indicator, so it is read by tape as each plan defines it: A–F
   on tapes C and O; on tapes A and B a republished band is `Restated`, any other band `Other`, and
   a limit-state message, which is not a band, is not reported. The raw codes are kept in

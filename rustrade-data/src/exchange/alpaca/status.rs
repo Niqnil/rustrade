@@ -31,6 +31,16 @@
 //! "not applicable". A resumption has no reason: its `rc` says why trading resumed, which is
 //! not a [`HaltReason`].
 //!
+//! # Repeated halts
+//! Tape B re-sends a halt every few seconds while it lasts, with a blank reason: a Limit Up-Limit
+//! Down pause arrives once as `"B:2:M"`, then as `"B:2:"` every 5 seconds until the resume. Read
+//! as a halt, each repeat would turn the pause into a [`Halted`](TradingState::Halted) state with
+//! no reason. So the decoder remembers, per connection, which symbols a tape A or B halt or pause
+//! holds until a resume. A blank-reason halt for a symbol already held is a repeat: no
+//! [`TradingStatus`] is produced, and it is logged at DEBUG. A blank-reason halt for a symbol not
+//! held is reported as [`Halted`](TradingState::Halted) with no reason. On a connection opened
+//! during a pause, that is how the first repeat is reported.
+//!
 //! # Venue code
 //! [`TradingStatus::venue_code`] is `"<tape>:<sc>:<rc>"` as Alpaca sent them, trimmed of padding
 //! spaces, always with three fields and an empty one for a missing or blank code: `"C:H:T12"`,
@@ -225,12 +235,41 @@ fn utp_reason(rc: &str) -> Option<HaltReason> {
 }
 
 /// Decodes the `statuses` channel, logging each undocumented tape and code once per connection.
+///
+/// It drops a tape A or B halt with a blank reason that repeats a halt or pause in force (see
+/// the module docs, "Repeated halts").
 #[derive(Debug, Default)]
 pub struct AlpacaStatusDecoder {
     warned: FnvHashSet<(SmolStr, SmolStr)>,
+    /// Symbols a tape A or B halt or pause holds, until a resume.
+    cta_held: FnvHashSet<SubscriptionId>,
 }
 
 impl AlpacaStatusDecoder {
+    /// Whether a tape A or B `status` with reason code `rc` repeats a halt or pause already in
+    /// force for `subscription_id`, keeping track of which symbols are held.
+    fn cta_repeats(
+        &mut self,
+        subscription_id: &SubscriptionId,
+        status: &TradingStatus,
+        rc: &str,
+    ) -> bool {
+        match status.state {
+            TradingState::Halted | TradingState::Paused => {
+                if self.cta_held.contains(subscription_id) {
+                    rc.is_empty()
+                } else {
+                    self.cta_held.insert(subscription_id.clone());
+                    false
+                }
+            }
+            _ => {
+                self.cta_held.remove(subscription_id);
+                false
+            }
+        }
+    }
+
     fn warn_once(&mut self, status: &AlpacaStatus, tape: &str, sc: &str, why: &str) {
         if self.warned.insert((SmolStr::new(tape), SmolStr::new(sc))) {
             warn!(
@@ -267,6 +306,19 @@ impl AlpacaDecoder for AlpacaStatusDecoder {
         };
 
         match read(plan, sc, rc) {
+            Reading::State(trading_status)
+                if plan == Plan::Cta
+                    && self.cta_repeats(&status.subscription_id, &trading_status, rc) =>
+            {
+                debug!(
+                    subscription = %status.subscription_id,
+                    tape,
+                    status_code = sc,
+                    "Alpaca halt with a blank reason repeats the halt or pause in force; \
+                     not reported"
+                );
+                None
+            }
             Reading::State(trading_status) => {
                 Some(trading_status.with_venue_code(format_smolstr!("{tape}:{sc}:{rc}")))
             }
@@ -388,6 +440,84 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    fn decode_all(messages: &[(&str, &str, &str, &str)]) -> Vec<Option<String>> {
+        let mut decoder = AlpacaStatusDecoder::default();
+        messages
+            .iter()
+            .map(|&(symbol, tape, sc, rc)| {
+                let mut message = status(Some(tape), Some(sc), Some(rc));
+                message.subscription_id = SubscriptionId::from(format!("statuses|{symbol}"));
+                decoder.decode(message).map(|status| {
+                    format!(
+                        "{:?} {:?} {}",
+                        status.state,
+                        status.reason,
+                        status.venue_code.unwrap()
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tape_b_pause_repeated_with_a_blank_reason_is_dropped_at_debug_until_the_resume() {
+        let mut decoder = AlpacaStatusDecoder::default();
+        let mut decode = |sc, rc| decoder.decode(status(Some("B"), Some(sc), Some(rc)));
+
+        assert_eq!(
+            decode("2", "M"),
+            Some(expected(
+                TradingState::Paused,
+                Some(HaltReason::Volatility),
+                "B:2:M"
+            ))
+        );
+        let (repeats, events) = capture(|| [decode("2", " "), decode("2", " ")]);
+        assert_eq!(repeats, [None, None]);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| event.level == Level::DEBUG));
+
+        assert_eq!(
+            decode("3", " "),
+            Some(expected(TradingState::Trading, None, "B:3:"))
+        );
+        // After the resume, a blank-reason halt is a new halt again.
+        assert_eq!(
+            decode("2", " "),
+            Some(expected(TradingState::Halted, None, "B:2:"))
+        );
+    }
+
+    #[test]
+    fn only_a_blank_reason_tape_a_or_b_halt_of_the_same_held_symbol_is_a_repeat() {
+        let decoded = decode_all(&[
+            // A blank-reason halt with nothing before it is reported; its repeat is not.
+            ("AAPL", "A", "2", " "),
+            ("AAPL", "A", "2", " "),
+            // A halt with a reason is reported while the symbol is held.
+            ("AAPL", "A", "2", "C"),
+            ("AAPL", "A", "2", " "),
+            // Another symbol is not held.
+            ("MSFT", "B", "2", " "),
+            // UTP tapes do not repeat halts this way: each is reported.
+            ("QQQ", "C", "H", ""),
+            ("QQQ", "C", "H", ""),
+        ]);
+
+        assert_eq!(
+            decoded,
+            [
+                Some("Halted None A:2:".into()),
+                None,
+                Some("Halted Some(Regulatory) A:2:C".into()),
+                None,
+                Some("Halted None B:2:".into()),
+                Some("Halted None C:H:".into()),
+                Some("Halted None C:H:".into()),
+            ]
+        );
     }
 
     #[test]
