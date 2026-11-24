@@ -533,6 +533,26 @@ where
     ///
     /// Balances are stamped as [`fetch_balances`](Self::fetch_balances) describes.
     ///
+    /// # Instruments
+    ///
+    /// `instruments` are the ones the caller registered. Return entries for those only, with
+    /// names matched as the venue matches them (the caller passes the names it registered). Ask
+    /// the venue for those alone when it lets you, and otherwise filter what it returns. The
+    /// `ExecutionManager` drops an entry for another instrument and logs the instrument names at
+    /// `error!` once per snapshot, as a client that broke this contract.
+    ///
+    /// - **Every requested instrument the client read gets an entry**, orders or not: an entry is
+    ///   what lets the engine retire an order it no longer lists (see `# Order completeness`).
+    ///   The position follows [`InstrumentAccountSnapshot::position`](crate::InstrumentAccountSnapshot::position).
+    /// - **A requested instrument the client could not read** is left out, or listed with
+    ///   `orders_complete: false` and [`PositionReport::Unreported`](crate::position::PositionReport::Unreported),
+    ///   or fails the call, as each client documents. It is never listed with an empty, complete
+    ///   order list, which would claim the venue holds no order on it.
+    /// - **An empty slice is the "return all" sentinel**, as for
+    ///   [`fetch_open_orders`](Self::fetch_open_orders): an entry for every instrument with
+    ///   something to report. Binance spot and cross margin need instruments, so an empty slice
+    ///   reads none there.
+    ///
     /// # Order completeness
     ///
     /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
