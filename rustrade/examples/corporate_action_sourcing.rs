@@ -167,7 +167,7 @@ impl StockSplitSource for DemoSplitSource {
     fn fetch_splits(
         &self,
         _filter: &CorporateActionFilter,
-    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send + use<'_> {
         futures::stream::iter([
             // Apple 4-for-1, 2020-08-31. A real source feeds the provider's `split_to`/`split_from`
             // straight into `stock_split`, which derives the validated ratio in one place.
