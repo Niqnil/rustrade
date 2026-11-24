@@ -732,6 +732,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: Hyperliquid spot reads refuse an instrument naming no spot pair the client trades**
+  (`rustrade-execution`, #1043). `HyperliquidSpotClient::account_snapshot` listed every requested
+  instrument with no open orders, complete, even one naming no listed pair, so it reported an
+  instrument it had not looked at; under another spelling of a listed pair (`hype-usdc-SPOT` for
+  `HYPE-USDC-SPOT`) it did so while the pair had open orders, reported under Hyperliquid's
+  spelling. `account_snapshot`, `fetch_open_orders` and `fetch_trades` now fail with
+  `ApiError::InstrumentInvalid` before reading anything, as the perpetuals client does, for a name
+  that is not `BASE-QUOTE-SPOT`, names no pair in `spotMeta`, or spells a listed pair's tokens
+  otherwise than Hyperliquid; the reason names the spelling to use, as `open_order`'s refusal
+  does. A pair the client holds no record of makes it read `spotMeta` again first, as before.
+  When that read fails, the pair may have been listed since, so the reads fail with the read's
+  error (a `ConnectivityError` for a network fault), and `open_order` leaves the order
+  `NotPlaced(NotSent)` for a network fault, or rejects it with a rate limit, instead of refusing
+  the instrument. An empty `instruments` slice is not checked.
 - **Breaking: `ExecutionClient::account_snapshot` must return balances for the requested assets
   only** (`rustrade-execution`, `rustrade`, #998). They are matched as `fetch_balances` matches
   them: an empty slice means every asset held, and names are compared ignoring ASCII case. The
@@ -743,6 +757,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `MockExchangeRequest::fetch_account_snapshot` take them, and
   `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new `assets` field; pass
   `&[]` or an empty `Vec` to keep every balance.
+- **Breaking: `ExecutionClient::account_snapshot` states its contract for `instruments`**
+  (`rustrade-execution`, `rustrade`, #1041). A client returns entries for the requested
+  instruments only, each one it read listed whether or not it has orders; an instrument it could
+  not read is left out, listed incomplete and `Unreported`, or fails the call, never listed with
+  an empty, complete order list; an empty slice means every instrument with something to report
+  (Binance spot and cross margin need instruments and read none). The `ExecutionManager` now
+  drops an entry for an instrument the map does not register and logs the names at `error!` once
+  per snapshot, as it does a stray balance, instead of failing the whole snapshot (and with it
+  every account-stream open); that holds for every snapshot it indexes, a `Snapshot` event on the
+  account stream included. `AccountEventIndexer::snapshot_partitioned` skips such an entry too:
+  `PartitionedSnapshot::untracked` is renamed `untracked_assets`, beside a new
+  `untracked_instruments`. `AccountEventIndexer::snapshot` still fails on either.
+  `SimulatedVenue::account_snapshot` and `MockExchangeRequest::fetch_account_snapshot` take the
+  instruments, and `MockExchangeRequestKind::FetchAccountSnapshot` carries them in a new
+  `instruments` field; pass `&[]` or an empty `Vec` for every instrument.
 - **Breaking: `IbkrSubscriptionKind` is `#[non_exhaustive]` and no longer `Copy`**
   (`rustrade-data`, #1019). It gains `Candles(IbkrCandleRequest)`; a `match` on it needs a
   wildcard arm, and a copy of it a `.clone()`. It also derives `PartialEq` and `Eq`.
@@ -1255,6 +1284,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The simulated venue's account snapshot reports only the requested instruments**
+  (`rustrade-execution`, #1041). `MockExecution` dropped the instruments it was asked for, and the
+  venue reported every instrument with an order and every CFD and option, so a venue trading more
+  instruments than the engine registered failed its snapshot at startup and on every reconnect,
+  where a live client succeeded. Each requested instrument the venue trades is now listed, orders
+  or not, as `ExecutionClient::account_snapshot` now requires. Names are matched exactly, as the
+  venue's other reads match them, so a requested name that differs from the venue's only in case
+  is now left out, where the instrument map's case-insensitive lookup used to index it.
 - **The Databento DBN file loaders no longer tie their iterator to the path**
   (`rustrade-data`). `load_trades_from_dbn` and `load_quotes_from_dbn` return an iterator that
   owns the open file, but its type borrowed `path`, so a caller could not drop the path, such as

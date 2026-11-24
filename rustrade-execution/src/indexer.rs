@@ -58,15 +58,18 @@ pub enum AccountIndexError {
     Rejected(IndexError),
 }
 
-/// An indexed [`AccountSnapshot`] and the assets whose balances it left out. See
-/// [`AccountEventIndexer::snapshot_partitioned`], whose caller must report `untracked`.
+/// An indexed [`AccountSnapshot`], and the assets and instruments it left out. See
+/// [`AccountEventIndexer::snapshot_partitioned`], whose caller must report both lists.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PartitionedSnapshot {
-    /// The snapshot, without the balances of the untracked assets.
+    /// The snapshot, without the balances of the untracked assets or the entries of the untracked
+    /// instruments.
     pub snapshot: AccountSnapshot,
     /// The assets of the skipped balances, in the order the venue reported them.
-    pub untracked: Vec<AssetNameExchange>,
+    pub untracked_assets: Vec<AssetNameExchange>,
+    /// The instruments of the skipped entries, in the order the venue reported them.
+    pub untracked_instruments: Vec<InstrumentNameExchange>,
 }
 
 impl AccountEventIndexer {
@@ -160,12 +163,15 @@ impl AccountEventIndexer {
         Ok(AccountEvent { exchange, kind })
     }
 
-    /// Index `snapshot`, failing on any asset the [`ExecutionInstrumentMap`] does not register.
+    /// Index `snapshot`, failing on any asset or instrument the [`ExecutionInstrumentMap`] does not
+    /// register.
     ///
-    /// Use [`Self::snapshot_partitioned`] to skip an unregistered balance instead. This is also
-    /// the path of an [`AccountEventKind::Snapshot`] event on an account stream, which stays
-    /// strict: it replaces the engine's whole view of the account, so losing part of it is not
-    /// tolerated.
+    /// Use [`Self::snapshot_partitioned`] to skip an unregistered balance or instrument instead.
+    /// This is the path [`Self::account_event`] takes for an [`AccountEventKind::Snapshot`], which
+    /// stays strict: the snapshot replaces the engine's whole view of the account, so losing part
+    /// of it is not tolerated there. The rustrade `ExecutionManager` indexes every snapshot it
+    /// receives, the account stream's included, with [`Self::snapshot_partitioned`] instead, and
+    /// logs what it skipped.
     ///
     /// # Errors
     ///
@@ -176,36 +182,49 @@ impl AccountEventIndexer {
     ) -> Result<AccountSnapshot, IndexError> {
         let PartitionedSnapshot {
             snapshot,
-            untracked,
+            untracked_assets,
+            untracked_instruments,
         } = self.snapshot_partitioned(snapshot)?;
-        match untracked.first() {
-            None => Ok(snapshot),
-            Some(asset) => Err(self
+        if let Some(asset) = untracked_assets.first() {
+            return Err(self
                 .map
                 .find_asset_index(asset)
                 .err()
-                .unwrap_or_else(|| IndexError::AssetIndex(format!("not registered: {asset}")))),
+                .unwrap_or_else(|| IndexError::AssetIndex(format!("not registered: {asset}"))));
+        }
+        match untracked_instruments.first() {
+            None => Ok(snapshot),
+            Some(instrument) => Err(self
+                .map
+                .find_instrument_index(instrument)
+                .err()
+                .unwrap_or_else(|| {
+                    IndexError::InstrumentIndex(format!("not registered: {instrument}"))
+                })),
         }
     }
 
-    /// Index `snapshot`, skipping the top-level balance of an asset the
-    /// [`ExecutionInstrumentMap`] does not register, and returning those assets beside it.
+    /// Index `snapshot`, skipping the top-level balance of an asset and the entry of an
+    /// instrument the [`ExecutionInstrumentMap`] does not register, and returning those assets
+    /// and instruments beside it.
     ///
     /// A venue may report more assets than the caller registered (see
-    /// [`AccountIndexError::UntrackedBalance`]), so such a balance is not a fault. Only top-level
-    /// balances are skipped: an unregistered exchange, instrument, order, or isolated-margin
-    /// base or quote asset still fails the snapshot, because each registered instrument brings
-    /// its own assets and the loss would be a mapping defect.
+    /// [`AccountIndexError::UntrackedBalance`]), and a client asked for every instrument (an
+    /// empty list) may report instruments the caller never registered, so neither is a fault
+    /// here. Only those are skipped: an unregistered exchange, an order on a registered
+    /// instrument that does not index, or an isolated-margin base or quote asset still fails the
+    /// snapshot, because each registered instrument brings its own assets and the loss would be
+    /// a mapping defect.
     ///
-    /// The caller must report [`PartitionedSnapshot::untracked`], or the drop is silent. An empty
-    /// [`PartitionedSnapshot::snapshot`] balance list beside a non-empty `untracked` usually means
-    /// the registered asset names do not match the venue's; it can also be an account that holds
-    /// only unregistered assets.
+    /// The caller must report [`PartitionedSnapshot::untracked_assets`] and
+    /// [`PartitionedSnapshot::untracked_instruments`], or the drop is silent. An empty
+    /// [`PartitionedSnapshot::snapshot`] balance list beside a non-empty `untracked_assets` usually
+    /// means the registered asset names do not match the venue's; it can also be an account that
+    /// holds only unregistered assets.
     ///
     /// # Errors
     ///
-    /// [`IndexError`] for an exchange, instrument, order or isolated-margin asset the map does
-    /// not register.
+    /// [`IndexError`] for an exchange, order or isolated-margin asset the map does not register.
     pub fn snapshot_partitioned(
         &self,
         snapshot: UnindexedAccountSnapshot,
@@ -218,7 +237,7 @@ impl AccountEventIndexer {
 
         let exchange = self.map.find_exchange_index(exchange)?;
 
-        let mut untracked = Vec::new();
+        let mut untracked_assets = Vec::new();
         let mut indexed_balances = Vec::with_capacity(balances.len());
         for balance in balances {
             match self.map.find_asset_index(&balance.asset) {
@@ -227,53 +246,60 @@ impl AccountEventIndexer {
                     balance: balance.balance,
                     time_exchange: balance.time_exchange,
                 }),
-                Err(IndexError::AssetIndex(_)) => untracked.push(balance.asset),
+                Err(IndexError::AssetIndex(_)) => untracked_assets.push(balance.asset),
                 Err(error) => return Err(error),
             }
         }
 
-        let instruments = instruments
-            .into_iter()
-            .map(|snapshot| {
-                let InstrumentAccountSnapshot {
-                    instrument,
-                    orders,
-                    orders_complete,
-                    position,
-                    isolated,
-                } = snapshot;
+        let mut untracked_instruments = Vec::new();
+        let mut indexed_instruments = Vec::with_capacity(instruments.len());
+        for snapshot in instruments {
+            let InstrumentAccountSnapshot {
+                instrument,
+                orders,
+                orders_complete,
+                position,
+                isolated,
+            } = snapshot;
 
-                let instrument = self.map.find_instrument_index(&instrument)?;
+            let instrument = match self.map.find_instrument_index(&instrument) {
+                Ok(index) => index,
+                Err(IndexError::InstrumentIndex(_)) => {
+                    untracked_instruments.push(instrument);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
-                let orders = orders
-                    .into_iter()
-                    .map(|report| self.order_report(report))
-                    .collect::<Result<Vec<_>, _>>()?;
+            let orders = orders
+                .into_iter()
+                .map(|report| self.order_report(report))
+                .collect::<Result<Vec<_>, _>>()?;
 
-                // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
-                // their base/quote asset names must be mapped to indices. A pair whose asset is
-                // unregistered fails the snapshot index, matching top-level-balance behaviour.
-                let isolated = isolated
-                    .map(|state| self.isolated_instrument_state(state))
-                    .transpose()?;
+            // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
+            // their base/quote asset names must be mapped to indices. A pair whose asset is
+            // unregistered fails the snapshot index, matching top-level-balance behaviour.
+            let isolated = isolated
+                .map(|state| self.isolated_instrument_state(state))
+                .transpose()?;
 
-                Ok(InstrumentAccountSnapshot {
-                    instrument,
-                    orders,
-                    orders_complete,
-                    position,
-                    isolated,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            indexed_instruments.push(InstrumentAccountSnapshot {
+                instrument,
+                orders,
+                orders_complete,
+                position,
+                isolated,
+            });
+        }
 
         Ok(PartitionedSnapshot {
             snapshot: AccountSnapshot {
                 exchange,
                 balances: indexed_balances,
-                instruments,
+                instruments: indexed_instruments,
             },
-            untracked,
+            untracked_assets,
+            untracked_instruments,
         })
     }
 
@@ -975,7 +1001,7 @@ impl AccountEventIndexer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::{
@@ -1007,50 +1033,91 @@ mod tests {
         let partitioned = indexer.snapshot_partitioned(snapshot()).unwrap();
         assert_eq!(partitioned.snapshot.balances.len(), 2);
         assert_eq!(
-            partitioned.untracked,
+            partitioned.untracked_assets,
             vec![AssetNameExchange::new("bnb"), AssetNameExchange::new("sol")]
         );
+        assert!(partitioned.untracked_instruments.is_empty());
         assert!(matches!(
             indexer.snapshot(snapshot()),
             Err(IndexError::AssetIndex(_))
         ));
     }
 
+    /// An entry for an instrument the map does not register is skipped and listed, beside the
+    /// skipped balances, while the strict path still fails on it. An unregistered exchange fails
+    /// both paths.
     #[test]
-    fn a_partitioned_snapshot_still_fails_on_an_unregistered_instrument_or_exchange() {
+    fn a_partitioned_snapshot_skips_an_unregistered_instrument_but_not_an_unregistered_exchange() {
         let indexer = binance_indexer();
         let instrument = |name: &str| {
             InstrumentAccountSnapshot::new(
                 InstrumentNameExchange::new(name),
                 vec![],
-                false,
+                true,
                 crate::position::PositionReport::Unreported,
                 None,
             )
         };
-        let unknown_instrument = UnindexedAccountSnapshot::new(
+        let registered = indexer
+            .map
+            .exchange_instruments()
+            .next()
+            .expect("the fixture registers an instrument")
+            .clone();
+        let snapshot = || {
+            UnindexedAccountSnapshot::new(
+                ExchangeId::BinanceSpot,
+                vec![AssetBalance::new(
+                    AssetNameExchange::new("bnb"),
+                    crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                    DateTime::<Utc>::MIN_UTC,
+                )],
+                vec![
+                    instrument("ETHUSDT"),
+                    instrument(registered.name().as_str()),
+                    instrument("SOLUSDT"),
+                ],
+            )
+        };
+
+        let partitioned = indexer.snapshot_partitioned(snapshot()).unwrap();
+        assert_eq!(
+            partitioned.untracked_instruments,
+            vec![
+                InstrumentNameExchange::new("ETHUSDT"),
+                InstrumentNameExchange::new("SOLUSDT")
+            ]
+        );
+        assert_eq!(
+            partitioned.untracked_assets,
+            vec![AssetNameExchange::new("bnb")]
+        );
+        assert_eq!(
+            partitioned
+                .snapshot
+                .instruments
+                .iter()
+                .map(|entry| indexer.map.find_instrument_name_exchange(entry.instrument))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![&registered]
+        );
+
+        // The strict path fails on the instrument as well as on the asset.
+        let instrument_only = UnindexedAccountSnapshot::new(
             ExchangeId::BinanceSpot,
             vec![],
             vec![instrument("ETHUSDT")],
         );
         assert!(matches!(
-            indexer.snapshot_partitioned(unknown_instrument),
+            indexer.snapshot(instrument_only),
             Err(IndexError::InstrumentIndex(_))
         ));
-        // A skipped balance does not hide a failure elsewhere in the same snapshot.
-        let skipped_and_unknown_instrument = UnindexedAccountSnapshot::new(
-            ExchangeId::BinanceSpot,
-            vec![AssetBalance::new(
-                AssetNameExchange::new("bnb"),
-                crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
-                DateTime::<Utc>::MIN_UTC,
-            )],
-            vec![instrument("ETHUSDT")],
-        );
         assert!(matches!(
-            indexer.snapshot_partitioned(skipped_and_unknown_instrument),
-            Err(IndexError::InstrumentIndex(_))
+            indexer.snapshot(snapshot()),
+            Err(IndexError::AssetIndex(_))
         ));
+
         let other_exchange = UnindexedAccountSnapshot::new(ExchangeId::Ibkr, vec![], vec![]);
         assert!(matches!(
             indexer.snapshot_partitioned(other_exchange),

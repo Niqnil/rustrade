@@ -977,7 +977,7 @@ where
         let seeding = venues
             .values()
             .map(|slot| {
-                let mut snapshot = slot.venue.account_snapshot(&[]);
+                let mut snapshot = slot.venue.account_snapshot(&[], &[]);
                 for balance in &mut snapshot.balances {
                     balance.time_exchange = time_engine_start;
                 }
