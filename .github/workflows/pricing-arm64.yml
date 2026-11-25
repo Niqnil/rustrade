@@ -1,0 +1,83 @@
+name: "Pricing on arm64"
+
+# `rustrade-pricing` promises bit-identical results on every platform for a given `libm` version
+# (its README, "Deterministic"), and a golden test pins results by their bits. Every other job runs
+# on x86-64, so this one runs the crate's tests on aarch64 hardware, where an architecture-specific
+# maths routine, an FMA, or a `std` maths call slipping into non-test code would change the bits.
+#
+# Not a required check: it runs only when a PR could change the result, and a required check that
+# does not start would leave every other PR waiting. A path filter, unlike a job skipped by its
+# `if:`, keeps the workflow off unrelated PRs entirely.
+on:
+  pull_request:
+    branches: ["main", "develop"]
+    paths:
+      - "rustrade-pricing/**"
+      - "rustrade-instrument/**"
+      # A `libm` bump, or any other dependency change, lands here.
+      - "Cargo.lock"
+      # Workspace dependencies and build profiles.
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - ".github/workflows/pricing-arm64.yml"
+      - ".github/actions/setup-rust/**"
+  push:
+    branches: ["main", "develop"]
+    paths:
+      - "rustrade-pricing/**"
+      - "rustrade-instrument/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - ".github/workflows/pricing-arm64.yml"
+      - ".github/actions/setup-rust/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: the job compiles third-party code (build scripts, proc macros).
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: rustrade-pricing tests (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # `.cargo/config.toml`'s mold and `split-debuginfo` flags are scoped to
+      # `x86_64-unknown-linux-gnu`, so this job needs no mold.
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      # Fails rather than passing on another architecture, should the label ever resolve to one.
+      - name: Check the host is aarch64
+        run: |
+          rustc -vV | grep -x 'host: aarch64-unknown-linux-gnu'
+
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266  # v2
+        with:
+          shared-key: "rustrade-pricing-arm64"
+
+      # Both profiles: the optimiser must not change a result's bits either.
+      - name: Test (debug)
+        run: cargo test -p rustrade-pricing --all-features --lib --tests
+
+      - name: Test (release)
+        run: cargo test -p rustrade-pricing --all-features --lib --tests --release
+
+      # A filter matching nothing still passes, so check the golden test ran: renamed, moved or
+      # ignored, it would otherwise drop out of the steps above unnoticed.
+      - name: Check the golden test ran
+        run: |
+          out=$(cargo test -p rustrade-pricing --all-features --lib -- --color never --exact \
+            finite_difference::tests::results_are_pinned_to_the_bit)
+          printf '%s\n' "$out"
+          grep -q 'test result: ok. 1 passed' <<< "$out"
