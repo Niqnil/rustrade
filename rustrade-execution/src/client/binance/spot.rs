@@ -47,19 +47,20 @@ use super::rules::RulesLoader;
 use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
-    BinanceTimeInForce, CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
-    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
-    RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
-    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    convert_order_report, dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after,
-    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
+    BinanceTimeInForce, CONNECT_TIMEOUT_SECS, CallerText, Disconnect, DisconnectOnDrop,
+    ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing,
+    PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache, UnhandledEvents,
+    UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time,
+    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    classify_rest_query_error, classify_rest_symbol_query_error, classify_ws_order_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, convert_order_report, dedup_key_from_event, disconnect_error,
+    disconnect_lookback, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
+    log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
+    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, rest_read_with_retry, retry_or_end, trailing_params, unix_ms,
+    unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
 use crate::client::log_excerpt::frame_excerpt;
@@ -515,7 +516,8 @@ impl BinanceSpot {
     ///
     /// # Errors
     ///
-    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list, or one it refuses
+    ///   as spelled: in lower case, or empty.
     /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
     ///   not read as a decimal, or for another symbol.
     pub async fn fetch_commission_rates(
@@ -1009,6 +1011,10 @@ async fn fetch_order_row(
     by: GetOrder,
     kind: RequestKind,
 ) -> Result<Option<GetOrderResponse>, UnindexedClientError> {
+    let text = match by {
+        GetOrder::ClientOrderId(_) => CallerText::SymbolAndOther,
+        GetOrder::OrderId(_) => CallerText::SymbolOnly,
+    };
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol = instrument.name().to_string();
     let response = match rest_call_with_retry(rest, rate_limiter, kind, |rest| {
@@ -1028,8 +1034,8 @@ async fn fetch_order_row(
     .await
     {
         Ok(response) => response,
-        Err(e) if is_unknown_order(&e) => return Ok(None),
-        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+        Err(e) if is_unknown_order(&e, instrument, text) => return Ok(None),
+        Err(e) => return Err(classify_rest_symbol_query_error(&e, instrument, text)),
     };
     response
         .data()
@@ -2073,8 +2079,8 @@ impl ExecutionClient for BinanceSpot {
 /// to eight at a time. Binance's `FILLED` is reported with its average price, `CANCELED` with
 /// what filled before it, `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention) as expired, and
 /// `REJECTED` as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). An order
-/// Binance does not know under the key's symbol (`-2013`, or `-1121` for a symbol that does not
-/// exist) is omitted. A row whose status this version does not know is omitted too, with a
+/// Binance does not know under the key's symbol is omitted: `-2013`, or a symbol Binance does not
+/// list (`-1121`) or refuses as spelled (in lower case, or empty), under which no order can exist. A row whose status this version does not know is omitted too, with a
 /// warning, as is a `PENDING_CANCEL` one, which Binance does not use.
 ///
 /// A keep-priority amend can give an order a new client order id while keeping its `orderId`.
@@ -8444,21 +8450,47 @@ mod tests {
 
     #[test]
     fn an_unknown_order_or_symbol_is_recognised_by_its_code() {
-        let bad = |code| anyhow::Error::new(sdk_errors::rest_refusal(400, Some(code), "no"));
-        assert!(is_unknown_order(&bad(-2013)));
-        assert!(is_unknown_order(&bad(-1121)));
-        assert!(!is_unknown_order(&bad(-1100)));
-        for status in [404, 409, 422] {
-            assert!(
-                is_unknown_order(&anyhow::Error::new(sdk_errors::rest_refusal(
-                    status,
-                    Some(-2013),
-                    "no"
-                ))),
-                "{status}"
+        use CallerText::{SymbolAndOther, SymbolOnly};
+        let bad = |code, msg| anyhow::Error::new(sdk_errors::rest_refusal(400, Some(code), msg));
+        let unknown = |e: &anyhow::Error, name: &str, text| {
+            is_unknown_order(e, &InstrumentNameExchange::new(name), text)
+        };
+        for text in [SymbolOnly, SymbolAndOther] {
+            assert!(unknown(&bad(-2013, "no"), "BTCUSDT", text), "{text:?}");
+            assert!(unknown(&bad(-1121, "no"), "NOPEUSDT", text), "{text:?}");
+            // A miscased or empty symbol, in spot's words, which name it.
+            let miscased = bad(-1100, "Illegal characters found in parameter 'symbol'.");
+            assert!(unknown(&miscased, "btcusdt", text), "{text:?}");
+            let empty = bad(-1105, "Parameter 'symbol' was empty.");
+            assert!(unknown(&empty, "", text), "{text:?}");
+            // Another parameter is not the symbol.
+            let cid = bad(
+                -1100,
+                "Illegal characters found in parameter 'origClientOrderId'.",
             );
+            assert!(!unknown(&cid, "btcusdt", text), "{text:?}");
         }
-        assert!(!is_unknown_order(&anyhow::anyhow!("-2013 in text only")));
+        // Margin's words name no parameter: the symbol's when nothing else came from the caller,
+        // or when the symbol shows the fault.
+        let unnamed = bad(-1100, "Illegal characters found in a parameter.");
+        assert!(unknown(&unnamed, "BTC/USDT", SymbolOnly));
+        assert!(!unknown(&unnamed, "BTC/USDT", SymbolAndOther));
+        assert!(unknown(&unnamed, "btcusdt", SymbolAndOther));
+        for status in [404, 409, 422] {
+            let e = anyhow::Error::new(sdk_errors::rest_refusal(status, Some(-2013), "no"));
+            assert!(unknown(&e, "BTCUSDT", SymbolOnly), "{status}");
+        }
+        assert!(!unknown(
+            &anyhow::anyhow!("-2013 in text only"),
+            "BTCUSDT",
+            SymbolOnly
+        ));
+        let codeless = sdk_errors::rest_refusal(400, None, "-1121 Invalid symbol.");
+        assert!(!unknown(
+            &anyhow::Error::new(codeless),
+            "NOPEUSDT",
+            SymbolOnly
+        ));
     }
 
     /// `new` keeps the client's signing clock read from Binance's server time, unless
@@ -8783,6 +8815,23 @@ mod tests {
         mount_order(&server, "live", row_response("live", "PARTIALLY_FILLED")).await;
         mount_order(&server, "unknown", venue_error(-2013)).await;
         mount_order(&server, "no-symbol", venue_error(-1121)).await;
+        // A miscased or empty symbol, in Binance's words, under which no order can exist.
+        let refused = |code: i64, msg: &str| {
+            wiremock::ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"code": code, "msg": msg}))
+        };
+        mount_order(
+            &server,
+            "miscased",
+            refused(-1100, "Illegal characters found in parameter 'symbol'."),
+        )
+        .await;
+        mount_order(
+            &server,
+            "empty",
+            refused(-1105, "Parameter 'symbol' was empty."),
+        )
+        .await;
         let mut client = <BinanceSpot as ExecutionClient>::new(
             BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
         );
@@ -8790,7 +8839,17 @@ mod tests {
         let keys = ["filled", "cancelled", "live", "unknown"].map(|cid| spot_key("BTCUSDT", cid));
 
         let mut ended = client
-            .fetch_ended_orders(&[keys.to_vec(), vec![spot_key("NOSUCH", "no-symbol")]].concat())
+            .fetch_ended_orders(
+                &[
+                    keys.to_vec(),
+                    vec![
+                        spot_key("NOSUCH", "no-symbol"),
+                        spot_key("btcusdt", "miscased"),
+                        spot_key("", "empty"),
+                    ],
+                ]
+                .concat(),
+            )
             .await
             .unwrap();
 
@@ -9539,6 +9598,63 @@ mod tests {
                 assert_eq!(instrument, nope);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// A lookup by order id carries no text from the caller but the symbol, so a refusal of a
+    /// malformed parameter is the symbol's even when its text names none: no order exists.
+    #[tokio::test]
+    async fn an_order_id_lookup_reads_a_malformed_parameter_as_no_order() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/order"))
+            .and(wiremock::matchers::query_param("orderId", "7"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"code": -1100, "msg": "Illegal characters found in a parameter."}),
+            ))
+            .mount(&server)
+            .await;
+        let found = fetch_order_row(
+            &rest_at(&server),
+            &RateLimitTracker::new(WeightPool::Spot),
+            &InstrumentNameExchange::new("BTC/USDT"),
+            GetOrder::OrderId(7),
+            RequestKind::Query,
+        )
+        .await;
+        assert!(matches!(found, Ok(None)), "got {found:?}");
+    }
+
+    /// A filtered read naming a symbol Binance refuses as miscased or empty fails with
+    /// `InstrumentInvalid` naming it, as an unlisted one does.
+    #[tokio::test]
+    async fn spot_open_orders_of_a_miscased_or_empty_symbol_refuse_it() {
+        for (name, code, msg) in [
+            (
+                "btcusdt",
+                -1100,
+                "Illegal characters found in parameter 'symbol'.",
+            ),
+            ("", -1105, "Parameter 'symbol' was empty."),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"code": code, "msg": msg})),
+                )
+                .mount(&server)
+                .await;
+            let mut client = <BinanceSpot as ExecutionClient>::new(
+                BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+            );
+            client.rest = rest_at(&server);
+            let asked = InstrumentNameExchange::new(name);
+            match client.fetch_open_orders(std::slice::from_ref(&asked)).await {
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                    assert_eq!(instrument, asked);
+                }
+                other => panic!("{name:?}: {other:?}"),
+            }
         }
     }
 

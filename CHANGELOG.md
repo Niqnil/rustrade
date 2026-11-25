@@ -1369,6 +1369,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance reads refuse a miscased or empty symbol as `InstrumentInvalid`**
+  (`rustrade-execution`, `binance`). Binance refuses a symbol in lower case (`-1100`) or empty
+  (`-1105`, or `-1102` on margin `myTrades`), as its open-order and trade reads answer, and a read
+  naming one instrument reported that as `ApiError::RequestRejected`, while an unlisted symbol
+  (`-1121`) was already `ApiError::InstrumentInvalid`. Every read filtered to an instrument (the
+  filtered `fetch_open_orders` and `fetch_trades`, `account_snapshot`'s open orders,
+  `fetch_commission_rates` and the margin pair reads) now reports any of these codes refusing the
+  symbol as `InstrumentInvalid`, naming the instrument. Order lookups by key
+  (`fetch_ended_orders`, `fetch_order_status`) leave such an order out as unknown, as they already
+  did for an unlisted symbol. Margin's refusal texts do not name the parameter, so on a lookup,
+  which also sends a client order id, they count as the symbol's only when the symbol is
+  miscased or empty; others, such as `BTC/USDT`, still fail the lookup.
 - **Alpaca's `fetch_shortability` matches the name ignoring case** (`rustrade-execution`,
   `alpaca`). It sent the name to `GET /v2/assets/{symbol}` as spelled, and Alpaca's lookup matches
   case, so `aapl` was refused as an unknown instrument. It now sends the name upper-cased, as the
