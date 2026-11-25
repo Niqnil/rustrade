@@ -1372,6 +1372,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EDGAR earnings releases furnished after the report are no longer dropped** (`rustrade-data`,
+  `sec-edgar`). `SecEdgarClient::earnings_releases` paired a period only with an Item 2.02 8-K
+  filed no later than its 10-Q or 10-K, so a release whose 8-K reached EDGAR after the report,
+  within Item 2.02's four business days, left the period with no release. Such an 8-K is now
+  paired when the event it reports (its report date) falls after the period end and no later
+  than the report, and it is filed no later than the next period's end, with no limit while no
+  later report is filed. As before, the latest candidate by filing date wins, and the release is
+  dated by the 8-K's acceptance, so it reads as late as the filing.
+
 - **Binance reads refuse a miscased or empty symbol as `InstrumentInvalid`**
   (`rustrade-execution`, `binance`). Binance refuses a symbol in lower case (`-1100`) or empty
   (`-1105`, or `-1102` on margin `myTrades`), as its open-order and trade reads answer, and a read
