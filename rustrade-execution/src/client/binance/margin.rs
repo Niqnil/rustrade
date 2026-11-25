@@ -6488,6 +6488,44 @@ mod tests {
         }
     }
 
+    /// A span that starts and ends at one millisecond is read, and holds a trade at it; only a
+    /// span that ends before it starts is empty unread.
+    #[tokio::test]
+    async fn margin_fetch_trades_reads_a_one_millisecond_span() {
+        let server = wiremock::MockServer::start().await;
+        let at = Utc::now().timestamp_millis() - 10 * 60 * 1000;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(venue(vec![(1, at)]))
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let instruments = [InstrumentNameExchange::new("BTCUSDT")];
+        let instant = DateTime::from_timestamp_millis(at).unwrap();
+
+        let inverted = client
+            .fetch_trades(
+                instant + chrono::Duration::milliseconds(1),
+                instant,
+                &instruments,
+            )
+            .await
+            .unwrap();
+        assert!(inverted.trades.is_empty());
+        assert_eq!(margin_requests(&server).await, vec![]);
+
+        let read = client
+            .fetch_trades(instant, instant, &instruments)
+            .await
+            .unwrap();
+        let times: Vec<_> = read
+            .trades
+            .iter()
+            .map(|trade| trade.time_exchange)
+            .collect();
+        assert_eq!(times, vec![instant]);
+    }
+
     #[tokio::test]
     async fn margin_order_id_lookup_fails_on_an_error_that_does_not_refuse_the_order() {
         // Another parameter's fault, and a fault that is not a parameter's, are not "no order".
