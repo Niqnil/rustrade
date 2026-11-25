@@ -191,7 +191,7 @@ impl<'a> ClientInstrument<'a> {
 /// | Client | A name matches | What a read finds is reported under | A name it cannot match |
 /// |---|---|---|---|
 /// | Alpaca | Alpaca's symbol, ignoring case; a crypto pair as `BASE/QUOTE` | Alpaca's symbol; an `account_snapshot` entry takes the requested name | Refused, except a contract past its expiry in `fetch_trades`, which is read without a lookup |
-/// | Binance spot, cross margin | Binance's symbol exactly, as Binance enforces | The requested name | Binance's error: `InstrumentInvalid` for an unlisted symbol |
+/// | Binance spot, cross margin | Binance's symbol exactly, as Binance enforces | The requested name | Binance's error: `InstrumentInvalid` for an unlisted, miscased or empty symbol |
 /// | Binance isolated margin | A name in `isolated_symbols`, exactly | The requested name | Left out, with a warning |
 /// | Hyperliquid perpetuals, spot | Hyperliquid's spelling exactly | Hyperliquid's spelling | Refused |
 /// | IBKR | A name in the client's contract registry, exactly | The registered name | Left out of a filtered read |
