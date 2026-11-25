@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ContractRegistry::registration`** (`rustrade-instrument`). It says how a name is registered,
+  as the new `Registration`: `Unregistered`, `NameOnly` (no contract ID maps back to the name, so
+  nothing IB reports by contract ID can be attributed to it) or `NameAndContractId`. It reads the
+  registry once, so a registration made at the same time cannot give a mix of its states before
+  and after.
 - **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
   `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
   `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,

@@ -269,7 +269,7 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    ibkr::{ContractRegistry, ContractRegistryError},
+    ibkr::{ContractRegistry, ContractRegistryError, Registration},
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
@@ -985,17 +985,16 @@ fn unattributable(
     contracts: &ContractRegistry,
     instrument: &InstrumentNameExchange,
 ) -> Option<&'static str> {
-    let Some(contract) = contracts.get_contract(instrument) else {
-        return Some(
+    match contracts.registration(instrument) {
+        Registration::NameAndContractId => None,
+        Registration::Unregistered => Some(
             "not in this client's contract registry, which matches names exactly, case included",
-        );
-    };
-    // `register` refuses a contract ID that is not positive, so such an ID maps back to no name.
-    let maps_back = contracts.get_name_by_con_id(contract.contract_id).as_ref() == Some(instrument);
-    (!maps_back).then_some(
-        "registered by name only, with no contract ID that maps back to it, so IB's reports \
-         cannot be attributed to it",
-    )
+        ),
+        Registration::NameOnly => Some(
+            "registered by name only, with no contract ID that maps back to it, so IB's reports \
+             cannot be attributed to it",
+        ),
+    }
 }
 
 /// Fail with [`ApiError::InstrumentInvalid`] on the first of `instruments` that IB's reports
