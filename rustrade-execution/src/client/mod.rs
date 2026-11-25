@@ -194,7 +194,7 @@ impl<'a> ClientInstrument<'a> {
 /// | Binance spot, cross margin | Binance's symbol exactly, as Binance enforces | The requested name | Binance's error: `InstrumentInvalid` for an unlisted symbol |
 /// | Binance isolated margin | A name in `isolated_symbols`, exactly | The requested name | Left out, with a warning |
 /// | Hyperliquid perpetuals, spot | Hyperliquid's spelling exactly | Hyperliquid's spelling | Refused |
-/// | IBKR | A name in the client's contract registry, exactly | The registered name | Left out of a filtered read |
+/// | IBKR | A name in the client's contract registry, exactly | The registered name | Refused |
 /// | Simulated (`MockExecution`) | A name the venue trades, exactly | The name traded | Left out of a read; refused by `open_order` |
 ///
 /// Each client's own documentation gives the detail.

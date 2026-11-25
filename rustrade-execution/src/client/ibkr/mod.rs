@@ -154,6 +154,14 @@
 //!   given up reconnecting or one that has shut down. Retrying cannot help: replace the client
 //!   (see [Caller Responsibilities](#caller-responsibilities)). Each method names its other cases.
 //!
+//! `account_snapshot`, `fetch_open_orders` and `fetch_trades` also refuse, with
+//! [`ApiError::InstrumentInvalid`], the first of the requested `instruments` they cannot match to
+//! what IB reports: one not registered under that exact name, case included, or one registered
+//! by name only ([`ContractRegistry::register_by_name_only`]), with no contract ID that maps back
+//! to it. IB reports fills, orders and positions by contract ID, so such a read could find
+//! nothing about the instrument. Nothing is sent to IB. Retrying cannot help: register the
+//! contract with [`IbkrClient::register_contract`], or correct the name.
+//!
 //! A read that fails returns nothing of what it read: part of a listing is not mistaken for all
 //! of it.
 //!
@@ -964,6 +972,46 @@ fn read_account_summary(
     Ok(aggregator)
 }
 
+/// Why what IB reports cannot be attributed to `instrument`, or `None` when it can.
+///
+/// IB reports fills, order listings and positions by contract ID, and the registry maps an ID
+/// back to the name it was registered under. So a name can be matched to IB's reports only if it
+/// is registered under that exact spelling, case included, with a contract ID that maps back to
+/// it, as [`ContractRegistry::register`] registers it.
+fn unattributable(
+    contracts: &ContractRegistry,
+    instrument: &InstrumentNameExchange,
+) -> Option<&'static str> {
+    let Some(contract) = contracts.get_contract(instrument) else {
+        return Some(
+            "not in this client's contract registry, which matches names exactly, case included",
+        );
+    };
+    // `register` refuses a contract ID that is not positive, so such an ID maps back to no name.
+    let maps_back = contracts.get_name_by_con_id(contract.contract_id).as_ref() == Some(instrument);
+    (!maps_back).then_some(
+        "registered by name only, with no contract ID that maps back to it, so IB's reports \
+         cannot be attributed to it",
+    )
+}
+
+/// Fail with [`ApiError::InstrumentInvalid`] on the first of `instruments` that IB's reports
+/// cannot be attributed to (see [`unattributable`]). A read filtered to it would otherwise
+/// report it empty, or leave it out, without having read anything about it.
+fn check_instruments(
+    contracts: &ContractRegistry,
+    instruments: &[InstrumentNameExchange],
+) -> Result<(), UnindexedClientError> {
+    instruments.iter().try_for_each(|instrument| {
+        unattributable(contracts, instrument).map_or(Ok(()), |reason| {
+            Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                instrument.clone(),
+                reason.to_string(),
+            )))
+        })
+    })
+}
+
 /// Read one account's positions into `positions`, returning whether IB marked the end of the
 /// listing before [`POSITION_STALL_TIMEOUT`] passed without a report.
 ///
@@ -1581,8 +1629,8 @@ impl IbkrClient {
     /// configured contract that cannot be registered, returning those in
     /// [`ConnectOutcome::skipped`].
     ///
-    /// Orders for a skipped contract's instrument are refused as for any unregistered
-    /// instrument, so check `skipped`. To retry one, call
+    /// Orders for a skipped contract's instrument, and reads filtered to it, are refused as for
+    /// any unregistered instrument, so check `skipped`. To retry one, call
     /// [`resolve_contract`](Self::resolve_contract) and then
     /// [`register_contract`](Self::register_contract) on the connected client.
     ///
@@ -2615,8 +2663,6 @@ impl ExecutionClient for IbkrClient {
     /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
     /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
     /// instruments are left out, with a warning, since the listing may be incomplete.
-    /// A requested instrument registered without a contract ID, or whose ID was registered again
-    /// under another name, cannot be matched to IB's reports and is left out too.
     ///
     /// **Several accounts.** This client reads the positions of every account the login manages,
     /// one account at a time. When more than one account holds the same instrument, the first account to report a
@@ -2650,7 +2696,8 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// As each [account read](crate::client::ibkr#account-read-errors), and as
+    /// As each [account read](crate::client::ibkr#account-read-errors), including its
+    /// refusal of an instrument it cannot match, and as
     /// [`fetch_balances`](ExecutionClient::fetch_balances). Also
     /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a `Decimal`,
     /// or if the request for the login's accounts yields none, as it does when the session ends
@@ -2684,6 +2731,7 @@ impl ExecutionClient for IbkrClient {
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        check_instruments(&self.contracts, instruments)?;
         // H-2 fix: Run balances and positions concurrently (independent IB requests)
         let client = self.client.clone();
         let contracts = self.contracts.clone();
@@ -2735,18 +2783,13 @@ impl ExecutionClient for IbkrClient {
             }
 
             // IB's reports are attributed by contract ID, so a requested instrument can be
-            // reported flat only if its ID is registered and resolves back to it: with no ID, or
-            // one another name took over, IB's position in it would be missed.
+            // reported flat only if its ID resolves back to it. The check at the start refused
+            // any that did not; this keeps one whose registration changed during the read from
+            // being reported flat without IB's position in it.
             let requested: Vec<_> = instruments_filter
                 .iter()
                 .flatten()
-                .filter(|instrument| {
-                    contracts.get_contract(instrument).is_some_and(|contract| {
-                        contract.contract_id != 0
-                            && contracts.get_name_by_con_id(contract.contract_id).as_ref()
-                                == Some(*instrument)
-                    })
-                })
+                .filter(|instrument| unattributable(&contracts, instrument).is_none())
                 .cloned()
                 .collect();
             Ok::<_, UnindexedClientError>((positions, requested))
@@ -3524,11 +3567,13 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// As each [account read](crate::client::ibkr#account-read-errors).
+    /// As each [account read](crate::client::ibkr#account-read-errors), including its refusal
+    /// of an instrument it cannot match.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        check_instruments(&self.contracts, instruments)?;
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
@@ -3592,7 +3637,8 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// As each [account read](crate::client::ibkr#account-read-errors).
+    /// As each [account read](crate::client::ibkr#account-read-errors), including its refusal
+    /// of an instrument it cannot match.
     ///
     /// # Corrections
     ///
@@ -3606,6 +3652,7 @@ impl ExecutionClient for IbkrClient {
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        check_instruments(&self.contracts, instruments)?;
         if start > end {
             return Ok(TradesRead::complete(Vec::new()));
         }
@@ -4314,6 +4361,92 @@ impl OrderStatusClient for IbkrClient {
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod instrument_check_tests {
+    use super::*;
+    use ibapi::contracts::Contract;
+
+    fn stock(symbol: &str, contract_id: i32) -> Contract {
+        let mut contract = Contract::stock(symbol).build();
+        contract.contract_id = contract_id;
+        contract
+    }
+
+    /// A registry with `AAPL` registered in both directions.
+    fn registry() -> ContractRegistry {
+        let contracts = ContractRegistry::new();
+        contracts
+            .register(InstrumentNameExchange::from("AAPL"), stock("AAPL", 265598))
+            .unwrap();
+        contracts
+    }
+
+    fn names(names: &[&str]) -> Vec<InstrumentNameExchange> {
+        names
+            .iter()
+            .copied()
+            .map(InstrumentNameExchange::from)
+            .collect()
+    }
+
+    /// The instrument and reason `check_instruments` refused with.
+    fn refused(contracts: &ContractRegistry, instruments: &[&str]) -> (String, String) {
+        match check_instruments(contracts, &names(instruments)) {
+            Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, reason))) => {
+                (instrument.to_string(), reason)
+            }
+            other => panic!("expected InstrumentInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_instrument_registered_in_both_directions_passes() {
+        let contracts = registry();
+        assert!(check_instruments(&contracts, &names(&["AAPL"])).is_ok());
+        assert!(check_instruments(&contracts, &[]).is_ok());
+    }
+
+    #[test]
+    fn an_unregistered_or_miscased_instrument_is_refused() {
+        let contracts = registry();
+        for name in ["MSFT", "aapl", ""] {
+            let (instrument, reason) = refused(&contracts, &[name]);
+            assert_eq!(instrument, name);
+            assert!(
+                reason.contains("not in this client's contract registry"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_instrument_registered_by_name_only_is_refused() {
+        let contracts = registry();
+        // Unresolved; with an ID no name maps back from; and with another name's ID.
+        contracts.register_by_name_only(InstrumentNameExchange::from("MSFT"), stock("MSFT", 0));
+        contracts.register_by_name_only(InstrumentNameExchange::from("IBM"), stock("IBM", 8314));
+        contracts
+            .register_by_name_only(InstrumentNameExchange::from("APPLE"), stock("AAPL", 265598));
+        for name in ["MSFT", "IBM", "APPLE"] {
+            let (instrument, reason) = refused(&contracts, &[name]);
+            assert_eq!(instrument, name);
+            assert!(reason.contains("registered by name only"), "{reason}");
+        }
+        // A name registered in both directions and then again by name only loses its reverse
+        // mapping.
+        contracts
+            .register_by_name_only(InstrumentNameExchange::from("AAPL"), stock("AAPL", 265598));
+        assert_eq!(refused(&contracts, &["AAPL"]).0, "AAPL");
+    }
+
+    #[test]
+    fn the_first_instrument_that_cannot_be_matched_is_named() {
+        let contracts = registry();
+        assert_eq!(refused(&contracts, &["AAPL", "nope", "MSFT"]).0, "nope");
     }
 }
 
