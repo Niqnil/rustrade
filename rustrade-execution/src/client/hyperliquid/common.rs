@@ -3220,6 +3220,22 @@ pub(super) mod info_tests {
     }
 
     #[test]
+    fn a_repeated_requested_instrument_is_listed_once() {
+        let listing = OpenOrderListing::new(
+            &rows(),
+            ExchangeId::HyperliquidPerp,
+            &[eth(), eth()],
+            &CarriedFills::default(),
+            perp,
+        );
+        let entries: Vec<_> = listing
+            .into_snapshots()
+            .map(|entry| (entry.instrument, entry.orders.len()))
+            .collect();
+        assert_eq!(entries, [(eth(), 2)]);
+    }
+
+    #[test]
     fn an_unfiltered_listing_covers_every_instrument_with_open_orders() {
         let listing = OpenOrderListing::new(
             &rows(),

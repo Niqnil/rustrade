@@ -9312,6 +9312,35 @@ mod tests {
         );
     }
 
+    /// A name repeated in `instruments` is read once: each order, trade and snapshot entry is
+    /// returned once, as for the name named once.
+    #[test]
+    fn a_repeated_instrument_name_is_read_once() {
+        let mut venue = spot_and_cfd_venue();
+        let spot = instrument_name();
+        let _ = venue.apply_market(
+            &spot,
+            MarketObservation::new(book("49000", "49100")),
+            time(1),
+        );
+        let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+        let _ = venue.open_order(limit_request("filled", Side::Buy, "1", "49200", gtc()));
+
+        let reads = |instruments: &[InstrumentNameExchange]| {
+            (
+                venue.orders_open(instruments).unwrap().len(),
+                venue
+                    .trades_between(time(0), time(2), instruments)
+                    .unwrap()
+                    .len(),
+                snapshot_entries(&venue, instruments),
+            )
+        };
+        let once = reads(std::slice::from_ref(&spot));
+        assert_eq!((once.0, once.1, once.2.len()), (1, 1, 1), "{once:?}");
+        assert_eq!(reads(&[spot.clone(), spot]), once);
+    }
+
     /// The instrument a read refused, if it refused one with `InstrumentInvalid`.
     fn refused<T: std::fmt::Debug>(read: Result<T, UnindexedApiError>) -> InstrumentNameExchange {
         match read {

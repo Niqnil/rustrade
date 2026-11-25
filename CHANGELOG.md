@@ -1391,6 +1391,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A name repeated in a read's `instruments` is read once** (`rustrade-execution`, `binance`,
+  `alpaca`). Binance spot and margin, cross and isolated, queried once per listed name, so
+  `["BTCUSDT", "BTCUSDT"]` returned each open order and trade twice, and two `account_snapshot`
+  entries, at twice the request weight. Alpaca's `account_snapshot` gave the repeat a second
+  entry, its position `Unreported` and its orders not complete. Each read now answers as for the
+  name given once, and a pair named twice in `BinanceMarginConfig::isolated_symbols` is kept
+  once. The `ExecutionClient` "# Instrument names" docs now state this for every client; the
+  others already met it. The engine never repeats a name, so only direct callers were affected.
+
 - **EDGAR earnings releases furnished after the report are no longer dropped** (`rustrade-data`,
   `sec-edgar`). `SecEdgarClient::earnings_releases` paired a period only with an Item 2.02 8-K
   filed no later than its 10-Q or 10-K, so a release whose 8-K reached EDGAR after the report,

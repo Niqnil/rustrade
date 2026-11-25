@@ -5061,9 +5061,10 @@ impl<'a> RequestedSymbols<'a> {
 /// position, so an equity or option without one is [`PositionReport::Flat`]. A crypto pair (a
 /// symbol with a `/`) is [`PositionReport::Unreported`]: its holding is a balance.
 ///
-/// Requested names match Alpaca's symbols ignoring case. When two requested names differ only in
-/// case, the first gets the symbol's orders and position; the second is
-/// [`PositionReport::Unreported`] with its orders not complete, since nothing is known about it.
+/// A name requested more than once gets one snapshot, where first requested. Requested names
+/// match Alpaca's symbols ignoring case. When two requested names differ only in case, the first
+/// gets the symbol's orders and position; the second is [`PositionReport::Unreported`] with its
+/// orders not complete, since nothing is known about it.
 ///
 /// Each snapshot declares its orders complete unless [`convert_open_order`] left one of its
 /// orders out. That holds because `orders` is every open order, unpaged: a response at Alpaca's
@@ -5139,6 +5140,7 @@ fn build_instrument_snapshots(
         let mut claimed = std::collections::HashSet::new();
         instruments
             .iter()
+            .unique()
             .map(|inst| {
                 let symbol = inst.name().as_str().to_ascii_uppercase();
                 // A second name for the same symbol, differing only in case: its listing went to
@@ -8904,6 +8906,36 @@ mod tests {
             ]
         );
         assert!(!snapshots[3].orders_complete);
+    }
+
+    #[test]
+    fn build_instrument_snapshots_lists_a_repeated_name_once() {
+        let orders = vec![make_order_response("o1", "AAPL")];
+        let positions = vec![("AAPL", position(dec!(5)))];
+        let instruments = vec![
+            InstrumentNameExchange::new("AAPL"),
+            InstrumentNameExchange::new("MSFT"),
+            InstrumentNameExchange::new("AAPL"),
+        ];
+
+        let snapshots = build_instrument_snapshots(orders, positions, &instruments);
+        let listed: Vec<_> = snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.instrument.name().as_str(),
+                    s.orders.len(),
+                    s.position.quantity(),
+                )
+            })
+            .collect();
+        // One entry for the name asked twice, where first asked, with its orders and position,
+        // rather than a second entry claiming nothing is known about it.
+        assert_eq!(
+            listed,
+            vec![("AAPL", 1, Some(dec!(5))), ("MSFT", 0, Some(Decimal::ZERO))]
+        );
+        assert!(snapshots.iter().all(|s| s.orders_complete));
     }
 
     fn epoch(secs: i64) -> DateTime<Utc> {
