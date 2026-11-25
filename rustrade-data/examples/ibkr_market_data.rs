@@ -37,8 +37,7 @@ use rustrade_data::{
     },
     streams::{consumer::MarketStreamOptions, reconnect::Event},
 };
-use rustrade_instrument::ibkr::ContractRegistry;
-use std::sync::Arc;
+use rustrade_instrument::ibkr::ContractsByName;
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -48,15 +47,11 @@ async fn main() {
     // Configuration for IB Gateway paper trading
     let config = IbkrStreamConfig::new("127.0.0.1", 4002, 100); // Gateway paper; use 7497 for TWS paper
 
-    // Build contract registry with instruments we want to subscribe to
-    let registry = ContractRegistry::new();
-
-    // Register AAPL stock contract. Market data looks contracts up by name only, and IB
-    // resolves the description on each request, so it need not be resolved first.
-    let aapl_contract = Contract::stock("AAPL").build();
-    registry.register_by_name_only("AAPL".into(), aapl_contract.clone());
-
-    let registry = Arc::new(registry);
+    // The contracts to subscribe to, by instrument name. IB resolves each description on
+    // request, so a contract built locally need not be resolved first. To stream what an
+    // `IbkrClient` trades, pass its `contract_registry().clone()` instead.
+    let contracts = ContractsByName::new();
+    contracts.insert("AAPL".into(), Contract::stock("AAPL").build());
 
     // Define subscriptions (see module docs for Trades subscription requirements)
     let subscriptions = vec![IbkrSubscription {
@@ -71,7 +66,7 @@ async fn main() {
     // backoff and set no silence timeout.
     let mut stream = match IbkrMarketStream::init(
         config,
-        registry,
+        contracts,
         subscriptions,
         MarketStreamOptions::default(),
     )

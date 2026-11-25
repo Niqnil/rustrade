@@ -147,7 +147,7 @@ use quotes::QuoteAggregator;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     exchange::ExchangeId,
-    ibkr::{ContractRegistry, codes},
+    ibkr::{ContractLookup, codes},
     instrument::name::InstrumentNameExchange,
 };
 use serde::{Deserialize, Serialize};
@@ -412,11 +412,12 @@ where
     /// # Arguments
     ///
     /// * `config` - Connection configuration
-    /// * `contracts` - Contract registry for instrument resolution. Subscriptions look their
-    ///   contracts up by name only, and IB resolves each contract description on request, so
-    ///   contracts registered with
-    ///   [`register_by_name_only`](rustrade_instrument::ibkr::ContractRegistry::register_by_name_only)
-    ///   need not be resolved first. It is read again on each reconnect.
+    /// * `contracts` - Where each subscription's contract is looked up by its instrument name.
+    ///   IB resolves each contract description on request, so a contract need not be resolved
+    ///   first: a [`ContractsByName`](rustrade_instrument::ibkr::ContractsByName) can hold one built locally. The stream only reads it, so
+    ///   an execution client's
+    ///   [`ContractRegistry`](rustrade_instrument::ibkr::ContractRegistry) can be passed as well. It is read again on
+    ///   each reconnect, so a contract added through a clone of it before then is used.
     /// * `subscriptions` - List of subscriptions to activate
     /// * `options` - How the stream reconnects, and whether it is ended when it stays silent; see
     ///   [`MarketStreamOptions`]. A silence timeout counts the market events of all subscriptions
@@ -430,8 +431,7 @@ where
     ///   depth rows outside 1-20, or a candle `since` later than one bar from now
     ///   ([`IbkrCandleRequest::since`]). Nothing is connected.
     /// - [`DataError::Socket`] if the connection to IB fails, the configured market data type
-    ///   cannot be sent, or no subscription could be activated (every contract missing from the
-    ///   registry).
+    ///   cannot be sent, or no subscription could be activated (no contract found in `contracts`).
     ///
     /// A failed reconnect is not returned: the stream yields it, as above, and tries again.
     ///
@@ -446,7 +446,7 @@ where
     /// Outside a tokio runtime: the blocking connection is made on tokio's blocking thread pool.
     pub async fn init(
         config: IbkrStreamConfig,
-        contracts: Arc<ContractRegistry>,
+        contracts: impl ContractLookup + Send + Sync + 'static,
         subscriptions: Vec<IbkrSubscription<K>>,
         options: MarketStreamOptions,
     ) -> Result<Self, DataError> {
@@ -464,6 +464,7 @@ where
                 reason,
             });
         }
+        let contracts: Arc<dyn ContractLookup + Send + Sync> = Arc::new(contracts);
         let shared = Shared::default();
         let backoff = options.reconnect.clone();
         info!(
@@ -481,7 +482,7 @@ where
             async move {
                 wait_before_open(delay).await;
                 tokio::task::spawn_blocking(move || {
-                    Connection::open(&config, &shared, &contracts, subscriptions)
+                    Connection::open(&config, &shared, contracts.as_ref(), subscriptions)
                 })
                 .await
                 .map_err(|e| DataError::Socket(format!("IB connect task: {e}")))?
@@ -794,7 +795,7 @@ where
     fn open(
         config: &IbkrStreamConfig,
         shared: &Shared,
-        contracts: &ContractRegistry,
+        contracts: &dyn ContractLookup,
         subscriptions: Vec<IbkrSubscription<K>>,
     ) -> Result<Self, DataError> {
         shared.pending_close.wait();
@@ -867,7 +868,7 @@ where
                 None => {
                     warn!(
                         %instrument,
-                        "Contract not found in registry, skipping subscription"
+                        "Contract not found by name, skipping subscription"
                     );
                     continue;
                 }
@@ -1722,6 +1723,7 @@ pub(crate) fn decimal_from_f64(value: f64) -> Option<Decimal> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use rustrade_instrument::ibkr::ContractsByName;
 
     mod quote_ticks {
         use super::*;
@@ -2272,7 +2274,7 @@ mod tests {
     async fn a_stream_with_no_subscriptions_is_refused_before_connecting() {
         let result = IbkrMarketStream::<()>::init(
             IbkrStreamConfig::default(),
-            Arc::new(ContractRegistry::new()),
+            ContractsByName::new(),
             vec![],
             MarketStreamOptions::default(),
         )
@@ -3127,7 +3129,7 @@ mod tests {
         ] {
             let result = IbkrMarketStream::<()>::init(
                 IbkrStreamConfig::new("127.0.0.1", 1, 1),
-                Arc::new(ContractRegistry::new()),
+                ContractsByName::new(),
                 vec![
                     IbkrSubscription::quotes((), InstrumentNameExchange::new("SPY")),
                     subscription,
