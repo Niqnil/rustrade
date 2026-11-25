@@ -1146,7 +1146,7 @@ impl BinanceMargin {
                 unconfigured.clone(),
                 format!(
                     "{unconfigured} is not in this isolated margin client's isolated_symbols, \
-                     so it reads no isolated account of it"
+                     so no isolated account is read for it"
                 ),
             ))),
             None => Ok(instruments.to_vec()),
@@ -1719,17 +1719,17 @@ impl ExecutionClient for BinanceMargin {
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
         use futures::StreamExt as _;
 
-        if start > end {
-            return Ok(TradesRead::complete(Vec::new()));
-        }
-
-        // Resolve the effective instrument set. Isolated resolves the empty sentinel to the
+        // Resolve the effective instrument set, refusing an unconfigured isolated pair before
+        // anything else, an empty span included. Isolated resolves the empty sentinel to the
         // configured isolated_symbols; cross keeps the slice verbatim (no no-symbol "all" form).
         let effective: Vec<InstrumentNameExchange> = if self.config.is_isolated {
             self.effective_isolated_set(instruments)?
         } else {
             instruments.to_vec()
         };
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
         if effective.is_empty() {
             // Only cross with an empty `instruments` slice (the documented no-op sentinel): the
             // isolated set is never empty, since `new` refuses an isolated client with no pair.
@@ -6450,6 +6450,7 @@ mod tests {
                 InstrumentNameExchange::new(name),
             ];
             let end = Utc::now();
+            let start = end - chrono::Duration::hours(1);
             let reads = [
                 (
                     "account_snapshot",
@@ -6462,7 +6463,15 @@ mod tests {
                 (
                     "fetch_trades",
                     client
-                        .fetch_trades(end - chrono::Duration::hours(1), end, &instruments)
+                        .fetch_trades(start, end, &instruments)
+                        .await
+                        .map(drop),
+                ),
+                // An empty span reads nothing, but the name is still refused.
+                (
+                    "fetch_trades, empty span",
+                    client
+                        .fetch_trades(end, start, &instruments)
                         .await
                         .map(drop),
                 ),
