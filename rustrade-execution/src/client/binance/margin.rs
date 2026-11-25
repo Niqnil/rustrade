@@ -76,11 +76,12 @@ use super::rules::RulesLoader;
 use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BINANCE_TIME_IN_FORCE, BinanceOrderType,
-    BinanceTimeInForce, FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SharedDedupCache, TrailingOrderError, Unclassified, UnrecoveredFills, WeightPool, WireInt,
-    answer_time, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
-    classify_rest_query_error, convert_ended_order, convert_open_order_listing,
+    BinanceTimeInForce, CallerText, FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, ORDER_REST_TIMEOUT_MS, OpenOrderListing, PlacementResponse,
+    RateLimitTracker, RequestKind, SharedDedupCache, TrailingOrderError, Unclassified,
+    UnrecoveredFills, WeightPool, WireInt, answer_time, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    classify_rest_symbol_query_error, convert_ended_order, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_unknown_order, new_dedup_cache, optional_decimal, placed_order_state,
     recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
@@ -760,7 +761,8 @@ impl BinanceMargin {
     ///
     /// # Errors
     ///
-    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list, or one it refuses
+    ///   as spelled: in lower case, or empty.
     /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
     ///   not read as a decimal, or for another symbol.
     pub async fn fetch_commission_rates(
@@ -2027,13 +2029,17 @@ impl ExecutionClient for BinanceMargin {
 /// eight at a time. Binance's `FILLED` is reported with its average price, `CANCELED` with what
 /// filled before it, `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention) as expired, and
 /// `REJECTED` as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). An order
-/// Binance does not know under the key's symbol (`-2013`, or `-1121` for a symbol that does not
-/// exist) is omitted. A row whose status this version does not know is omitted too, with a
-/// warning, as is a `PENDING_CANCEL` one.
+/// Binance does not know under the key's symbol is omitted: `-2013`, or a symbol Binance does not
+/// list (`-1121`) or refuses as spelled (in lower case, or empty), under which no order can exist.
+/// Margin's refusal of a malformed parameter does not say which one, so it counts as the
+/// symbol's only when the symbol shows the fault (a lower-case letter, or empty); any other, such
+/// as for `BTC/USDT` or a client order id Binance will not take, fails the read. A row whose
+/// status this version does not know is omitted too, with a warning, as is a `PENDING_CANCEL`
+/// one.
 ///
 /// In isolated mode a key's symbol is asked about whether or not it is one of
 /// [`isolated_symbols`](BinanceMarginConfig::isolated_symbols), since an order can be placed on any
-/// pair. Any error other than those two codes fails the call, including one Binance gives for a
+/// pair. Any other error fails the call, including one Binance gives for a
 /// pair with no isolated account.
 ///
 /// The account stream runs the same lookup itself after a reconnect; see
@@ -2805,11 +2811,17 @@ async fn fetch_margin_order_lookup(
     .await
     {
         Ok(response) => response,
-        Err(e) if is_unknown_order(&e) => {
+        Err(e) if is_unknown_order(&e, &key.instrument, CallerText::SymbolAndOther) => {
             debug!(instrument = %key.instrument, cid = %key.cid, error = %e, "BinanceMargin does not know this order");
             return Ok(OrderLookup::Unknown);
         }
-        Err(e) => return Err(classify_rest_query_error(&e, Some(&key.instrument))),
+        Err(e) => {
+            return Err(classify_rest_symbol_query_error(
+                &e,
+                &key.instrument,
+                CallerText::SymbolAndOther,
+            ));
+        }
     };
 
     let row = response.data().await.map_err(response_decode_error)?;
@@ -2848,7 +2860,7 @@ async fn fetch_margin_order_cid(
     .await
     {
         Ok(response) => response,
-        Err(e) if is_unknown_order(&e) => {
+        Err(e) if is_unknown_order(&e, instrument, CallerText::SymbolOnly) => {
             debug!(%instrument, order_id, error = %e, "BinanceMargin does not know this order");
             return Ok(None);
         }
@@ -6334,6 +6346,116 @@ mod tests {
         );
     }
 
+    /// The client order id lookup by order id (fill recovery) carries no text from the caller but
+    /// the symbol, so margin's refusal of a malformed parameter, which names none, is the
+    /// symbol's: no order exists.
+    #[tokio::test]
+    async fn margin_order_id_lookup_reads_a_malformed_parameter_as_no_order() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "7"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"code": -1100, "msg": "Illegal characters found in a parameter."}),
+            ))
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let found = fetch_margin_order_cid(
+            &client.rest,
+            &client.rate_limiter,
+            &InstrumentNameExchange::new("BTC/USDT"),
+            7,
+            false,
+        )
+        .await;
+        assert!(matches!(found, Ok(None)), "got {found:?}");
+    }
+
+    #[tokio::test]
+    async fn margin_filtered_reads_of_a_miscased_or_empty_symbol_refuse_it() {
+        // Binance's margin texts name no parameter: the symbol is the read's only text.
+        let cases = [
+            (
+                "/sapi/v1/margin/openOrders",
+                "btcusdt",
+                -1100,
+                "Illegal characters found in a parameter.",
+            ),
+            (
+                "/sapi/v1/margin/openOrders",
+                "",
+                -1105,
+                "A parameter was empty.",
+            ),
+            (
+                "/sapi/v1/margin/myTrades",
+                "",
+                -1102,
+                "Mandatory parameter 'symbol' was not sent, was empty/null, or malformed.",
+            ),
+        ];
+        for (endpoint, name, code, msg) in cases {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path(endpoint))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"code": code, "msg": msg})),
+                )
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let asked = InstrumentNameExchange::new(name);
+            let instruments = std::slice::from_ref(&asked);
+            let read = if endpoint.ends_with("openOrders") {
+                client.fetch_open_orders(instruments).await.map(drop)
+            } else {
+                let end = Utc::now();
+                client
+                    .fetch_trades(end - chrono::Duration::hours(1), end, instruments)
+                    .await
+                    .map(drop)
+            };
+            match read {
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                    assert_eq!(instrument, asked, "{endpoint} {name:?}");
+                }
+                other => panic!("{endpoint} {name:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_order_id_lookup_fails_on_an_error_that_does_not_refuse_the_order() {
+        // Another parameter's fault, and a fault that is not a parameter's, are not "no order".
+        for (code, msg) in [
+            (
+                -1102,
+                "Mandatory parameter 'orderId' was not sent, was empty/null, or malformed.",
+            ),
+            (-1022, "Signature for this request is not valid."),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .and(wiremock::matchers::query_param("orderId", "7"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"code": code, "msg": msg})),
+                )
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let found = fetch_margin_order_cid(
+                &client.rest,
+                &client.rate_limiter,
+                &InstrumentNameExchange::new("BTCUSDT"),
+                7,
+                false,
+            )
+            .await;
+            assert!(found.is_err(), "{code}: got {found:?}");
+        }
+    }
+
     #[tokio::test]
     async fn margin_fetch_ended_orders_asks_the_configured_account_and_omits_the_rest() {
         use crate::order::state::InactiveOrderState;
@@ -6343,12 +6465,32 @@ mod tests {
             mount_margin_order(&server, "live", margin_row_response("live", "NEW")).await;
             mount_margin_order(&server, "unknown", margin_venue_error(-2013)).await;
             mount_margin_order(&server, "no-symbol", margin_venue_error(-1121)).await;
+            // A miscased or empty symbol, in margin's words, which name no parameter.
+            let refused = |code: i64, msg: &str| {
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": code, "msg": msg}))
+            };
+            mount_margin_order(
+                &server,
+                "miscased",
+                refused(-1100, "Illegal characters found in a parameter."),
+            )
+            .await;
+            mount_margin_order(&server, "empty", refused(-1105, "A parameter was empty.")).await;
             let client = margin_client_at(&server, is_isolated);
             let keys = ["filled", "live", "unknown"].map(|cid| margin_key("BTCUSDT", cid));
 
             let ended = client
                 .fetch_ended_orders(
-                    &[keys.to_vec(), vec![margin_key("NOSUCH", "no-symbol")]].concat(),
+                    &[
+                        keys.to_vec(),
+                        vec![
+                            margin_key("NOSUCH", "no-symbol"),
+                            margin_key("btcusdt", "miscased"),
+                            margin_key("", "empty"),
+                        ],
+                    ]
+                    .concat(),
                 )
                 .await
                 .unwrap();
@@ -6359,7 +6501,7 @@ mod tests {
             assert_eq!(order.key, keys[0], "the strategy asked survives");
             assert!(matches!(order.state, InactiveOrderState::FullyFilled(_)));
             let requests = margin_requests(&server).await;
-            assert_eq!(requests.len(), 4);
+            assert_eq!(requests.len(), 6);
             for (path, isolated) in requests {
                 assert_eq!(path, "/sapi/v1/margin/order");
                 assert_eq!(
