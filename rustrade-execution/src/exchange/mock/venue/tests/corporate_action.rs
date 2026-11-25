@@ -100,7 +100,7 @@ fn a_split_cancels_every_order_on_its_instrument_releasing_each_hold() {
     };
     assert_eq!(state.time_exchange, time(5), "stamped at the split");
     assert_eq!(state.filled_quantity, Some(Decimal::ZERO));
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn a_split_leaves_the_orders_of_other_instruments_alone() {
     let outcome = apply_split(&mut venue, "split-1", 5);
 
     assert_eq!(cancelled_cids(&outcome.events), ["btc-bid"]);
-    let open = venue.orders_open(&[]);
+    let open = venue.orders_open(&[]).unwrap();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].key.instrument, eth);
 }
@@ -278,7 +278,7 @@ fn the_same_action_applied_twice_changes_nothing_the_second_time() {
 
     assert_eq!(again.response, CorporateActionResponse::AlreadyApplied);
     assert!(again.events.is_empty());
-    assert_eq!(venue.orders_open(&[]).len(), 1);
+    assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
     assert_eq!(venue.market(&instrument_name()).unwrap().split_at, None);
 
     // Another id is another action.
@@ -305,7 +305,7 @@ fn a_refused_action_changes_nothing_and_does_not_record_its_id() {
         CorporateActionResponse::Refused(CorporateActionRefusal::UnknownInstrument)
     );
     assert!(unknown.events.is_empty());
-    assert_eq!(venue.orders_open(&[]).len(), 1);
+    assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
     assert_eq!(venue.market(&instrument_name()).unwrap().split_at, None);
 
     // The id was not recorded, so the same action applies once it names the right instrument.
@@ -534,7 +534,7 @@ fn adjust_restates_a_buy_limit_and_cancels_every_other_order() {
     assert_eq!(open.id, id, "it keeps its venue order id");
     assert_eq!(open.time_exchange, time(5), "stamped at the split");
     assert_eq!(bids(&venue), [bid("bid", "24000", "2", "0")]);
-    assert_eq!(venue.orders_open(&[]).len(), 1);
+    assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
 }
 
 #[test]
@@ -545,7 +545,7 @@ fn adjust_on_a_forward_split_still_cancels_every_order_on_a_reverse_split() {
     let outcome = apply(&mut venue, "0.5", SplitRoundingPolicy::Fractional, 5);
 
     assert_eq!(cancelled_cids(&outcome.events), ["bid"]);
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
 }
 
 #[test]
@@ -700,7 +700,7 @@ fn adjust_cancels_an_order_whose_hold_the_account_can_no_longer_afford() {
 
     // 2 at 24000 now holds 48480, more than the 48010 held.
     assert_eq!(cancelled_cids(&outcome.events), ["bid"]);
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
     assert_eq!(
         venue.account.free(&quote()),
         d("48010"),
@@ -1050,6 +1050,7 @@ mod options_on_the_equity {
     fn option_entry(venue: &SimulatedVenue) -> Option<Decimal> {
         venue
             .account_snapshot(&[], &[])
+            .unwrap()
             .instruments
             .iter()
             .find(|instrument| instrument.instrument == option_name())
@@ -1337,7 +1338,7 @@ mod options_on_the_equity {
         // The adjusted bid's hold, 252 × (74.9999999999999999999999995 ÷ 126), rounds to 150, a
         // step above what it held, and the put has taken the last free step: the account can no
         // longer afford it, so it is cancelled as such an adjusted order is.
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
         assert_eq!(
             totals(&venue, usd()).1,
             d("150") - d("0.000000000000000000000001")
@@ -1408,7 +1409,7 @@ mod options_on_the_equity {
 
         assert_eq!(outcome.response, CorporateActionResponse::Applied);
         assert_eq!(cancelled_cids(&outcome.events), ["call-ask", "call-bid"]);
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
         assert_eq!(totals(&venue, spy()), (d("200"), d("200")));
         assert_eq!(totals(&venue, usd()), (d("1000"), d("1000")));
     }
@@ -1481,7 +1482,11 @@ mod options_on_the_equity {
             5,
             CorporateActionRefusal::OptionExposureAtNonStandardSplit,
         );
-        assert_eq!(venue.orders_open(&[]).len(), 2, "nothing cancelled");
+        assert_eq!(
+            venue.orders_open(&[]).unwrap().len(),
+            2,
+            "nothing cancelled"
+        );
     }
 
     #[test]
@@ -1508,7 +1513,11 @@ mod options_on_the_equity {
             5,
             CorporateActionRefusal::Overflow,
         );
-        assert_eq!(venue.orders_open(&[]).len(), 2, "nothing cancelled");
+        assert_eq!(
+            venue.orders_open(&[]).unwrap().len(),
+            2,
+            "nothing cancelled"
+        );
 
         // Not recorded: the same id applies once the market is observed again within range.
         let _ = venue.apply_market(

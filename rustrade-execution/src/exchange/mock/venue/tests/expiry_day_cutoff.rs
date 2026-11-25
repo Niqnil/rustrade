@@ -176,7 +176,7 @@ fn an_opening_order_working_from_before_the_cutoff_keeps_working_and_fills_after
     let mut venue = cutting_off_calls("10000", "0");
     assert_accepted(&venue.open_order(limit(option_name(), Side::Buy, "1", "1", "bid")));
     reach(&mut venue, cutoff_at());
-    assert_eq!(venue.orders_open(&[]).len(), 1);
+    assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
 
     let _ = venue.apply_market(
         &option_name(),
@@ -227,7 +227,7 @@ fn after_the_cutoff_an_amend_raising_a_closing_sale_is_refused() {
         "{:?}",
         outcome.response.state
     );
-    assert_eq!(venue.orders_open(&[])[0].quantity, d("1"));
+    assert_eq!(venue.orders_open(&[]).unwrap()[0].quantity, d("1"));
 }
 
 /// A close every day at [`time`]`(seconds)`'s time of day, in UTC. [`expiry`] falls on that date.

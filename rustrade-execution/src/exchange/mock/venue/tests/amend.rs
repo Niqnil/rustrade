@@ -489,7 +489,7 @@ fn a_price_amend_through_the_market_fills_as_a_taker() {
     assert_eq!(trade.order_id, id.or_client_id(&cid("resting")));
     assert_eq!(filled_price(order_of(ended)), d("49100"));
     assert_eq!(amended(&outcome).open.filled_quantity, d("1"));
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
     assert!(venue.account.is_filled(&cid("resting")));
 }
 
@@ -1527,6 +1527,7 @@ fn a_rename_onto_an_ended_orders_id_forgets_how_that_one_ended() {
     assert!(venue.orders_ended(&[key]).is_empty());
     let listed: Vec<_> = venue
         .account_snapshot(&[], &[])
+        .unwrap()
         .instruments
         .iter()
         .flat_map(|instrument| &instrument.orders)

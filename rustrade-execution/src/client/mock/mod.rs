@@ -7,9 +7,7 @@ use crate::{
         ClientError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
         UnindexedClientError, UnindexedOrderError,
     },
-    exchange::mock::{
-        CorporateActionResponse, request::MockExchangeRequest, venue::is_requested_instrument,
-    },
+    exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
     expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
@@ -982,11 +980,14 @@ where
                 ))
             })?;
 
-        response_rx.await.map_err(|_| {
-            UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
-                self.mocked_exchange,
-            ))
-        })
+        response_rx
+            .await
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?
+            .map_err(ClientError::Api)
     }
 
     async fn account_stream(
@@ -1202,11 +1203,14 @@ where
                 ))
             })?;
 
-        response_rx.await.map_err(|_| {
-            UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
-                self.mocked_exchange,
-            ))
-        })
+        response_rx
+            .await
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?
+            .map_err(ClientError::Api)
     }
 
     /// The mock venue holds every trade and answers a span whole, so the read is always
@@ -1225,6 +1229,7 @@ where
                 response_tx,
                 start,
                 end,
+                instruments.to_vec(),
             ))
             .map_err(|_| {
                 UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
@@ -1232,12 +1237,14 @@ where
                 ))
             })?;
 
-        let mut trades = response_rx.await.map_err(|_| {
-            UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
-                self.mocked_exchange,
-            ))
-        })?;
-        trades.retain(|trade| is_requested_instrument(instruments, &trade.instrument));
+        let trades = response_rx
+            .await
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?
+            .map_err(ClientError::Api)?;
         Ok(TradesRead::complete(trades))
     }
 }
@@ -1670,8 +1677,8 @@ mod tests {
         )
     }
 
-    /// `fetch_trades` asks the mock exchange for its span and keeps the requested instruments'
-    /// trades, reading the span whole.
+    /// `fetch_trades` asks the mock exchange for its span and the requested instruments, and
+    /// answers with what the venue read, whole.
     #[tokio::test]
     async fn fetch_trades_reads_the_span_for_the_requested_instruments() {
         use crate::{
@@ -1712,13 +1719,15 @@ mod tests {
                 response_tx,
                 start: asked_start,
                 end: asked_end,
+                instruments,
             } = request.kind
             else {
                 panic!("expected FetchTrades, got {:?}", request.kind);
             };
             assert_eq!((asked_start, asked_end), (start, end));
+            assert_eq!(instruments, [InstrumentNameExchange::new("eth_usdt")]);
             response_tx
-                .send(vec![trade("btc_usdt"), trade("eth_usdt")])
+                .send(Ok(vec![trade("eth_usdt")]))
                 .expect("the client awaits the answer");
         });
 
@@ -1754,7 +1763,7 @@ mod tests {
                 panic!("expected FetchAccountSnapshot, got {:?}", request.kind);
             };
             response_tx
-                .send(empty_snapshot())
+                .send(Ok(empty_snapshot()))
                 .expect("the caller awaits the answer");
             (assets, instruments)
         });
@@ -1770,6 +1779,67 @@ mod tests {
             exchange.await.unwrap(),
             (assets.to_vec(), instruments.to_vec())
         );
+    }
+
+    /// Each read naming instruments returns the venue's refusal of one as the client's
+    /// `ClientError::Api`, unchanged.
+    #[tokio::test]
+    async fn a_read_returns_the_venue_s_refusal_of_an_instrument() {
+        use crate::{error::ApiError, exchange::mock::request::MockExchangeRequestKind};
+
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
+        let (_event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
+        let unknown = InstrumentNameExchange::new("ETHUSDT");
+        let refusal = {
+            let unknown = unknown.clone();
+            move || ApiError::InstrumentInvalid(unknown.clone(), "unknown".to_string())
+        };
+        let exchange = tokio::spawn({
+            let refusal = refusal.clone();
+            async move {
+                for _ in 0..3 {
+                    let request = request_rx.recv().await.expect("a request");
+                    let sent = match request.kind {
+                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx, .. } => {
+                            response_tx.send(Err(refusal())).is_ok()
+                        }
+                        MockExchangeRequestKind::FetchOrdersOpen { response_tx, .. } => {
+                            response_tx.send(Err(refusal())).is_ok()
+                        }
+                        MockExchangeRequestKind::FetchTrades { response_tx, .. } => {
+                            response_tx.send(Err(refusal())).is_ok()
+                        }
+                        other => panic!("expected a read, got {other:?}"),
+                    };
+                    assert!(sent, "the client awaits the answer");
+                }
+            }
+        });
+
+        let instruments = std::slice::from_ref(&unknown);
+        assert_eq!(
+            client.account_snapshot(&[], instruments).await.unwrap_err(),
+            ClientError::Api(refusal())
+        );
+        assert_eq!(
+            client.fetch_open_orders(instruments).await.unwrap_err(),
+            ClientError::Api(refusal())
+        );
+        assert_eq!(
+            client
+                .fetch_trades(Utc::now(), Utc::now(), instruments)
+                .await
+                .unwrap_err(),
+            ClientError::Api(refusal())
+        );
+        exchange.await.unwrap();
     }
 
     /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the

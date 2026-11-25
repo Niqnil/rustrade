@@ -433,10 +433,13 @@ impl MockExchange {
                 response_tx,
                 start,
                 end,
+                instruments,
             } => {
-                let mut trades = self.venue.trades(start);
-                trades.retain(|trade| trade.time_exchange <= end);
-                emit.respond(Vec::new(), response_tx, trades);
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.trades_between(start, end, &instruments),
+                );
             }
             MockExchangeRequestKind::Checkpoint { response_tx } => {
                 let checkpoint = self.venue.checkpoint();
@@ -1296,7 +1299,10 @@ mod tests {
                 response_tx,
             ))
             .unwrap();
-        let snapshot = response_rx.await.expect("a snapshot must be answered");
+        let snapshot = response_rx
+            .await
+            .expect("a snapshot must be answered")
+            .unwrap();
 
         let assets = snapshot
             .balances
@@ -1310,6 +1316,58 @@ mod tests {
             .map(|entry| entry.instrument.clone())
             .collect::<Vec<_>>();
         assert_eq!(instruments, [instrument_name()]);
+
+        drop(request_tx);
+        driver.await.unwrap();
+    }
+
+    /// The instruments an open-order or trade request names reach the venue, which refuses one
+    /// it does not trade and reads the others.
+    #[tokio::test]
+    async fn an_open_order_or_trade_request_passes_its_instruments_to_the_venue() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _events) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("100", "10000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+        let unknown = InstrumentNameExchange::new("ETHUSDT");
+        let refused = |error| matches!(error, crate::error::ApiError::InstrumentInvalid(name, _) if name == unknown);
+
+        for instruments in [vec![unknown.clone()], vec![instrument_name()]] {
+            let (orders_tx, orders_rx) = oneshot::channel();
+            request_tx
+                .send(MockExchangeRequest::fetch_orders_open(
+                    Utc::now(),
+                    instruments.clone(),
+                    orders_tx,
+                ))
+                .unwrap();
+            let orders = orders_rx.await.unwrap();
+
+            let (trades_tx, trades_rx) = oneshot::channel();
+            request_tx
+                .send(MockExchangeRequest::fetch_trades(
+                    Utc::now(),
+                    trades_tx,
+                    Utc::now() - TimeDelta::hours(1),
+                    Utc::now(),
+                    instruments.clone(),
+                ))
+                .unwrap();
+            let trades = trades_rx.await.unwrap();
+
+            if instruments == [unknown.clone()] {
+                assert!(refused(orders.unwrap_err()));
+                assert!(refused(trades.unwrap_err()));
+            } else {
+                assert!(orders.unwrap().is_empty());
+                assert!(trades.unwrap().is_empty());
+            }
+        }
 
         drop(request_tx);
         driver.await.unwrap();
@@ -1880,10 +1938,14 @@ mod tests {
         let (trades_tx, trades_rx) = oneshot::channel();
         request_tx
             .send(MockExchangeRequest::fetch_trades(
-                made, trades_tx, made, booked,
+                made,
+                trades_tx,
+                made,
+                booked,
+                Vec::new(),
             ))
             .unwrap();
-        let trades = trades_rx.await.expect("the fetch is answered");
+        let trades = trades_rx.await.expect("the fetch is answered").unwrap();
         assert_eq!(
             trades
                 .iter()

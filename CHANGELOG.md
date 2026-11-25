@@ -762,6 +762,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: the simulated venue's reads refuse an instrument it does not know**
+  (`rustrade-execution`). `MockExecution::account_snapshot`, `fetch_open_orders` and
+  `fetch_trades` left out a requested instrument the venue neither trades nor holds an order on,
+  including one it trades spelled in another case (`btcusdt` for `BTCUSDT`), so a read filtered to
+  it returned nothing, as if it had no orders, fills or position, where a live venue refuses a
+  symbol it does not list. All three now fail with `ApiError::InstrumentInvalid` on the first such
+  instrument, as `open_order` already did. An empty `instruments` slice is not checked. The venue
+  decides, so `SimulatedVenue::account_snapshot` and `SimulatedVenue::orders_open` return
+  `Result<_, UnindexedApiError>`, the new `SimulatedVenue::trades_between` is what
+  `fetch_trades` reads, and `MockExchangeRequest::fetch_account_snapshot`, `fetch_orders_open`
+  and `fetch_trades` answer with a `Result` (`fetch_trades` also takes the instruments). Every
+  client now refuses an instrument it cannot match, so the `ExecutionClient` contract on
+  `account_snapshot`, `fetch_open_orders` and `fetch_trades` says it must.
 - **Breaking: Binance isolated margin reads refuse a pair the client is not configured for**
   (`rustrade-execution`, `binance`). `BinanceMargin::account_snapshot`, `fetch_open_orders` and
   `fetch_trades` on an isolated client left out, with a warning, a requested instrument not in

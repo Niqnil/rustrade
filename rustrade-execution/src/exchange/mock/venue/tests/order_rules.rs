@@ -54,7 +54,7 @@ fn refusal(venue: &SimulatedVenue, outcome: &OpenOutcome) -> UnindexedOrderError
         "a refused open reports nothing: {:?}",
         outcome.events
     );
-    assert!(venue.orders_open(&[]).is_empty(), "nothing rests");
+    assert!(venue.orders_open(&[]).unwrap().is_empty(), "nothing rests");
     assert!(venue.trades(time(0)).is_empty(), "nothing trades");
     match &outcome.response.state {
         OrderState::Inactive(InactiveOrderState::OpenFailed(error)) => error.clone(),
@@ -287,7 +287,7 @@ fn a_held_market_order_breaking_the_market_notional_at_release_ends_refused() {
     assert_eq!(order_of(ended).state, state, "the arrival's typed refusal");
     assert_eq!(order_of(ended).key.cid, ClientOrderId::new("held"));
     assert!(venue.trades(time(0)).is_empty());
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
     assert_eq!(
         venue
             .orders_ended(std::slice::from_ref(&held.response.key))

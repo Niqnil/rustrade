@@ -183,10 +183,11 @@ impl<'a> ClientInstrument<'a> {
 ///
 /// Each client matches a requested [`InstrumentNameExchange`] by one rule, given below, and never
 /// rewrites it: it does not turn one spelling into another, such as `BTCUSD` into `BTC/USD`. A
-/// requested instrument the client cannot match is meant to be refused with
-/// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid), never left out
-/// or reported flat or empty, since nothing was read about it. The rows below that still leave
-/// such a name out say so.
+/// requested instrument the client cannot match must be refused with
+/// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) by
+/// [`account_snapshot`](Self::account_snapshot), [`fetch_open_orders`](Self::fetch_open_orders)
+/// and [`fetch_trades`](Self::fetch_trades), never left out or reported flat or empty, since
+/// nothing was read about it. The one exception is in Alpaca's row.
 ///
 /// | Client | A name matches | What a read finds is reported under | A name it cannot match |
 /// |---|---|---|---|
@@ -195,7 +196,7 @@ impl<'a> ClientInstrument<'a> {
 /// | Binance isolated margin | A name in `isolated_symbols`, exactly | The requested name | Refused |
 /// | Hyperliquid perpetuals, spot | Hyperliquid's spelling exactly | Hyperliquid's spelling | Refused |
 /// | IBKR | A name in the client's contract registry, exactly | The registered name | Refused |
-/// | Simulated (`MockExecution`) | A name the venue trades, exactly | The name traded | Left out of a read; refused by `open_order` |
+/// | Simulated (`MockExecution`) | A name the venue trades or holds an order on, exactly | The name traded | Refused |
 ///
 /// Each client's own documentation gives the detail.
 ///
@@ -564,8 +565,11 @@ where
     /// - **Every requested instrument the client read gets an entry**, orders or not: an entry is
     ///   what lets the engine retire an order it no longer lists (see `# Order completeness`).
     ///   The position follows [`InstrumentAccountSnapshot::position`](crate::InstrumentAccountSnapshot::position).
-    /// - **A requested instrument the client could not read** is left out, or listed with
-    ///   `orders_complete: false` and [`PositionReport::Unreported`](crate::position::PositionReport::Unreported),
+    /// - **A requested instrument the client cannot match** to the venue's names fails the call
+    ///   with [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid), as
+    ///   [`# Instrument names`](Self#instrument-names) says.
+    /// - **A requested instrument the client matched but could not read** is left out, or listed
+    ///   with `orders_complete: false` and [`PositionReport::Unreported`](crate::position::PositionReport::Unreported),
     ///   or fails the call, as each client documents. It is never listed with an empty, complete
     ///   order list, which would claim the venue holds no order on it.
     /// - **An empty slice is the "return all" sentinel**, as for
@@ -907,7 +911,9 @@ where
     ///
     /// An empty `instruments` slice is the "return all" sentinel: implementations must
     /// return open orders across all instruments. When non-empty, only orders for the
-    /// listed instruments are returned.
+    /// listed instruments are returned, and one the client cannot match is refused with
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid), as
+    /// [`# Instrument names`](Self#instrument-names) says.
     fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -920,7 +926,9 @@ where
     ///
     /// An empty `instruments` slice is the "return all" sentinel: implementations must
     /// return trades across all instruments. When non-empty, only trades for the listed
-    /// instruments are returned.
+    /// instruments are returned, and one the client cannot match is refused with
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid), as
+    /// [`# Instrument names`](Self#instrument-names) says.
     ///
     /// # Bounded, resumable reads
     ///
