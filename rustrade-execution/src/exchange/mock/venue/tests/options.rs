@@ -167,7 +167,7 @@ pub(super) fn balance(venue: &SimulatedVenue, asset: AssetNameExchange) -> Balan
 
 /// The option position the venue reports, `None` while flat.
 pub(super) fn option_position(venue: &SimulatedVenue) -> Option<Decimal> {
-    let snapshot = venue.account_snapshot(&[], &[]);
+    let snapshot = venue.account_snapshot(&[], &[]).unwrap();
     let instrument = snapshot
         .instruments
         .iter()
@@ -1833,7 +1833,7 @@ fn a_resting_covered_call_whose_fee_exceeds_its_premium_is_cancelled_at_its_fill
         time(3),
     );
 
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
     assert_eq!(option_position(&venue), None);
     assert_eq!(totals(&venue, spy()), (d("100"), d("100")));
     assert_eq!(totals(&venue, usd()), (Decimal::ZERO, Decimal::ZERO));

@@ -127,7 +127,7 @@ fn a_day_limit_rests_through_the_close_and_expires_the_instant_after_it() {
 
     // Still working at the close itself.
     advance(&mut venue, tuesday_close());
-    assert_eq!(venue.orders_open(&[]).len(), 1);
+    assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
 
     let events = venue.advance_time(just_after(tuesday_close()));
 
@@ -150,7 +150,7 @@ fn a_day_limit_rests_through_the_close_and_expires_the_instant_after_it() {
         }
         other => panic!("the order must be reported expired, got: {other:?}"),
     }
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
 }
 
 /// What trades at the close itself can still fill a day order, unlike a `GoodTillDate` order,
@@ -538,7 +538,7 @@ fn a_calendar_that_cannot_answer_refuses_the_day_order_and_moves_nothing() {
     let outcome = venue.open_order(limit_request("day", Side::Buy, "1", "48000", day()));
 
     assert!(outcome.events.is_empty());
-    assert!(venue.orders_open(&[]).is_empty());
+    assert!(venue.orders_open(&[]).unwrap().is_empty());
     match outcome.response.state {
         OrderState::Inactive(InactiveOrderState::OpenFailed(
             OrderError::UnsupportedTimeInForce { ref reason, .. },

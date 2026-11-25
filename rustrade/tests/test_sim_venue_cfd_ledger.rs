@@ -197,7 +197,7 @@ fn fill(
 }
 
 fn venue_position(venue: &SimulatedVenue) -> Option<(Decimal, Decimal)> {
-    let snapshot = venue.account_snapshot(&[], &[]);
+    let snapshot = venue.account_snapshot(&[], &[]).unwrap();
     let instrument = snapshot
         .instruments
         .iter()

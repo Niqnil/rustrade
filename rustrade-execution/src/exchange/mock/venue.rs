@@ -4724,15 +4724,23 @@ impl SimulatedVenue {
         })
     }
 
+    /// The account's open orders on `instruments`, or on every instrument with `instruments`
+    /// empty.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] for a requested instrument this venue does not know, as
+    /// [`account_snapshot`](Self::account_snapshot) says, before reading anything.
     pub fn orders_open(
         &self,
         instruments: &[InstrumentNameExchange],
-    ) -> Vec<Order<ExchangeId, InstrumentNameExchange, Open>> {
-        self.account
+    ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedApiError> {
+        self.refuse_unknown_instruments(instruments)?;
+        Ok(self
+            .account
             .orders_open()
             .filter(|order| is_requested_instrument(instruments, &order.key.instrument))
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// How each of `orders` ended, for those that have: filled, cancelled (including the
@@ -4764,11 +4772,77 @@ impl SimulatedVenue {
             .collect()
     }
 
+    /// Every trade the account made at or after `time_since`, on every instrument: the ledger
+    /// as it stands. [`trades_between`](Self::trades_between) is the read a client makes, bounded
+    /// on both sides and refusing an instrument this venue does not know.
     pub fn trades(
         &self,
         time_since: DateTime<Utc>,
     ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
         self.account.trades(time_since).cloned().collect()
+    }
+
+    /// The account's trades from `start` to `end`, both inclusive, on `instruments`, or on every
+    /// instrument with `instruments` empty: what
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) reads. A
+    /// `start` after `end` is an empty span, which reads no trades.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] for a requested instrument this venue does not know, as
+    /// [`account_snapshot`](Self::account_snapshot) says, before reading anything, so an empty
+    /// span refuses one too.
+    pub fn trades_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedApiError> {
+        self.refuse_unknown_instruments(instruments)?;
+        Ok(self
+            .account
+            .trades(start)
+            .filter(|trade| {
+                trade.time_exchange <= end
+                    && is_requested_instrument(instruments, &trade.instrument)
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Refuses the first of `instruments` this venue does not know: one it neither trades nor
+    /// holds an order on, open, cancelled or expired. Names are matched exactly, so a name spelled
+    /// in another case is unknown too.
+    ///
+    /// A read that left such a name out would answer for it with nothing, which a caller cannot
+    /// tell from "nothing there"; a live venue refuses a symbol it does not list. An order seeded
+    /// through `initial_state` on an instrument this venue does not trade is still held, and still
+    /// reported, so its instrument is known.
+    fn refuse_unknown_instruments(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<(), UnindexedApiError> {
+        // Reached only for a name this venue does not trade, which no order it booked can carry.
+        let holds_orders_on = |instrument: &InstrumentNameExchange| {
+            let named = |key: &UnindexedOrderKey| key.instrument == *instrument;
+            self.account.orders_open().any(|order| named(&order.key))
+                || self
+                    .account
+                    .orders_cancelled()
+                    .any(|order| named(&order.key))
+                || self.account.orders_expired().any(|order| named(&order.key))
+        };
+        match instruments.iter().find(|instrument| {
+            !self.instruments.contains_key(*instrument) && !holds_orders_on(instrument)
+        }) {
+            Some(unknown) => Err(ApiError::InstrumentInvalid(
+                unknown.clone(),
+                format!(
+                    "SimulatedVenue neither trades nor holds an order on {unknown} (names are \
+                     matched exactly)"
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Books an open against the ledger and reports everything it owes the client.
@@ -5537,17 +5611,23 @@ impl SimulatedVenue {
     /// [`ExecutionClient::account_snapshot`](crate::client::ExecutionClient::account_snapshot)
     /// defines them.
     ///
-    /// Instrument names are matched exactly, as [`orders_open`](Self::orders_open) matches them.
-    /// Each requested instrument this venue trades gets an entry, orders or not, so a consumer can
-    /// tell that an order it no longer lists is gone. A requested instrument it neither trades nor
-    /// holds an order on is left out: unknown, never flat. With `instruments` empty, the entries
-    /// are those with something to report: every instrument with an order, and every CFD and
-    /// option, flat or not.
+    /// Instrument names are matched exactly. Each requested instrument gets an entry, orders or
+    /// not, so a consumer can tell that an order it no longer lists is gone. With `instruments`
+    /// empty, the entries are those with something to report: every instrument with an order, and
+    /// every CFD and option, flat or not.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] for the first requested instrument this venue does not
+    /// know, before reading anything: one it neither trades nor holds an order on, which includes
+    /// a name it trades spelled in another case. An order seeded through `initial_state` on an
+    /// instrument it does not trade is still held, so that instrument is known, and its entry
+    /// lists the order with its position [`Unreported`](PositionReport::Unreported).
     pub fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> UnindexedAccountSnapshot {
+    ) -> Result<UnindexedAccountSnapshot, UnindexedApiError> {
+        self.refuse_unknown_instruments(instruments)?;
         let balances = self.balances(assets);
         // Filtered before each order is cloned, so an unrequested instrument's orders cost nothing.
         let requested =
@@ -5632,11 +5712,11 @@ impl SimulatedVenue {
         );
         snapshots.sort_unstable_by(|a, b| a.instrument.cmp(&b.instrument));
 
-        UnindexedAccountSnapshot {
+        Ok(UnindexedAccountSnapshot {
             exchange: self.exchange,
             balances,
             instruments: snapshots,
-        }
+        })
     }
 
     /// The position this venue reports for `instrument`.
@@ -7952,19 +8032,19 @@ fn invalid_config(error: &VenueConfigError) -> ! {
     panic!("invalid SimulatedVenue configuration: {error}")
 }
 
-/// What `balance` owes: its loan and the interest on it, zero on a cash account.
 /// Whether `instrument` is among those a read of `instruments` asks for: every instrument when
 /// `instruments` is empty, the "return all" sentinel of the [`ExecutionClient`] reads, and
 /// otherwise one named exactly.
 ///
 /// [`ExecutionClient`]: crate::client::ExecutionClient
-pub(crate) fn is_requested_instrument(
+fn is_requested_instrument(
     instruments: &[InstrumentNameExchange],
     instrument: &InstrumentNameExchange,
 ) -> bool {
     instruments.is_empty() || instruments.contains(instrument)
 }
 
+/// What `balance` owes: its loan and the interest on it, zero on a cash account.
 fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
     balance
         .balance
@@ -9130,6 +9210,7 @@ mod tests {
         let names = |assets: &[AssetNameExchange]| {
             let mut names = venue
                 .account_snapshot(assets, &[])
+                .unwrap()
                 .balances
                 .into_iter()
                 .map(|balance| balance.asset.name().to_string())
@@ -9166,6 +9247,7 @@ mod tests {
     ) -> Vec<(String, Vec<String>)> {
         venue
             .account_snapshot(&[], instruments)
+            .unwrap()
             .instruments
             .into_iter()
             .map(|entry| {
@@ -9179,10 +9261,9 @@ mod tests {
             .collect()
     }
 
-    /// An account snapshot reports the instruments asked for, each one this venue trades whether
-    /// or not it has anything to report, and leaves out one it does not trade or names otherwise.
-    /// Asked for none, it reports those with something to report: an instrument with an order,
-    /// and the CFD's position, flat or not.
+    /// An account snapshot reports the instruments asked for, each one whether or not it has
+    /// anything to report. Asked for none, it reports those with something to report: an
+    /// instrument with an order, and the CFD's position, flat or not.
     #[test]
     fn account_snapshot_reports_only_the_requested_instruments() {
         let mut venue = spot_and_cfd_venue();
@@ -9207,9 +9288,12 @@ mod tests {
             time(1),
         );
         let _ = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
-        assert_eq!(venue.orders_open(&[]).len(), 1, "the order rests");
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1, "the order rests");
         assert!(
-            venue.orders_open(std::slice::from_ref(&cfd)).is_empty(),
+            venue
+                .orders_open(std::slice::from_ref(&cfd))
+                .unwrap()
+                .is_empty(),
             "an open-order read filters by instrument as the snapshot does"
         );
 
@@ -9226,16 +9310,94 @@ mod tests {
             [entry(&cfd, &[])],
             "the spot instrument's order is not reported when only the CFD is asked for"
         );
+    }
+
+    /// The instrument a read refused, if it refused one with `InstrumentInvalid`.
+    fn refused<T: std::fmt::Debug>(read: Result<T, UnindexedApiError>) -> InstrumentNameExchange {
+        match read {
+            Err(ApiError::InstrumentInvalid(instrument, _)) => instrument,
+            other => panic!("expected InstrumentInvalid, got {other:?}"),
+        }
+    }
+
+    /// Every read naming instruments refuses one this venue does not know, as a live venue
+    /// refuses a symbol it does not list, rather than answering for it with nothing: one it does
+    /// not trade, and one it trades spelled in another case. A request naming a known instrument
+    /// beside an unknown one is refused whole, naming the unknown one, and a trade read refuses
+    /// one for an empty span too.
+    #[test]
+    fn every_read_refuses_an_instrument_the_venue_does_not_know() {
+        let venue = spot_and_cfd_venue();
+        let spot = instrument_name();
+        for unknown in ["ETHUSDT", "btcusdt"].map(InstrumentNameExchange::new) {
+            for instruments in [vec![unknown.clone()], vec![spot.clone(), unknown.clone()]] {
+                assert_eq!(
+                    refused(venue.account_snapshot(&[], &instruments)),
+                    unknown,
+                    "{instruments:?}"
+                );
+                assert_eq!(
+                    refused(venue.orders_open(&instruments)),
+                    unknown,
+                    "{instruments:?}"
+                );
+                assert_eq!(
+                    refused(venue.trades_between(time(0), time(10), &instruments)),
+                    unknown,
+                    "{instruments:?}"
+                );
+            }
+            assert_eq!(
+                refused(venue.trades_between(time(10), time(0), std::slice::from_ref(&unknown))),
+                unknown,
+                "an empty span still refuses"
+            );
+        }
+
+        let Err(ApiError::InstrumentInvalid(_, reason)) =
+            venue.orders_open(&[InstrumentNameExchange::new("btcusdt")])
+        else {
+            panic!("refused above");
+        };
         assert_eq!(
-            snapshot_entries(&venue, &[InstrumentNameExchange::new("ETHUSDT")]),
-            [],
-            "an instrument the venue does not trade is unknown, not listed empty"
+            reason,
+            "SimulatedVenue neither trades nor holds an order on btcusdt (names are matched \
+             exactly)"
         );
+    }
+
+    /// A trade read returns the requested instruments' trades from `start` to `end`, both
+    /// inclusive, and every instrument's with none requested.
+    #[test]
+    fn a_trade_read_keeps_the_requested_instruments_and_span() {
+        let mut venue = spot_and_cfd_venue();
+        let (spot, cfd) = (instrument_name(), cfd_instrument_name());
+        let _ = venue.apply_market(
+            &spot,
+            MarketObservation::new(book("49000", "49100")),
+            time(1),
+        );
+        let _ = venue.open_order(limit_request("taker", Side::Buy, "0.01", "49200", gtc()));
+        let [trade] = venue.trades(time(0)).try_into().unwrap();
+        let at = trade.time_exchange;
+        let read = |start, end, instruments: &[InstrumentNameExchange]| {
+            venue
+                .trades_between(start, end, instruments)
+                .unwrap()
+                .into_iter()
+                .map(|trade| trade.id)
+                .collect::<Vec<_>>()
+        };
+
         assert_eq!(
-            snapshot_entries(&venue, &[InstrumentNameExchange::new("btcusdt")]),
-            [],
-            "names are matched exactly, as the venue's other reads match them"
+            read(at, at, std::slice::from_ref(&spot)),
+            std::slice::from_ref(&trade.id)
         );
+        assert_eq!(read(time(0), at, &[]), std::slice::from_ref(&trade.id));
+        assert_eq!(read(time(0), at, &[cfd.clone(), spot.clone()]), [trade.id]);
+        assert!(read(time(0), at, std::slice::from_ref(&cfd)).is_empty());
+        assert!(read(time(0), at - TimeDelta::milliseconds(1), &[]).is_empty());
+        assert!(read(at + TimeDelta::milliseconds(1), time(100), &[]).is_empty());
     }
 
     /// A venue trading an instrument the engine does not register, asked for the assets and
@@ -9267,18 +9429,19 @@ mod tests {
         let indexer = AccountEventIndexer::new(std::sync::Arc::new(map));
 
         let indexed = indexer
-            .snapshot(venue.account_snapshot(&assets, &instruments))
+            .snapshot(venue.account_snapshot(&assets, &instruments).unwrap())
             .expect("a snapshot of the registered instruments indexes");
         assert_eq!(indexed.instruments.len(), 1, "{indexed:?}");
 
         assert!(matches!(
-            indexer.snapshot(venue.account_snapshot(&assets, &[])),
+            indexer.snapshot(venue.account_snapshot(&assets, &[]).unwrap()),
             Err(IndexError::InstrumentIndex(_))
         ));
     }
 
     /// An order seeded on an instrument the venue does not trade is still held, so a request
-    /// naming that instrument lists it, and one naming another instrument does not.
+    /// naming that instrument lists it, and one naming another instrument does not. Every read
+    /// knows its instrument while the venue holds the order open, cancelled or expired.
     #[test]
     fn a_seeded_order_on_an_instrument_the_venue_does_not_trade_is_listed_when_asked_for() {
         let untraded = InstrumentNameExchange::new("ETHUSDT");
@@ -9318,6 +9481,114 @@ mod tests {
             snapshot_entries(&venue, &[instrument_name()]),
             [("BTCUSDT".to_string(), Vec::<String>::new())]
         );
+        assert_eq!(
+            venue
+                .orders_open(std::slice::from_ref(&untraded))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            venue
+                .trades_between(time(0), time(10), std::slice::from_ref(&untraded))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A venue seeded with `order` on `instrument`, which it does not trade.
+    fn venue_seeded_off_list(
+        instrument: &InstrumentNameExchange,
+        order: Order<
+            ExchangeId,
+            InstrumentNameExchange,
+            OrderState<AssetNameExchange, InstrumentNameExchange>,
+        >,
+    ) -> SimulatedVenue {
+        let mut config = spot_config("10", "10000000", FeeModelConfig::default());
+        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+            instrument: instrument.clone(),
+            orders: vec![OrderReport::state_only(order)],
+            orders_complete: true,
+            position: PositionReport::Unreported,
+            isolated: None,
+        }];
+        SimulatedVenue::new(&config, spot_instruments())
+    }
+
+    /// A seeded order on `instrument` in `time_in_force` and `state`.
+    fn seeded_off_list(
+        instrument: &InstrumentNameExchange,
+        time_in_force: TimeInForce,
+        state: OrderState<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Order<
+        ExchangeId,
+        InstrumentNameExchange,
+        OrderState<AssetNameExchange, InstrumentNameExchange>,
+    > {
+        Order {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument.clone(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("seeded"),
+            },
+            side: Side::Buy,
+            price: Some(d("2000")),
+            quantity: d("1"),
+            kind: OrderKind::Limit,
+            time_in_force,
+            state,
+        }
+    }
+
+    /// An instrument the venue does not trade stays known once the only order on it has ended
+    /// cancelled or expired, since the venue still holds that order and lists it.
+    #[test]
+    fn an_untraded_instrument_stays_known_while_an_ended_order_on_it_is_held() {
+        let untraded = InstrumentNameExchange::new("ETHUSDT");
+        let known = |venue: &SimulatedVenue| {
+            venue
+                .account_snapshot(&[], std::slice::from_ref(&untraded))
+                .is_ok()
+                && venue.orders_open(std::slice::from_ref(&untraded)).is_ok()
+                && venue
+                    .trades_between(time(0), time(100), std::slice::from_ref(&untraded))
+                    .is_ok()
+        };
+
+        let cancelled = venue_seeded_off_list(
+            &untraded,
+            seeded_off_list(
+                &untraded,
+                gtc(),
+                OrderState::inactive(Cancelled::new(
+                    OrderId::new("seeded"),
+                    time(0),
+                    Some(Decimal::ZERO),
+                )),
+            ),
+        );
+        assert!(known(&cancelled), "a held cancelled order keeps it known");
+
+        let mut expiring = venue_seeded_off_list(
+            &untraded,
+            seeded_off_list(
+                &untraded,
+                TimeInForce::GoodTillDate { expiry: time(10) },
+                OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("seeded")),
+                    time_exchange: time(0),
+                    filled_quantity: Decimal::ZERO,
+                }),
+            ),
+        );
+        let _ = expiring.advance_time(time(11));
+        assert!(
+            expiring.orders_open(&[]).unwrap().is_empty(),
+            "the order expired"
+        );
+        assert!(known(&expiring), "a held expired order keeps it known");
     }
 
     fn make_venue_with_fee(btc: &str, usdt: &str, fee_model: FeeModelConfig) -> SimulatedVenue {
@@ -9753,7 +10024,7 @@ mod tests {
 
         advance(&mut venue, much_later);
 
-        let resting = venue.orders_open(&[]);
+        let resting = venue.orders_open(&[]).unwrap();
         assert_eq!(resting.len(), 1, "the seeded order must still be open");
         assert_eq!(
             resting[0].state.time_exchange, arrived,
@@ -9800,7 +10071,11 @@ mod tests {
 
         // Nothing was cancelled, so nothing may appear in the ledger either.
         assert!(
-            venue.account_snapshot(&[], &[]).instruments.is_empty(),
+            venue
+                .account_snapshot(&[], &[])
+                .unwrap()
+                .instruments
+                .is_empty(),
             "a rejected cancel must not enter the ledger"
         );
     }
@@ -10016,7 +10291,7 @@ mod tests {
 
     /// The venue's reported CFD position as `(quantity, entry)`, or `None` while flat.
     fn cfd_position(venue: &SimulatedVenue) -> Option<(Decimal, Option<Decimal>)> {
-        let snapshot = venue.account_snapshot(&[], &[]);
+        let snapshot = venue.account_snapshot(&[], &[]).unwrap();
         let Some(instrument) = snapshot
             .instruments
             .iter()
@@ -10152,7 +10427,7 @@ mod tests {
             market_prices("50000"),
         ));
 
-        let snapshot = venue.account_snapshot(&[], &[]);
+        let snapshot = venue.account_snapshot(&[], &[]).unwrap();
         assert!(
             snapshot
                 .instruments
@@ -11994,6 +12269,7 @@ mod tests {
 
         let reports = venue
             .account_snapshot(&[], &[])
+            .unwrap()
             .instruments
             .into_iter()
             .flat_map(|instrument| instrument.orders)
@@ -12126,7 +12402,7 @@ mod tests {
             );
             assert!(outcome.events.is_empty(), "a refused order moves nothing");
             assert!(venue.trades(time(0)).is_empty(), "and nothing traded");
-            assert!(venue.orders_open(&[]).is_empty(), "or rests");
+            assert!(venue.orders_open(&[]).unwrap().is_empty(), "or rests");
             assert_eq!(free_quote(&venue), d("10000000"));
             assert_eq!(total_base(&venue), d("100"));
         }
@@ -12237,6 +12513,7 @@ mod tests {
 
         let open = venue
             .orders_open(&[instrument_name()])
+            .unwrap()
             .pop()
             .expect("the order is on the book");
         assert_eq!(open.price, Some(d("48000")));
@@ -12344,7 +12621,7 @@ mod tests {
             order_of(&events[3]).state
         );
         assert!(
-            venue.orders_open(&[]).is_empty(),
+            venue.orders_open(&[]).unwrap().is_empty(),
             "a filled order leaves the book"
         );
     }
@@ -12700,7 +12977,7 @@ mod tests {
             "10bp TAKER on 47900: it crossed the spread rather than resting"
         );
         assert!(
-            venue.orders_open(&[]).is_empty(),
+            venue.orders_open(&[]).unwrap().is_empty(),
             "it filled on arrival, so it never rested"
         );
     }
@@ -12857,6 +13134,7 @@ mod tests {
         assert_eq!(
             venue
                 .orders_open(&[])
+                .unwrap()
                 .into_iter()
                 .map(|order| order.key.cid)
                 .collect::<Vec<_>>(),
@@ -12916,7 +13194,7 @@ mod tests {
             "the offer is 48100, so a 48000 bid is not crossed however the trade price reads"
         );
         assert_eq!(
-            venue.orders_open(&[]).len(),
+            venue.orders_open(&[]).unwrap().len(),
             1,
             "the order is still resting"
         );
@@ -13033,7 +13311,10 @@ mod tests {
                 ApiError::BalanceInsufficient(..)
             )))
         ));
-        assert!(venue.orders_open(&[]).is_empty(), "it never rested");
+        assert!(
+            venue.orders_open(&[]).unwrap().is_empty(),
+            "it never rested"
+        );
         assert_eq!(
             venue.balances(&[quote()]).remove(0).balance.free,
             d("1000"),
@@ -13076,7 +13357,7 @@ mod tests {
         let cancelled = outcome.response.state.expect("the order was on the book");
         assert_eq!(cancelled.filled_quantity, Some(Decimal::ZERO));
         assert_eq!(cancelled.time_exchange, time(2));
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
     }
 
     /// The cancel-vs-fill race, which a non-zero `to_venue` latency makes reachable. The caller is
@@ -13155,7 +13436,7 @@ mod tests {
             state: RequestCancel { id: None },
         });
 
-        let snapshot = venue.account_snapshot(&[], &[]);
+        let snapshot = venue.account_snapshot(&[], &[]).unwrap();
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -13198,7 +13479,7 @@ mod tests {
                 "{time_in_force} must move no balance"
             );
             assert!(
-                venue.orders_open(&[]).is_empty(),
+                venue.orders_open(&[]).unwrap().is_empty(),
                 "{time_in_force} must not rest"
             );
             match outcome.response.state {
@@ -13272,7 +13553,7 @@ mod tests {
 
             assert!(outcome.events.is_empty(), "limit {limit}: no balance moves");
             assert!(
-                venue.orders_open(&[]).is_empty(),
+                venue.orders_open(&[]).unwrap().is_empty(),
                 "limit {limit}: nothing rests"
             );
             match outcome.response.state {
@@ -13362,7 +13643,10 @@ mod tests {
         ));
 
         assert!(outcome.events.is_empty(), "nothing was reserved or traded");
-        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        assert!(
+            venue.orders_open(&[]).unwrap().is_empty(),
+            "it must not rest"
+        );
         assert!(venue.trades(time(0)).is_empty(), "it must not trade");
 
         match outcome.response.state {
@@ -13397,7 +13681,7 @@ mod tests {
         ));
 
         assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
-        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
         assert_eq!(
             balance_of(&outcome.events[0]).balance.free,
             d("1000000") - d("48000") - d("9.6"),
@@ -13433,7 +13717,7 @@ mod tests {
                 "{time_in_force} must move no balance"
             );
             assert!(
-                venue.orders_open(&[]).is_empty(),
+                venue.orders_open(&[]).unwrap().is_empty(),
                 "{time_in_force} must not rest"
             );
             match outcome.response.state {
@@ -13497,7 +13781,11 @@ mod tests {
 
         // Short of the deadline, so the sweep must find nothing.
         advance(&mut venue, time(8));
-        assert_eq!(venue.orders_open(&[]).len(), 1, "still working at time(8)");
+        assert_eq!(
+            venue.orders_open(&[]).unwrap().len(),
+            1,
+            "still working at time(8)"
+        );
     }
 
     /// Advancing to the deadline retires the order, releases what it held, and says so in order.
@@ -13533,7 +13821,10 @@ mod tests {
             ref other => panic!("the order must be reported expired, got: {other:?}"),
         }
 
-        assert!(venue.orders_open(&[]).is_empty(), "it must leave the book");
+        assert!(
+            venue.orders_open(&[]).unwrap().is_empty(),
+            "it must leave the book"
+        );
     }
 
     /// The deadline is reached *at* its instant, not after it.
@@ -13555,11 +13846,11 @@ mod tests {
 
         // One second short: still working.
         advance(&mut venue, time(4));
-        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
 
         // Exactly the stated instant: retired.
         assert_eq!(venue.advance_time(time(5)).len(), 2);
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
     }
 
     /// A tick that both reaches a deadline and crosses the order retires it rather than filling it.
@@ -13616,7 +13907,10 @@ mod tests {
         ));
 
         assert!(outcome.events.is_empty(), "nothing was reserved");
-        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        assert!(
+            venue.orders_open(&[]).unwrap().is_empty(),
+            "it must not rest"
+        );
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
                 assert_eq!(expired.time_exchange, time(9), "stamped when it was found");
@@ -13648,7 +13942,10 @@ mod tests {
             TimeInForce::GoodTillDate { expiry: time(5) },
         ));
 
-        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        assert!(
+            venue.orders_open(&[]).unwrap().is_empty(),
+            "it must not rest"
+        );
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
                 assert_eq!(expired.time_exchange, time(9), "stamped at the tick");
@@ -13784,7 +14081,7 @@ mod tests {
         ));
         assert_eq!(venue.advance_time(time(5)).len(), 2);
 
-        let snapshot = venue.account_snapshot(&[], &[]);
+        let snapshot = venue.account_snapshot(&[], &[]).unwrap();
         let orders = &snapshot.instruments[0].orders;
         assert_eq!(orders.len(), 1);
         assert!(matches!(
@@ -13851,7 +14148,7 @@ mod tests {
             2,
             "the quiet instrument's order still retires"
         );
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
     }
 
     /// An order the venue took nothing for releases nothing, exactly as cancelling one does.
@@ -14046,7 +14343,7 @@ mod tests {
             other => panic!("a market order's unfillable remainder is cancelled, got: {other:?}"),
         }
         assert!(
-            venue.orders_open(&[]).is_empty(),
+            venue.orders_open(&[]).unwrap().is_empty(),
             "a market order has no price to rest the remainder at"
         );
     }
@@ -14122,7 +14419,7 @@ mod tests {
             "the remainder rests carrying what has already traded"
         );
         assert_eq!(open.quantity_remaining(d("1")), d("0.6"));
-        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
 
         // Settled the taker leg, still holding the maker one: 19179.16 spent, 28805.76 held.
         assert_eq!(total_quote(&venue), d("1000000") - d("19179.16"));
@@ -14489,7 +14786,7 @@ mod tests {
         assert_eq!(free_quote(&venue), d(FUNDED), "the ledger is as it was");
         assert_eq!(total_quote(&venue), d(FUNDED));
         assert!(venue.trades(time(0)).is_empty(), "and nothing traded");
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
     }
 
     fn is_duplicate_cid(state: &UnindexedOrderState) -> bool {
@@ -14517,7 +14814,7 @@ mod tests {
             second.response.state
         );
         assert!(second.events.is_empty(), "a rejection moves nothing");
-        let [resting] = &venue.orders_open(&[])[..] else {
+        let [resting] = &venue.orders_open(&[]).unwrap()[..] else {
             panic!("one cid, one resting order");
         };
         assert_eq!(
@@ -14549,7 +14846,7 @@ mod tests {
             outcome.response.state
         );
         assert!(venue.trades(time(0)).is_empty(), "nothing traded");
-        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
     }
 
     /// A malformed request is reported as malformed, even under a resting id.
@@ -14602,7 +14899,7 @@ mod tests {
             venue.orders_ended(&[key_of("resting")]).is_empty(),
             "the order under the id is working, whatever became of the one before it"
         );
-        let snapshot = venue.account_snapshot(&[], &[]);
+        let snapshot = venue.account_snapshot(&[], &[]).unwrap();
         let listed = snapshot
             .instruments
             .iter()
@@ -15422,7 +15719,7 @@ mod tests {
         assert!(reject.message.contains("spx500_usd"), "{}", reject.message);
         assert_eq!(free_usd(&venue), d("10000000"));
         assert_eq!(cfd_position(&venue), None);
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
     }
 
     /// A delisting time at or before the clock refuses the short even when the provider still
@@ -15868,7 +16165,7 @@ mod tests {
         );
         assert_eq!(total_quote(&venue), d("10000"), "and nothing paid yet");
         assert!(venue.trades(time(0)).is_empty());
-        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(venue.orders_open(&[]).unwrap().len(), 1);
         assert!(venue.account.orders().holds(&instrument_name()));
     }
 
@@ -15908,7 +16205,7 @@ mod tests {
             order_of(&events[3]).state
         );
 
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
         assert!(!venue.account.orders().holds(&instrument_name()));
         assert_eq!(total_base(&venue), d("11"));
         assert_eq!(free_quote(&venue), d("9898"));
@@ -16065,7 +16362,7 @@ mod tests {
         let outcome = venue.open_order(request);
         assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
         assert_eq!(outcome.response.price, None, "reported as it is held");
-        assert_eq!(venue.orders_open(&[])[0].price, None);
+        assert_eq!(venue.orders_open(&[]).unwrap()[0].price, None);
 
         let ticked = venue.apply_market(
             &instrument_name(),
@@ -16271,7 +16568,7 @@ mod tests {
             "{:?}",
             order.state
         );
-        assert!(venue.orders_open(&[]).is_empty());
+        assert!(venue.orders_open(&[]).unwrap().is_empty());
         assert!(
             venue.expire_held(time(6)).is_empty(),
             "nothing is held twice"

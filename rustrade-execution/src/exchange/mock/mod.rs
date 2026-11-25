@@ -433,10 +433,13 @@ impl MockExchange {
                 response_tx,
                 start,
                 end,
+                instruments,
             } => {
-                let mut trades = self.venue.trades(start);
-                trades.retain(|trade| trade.time_exchange <= end);
-                emit.respond(Vec::new(), response_tx, trades);
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.trades_between(start, end, &instruments),
+                );
             }
             MockExchangeRequestKind::Checkpoint { response_tx } => {
                 let checkpoint = self.venue.checkpoint();
@@ -1296,7 +1299,10 @@ mod tests {
                 response_tx,
             ))
             .unwrap();
-        let snapshot = response_rx.await.expect("a snapshot must be answered");
+        let snapshot = response_rx
+            .await
+            .expect("a snapshot must be answered")
+            .unwrap();
 
         let assets = snapshot
             .balances
@@ -1310,6 +1316,83 @@ mod tests {
             .map(|entry| entry.instrument.clone())
             .collect::<Vec<_>>();
         assert_eq!(instruments, [instrument_name()]);
+
+        drop(request_tx);
+        driver.await.unwrap();
+    }
+
+    /// The instruments an open-order or trade request names reach the venue, which refuses one
+    /// it does not trade and reads the others: here the spot instrument's one fill.
+    #[tokio::test]
+    async fn an_open_order_or_trade_request_passes_its_instruments_to_the_venue() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _events) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("100", "10000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+
+        let (open_tx, open_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                open_tx,
+                buy_request("0.01", market_prices("50000")),
+            ))
+            .unwrap();
+        open_rx.await.unwrap();
+
+        let orders_open = |instruments: Vec<InstrumentNameExchange>| {
+            let (orders_tx, orders_rx) = oneshot::channel();
+            request_tx
+                .send(MockExchangeRequest::fetch_orders_open(
+                    Utc::now(),
+                    instruments,
+                    orders_tx,
+                ))
+                .unwrap();
+            orders_rx
+        };
+        let trades = |instruments: Vec<InstrumentNameExchange>| {
+            let (trades_tx, trades_rx) = oneshot::channel();
+            request_tx
+                .send(MockExchangeRequest::fetch_trades(
+                    Utc::now(),
+                    trades_tx,
+                    Utc::now() - TimeDelta::hours(1),
+                    Utc::now() + TimeDelta::hours(1),
+                    instruments,
+                ))
+                .unwrap();
+            trades_rx
+        };
+
+        let unknown = InstrumentNameExchange::new("ETHUSDT");
+        let refused = |read: Result<(), crate::error::UnindexedApiError>| matches!(read, Err(crate::error::ApiError::InstrumentInvalid(name, _)) if name == unknown);
+        let unknown_orders: Result<Vec<_>, _> = orders_open(vec![unknown.clone()]).await.unwrap();
+        assert!(refused(unknown_orders.map(drop)));
+        let unknown_trades: Result<Vec<_>, _> = trades(vec![unknown.clone()]).await.unwrap();
+        assert!(refused(unknown_trades.map(drop)));
+
+        assert!(
+            orders_open(vec![instrument_name()])
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "the market order filled whole"
+        );
+        let fills = trades(vec![instrument_name()]).await.unwrap().unwrap();
+        assert_eq!(
+            fills
+                .iter()
+                .map(|trade| trade.instrument.clone())
+                .collect::<Vec<_>>(),
+            [instrument_name()]
+        );
 
         drop(request_tx);
         driver.await.unwrap();
@@ -1880,10 +1963,14 @@ mod tests {
         let (trades_tx, trades_rx) = oneshot::channel();
         request_tx
             .send(MockExchangeRequest::fetch_trades(
-                made, trades_tx, made, booked,
+                made,
+                trades_tx,
+                made,
+                booked,
+                Vec::new(),
             ))
             .unwrap();
-        let trades = trades_rx.await.expect("the fetch is answered");
+        let trades = trades_rx.await.expect("the fetch is answered").unwrap();
         assert_eq!(
             trades
                 .iter()

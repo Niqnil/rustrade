@@ -41,7 +41,7 @@ impl MockExchangeRequest {
         time_request: DateTime<Utc>,
         assets: Vec<AssetNameExchange>,
         instruments: Vec<InstrumentNameExchange>,
-        response_tx: oneshot::Sender<UnindexedAccountSnapshot>,
+        response_tx: oneshot::Sender<Result<UnindexedAccountSnapshot, UnindexedApiError>>,
     ) -> Self {
         Self::new(
             time_request,
@@ -70,7 +70,9 @@ impl MockExchangeRequest {
     pub fn fetch_orders_open(
         time_request: DateTime<Utc>,
         instruments: Vec<InstrumentNameExchange>,
-        response_tx: oneshot::Sender<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>>,
+        response_tx: oneshot::Sender<
+            Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedApiError>,
+        >,
     ) -> Self {
         Self::new(
             time_request,
@@ -113,9 +115,12 @@ impl MockExchangeRequest {
 
     pub fn fetch_trades(
         time_request: DateTime<Utc>,
-        response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
+        response_tx: oneshot::Sender<
+            Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedApiError>,
+        >,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        instruments: Vec<InstrumentNameExchange>,
     ) -> Self {
         Self::new(
             time_request,
@@ -123,6 +128,7 @@ impl MockExchangeRequest {
                 response_tx,
                 start,
                 end,
+                instruments,
             },
         )
     }
@@ -232,19 +238,24 @@ pub enum MockExchangeRequestKind {
         /// The assets whose balances to report; empty for every asset held.
         assets: Vec<AssetNameExchange>,
         /// The instruments whose orders and positions to report; empty for every instrument with
-        /// something to report. See [`SimulatedVenue::account_snapshot`].
+        /// something to report. See [`SimulatedVenue::account_snapshot`], which also gives the
+        /// refusal the answer carries for an instrument the venue does not know.
         ///
         /// [`SimulatedVenue::account_snapshot`]: crate::exchange::mock::venue::SimulatedVenue::account_snapshot
         instruments: Vec<InstrumentNameExchange>,
-        response_tx: oneshot::Sender<UnindexedAccountSnapshot>,
+        response_tx: oneshot::Sender<Result<UnindexedAccountSnapshot, UnindexedApiError>>,
     },
     FetchBalances {
         assets: Vec<AssetNameExchange>,
         response_tx: oneshot::Sender<Vec<AssetBalance<AssetNameExchange>>>,
     },
+    /// The open orders on `instruments`, empty for every instrument: see
+    /// [`SimulatedVenue::orders_open`](crate::exchange::mock::venue::SimulatedVenue::orders_open).
     FetchOrdersOpen {
         instruments: Vec<InstrumentNameExchange>,
-        response_tx: oneshot::Sender<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>>,
+        response_tx: oneshot::Sender<
+            Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedApiError>,
+        >,
     },
     FetchOrdersEnded {
         orders: Vec<UnindexedOrderKey>,
@@ -256,11 +267,16 @@ pub enum MockExchangeRequestKind {
         side: Side,
         response_tx: oneshot::Sender<Result<BorrowCapacity, UnindexedApiError>>,
     },
-    /// Every trade from `start` to `end`, both inclusive.
+    /// Every trade from `start` to `end`, both inclusive, on `instruments`, empty for every
+    /// instrument: see
+    /// [`SimulatedVenue::trades_between`](crate::exchange::mock::venue::SimulatedVenue::trades_between).
     FetchTrades {
-        response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
+        response_tx: oneshot::Sender<
+            Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedApiError>,
+        >,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        instruments: Vec<InstrumentNameExchange>,
     },
     /// Send a [`VenueCheckpoint`](crate::exchange::mock::venue::VenueCheckpoint) on the account
     /// stream, after everything the venue produced before it, answering with its id once sent.

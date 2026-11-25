@@ -3184,20 +3184,21 @@ mod tests {
                 while let Some(MockExchangeRequest { kind, .. }) = request_rx.recv().await {
                     match kind {
                         MockExchangeRequestKind::FetchAccountSnapshot { response_tx, .. } => {
-                            let _ = response_tx.send(UnindexedAccountSnapshot::new(
+                            let _ = response_tx.send(Ok(UnindexedAccountSnapshot::new(
                                 ExchangeId::Mock,
                                 vec![],
                                 vec![],
-                            ));
+                            )));
                         }
                         MockExchangeRequestKind::FetchTrades {
                             response_tx,
                             start,
                             end,
+                            ..
                         } => {
                             let held = (start..=end).contains(&fill.time_exchange);
-                            let _ =
-                                response_tx.send(held.then(|| fill.clone()).into_iter().collect());
+                            let _ = response_tx
+                                .send(Ok(held.then(|| fill.clone()).into_iter().collect()));
                         }
                         other => panic!("unexpected request {other:?}"),
                     }

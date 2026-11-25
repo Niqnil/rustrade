@@ -977,7 +977,12 @@ where
         let seeding = venues
             .values()
             .map(|slot| {
-                let mut snapshot = slot.venue.account_snapshot(&[], &[]);
+                // Asked for every instrument, the venue names none it could refuse.
+                let mut snapshot = slot.venue.account_snapshot(&[], &[]).map_err(|error| {
+                    SimFault(format!(
+                        "could not read the venue's initial account: {error}"
+                    ))
+                })?;
                 for balance in &mut snapshot.balances {
                     balance.time_exchange = time_engine_start;
                 }
@@ -3838,7 +3843,7 @@ mod tests {
         );
         let venue = &harness.runner.venues()[&harness.exchange].venue;
         assert!(
-            venue.orders_open(&[]).is_empty(),
+            venue.orders_open(&[]).unwrap().is_empty(),
             "the venue never saw the opens"
         );
     }
