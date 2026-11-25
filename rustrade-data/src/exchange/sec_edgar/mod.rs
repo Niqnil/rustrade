@@ -23,6 +23,12 @@
 //!   report (nor than the next period's end). An issuer can furnish other figures under Item 2.02
 //!   between a period's end and its results, such as quarterly production and delivery numbers or
 //!   preliminary results; the full results come last.
+//! - **A release furnished after its report counts.** Item 2.02 allows four business days, so a
+//!   release made the day the report is filed can reach EDGAR after it. An Item 2.02 8-K filed
+//!   after the report is also a candidate when its report date, the date of the event it
+//!   reports, falls after the period end and no later than the report, and it is filed no later
+//!   than the next period's end (with no limit while no later report is filed). The latest
+//!   candidate is chosen by filing date, then acceptance.
 //! - **The newest period appears once its report is filed.** Until then nothing in the index says
 //!   which Item 2.02 filing is its release, so it is left out rather than guessed. Large companies
 //!   often file the 10-Q with the release or days later; a 10-Q is due 40 to 45 days after the
@@ -42,8 +48,9 @@
 //! - **Foreign private issuers** file 20-F, 40-F and 6-K reports, which carry no item numbers:
 //!   [`SecEdgarError::ForeignPrivateIssuer`].
 //! - **Results first disclosed in the 10-Q or 10-K**, with no 8-K: no release.
-//! - **A later Item 2.02 filing before the report**, such as an updated outlook furnished between
-//!   the results and the 10-Q: it is taken as the release, in place of the results.
+//! - **A later Item 2.02 filing**, such as an updated outlook furnished between the results and
+//!   the 10-Q, or supplementary figures furnished after the 10-Q about an event no later than it:
+//!   it is taken as the release, in place of the results.
 //! - **Older filings**: EDGAR's item lists are complete from 2012; some earlier 8-Ks lack them, so
 //!   their releases can be missing.
 //! - **Coming releases**: EDGAR records filings only after the fact.

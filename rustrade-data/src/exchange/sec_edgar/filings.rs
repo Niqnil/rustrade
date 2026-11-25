@@ -142,8 +142,14 @@ pub(crate) enum Releases<'a> {
 }
 
 /// The release of each fiscal period: for a quarterly or annual report with period end P, filed
-/// on F, the **latest** 8-K furnishing Item 2.02 filed after P and no later than F, nor than the
-/// next report's period end.
+/// on F, the **latest** 8-K furnishing Item 2.02 that is either
+/// - filed after P and no later than F, nor than the next report's period end, or
+/// - filed after F, no later than the next report's period end (unbounded while no later report
+///   is filed), with a report date, the date of the event it reports, after P and no later
+///   than F: a release furnished after the report, as Item 2.02's four business days allow.
+///
+/// The latest is chosen by filing date, then acceptance, so a release furnished after the report
+/// wins over figures furnished before it.
 ///
 /// - **The latest, not the earliest**, because an issuer can furnish other results under Item
 ///   2.02 after a period ends and before its release: a quarter's production and delivery
@@ -187,13 +193,20 @@ pub(crate) fn releases(filings: &[Filing]) -> Releases<'_> {
         .iter()
         .enumerate()
         .filter_map(|(index, &(period_end, report_filed))| {
-            let last = periods
-                .get(index + 1)
-                .map_or(report_filed, |&(next_end, _)| report_filed.min(next_end));
+            let next_end = periods.get(index + 1).map(|&(next_end, _)| next_end);
+            let last = next_end.map_or(report_filed, |next_end| report_filed.min(next_end));
+            let reports_before_the_report =
+                |date: NaiveDate| date > period_end && date <= report_filed;
             results
                 .iter()
                 .copied()
-                .filter(|f| f.filed > period_end && f.filed <= last)
+                .filter(|f| {
+                    let filed_by_the_report = f.filed > period_end && f.filed <= last;
+                    let filed_after_the_report = f.filed > report_filed
+                        && next_end.is_none_or(|next_end| f.filed <= next_end)
+                        && f.report_date.is_some_and(reports_before_the_report);
+                    filed_by_the_report || filed_after_the_report
+                })
                 .max_by(|a, b| (a.filed, &a.acceptance).cmp(&(b.filed, &b.acceptance)))
                 .map(|release| (period_end, release))
         })
@@ -294,6 +307,82 @@ mod tests {
                 (date("2026-09-30"), "q3-results"),
             ]
         );
+    }
+
+    #[test]
+    fn a_release_furnished_after_its_report_is_paired_by_its_report_date() {
+        // Two releases whose 8-K was filed the day after the 10-Q, each reporting the release
+        // day, the day the 10-Q was filed.
+        let filings = [
+            filing("q3-10q", "10-Q", "2023-11-08", "2023-09-30", ""),
+            filing("q3-results", "8-K", "2023-11-09", "2023-11-08", "2.02,9.01"),
+            filing("q4-10k", "10-K", "2024-03-12", "2023-12-31", ""),
+            filing("q4-results", "8-K", "2024-03-07", "2024-03-07", "2.02,9.01"),
+            filing("q1-10q", "10-Q", "2025-05-08", "2025-03-31", ""),
+            filing("q1-results", "8-K", "2025-05-09", "2025-05-08", "2.02,9.01"),
+        ];
+        assert_eq!(
+            paired(&filings),
+            vec![
+                (date("2023-09-30"), "q3-results"),
+                (date("2023-12-31"), "q4-results"),
+                (date("2025-03-31"), "q1-results"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_release_furnished_after_its_report_wins_over_figures_furnished_before() {
+        let filings = [
+            filing("q3-10q", "10-Q", "2026-11-05", "2026-09-30", ""),
+            filing("q3-deliveries", "8-K", "2026-10-02", "2026-10-02", "2.02"),
+            filing("q3-results", "8-K", "2026-11-06", "2026-11-05", "2.02,9.01"),
+        ];
+        assert_eq!(paired(&filings), vec![(date("2026-09-30"), "q3-results")]);
+    }
+
+    #[test]
+    fn an_8k_furnished_after_the_report_needs_a_report_date_within_the_period_window() {
+        let filings = [
+            filing("q2-10q", "10-Q", "2026-08-05", "2026-06-30", ""),
+            // Reports an event after the 10-Q was filed: not this period's release.
+            filing("later-event", "8-K", "2026-08-07", "2026-08-06", "2.02"),
+            // Reports an event on the period end or earlier.
+            filing("on-period-end", "8-K", "2026-08-06", "2026-06-30", "2.02"),
+            // No report date.
+            filing("no-report-date", "8-K", "2026-08-06", "", "2.02"),
+        ];
+        assert_eq!(paired(&filings), vec![]);
+    }
+
+    #[test]
+    fn an_8k_furnished_after_the_report_must_be_filed_by_the_next_period_end() {
+        let filings = [
+            filing("q2-10q", "10-Q", "2026-08-05", "2026-06-30", ""),
+            filing("q3-10q", "10-Q", "2026-11-05", "2026-09-30", ""),
+            // Reports Q2's release day, but filed after Q3 ended.
+            filing("too-late", "8-K", "2026-10-01", "2026-08-05", "2.02"),
+            // Filed on Q3's period end: still Q2's.
+            filing("in-time", "8-K", "2026-09-30", "2026-08-04", "2.02"),
+            filing("q3-results", "8-K", "2026-10-28", "2026-10-28", "2.02"),
+        ];
+        assert_eq!(
+            paired(&filings),
+            vec![
+                (date("2026-06-30"), "in-time"),
+                (date("2026-09-30"), "q3-results"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_newest_periods_release_furnished_after_its_report_is_paired_however_late() {
+        // No later report is filed, so the next period end is not known.
+        let filings = [
+            filing("q2-10q", "10-Q", "2026-08-05", "2026-06-30", ""),
+            filing("q2-results", "8-K", "2026-12-01", "2026-08-05", "2.02"),
+        ];
+        assert_eq!(paired(&filings), vec![(date("2026-06-30"), "q2-results")]);
     }
 
     #[test]
