@@ -1128,10 +1128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The engine's `GenerateAlgoOrders` implementation requires `State: PreparesAmend`.**
     `EngineState` implements it; a custom engine state must implement it too.
 - **Breaking: the simulated venue's configs gain amend fields** (`rustrade-execution`, #892).
-  - `MockExecutionConfig` has an `amend` field. A struct literal must set it
-    (`Default::default()` amends both fields, `AmendConfig::NONE` refuses every amend), and
-    `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads
-    as `AmendConfig::FULL`.
+  - `MockExecutionConfig` has an `amend` field. `MockExecutionConfig::new` sets it to
+    `AmendConfig::default()`, which amends both fields; `with_amend(AmendConfig::NONE)` refuses
+    every amend. A serialized config without it reads as `AmendConfig::FULL`.
   - `MockExecutionClientConfig` and `MockExecution` have an `amend_support` field, which the
     `rustrade` builders fill from the venue's config. Their struct literals and `new`
     constructors must set it.
@@ -1142,9 +1141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The simulated venue: `AtOpen` and `AtClose` on any order, `GoodUntilEndOfDay` on a limit order,
     and post-only on a market order.
   - A caller matching on the old error for these cases must match the new variant.
-  - `MockExecutionConfig` has a `time_in_force` field. A struct literal must set it
-    (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
-    argument.
+  - `MockExecutionConfig` has a `time_in_force` field. `MockExecutionConfig::new` sets it to
+    `TimeInForceRules::default()`, no rules; `with_time_in_force` sets others.
 
 - **Breaking: the Binance and IBKR clients refuse a time in force they cannot send with
   `OrderError::UnsupportedTimeInForce`** (`rustrade-execution`, #923).
@@ -1204,22 +1202,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     id) stays `Rejected(OrderRejected)`.
 
 - **Breaking: `MockExecutionConfig` has an `expiry_sell_out` field** (`rustrade-execution`,
-  #917). A struct literal must set it (`None` to hold every long to expiry), and
-  `MockExecutionConfig::new` takes it as a last argument. A serialized config without it reads as
-  `None`.
+  #917). `MockExecutionConfig::new` sets it to `None`, holding every long to expiry;
+  `with_expiry_sell_out` sets a rule. A serialized config without it reads as `None`.
 
-- **Breaking: `MockExecutionConfig` has an `expiry_day_cutoff` field** (`rustrade-execution`). A
-  struct literal must set it (`None` to take opening orders until expiry);
-  `MockExecutionConfig::new` sets it to `None`. A serialized config without it reads as `None`.
+- **Breaking: `MockExecutionConfig` has an `expiry_day_cutoff` field** (`rustrade-execution`).
+  `MockExecutionConfig::new` sets it to `None`, taking opening orders until expiry;
+  `with_expiry_day_cutoff` sets a cutoff. A serialized config without it reads as `None`.
 
 - **Breaking: `MockExecutionConfig` has a `session_close_overrides` field** (`rustrade-execution`).
-  A struct literal must set it (`SessionCloseOverrides::default()` for none);
-  `MockExecutionConfig::new` sets it empty. A serialized config without it reads as empty.
+  `MockExecutionConfig::new` sets it empty; `with_session_close_overrides` sets overrides. A
+  serialized config without it reads as empty.
 
 - **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
   `rustrade-instrument`, #905).
-  - `MockExecutionConfig` has a `session_close` field. A struct literal must set it (`None` for
-    none), and `MockExecutionConfig::new` takes it as a last argument.
+  - `MockExecutionConfig` has a `session_close` field. `MockExecutionConfig::new` sets it to
+    `None`; `with_session_close` sets a calendar.
   - `RestingOrder` has a `deadline` field and is `#[non_exhaustive]`: build one with
     `RestingOrder::new`. `OpenOrders::insert` and `OpenOrders::hold`, and `AccountState::book`
     and `AccountState::hold`, take a `RestingOrder` instead of an order and its reservation.
