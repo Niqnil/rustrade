@@ -772,8 +772,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decides, so `SimulatedVenue::account_snapshot` and `SimulatedVenue::orders_open` return
   `Result<_, UnindexedApiError>`, the new `SimulatedVenue::trades_between` is what
   `fetch_trades` reads, and `MockExchangeRequest::fetch_account_snapshot`, `fetch_orders_open`
-  and `fetch_trades` answer with a `Result` (`fetch_trades` also takes the instruments). Every
-  client now refuses an instrument it cannot match, so the `ExecutionClient` contract on
+  and `fetch_trades` answer with a `Result` (`fetch_trades` also takes the instruments). With
+  this, every client refuses an instrument it cannot match (Alpaca's `fetch_trades` still reads a
+  contract past its expiry without a lookup), so the `ExecutionClient` contract on
   `account_snapshot`, `fetch_open_orders` and `fetch_trades` says it must.
 - **Breaking: Binance isolated margin reads refuse a pair the client is not configured for**
   (`rustrade-execution`, `binance`). `BinanceMargin::account_snapshot`, `fetch_open_orders` and

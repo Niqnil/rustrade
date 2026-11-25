@@ -4772,6 +4772,9 @@ impl SimulatedVenue {
             .collect()
     }
 
+    /// Every trade the account made at or after `time_since`, on every instrument: the ledger
+    /// as it stands. [`trades_between`](Self::trades_between) is the read a client makes, bounded
+    /// on both sides and refusing an instrument this venue does not know.
     pub fn trades(
         &self,
         time_since: DateTime<Utc>,
@@ -8029,7 +8032,6 @@ fn invalid_config(error: &VenueConfigError) -> ! {
     panic!("invalid SimulatedVenue configuration: {error}")
 }
 
-/// What `balance` owes: its loan and the interest on it, zero on a cash account.
 /// Whether `instrument` is among those a read of `instruments` asks for: every instrument when
 /// `instruments` is empty, the "return all" sentinel of the [`ExecutionClient`] reads, and
 /// otherwise one named exactly.
@@ -8042,6 +8044,7 @@ fn is_requested_instrument(
     instruments.is_empty() || instruments.contains(instrument)
 }
 
+/// What `balance` owes: its loan and the interest on it, zero on a cash account.
 fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
     balance
         .balance

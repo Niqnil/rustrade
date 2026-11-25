@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     /// The instruments an open-order or trade request names reach the venue, which refuses one
-    /// it does not trade and reads the others.
+    /// it does not trade and reads the others: here the spot instrument's one fill.
     #[tokio::test]
     async fn an_open_order_or_trade_request_passes_its_instruments_to_the_venue() {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
@@ -1334,40 +1334,65 @@ mod tests {
             spot_instruments(),
         );
         let driver = tokio::spawn(exchange.run());
-        let unknown = InstrumentNameExchange::new("ETHUSDT");
-        let refused = |error| matches!(error, crate::error::ApiError::InstrumentInvalid(name, _) if name == unknown);
 
-        for instruments in [vec![unknown.clone()], vec![instrument_name()]] {
+        let (open_tx, open_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                open_tx,
+                buy_request("0.01", market_prices("50000")),
+            ))
+            .unwrap();
+        open_rx.await.unwrap();
+
+        let orders_open = |instruments: Vec<InstrumentNameExchange>| {
             let (orders_tx, orders_rx) = oneshot::channel();
             request_tx
                 .send(MockExchangeRequest::fetch_orders_open(
                     Utc::now(),
-                    instruments.clone(),
+                    instruments,
                     orders_tx,
                 ))
                 .unwrap();
-            let orders = orders_rx.await.unwrap();
-
+            orders_rx
+        };
+        let trades = |instruments: Vec<InstrumentNameExchange>| {
             let (trades_tx, trades_rx) = oneshot::channel();
             request_tx
                 .send(MockExchangeRequest::fetch_trades(
                     Utc::now(),
                     trades_tx,
                     Utc::now() - TimeDelta::hours(1),
-                    Utc::now(),
-                    instruments.clone(),
+                    Utc::now() + TimeDelta::hours(1),
+                    instruments,
                 ))
                 .unwrap();
-            let trades = trades_rx.await.unwrap();
+            trades_rx
+        };
 
-            if instruments == [unknown.clone()] {
-                assert!(refused(orders.unwrap_err()));
-                assert!(refused(trades.unwrap_err()));
-            } else {
-                assert!(orders.unwrap().is_empty());
-                assert!(trades.unwrap().is_empty());
-            }
-        }
+        let unknown = InstrumentNameExchange::new("ETHUSDT");
+        let refused = |read: Result<(), crate::error::UnindexedApiError>| matches!(read, Err(crate::error::ApiError::InstrumentInvalid(name, _)) if name == unknown);
+        let unknown_orders: Result<Vec<_>, _> = orders_open(vec![unknown.clone()]).await.unwrap();
+        assert!(refused(unknown_orders.map(drop)));
+        let unknown_trades: Result<Vec<_>, _> = trades(vec![unknown.clone()]).await.unwrap();
+        assert!(refused(unknown_trades.map(drop)));
+
+        assert!(
+            orders_open(vec![instrument_name()])
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "the market order filled whole"
+        );
+        let fills = trades(vec![instrument_name()]).await.unwrap().unwrap();
+        assert_eq!(
+            fills
+                .iter()
+                .map(|trade| trade.instrument.clone())
+                .collect::<Vec<_>>(),
+            [instrument_name()]
+        );
 
         drop(request_tx);
         driver.await.unwrap();
