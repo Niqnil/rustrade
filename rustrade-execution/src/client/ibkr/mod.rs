@@ -159,8 +159,11 @@
 //! what IB reports: one not registered under that exact name, case included, or one registered
 //! by name only ([`ContractRegistry::register_by_name_only`]), with no contract ID that maps back
 //! to it. IB reports fills, orders and positions by contract ID, so such a read could find
-//! nothing about the instrument. Nothing is sent to IB. Retrying cannot help: register the
-//! contract with [`IbkrClient::register_contract`], or correct the name.
+//! nothing about the instrument. The check comes first, so the refusal is returned even while
+//! the connection is down, and nothing is sent to IB. Retrying cannot help: register the
+//! contract with [`IbkrClient::register_contract`], or correct the name. The check is made once,
+//! when the read starts: a registration that changes while the read runs can still leave that
+//! instrument out of what the read returns.
 //!
 //! A read that fails returns nothing of what it read: part of a listing is not mistaken for all
 //! of it.
