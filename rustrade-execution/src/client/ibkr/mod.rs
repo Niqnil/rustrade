@@ -2737,11 +2737,7 @@ impl ExecutionClient for IbkrClient {
         // H-2 fix: Run balances and positions concurrently (independent IB requests)
         let client = self.client.clone();
         let contracts = self.contracts.clone();
-        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            Some(instruments.iter().cloned().collect())
-        };
+        let instruments_filter = instruments_filter(instruments);
 
         let balances_future = self.fetch_balances(assets);
         let positions_filter = instruments_filter.clone();
@@ -3582,11 +3578,7 @@ impl ExecutionClient for IbkrClient {
         let listings = self.listings.clone();
         let clock = self.clock.clone();
         let session_zone = self.session_zone;
-        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            Some(instruments.iter().cloned().collect())
-        };
+        let instruments_filter = instruments_filter(instruments);
 
         let listed = tokio::task::spawn_blocking(move || {
             let listing = listings.open_orders(&client)?;
@@ -3663,11 +3655,7 @@ impl ExecutionClient for IbkrClient {
         let contracts = self.contracts.clone();
         let scope = self.execution_scope();
         let session_zone = self.session_zone;
-        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            Some(instruments.iter().cloned().collect())
-        };
+        let instruments_filter = instruments_filter(instruments);
 
         tokio::task::spawn_blocking(move || {
             // Every client's executions: `scope` decides which are reported (see
@@ -3704,6 +3692,14 @@ impl ExecutionClient for IbkrClient {
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
+}
+
+/// The instruments a filtered read keeps, each once however often it is named, or `None` for an
+/// empty `instruments`, the "return all" sentinel of the [`ExecutionClient`] reads.
+fn instruments_filter(
+    instruments: &[InstrumentNameExchange],
+) -> Option<HashSet<InstrumentNameExchange>> {
+    (!instruments.is_empty()).then(|| instruments.iter().cloned().collect())
 }
 
 /// The trades [`ExecutionClient::fetch_trades`] returns from what one executions request
@@ -5663,6 +5659,19 @@ mod order_reader_tests {
             AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
                 if reason == "IBKR order-update stream ended"
         ));
+    }
+
+    /// A name repeated in a read's `instruments` is kept once, so the read covers it once; an
+    /// empty slice filters nothing.
+    #[test]
+    fn instruments_filter_keeps_a_repeated_name_once() {
+        let msft = InstrumentNameExchange::new("MSFT");
+        let aapl = InstrumentNameExchange::new("AAPL");
+        assert_eq!(
+            instruments_filter(&[msft.clone(), aapl.clone(), msft.clone()]),
+            Some(HashSet::from([msft, aapl]))
+        );
+        assert_eq!(instruments_filter(&[]), None);
     }
 
     mod listings {

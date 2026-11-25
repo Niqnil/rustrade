@@ -191,7 +191,8 @@ impl<'a> ClientInstrument<'a> {
 ///
 /// A name repeated in `instruments` must be read once: the three reads answer as for that name
 /// given once, with one `account_snapshot` entry for it and each of its orders and trades once.
-/// Names that differ, in case or otherwise, are different names.
+/// This is about a name repeated exactly. Names that differ only in case are matched by each
+/// client's rule in the table below: Alpaca reads them as one symbol.
 ///
 /// | Client | A name matches | What a read finds is reported under | A name it cannot match |
 /// |---|---|---|---|
