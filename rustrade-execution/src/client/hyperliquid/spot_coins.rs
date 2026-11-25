@@ -44,9 +44,12 @@ struct Refetch {
     unanswered: Option<UnindexedClientError>,
 }
 
-/// The pairs a lookup found, and why they may lack a pair listed since they were read.
-struct Lookup {
+/// The pairs a lookup ended with, what it found in them, and why they may lack a pair listed
+/// since they were read.
+struct Lookup<T> {
     pairs: Arc<SpotPairs>,
+    /// What was looked for, `None` when the pairs lack it.
+    found: Option<T>,
     /// The error of the last read of `spotMeta` again, when the pairs lacked what was looked for
     /// and that read did not answer.
     unanswered: Option<UnindexedClientError>,
@@ -83,6 +86,7 @@ impl SpotCoins {
                 .clone()
                 .into_iter()
                 .all(|coin| CoinKind::of(coin) != CoinKind::Spot || pairs.get(coin).is_some())
+                .then_some(())
         })
         .await
         .pairs
@@ -104,33 +108,36 @@ impl SpotCoins {
         base: &str,
         quote: &str,
     ) -> Result<Option<SpotPair>, UnindexedClientError> {
-        let Lookup { pairs, unanswered } = self
-            .read_again_unless(|pairs| pairs.find(base, quote).is_some())
+        let Lookup {
+            found, unanswered, ..
+        } = self
+            .read_again_unless(|pairs| pairs.find(base, quote).cloned())
             .await;
-        match (pairs.find(base, quote), unanswered) {
-            (Some(pair), _) => Ok(Some(pair.clone())),
+        match (found, unanswered) {
+            (Some(pair), _) => Ok(Some(pair)),
             (None, Some(error)) => Err(error),
             (None, None) => Ok(None),
         }
     }
 
-    /// The pairs, read again first unless they are `complete`, at most once per
-    /// [`REFETCH_INTERVAL`].
-    async fn read_again_unless(&self, complete: impl Fn(&SpotPairs) -> bool) -> Lookup {
-        let answered = |pairs| Lookup {
+    /// The pairs, read again first unless `find` finds what is looked for in them, at most once
+    /// per [`REFETCH_INTERVAL`]. `find` runs once on each version of the pairs looked at.
+    async fn read_again_unless<T>(&self, find: impl Fn(&SpotPairs) -> Option<T>) -> Lookup<T> {
+        let answered = |pairs, found| Lookup {
             pairs,
+            found,
             unanswered: None,
         };
         let pairs = self.current();
-        if complete(&pairs) {
-            return answered(pairs);
+        if let found @ Some(_) = find(&pairs) {
+            return answered(pairs, found);
         }
 
         let mut refetched = self.0.refetched.lock().await;
         // Another caller may have read `spotMeta` while this one waited for the lock.
         let pairs = self.current();
-        if complete(&pairs) {
-            return answered(pairs);
+        if let found @ Some(_) = find(&pairs) {
+            return answered(pairs, found);
         }
         if let Some(last) = refetched
             .as_ref()
@@ -138,6 +145,7 @@ impl SpotCoins {
         {
             return Lookup {
                 pairs,
+                found: None,
                 unanswered: last.unanswered.clone(),
             };
         }
@@ -157,13 +165,15 @@ impl SpotCoins {
                 last.unanswered = None;
                 let fetched = Arc::new(fetched);
                 *self.0.pairs.write() = Arc::clone(&fetched);
-                answered(fetched)
+                let found = find(&fetched);
+                answered(fetched, found)
             }
             Err(error) => {
                 warn!(%error, "Hyperliquid spotMeta could not be read again");
                 last.unanswered = Some(error.clone());
                 Lookup {
                     pairs,
+                    found: None,
                     unanswered: Some(error),
                 }
             }
