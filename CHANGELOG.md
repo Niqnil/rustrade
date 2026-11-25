@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ContractRegistry::registration`** (`rustrade-instrument`). It says how a name is registered,
+  as the new `Registration`: `Unregistered`, `NameOnly` (no contract ID maps back to the name, so
+  nothing IB reports by contract ID can be attributed to it) or `NameAndContractId`. It reads the
+  registry once, so a registration made at the same time cannot give a mix of its states before
+  and after.
 - **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
   `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
   `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,
@@ -757,6 +762,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: IBKR reads refuse an instrument the client cannot match to IB's reports**
+  (`rustrade-execution`, `ibkr`). `IbkrClient::account_snapshot`, `fetch_open_orders` and
+  `fetch_trades` silently left out a requested instrument that is not in the client's contract
+  registry under that exact name, case included (`aapl` for a registered `AAPL`), so a read
+  filtered to it returned nothing, as if it had no orders, fills or position. They did the same
+  for one registered by name only, with no contract ID that maps back to it, since IB reports
+  fills, orders and positions by contract ID. All three now fail with
+  `ApiError::InstrumentInvalid` on the first such instrument, before sending anything to IB; its
+  reason says which case it is. Register the contract with `IbkrClient::register_contract`, or
+  correct the name. An empty `instruments` slice is not checked.
 - **Breaking: Alpaca reads refuse an instrument Alpaca does not list under that name**
   (`rustrade-execution`, `alpaca`). `AlpacaClient::account_snapshot` reported a requested equity
   or option Alpaca does not list (`NOPE`) as flat with no open orders, complete, without having

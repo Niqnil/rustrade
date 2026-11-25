@@ -50,6 +50,7 @@
 //! | `test_account_snapshot` | Fetch full account snapshot |
 //! | `test_account_snapshot_positions_match_ib` | The snapshot's positions match IB's own position listing |
 //! | `test_fetch_open_orders` | Fetch currently open orders |
+//! | `test_filtered_reads_refuse_an_instrument_they_cannot_match` | A read filtered to an unregistered or miscased name fails with `InstrumentInvalid` |
 //! | `test_account_stream` | Stream account events |
 //! | `test_fetch_trades` | Fetch historical trades |
 //! | `test_account_reads_while_the_connection_is_down` | A dropped connection fails the account reads as transient `Connectivity` |
@@ -548,6 +549,46 @@ async fn test_fetch_open_orders() {
         println!(
             "  {:?} {} {} @ {:?}",
             order.side, order.quantity, order.key.instrument, order.price
+        );
+    }
+}
+
+/// `account_snapshot`, `fetch_open_orders` and `fetch_trades` refuse a name the contract registry
+/// does not hold under that spelling, an unregistered one or a registered one in another case,
+/// rather than reading nothing about it. A registered name alongside does not lift the refusal.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_filtered_reads_refuse_an_instrument_they_cannot_match() {
+    init_logging();
+
+    let client = connect_client(resolved_aapl_config(34))
+        .await
+        .expect("connection failed");
+
+    for name in ["NOPE", "aapl"] {
+        let instruments = [InstrumentNameExchange::from("AAPL"), name.into()];
+        let refused = |result: Result<(), UnindexedClientError>, read: &str| match result {
+            Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                assert_eq!(instrument.as_ref(), name, "{read} refused another name");
+            }
+            other => panic!("{read} of {name}: expected InstrumentInvalid, got {other:?}"),
+        };
+        refused(
+            client.account_snapshot(&[], &instruments).await.map(drop),
+            "account_snapshot",
+        );
+        refused(
+            client.fetch_open_orders(&instruments).await.map(drop),
+            "fetch_open_orders",
+        );
+        let now = chrono::Utc::now();
+        refused(
+            client
+                .fetch_trades(now - chrono::Duration::hours(1), now, &instruments)
+                .await
+                .map(drop),
+            "fetch_trades",
         );
     }
 }

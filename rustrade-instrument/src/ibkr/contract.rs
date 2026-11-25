@@ -42,6 +42,24 @@ pub enum ContractRegistryError {
     },
 }
 
+/// How a name is registered in a [`ContractRegistry`], which decides whether what IB
+/// reports by contract id (fills, order listings, positions) can be attributed to it.
+/// See [`ContractRegistry::registration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    /// No contract is registered under this exact name, case included.
+    Unregistered,
+    /// Registered by name only: no contract id maps back to the name, so nothing IB
+    /// reports by contract id can be attributed to it. This is the case after
+    /// [`ContractRegistry::register_by_name_only`], whether or not its contract carries an
+    /// id, and even when the name was earlier registered with
+    /// [`ContractRegistry::register`].
+    NameOnly,
+    /// Registered with [`ContractRegistry::register`]: its contract id maps back to the
+    /// name, so IB's reports for the contract are attributed to it.
+    NameAndContractId,
+}
+
 /// Bidirectional registry mapping rustrade instrument names to IB contracts.
 ///
 /// IB's `Contract` is a composite key (symbol, secType, exchange, currency, etc.).
@@ -158,6 +176,21 @@ impl ContractRegistry {
     /// Look up a rustrade instrument name by IB contract ID.
     pub fn get_name_by_con_id(&self, con_id: i32) -> Option<InstrumentNameExchange> {
         self.inner.read().by_con_id.get(&con_id).cloned()
+    }
+
+    /// How `name` is registered, read in one look at the registry, so a registration
+    /// made at the same time cannot give a mix of its states before and after.
+    pub fn registration(&self, name: &InstrumentNameExchange) -> Registration {
+        let inner = self.inner.read();
+        match inner.by_name.get(name) {
+            None => Registration::Unregistered,
+            // `register` refuses a contract id that is not positive, so such an id maps
+            // back to no name.
+            Some(contract) if inner.by_con_id.get(&contract.contract_id) == Some(name) => {
+                Registration::NameAndContractId
+            }
+            Some(_) => Registration::NameOnly,
+        }
     }
 
     /// Check if an instrument is registered.
@@ -377,5 +410,53 @@ mod tests {
         registry.register_by_name_only(quotes, stock_contract("AAPL", "SMART", "USD"));
 
         assert_eq!(registry.get_name_by_con_id(265598), Some(aapl));
+    }
+
+    #[test]
+    fn test_registration_tells_each_state_apart() {
+        let registry = ContractRegistry::new();
+        let name = |s: &str| InstrumentNameExchange::from(s);
+        let stock = |symbol: &str, contract_id: i32| {
+            let mut contract = stock_contract(symbol, "SMART", "USD");
+            contract.contract_id = contract_id;
+            contract
+        };
+        registry
+            .register(name("AAPL"), stock("AAPL", 265598))
+            .unwrap();
+        // Unresolved; with an id no name maps back from; and with another name's id.
+        registry.register_by_name_only(name("MSFT"), stock("MSFT", 0));
+        registry.register_by_name_only(name("IBM"), stock("IBM", 8314));
+        registry.register_by_name_only(name("APPLE"), stock("AAPL", 265598));
+
+        assert_eq!(
+            registry.registration(&name("AAPL")),
+            Registration::NameAndContractId
+        );
+        for unregistered in ["aapl", "NOPE", ""] {
+            assert_eq!(
+                registry.registration(&name(unregistered)),
+                Registration::Unregistered,
+                "{unregistered}"
+            );
+        }
+        for name_only in ["MSFT", "IBM", "APPLE"] {
+            assert_eq!(
+                registry.registration(&name(name_only)),
+                Registration::NameOnly,
+                "{name_only}"
+            );
+        }
+
+        // Registered by name only after `register`, then with `register` again.
+        registry.register_by_name_only(name("AAPL"), stock("AAPL", 265598));
+        assert_eq!(registry.registration(&name("AAPL")), Registration::NameOnly);
+        registry
+            .register(name("AAPL"), stock("AAPL", 265598))
+            .unwrap();
+        assert_eq!(
+            registry.registration(&name("AAPL")),
+            Registration::NameAndContractId
+        );
     }
 }

@@ -6,4 +6,4 @@
 pub mod codes;
 pub mod contract;
 
-pub use contract::{ContractRegistry, ContractRegistryError};
+pub use contract::{ContractRegistry, ContractRegistryError, Registration};
