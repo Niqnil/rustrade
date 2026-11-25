@@ -1,4 +1,14 @@
-//! Bidirectional registry mapping rustrade instrument names to IB contracts.
+//! Mappings from rustrade instrument names to IB contracts.
+//!
+//! - [`ContractRegistry`] maps a name to a contract IB has resolved, and that contract's id
+//!   back to the name. An execution client needs both directions: IB reports fills, order
+//!   listings and positions by contract id.
+//! - [`ContractsByName`] maps a name to any contract, resolved or not, for uses that only look
+//!   contracts up by name, such as market data subscriptions, where IB resolves the contract
+//!   on each request.
+//!
+//! Both implement [`ContractLookup`], the read a market data stream needs, so a stream can read
+//! an execution client's registry without being able to change it.
 
 use crate::instrument::name::InstrumentNameExchange;
 use fnv::FnvHashMap;
@@ -6,6 +16,16 @@ use ibapi::contracts::Contract;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Looking up an IB contract by rustrade instrument name, read-only.
+///
+/// What a market data stream needs from its contracts. Implemented by [`ContractRegistry`]
+/// and [`ContractsByName`]; implement it to combine them, for example a [`ContractsByName`]
+/// that falls back to an execution client's registry.
+pub trait ContractLookup {
+    /// The contract registered under `name`, compared exactly, case included.
+    fn get_contract(&self, name: &InstrumentNameExchange) -> Option<Contract>;
+}
 
 /// Reasons [`ContractRegistry::register`] refuses a contract.
 ///
@@ -42,35 +62,17 @@ pub enum ContractRegistryError {
     },
 }
 
-/// How a name is registered in a [`ContractRegistry`], which decides whether what IB
-/// reports by contract id (fills, order listings, positions) can be attributed to it.
-/// See [`ContractRegistry::registration`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Registration {
-    /// No contract is registered under this exact name, case included.
-    Unregistered,
-    /// Registered by name only: no contract id maps back to the name, so nothing IB
-    /// reports by contract id can be attributed to it. This is the case after
-    /// [`ContractRegistry::register_by_name_only`], whether or not its contract carries an
-    /// id, and even when the name was earlier registered with
-    /// [`ContractRegistry::register`].
-    NameOnly,
-    /// Registered with [`ContractRegistry::register`]: its contract id maps back to the
-    /// name, so IB's reports for the contract are attributed to it.
-    NameAndContractId,
-}
-
-/// Bidirectional registry mapping rustrade instrument names to IB contracts.
+/// Bidirectional registry mapping rustrade instrument names to IB contracts IB has resolved.
 ///
 /// IB's `Contract` is a composite key (symbol, secType, exchange, currency, etc.).
 /// Rustrade uses a single string `InstrumentNameExchange`. This registry maintains
 /// the mapping in both directions: by name, to build requests, and by IB contract id,
 /// to attribute what IB reports back (fills, order listings, positions).
 ///
-/// [`register`](Self::register) fills both directions and requires a contract IB has
-/// resolved. [`register_by_name_only`](Self::register_by_name_only) fills only the
-/// name direction, for uses that never map IB's reports back, such as market data
-/// subscriptions, where IB resolves the contract on each request.
+/// Every registered name has a contract id that maps back to it:
+/// [`register`](Self::register) refuses a contract IB has not resolved, and one whose id is
+/// another name's. For lookups by name only, with contracts that need not be resolved, use
+/// [`ContractsByName`].
 ///
 /// # Thread Safety
 ///
@@ -81,24 +83,12 @@ pub struct ContractRegistry {
     inner: Arc<RwLock<ContractRegistryInner>>,
 }
 
+/// Invariant: `by_con_id` holds exactly one entry per `by_name` entry, mapping that entry's
+/// contract id back to its name.
 #[derive(Debug, Default)]
 struct ContractRegistryInner {
     by_name: FnvHashMap<InstrumentNameExchange, Contract>,
     by_con_id: FnvHashMap<i32, InstrumentNameExchange>,
-}
-
-impl ContractRegistryInner {
-    /// Remove the contract id that maps back to `name`, if one does.
-    fn remove_reverse_mapping(&mut self, name: &InstrumentNameExchange) {
-        let Some(old_con_id) = self.by_name.get(name).map(|contract| contract.contract_id) else {
-            return;
-        };
-        // A name registered by name only keeps no reverse mapping, and its contract id
-        // may be another name's.
-        if self.by_con_id.get(&old_con_id) == Some(name) {
-            self.by_con_id.remove(&old_con_id);
-        }
-    }
 }
 
 impl ContractRegistry {
@@ -113,16 +103,17 @@ impl ContractRegistry {
     /// directions: [`get_contract`](Self::get_contract) finds it by name, and
     /// [`get_name_by_con_id`](Self::get_name_by_con_id) finds the name by its contract id.
     ///
-    /// Registering a name again replaces its contract, and its earlier contract id no
-    /// longer maps back to it.
+    /// Registering a name again replaces its contract. If the new contract has another id,
+    /// the earlier id no longer maps back to the name, so anything IB still reports under it,
+    /// such as a late fill of an order placed on the earlier contract, can no longer be
+    /// attributed to the name.
     ///
     /// # Errors
     ///
     /// Leaves the registry unchanged and returns:
     /// - [`ContractRegistryError::Unresolved`] when the contract has no IB contract id.
-    ///   Resolve it through IB's contract details first, or use
-    ///   [`register_by_name_only`](Self::register_by_name_only) where nothing maps IB's
-    ///   reports back to the name.
+    ///   Resolve it through IB's contract details first, or use [`ContractsByName`] where
+    ///   nothing maps IB's reports back to the name.
     /// - [`ContractRegistryError::ContractIdTaken`] when the contract id is already
     ///   registered under a different name.
     pub fn register(
@@ -146,26 +137,11 @@ impl ContractRegistry {
             });
         }
 
-        inner.remove_reverse_mapping(&name);
-        inner.by_name.insert(name.clone(), contract);
+        if let Some(old) = inner.by_name.insert(name.clone(), contract) {
+            inner.by_con_id.remove(&old.contract_id);
+        }
         inner.by_con_id.insert(con_id, name);
         Ok(())
-    }
-
-    /// Register a contract under its rustrade instrument name for lookups by name only.
-    ///
-    /// The contract may be unresolved. [`get_name_by_con_id`](Self::get_name_by_con_id)
-    /// never finds the name through it, even if the contract carries an id, so anything
-    /// IB reports for it by contract id cannot be attributed. Use this only where
-    /// nothing maps IB's reports back to the name, such as market data subscriptions.
-    /// An execution client needs [`register`](Self::register).
-    ///
-    /// Registering a name again replaces its contract, and an earlier contract id
-    /// registered with [`register`](Self::register) no longer maps back to it.
-    pub fn register_by_name_only(&self, name: InstrumentNameExchange, contract: Contract) {
-        let mut inner = self.inner.write();
-        inner.remove_reverse_mapping(&name);
-        inner.by_name.insert(name, contract);
     }
 
     /// Look up an IB contract by rustrade instrument name.
@@ -178,22 +154,9 @@ impl ContractRegistry {
         self.inner.read().by_con_id.get(&con_id).cloned()
     }
 
-    /// How `name` is registered, read in one look at the registry, so a registration
-    /// made at the same time cannot give a mix of its states before and after.
-    pub fn registration(&self, name: &InstrumentNameExchange) -> Registration {
-        let inner = self.inner.read();
-        match inner.by_name.get(name) {
-            None => Registration::Unregistered,
-            // `register` refuses a contract id that is not positive, so such an id maps
-            // back to no name.
-            Some(contract) if inner.by_con_id.get(&contract.contract_id) == Some(name) => {
-                Registration::NameAndContractId
-            }
-            Some(_) => Registration::NameOnly,
-        }
-    }
-
-    /// Check if an instrument is registered.
+    /// Check if an instrument is registered under this exact name, case included. A
+    /// registered name's contract id maps back to it, so what IB reports for the contract
+    /// is attributed to it.
     pub fn contains(&self, name: &InstrumentNameExchange) -> bool {
         self.inner.read().by_name.contains_key(name)
     }
@@ -212,6 +175,68 @@ impl ContractRegistry {
 impl Default for ContractRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ContractLookup for ContractRegistry {
+    fn get_contract(&self, name: &InstrumentNameExchange) -> Option<Contract> {
+        ContractRegistry::get_contract(self, name)
+    }
+}
+
+/// Map from rustrade instrument names to IB contracts, for lookups by name only.
+///
+/// For market data subscriptions, where IB resolves the contract description on each
+/// request, so a contract need not be resolved first: one built locally, such as
+/// `Contract::stock("AAPL").build()`, will do. Nothing maps a contract id back to a name, so
+/// an execution client, which attributes IB's reports by contract id, needs a
+/// [`ContractRegistry`] instead.
+///
+/// # Thread Safety
+///
+/// This type is `Clone` and thread-safe. Cloning creates a shallow copy with
+/// shared `Arc` reference to the underlying data, so a contract inserted through one clone is
+/// found through every other, such as the one a market data stream reads when it reconnects.
+#[derive(Debug, Clone, Default)]
+pub struct ContractsByName {
+    inner: Arc<RwLock<FnvHashMap<InstrumentNameExchange, Contract>>>,
+}
+
+impl ContractsByName {
+    /// Create a new empty map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `contract` under `name`, returning the contract it replaces, if any.
+    pub fn insert(&self, name: InstrumentNameExchange, contract: Contract) -> Option<Contract> {
+        self.inner.write().insert(name, contract)
+    }
+
+    /// Look up an IB contract by rustrade instrument name, compared exactly, case included.
+    pub fn get_contract(&self, name: &InstrumentNameExchange) -> Option<Contract> {
+        self.inner.read().get(name).cloned()
+    }
+
+    /// Check if a contract is held under this exact name, case included.
+    pub fn contains(&self, name: &InstrumentNameExchange) -> bool {
+        self.inner.read().contains_key(name)
+    }
+
+    /// Number of contracts held.
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Check if the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+}
+
+impl ContractLookup for ContractsByName {
+    fn get_contract(&self, name: &InstrumentNameExchange) -> Option<Contract> {
+        ContractsByName::get_contract(self, name)
     }
 }
 
@@ -367,96 +392,61 @@ mod tests {
     }
 
     #[test]
-    fn a_name_only_contract_is_found_by_name_and_never_by_contract_id() {
-        let registry = ContractRegistry::new();
-        let unresolved = InstrumentNameExchange::from("MSFT");
-        let with_id = InstrumentNameExchange::from("AAPL");
-
-        registry.register_by_name_only(unresolved.clone(), stock_contract("MSFT", "SMART", "USD"));
-        registry.register_by_name_only(with_id.clone(), resolved("AAPL", 265598));
-
-        assert!(registry.get_contract(&unresolved).is_some());
-        assert!(registry.get_contract(&with_id).is_some());
-        assert!(registry.get_name_by_con_id(0).is_none());
-        assert!(registry.get_name_by_con_id(265598).is_none());
-        assert_eq!(registry.len(), 2);
-    }
-
-    #[test]
-    fn registering_a_name_by_name_only_clears_its_contract_id() {
-        let registry = ContractRegistry::new();
+    fn contracts_by_name_hold_unresolved_contracts_and_report_a_replacement() {
+        let contracts = ContractsByName::new();
         let name = InstrumentNameExchange::from("AAPL");
-        registry
-            .register(name.clone(), resolved("AAPL", 265598))
-            .unwrap();
+        assert!(contracts.is_empty());
 
-        registry.register_by_name_only(name.clone(), stock_contract("AAPL", "SMART", "USD"));
+        let unresolved = stock_contract("AAPL", "SMART", "USD");
+        assert!(contracts.insert(name.clone(), unresolved).is_none());
+        let replaced = contracts.insert(name.clone(), resolved("AAPL", 265598));
 
-        assert!(registry.get_name_by_con_id(265598).is_none());
-        assert_eq!(registry.get_contract(&name).unwrap().contract_id, 0);
+        assert_eq!(replaced.map(|contract| contract.contract_id), Some(0));
+        assert_eq!(contracts.get_contract(&name).unwrap().contract_id, 265598);
+        assert!(contracts.contains(&name));
+        assert!(!contracts.contains(&InstrumentNameExchange::from("aapl")));
+        assert_eq!(contracts.len(), 1);
+
+        contracts.insert(
+            InstrumentNameExchange::from("MSFT"),
+            stock_contract("MSFT", "SMART", "USD"),
+        );
+        assert_eq!(contracts.len(), 2);
+        assert!(!contracts.is_empty());
     }
 
     #[test]
-    fn a_name_only_entry_does_not_clear_another_names_contract_id() {
-        let registry = ContractRegistry::new();
-        let aapl = InstrumentNameExchange::from("AAPL");
-        let quotes = InstrumentNameExchange::from("AAPL-QUOTES");
-        registry
-            .register(aapl.clone(), resolved("AAPL", 265598))
-            .unwrap();
-        registry.register_by_name_only(quotes.clone(), resolved("AAPL", 265598));
+    fn a_contract_inserted_through_one_clone_is_found_through_another() {
+        let contracts = ContractsByName::new();
+        let reader = contracts.clone();
+        let name = InstrumentNameExchange::from("MSFT");
 
-        // Re-registering the name-only entry must leave AAPL's reverse mapping alone.
-        registry.register_by_name_only(quotes, stock_contract("AAPL", "SMART", "USD"));
+        contracts.insert(name.clone(), stock_contract("MSFT", "SMART", "USD"));
 
-        assert_eq!(registry.get_name_by_con_id(265598), Some(aapl));
+        assert_eq!(reader.get_contract(&name).unwrap().symbol.as_str(), "MSFT");
     }
 
     #[test]
-    fn test_registration_tells_each_state_apart() {
+    fn both_types_answer_a_lookup_by_name() {
         let registry = ContractRegistry::new();
-        let name = |s: &str| InstrumentNameExchange::from(s);
-        let stock = |symbol: &str, contract_id: i32| {
-            let mut contract = stock_contract(symbol, "SMART", "USD");
-            contract.contract_id = contract_id;
-            contract
+        let by_name = ContractsByName::new();
+        let traded = InstrumentNameExchange::from("AAPL");
+        let quoted = InstrumentNameExchange::from("MSFT");
+        registry
+            .register(traded.clone(), resolved("AAPL", 265598))
+            .unwrap();
+        by_name.insert(quoted.clone(), stock_contract("MSFT", "SMART", "USD"));
+
+        let lookups: [&dyn ContractLookup; 2] = [&registry, &by_name];
+        let found = |lookup: &dyn ContractLookup, name: &InstrumentNameExchange| {
+            lookup
+                .get_contract(name)
+                .map(|contract| contract.symbol.to_string())
         };
-        registry
-            .register(name("AAPL"), stock("AAPL", 265598))
-            .unwrap();
-        // Unresolved; with an id no name maps back from; and with another name's id.
-        registry.register_by_name_only(name("MSFT"), stock("MSFT", 0));
-        registry.register_by_name_only(name("IBM"), stock("IBM", 8314));
-        registry.register_by_name_only(name("APPLE"), stock("AAPL", 265598));
 
-        assert_eq!(
-            registry.registration(&name("AAPL")),
-            Registration::NameAndContractId
-        );
-        for unregistered in ["aapl", "NOPE", ""] {
-            assert_eq!(
-                registry.registration(&name(unregistered)),
-                Registration::Unregistered,
-                "{unregistered}"
-            );
-        }
-        for name_only in ["MSFT", "IBM", "APPLE"] {
-            assert_eq!(
-                registry.registration(&name(name_only)),
-                Registration::NameOnly,
-                "{name_only}"
-            );
-        }
-
-        // Registered by name only after `register`, then with `register` again.
-        registry.register_by_name_only(name("AAPL"), stock("AAPL", 265598));
-        assert_eq!(registry.registration(&name("AAPL")), Registration::NameOnly);
-        registry
-            .register(name("AAPL"), stock("AAPL", 265598))
-            .unwrap();
-        assert_eq!(
-            registry.registration(&name("AAPL")),
-            Registration::NameAndContractId
-        );
+        assert_eq!(found(lookups[0], &traded).as_deref(), Some("AAPL"));
+        assert_eq!(found(lookups[0], &quoted), None);
+        assert_eq!(found(lookups[1], &quoted).as_deref(), Some("MSFT"));
+        assert_eq!(found(lookups[1], &traded), None);
     }
 }

@@ -104,7 +104,10 @@ use rustrade_data::{
     },
     streams::{consumer::MarketStreamOptions, reconnect::Event},
 };
-use rustrade_instrument::{exchange::ExchangeId, ibkr::ContractRegistry};
+use rustrade_instrument::{
+    exchange::ExchangeId,
+    ibkr::{ContractRegistry, ContractsByName},
+};
 use serial_test::serial;
 use std::{sync::Arc, time::Duration};
 use tokio_stream::{Stream, StreamExt};
@@ -124,7 +127,7 @@ fn init_logging() {
 /// A reconnect fails the test: none of the tests reading it cuts the connection.
 async fn init_stream(
     config: IbkrStreamConfig,
-    contracts: Arc<ContractRegistry>,
+    contracts: ContractsByName,
     subscriptions: Vec<IbkrSubscription<String>>,
 ) -> Result<impl Stream<Item = Result<MarketEvent<String, DataKind>, DataError>> + Unpin, DataError>
 {
@@ -676,9 +679,8 @@ async fn test_market_stream_connection() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 10);
 
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
-    let registry = Arc::new(registry);
+    let registry = ContractsByName::new();
+    registry.insert("AAPL".into(), aapl_contract());
 
     let subscriptions = vec![IbkrSubscription {
         instrument: "AAPL".into(),
@@ -706,9 +708,8 @@ async fn test_market_stream_quotes() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 11);
 
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
-    let registry = Arc::new(registry);
+    let registry = ContractsByName::new();
+    registry.insert("AAPL".into(), aapl_contract());
 
     let subscriptions = vec![IbkrSubscription {
         instrument: "AAPL".into(),
@@ -788,7 +789,7 @@ async fn test_market_stream_option_quotes_delayed() {
     let calls = resolve_aapl_calls_near_the_money(&resolver, lines).await;
     resolver.disconnect();
 
-    let registry = ContractRegistry::new();
+    let registry = ContractsByName::new();
     let subscriptions: Vec<_> = calls
         .into_iter()
         .map(|call| {
@@ -796,14 +797,14 @@ async fn test_market_stream_option_quotes_delayed() {
                 "AAPL {} {}C",
                 call.last_trade_date_or_contract_month, call.strike
             );
-            registry.register_by_name_only(name.as_str().into(), call);
+            registry.insert(name.as_str().into(), call);
             IbkrSubscription::quotes(name.clone(), name.as_str().into())
         })
         .collect();
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 35)
         .with_market_data_type(IbkrMarketDataType::DelayedFrozen);
-    let mut stream = init_stream(config, Arc::new(registry), subscriptions)
+    let mut stream = init_stream(config, registry, subscriptions)
         .await
         .expect("stream init failed");
 
@@ -911,13 +912,13 @@ async fn test_market_stream_reconnects_after_the_socket_is_cut() {
     let proxy = CuttableProxy::start(test_port()).await;
     let config = IbkrStreamConfig::new("127.0.0.1", proxy.port, test_client_id_base() + 36)
         .with_market_data_type(IbkrMarketDataType::DelayedFrozen);
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    let registry = ContractsByName::new();
+    registry.insert("AAPL".into(), aapl_contract());
     let subscriptions = vec![IbkrSubscription::quotes("AAPL".to_string(), "AAPL".into())];
 
     let mut stream = IbkrMarketStream::init(
         config,
-        Arc::new(registry),
+        registry,
         subscriptions,
         MarketStreamOptions::default(),
     )
@@ -997,9 +998,8 @@ async fn test_market_stream_depth() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 12);
 
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
-    let registry = Arc::new(registry);
+    let registry = ContractsByName::new();
+    registry.insert("AAPL".into(), aapl_contract());
 
     let subscriptions = vec![IbkrSubscription {
         instrument: "AAPL".into(),
@@ -1053,7 +1053,7 @@ async fn test_market_stream_unregistered_contract() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 13);
 
-    let registry = Arc::new(ContractRegistry::new());
+    let registry = ContractsByName::new();
 
     let subscriptions = vec![IbkrSubscription {
         instrument: "UNKNOWN_SYMBOL".into(),
@@ -1082,10 +1082,9 @@ async fn test_market_stream_multiple_subscriptions() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 14);
 
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
-    registry.register_by_name_only("MSFT".into(), Contract::stock("MSFT").build());
-    let registry = Arc::new(registry);
+    let registry = ContractsByName::new();
+    registry.insert("AAPL".into(), aapl_contract());
+    registry.insert("MSFT".into(), Contract::stock("MSFT").build());
 
     let subscriptions = vec![
         IbkrSubscription {
@@ -1501,11 +1500,10 @@ async fn test_option_greeks_stream() {
     // before opening the streaming connection.
     let option = aapl_call_option().await;
 
-    // The stream looks contracts up by name only, and the chain's contract carries no contract ID,
-    // which `register` requires.
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL_CALL".into(), option);
-    let registry = Arc::new(registry);
+    // The chain's contract carries no contract ID, so it goes in a `ContractsByName`, not a
+    // `ContractRegistry`.
+    let registry = ContractsByName::new();
+    registry.insert("AAPL_CALL".into(), option);
 
     let subscriptions = vec![IbkrSubscription {
         instrument: "AAPL_CALL".into(),
@@ -1585,9 +1583,9 @@ async fn test_quotes_report_a_halted_contracts_trading_status() {
 
     let config = IbkrStreamConfig::new("127.0.0.1", test_port(), test_client_id_base() + 41)
         .with_market_data_type(test_market_data_type());
-    let registry = ContractRegistry::new();
-    registry.register_by_name_only(halted.as_str().into(), Contract::stock(&halted).build());
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    let registry = ContractsByName::new();
+    registry.insert(halted.as_str().into(), Contract::stock(&halted).build());
+    registry.insert("AAPL".into(), aapl_contract());
     let subscription = |name: &str, kind| IbkrSubscription {
         instrument: name.into(),
         key: name.to_string(),
@@ -1599,7 +1597,7 @@ async fn test_quotes_report_a_halted_contracts_trading_status() {
         subscription("AAPL", IbkrSubscriptionKind::Quotes),
     ];
 
-    let mut stream = init_stream(config, Arc::new(registry), subscriptions)
+    let mut stream = init_stream(config, registry, subscriptions)
         .await
         .expect("stream init failed");
 

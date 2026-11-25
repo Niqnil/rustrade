@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct IbkrSubscription<K> {
     /// Instrument key for MarketEvent output
     pub key: K,
-    /// Instrument name (must be registered in ContractRegistry)
+    /// Instrument name, under which the stream looks up its contract (see
+    /// [`IbkrMarketStream::init`](super::IbkrMarketStream::init))
     pub instrument: InstrumentNameExchange,
     /// Type of market data to subscribe to
     pub kind: IbkrSubscriptionKind,
