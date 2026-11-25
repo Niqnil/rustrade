@@ -7,7 +7,9 @@
 // Architecture:
 // - REST (reqwest): account_snapshot, fetch_balances, fetch_open_orders,
 //   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol}),
-//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close)
+//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close);
+//   the filtered reads first check each requested name is listed (GET /v2/assets/{symbol} or
+//   GET /v2/options/contracts/{symbol}, once per listed name per client)
 // - WebSocket (tungstenite): account_stream via Alpaca's trade_updates stream
 //   at wss://[paper-]api.alpaca.markets/stream
 //
@@ -90,7 +92,7 @@ use crate::{
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use fnv::FnvHashMap;
-use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
+use futures::{SinkExt as _, StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
 use itertools::Itertools as _;
 use lru::LruCache;
@@ -1144,6 +1146,38 @@ struct AlpacaOrderWs<'a> {
 /// minute without one, and is retried. Once the retries are exhausted the request fails with
 /// [`ApiError::RateLimit`], carrying that wait, and later requests still wait for it.
 ///
+/// # Instrument lookups
+/// Names match Alpaca's symbols ignoring case, and what a read finds is reported under Alpaca's
+/// symbol. Before [`account_snapshot`](ExecutionClient::account_snapshot),
+/// [`fetch_open_orders`](ExecutionClient::fetch_open_orders) or
+/// [`fetch_trades`](ExecutionClient::fetch_trades) reads anything, it checks that Alpaca lists
+/// each requested instrument, and fails with [`ApiError::InstrumentInvalid`] on the first it does
+/// not, rather than reporting it flat and orderless without having looked.
+///
+/// - **Lookups.** A name not yet known is looked up upper-cased, as Alpaca's lookups match case:
+///   an OCC symbol with `GET /v2/options/contracts/{symbol}`, any other with
+///   `GET /v2/assets/{symbol}`, up to 8 at a time. Each costs one request against the account's
+///   rate limit, which orders share (200 a minute by default). A first read naming more names
+///   than the window has left uses it up: the rest of its lookups, and every order, then wait for
+///   the window to reset (see "Rate limits"). A caller with a large universe can spread its first
+///   reads, or read with fewer instruments at a time.
+/// - **Not listed.** A 404, or a listing under another symbol: `GET /v2/assets/BTCUSD` finds
+///   `BTC/USD`, but orders and trades on that pair are reported as `BTC/USD`, so `BTCUSD` is
+///   refused, and the error names the symbol to use. A failed lookup fails the read.
+/// - **Listed.** An asset or contract counts as listed whatever its status, so an inactive asset
+///   or an expired contract can still be read. A listed name is remembered for the client's
+///   life, by every clone, and not looked up again; one not listed is looked up again on each
+///   read naming it.
+/// - **Expired contracts in [`fetch_trades`](ExecutionClient::fetch_trades).** Alpaca does not
+///   keep every expired contract: in November 2026 it still found one that expired in January
+///   2024, but not one that expired in January 2023. So `fetch_trades` does not look up an OCC
+///   symbol whose expiry, read from the symbol, is before today (UTC): it reads that contract's
+///   trades, matched ignoring case, as for any other name. A misspelt past contract therefore
+///   reads as having no trades rather than being refused. A contract expiring today or later is
+///   looked up, and [`account_snapshot`](ExecutionClient::account_snapshot) and
+///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders) look up every name, so they refuse
+///   a contract Alpaca no longer keeps.
+///
 /// # Fees, interest and borrow fees
 /// Every [`Trade`] this client reports carries zero fees. Equities and options trade without
 /// commission. Alpaca's fill events carry no fee for crypto either: it is taken from the asset
@@ -1168,6 +1202,10 @@ pub struct AlpacaClient {
     /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     /// clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    /// The symbols a lookup found Alpaca lists, upper-cased, so a filtered read asks about each
+    /// name once per client. Shared by every clone. Only listings are kept: a name Alpaca did not
+    /// list is asked about again, in case it has been listed since.
+    listed: Arc<parking_lot::Mutex<fnv::FnvHashSet<SmolStr>>>,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -1246,6 +1284,97 @@ impl AlpacaClient {
             known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
+
+    /// Fail with [`ApiError::InstrumentInvalid`] on the first of `instruments` Alpaca does not
+    /// list under that name, ignoring case. A read filtered to it would otherwise report it flat
+    /// and orderless without having looked, and a crypto pair named without its `/` would miss
+    /// the pair's orders and trades, which Alpaca reports under `BASE/QUOTE`.
+    ///
+    /// Each name not yet known is looked up once, upper-cased, as Alpaca's lookups match case:
+    /// an OCC symbol with `GET /v2/options/contracts/{symbol}`, any other with
+    /// `GET /v2/assets/{symbol}`, up to [`LISTING_LOOKUPS_IN_FLIGHT`] at a time. A 404 is not
+    /// listed. So is a listing under another symbol, as `GET /v2/assets/BTCUSD` finds `BTC/USD`.
+    /// A listed asset or contract counts whatever its status, an expired contract included, as
+    /// orders and trades on it can still be read. A lookup that fails fails the read.
+    ///
+    /// With `expired_before` set, an OCC symbol whose expiry is before that date is not looked up,
+    /// nor remembered as listed: Alpaca drops long-expired contracts, and a read that must not
+    /// refuse them passes the day it is read (see the struct docs, "Instrument lookups").
+    async fn check_listed(
+        &self,
+        instruments: &[InstrumentNameExchange],
+        expired_before: Option<NaiveDate>,
+    ) -> Result<(), UnindexedClientError> {
+        let unknown: Vec<(InstrumentNameExchange, SmolStr)> = {
+            let listed = self.listed.lock();
+            let mut asked = fnv::FnvHashSet::default();
+            instruments
+                .iter()
+                .filter_map(|instrument| {
+                    let symbol = SmolStr::from(upper_symbol(instrument.name().as_str()));
+                    let exempt = expired_before.is_some_and(|day| expires_before(&symbol, day));
+                    (!exempt && !listed.contains(&symbol) && asked.insert(symbol.clone()))
+                        .then(|| (instrument.clone(), symbol))
+                })
+                .collect()
+        };
+        let lookups = unknown
+            .into_iter()
+            .map(|(instrument, symbol)| self.look_up_listing(instrument, symbol));
+        futures::stream::iter(lookups)
+            // In order, so the error is the first refused instrument's whatever the timing.
+            .buffered(LISTING_LOOKUPS_IN_FLIGHT)
+            .try_collect()
+            .await
+    }
+
+    /// Whether Alpaca lists `symbol`, the upper-cased name of `instrument`, remembering it when it
+    /// does; see [`check_listed`](Self::check_listed).
+    async fn look_up_listing(
+        &self,
+        instrument: InstrumentNameExchange,
+        symbol: SmolStr,
+    ) -> Result<(), UnindexedClientError> {
+        // A URL path drops a `.` or `..` segment and keeps an empty one, so the lookup would read
+        // another endpoint, such as the list of every asset. Alpaca lists nothing under these.
+        if matches!(symbol.as_str(), "" | "." | "..") {
+            return Err(instrument_invalid(
+                &instrument,
+                "Alpaca lists nothing under an empty name, `.` or `..`",
+            ));
+        }
+        let url = if occ_contract(&symbol).is_some() {
+            rest_url(self.base_url(), &["v2", "options", "contracts", &symbol])
+        } else {
+            rest_url(self.base_url(), &["v2", "assets", &symbol])
+        }?;
+        let found: Option<AlpacaListing> =
+            rest_lookup_with_retry(&self.rate_limiter, || self.http.get(url.clone())).await?;
+        match found {
+            None => Err(instrument_invalid(
+                &instrument,
+                "Alpaca lists no asset or option contract under this symbol",
+            )),
+            Some(listing) if listing.symbol.eq_ignore_ascii_case(&symbol) => {
+                self.listed.lock().insert(symbol);
+                Ok(())
+            }
+            Some(listing) => Err(instrument_invalid(
+                &instrument,
+                &format!("Alpaca lists this as {}: name it so", listing.symbol),
+            )),
+        }
+    }
+}
+
+/// How many listing lookups [`AlpacaClient::check_listed`] runs at once.
+const LISTING_LOOKUPS_IN_FLIGHT: usize = 8;
+
+/// The field of `GET /v2/assets/{symbol}` and `GET /v2/options/contracts/{symbol}` that
+/// [`AlpacaClient::check_listed`] reads: the symbol Alpaca lists the asset or contract under.
+#[derive(Debug, Deserialize)]
+struct AlpacaListing {
+    symbol: SmolStr,
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,6 +1704,7 @@ impl ExecutionClient for AlpacaClient {
             rate_limiter: Arc::new(RateLimitTracker::new()),
             orders_url,
             known_live: KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            listed: Arc::default(),
         }
     }
 
@@ -1600,17 +1730,19 @@ impl ExecutionClient for AlpacaClient {
     ///   be sold short, so there is no position to report: its instruments are
     ///   [`PositionReport::Unreported`].
     ///
-    /// # Limitations
+    /// # Instruments
     ///
-    /// A position is reported only under the instrument name Alpaca uses for it, ignoring case:
-    /// the ticker for an equity and the OCC symbol for an option. A requested equity or option
-    /// named otherwise is reported [`PositionReport::Flat`] even while Alpaca holds it. A crypto
-    /// pair is recognised by the `/` in its name (e.g. `BTC/USD`, the form its orders use); one
-    /// named without it is taken for an equity and reported flat too. With `instruments` empty,
-    /// every instrument that has an open order or a position gets a snapshot; otherwise only the
-    /// requested ones do.
+    /// A requested name matches Alpaca's symbol ignoring case: the ticker for an equity, the OCC
+    /// symbol for an option, and `BASE/QUOTE` for a crypto pair (e.g. `BTC/USD`, the form its
+    /// orders use). With `instruments` empty, every instrument that has an open order or a
+    /// position gets a snapshot; otherwise each requested one does, under the name requested.
     ///
     /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a requested instrument Alpaca does not list under that
+    /// name, such as an unknown ticker or contract, or a crypto pair named without its `/`
+    /// (`BTCUSD`): it was not read, so nothing can be said about it. See
+    /// [Instrument lookups](AlpacaClient#instrument-lookups).
     ///
     /// [`ClientError::Internal`](crate::error::ClientError::Internal) when a response does not
     /// decode, or when any non-zero equity or option position, requested or not, has a missing or
@@ -1629,6 +1761,7 @@ impl ExecutionClient for AlpacaClient {
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        self.check_listed(instruments, None).await?;
         let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
@@ -2112,10 +2245,16 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// A requested name matches Alpaca's symbol ignoring case. Each order is keyed by Alpaca's
     /// symbol, as the account stream reports it, whatever case it was requested in.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a requested instrument Alpaca does not list under that
+    /// name, as for [`account_snapshot`](ExecutionClient::account_snapshot).
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        self.check_listed(instruments, None).await?;
         let base = self.base_url();
         let http = self.http.clone();
 
@@ -2150,12 +2289,22 @@ impl ExecutionClient for AlpacaClient {
     /// An activity whose `transaction_time` does not parse is still returned, since Alpaca placed
     /// it in the span. Its `time_exchange` is then the local clock at the read, which can lie
     /// outside the span, and a warning names it.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a requested instrument Alpaca does not list under that
+    /// name, as for [`account_snapshot`](ExecutionClient::account_snapshot), even over an empty
+    /// span. An OCC contract whose expiry, read from its symbol, is before today (UTC) is not
+    /// looked up, as Alpaca drops long-expired contracts: its trades are read, and a misspelt one
+    /// reads as having none (see [`AlpacaClient`], "Instrument lookups").
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        self.check_listed(instruments, Some(Utc::now().date_naive()))
+            .await?;
         // An empty span, or one ending before the epoch, holds nothing Alpaca has.
         if start > end || end < DateTime::UNIX_EPOCH {
             return Ok(TradesRead::complete(Vec::new()));
@@ -5986,6 +6135,21 @@ fn occ_contract(symbol: &str) -> Option<(&str, bool, Decimal)> {
     Some((root, is_call, Decimal::new(strike, 3)))
 }
 
+/// The expiry of a contract from its OCC symbol (see [`occ_contract`]): `YYMMDD` read as a date in
+/// 2000–2099, or `None` when the symbol is not an OCC symbol or the date does not exist.
+fn occ_expiry(symbol: &str) -> Option<NaiveDate> {
+    occ_contract(symbol)?;
+    let yymmdd = symbol.get(symbol.len() - 15..symbol.len() - 9)?;
+    let field = |range: std::ops::Range<usize>| yymmdd.get(range)?.parse::<u32>().ok();
+    let year = i32::try_from(2000 + field(0..2)?).ok()?;
+    NaiveDate::from_ymd_opt(year, field(2..4)?, field(4..6)?)
+}
+
+/// Whether `symbol` is an OCC symbol whose contract expired before `day`.
+fn expires_before(symbol: &str, day: NaiveDate) -> bool {
+    occ_expiry(symbol).is_some_and(|expiry| expiry < day)
+}
+
 /// Whether `contract`, an exercise or assignment, is the one `shares`, an `OPTRD`, is the share
 /// leg of. See [`AlpacaClient::fetch_option_events`].
 fn is_share_leg_of(shares: &OptionLeg<'_>, contract: &OptionLeg<'_>) -> bool {
@@ -6402,7 +6566,8 @@ impl OrderStatusClient for AlpacaClient {
 // ---------------------------------------------------------------------------
 
 impl ShortabilityClient for AlpacaClient {
-    /// Reads the asset with `GET /v2/assets/{symbol}`, one request.
+    /// Reads the asset with `GET /v2/assets/{symbol}`, one request. The name is sent upper-cased:
+    /// Alpaca's lookup matches case, and this client matches names ignoring case.
     ///
     /// - `shortable` is the asset's `shortable`.
     /// - `easy_to_borrow` is its `borrow_status`, which Alpaca reports for US equities only, or
@@ -6424,7 +6589,8 @@ impl ShortabilityClient for AlpacaClient {
         &self,
         instrument: &InstrumentNameExchange,
     ) -> Result<Shortability, UnindexedClientError> {
-        let url = asset_url(self.base_url(), instrument)?;
+        let symbol = upper_symbol(instrument.name().as_str());
+        let url = rest_url(self.base_url(), &["v2", "assets", &symbol])?;
         let found: Option<AlpacaAsset> =
             rest_lookup_with_retry(&self.rate_limiter, || self.http.get(url.clone())).await?;
         let Some(asset) = found else {
@@ -6437,12 +6603,9 @@ impl ShortabilityClient for AlpacaClient {
     }
 }
 
-/// `GET /v2/assets/{symbol}`, with the symbol as one path segment, so a crypto pair's `/` is
-/// escaped rather than read as a path separator.
-fn asset_url(
-    base_url: &str,
-    instrument: &InstrumentNameExchange,
-) -> Result<reqwest::Url, UnindexedClientError> {
+/// `base_url` followed by `segments`, each one path segment, so a crypto pair's `/` in a symbol
+/// is escaped rather than read as a path separator.
+fn rest_url(base_url: &str, segments: &[&str]) -> Result<reqwest::Url, UnindexedClientError> {
     let mut url = reqwest::Url::parse(base_url).map_err(|error| {
         UnindexedClientError::Internal(format!("Alpaca base URL {base_url:?}: {error}"))
     })?;
@@ -6451,7 +6614,7 @@ fn asset_url(
             UnindexedClientError::Internal(format!("Alpaca base URL {base_url:?} has no path"))
         })?
         .pop_if_empty()
-        .extend(["v2", "assets", instrument.name().as_str()]);
+        .extend(segments);
     Ok(url)
 }
 
@@ -9998,6 +10161,29 @@ mod tests {
             ))
         }
 
+        /// Serve Alpaca's listing of each of `symbols`, as Alpaca spells them: an OCC symbol on
+        /// the options-contracts lookup, any other on the asset lookup.
+        async fn mount_listings(server: &MockServer, symbols: &[&str]) {
+            for symbol in symbols {
+                let url = if occ_contract(symbol).is_some() {
+                    rest_url(&server.uri(), &["v2", "options", "contracts", symbol])
+                } else {
+                    rest_url(&server.uri(), &["v2", "assets", symbol])
+                };
+                let Ok(url) = url else {
+                    panic!("the mock server's URI parses");
+                };
+                Mock::given(method("GET"))
+                    .and(path(url.path()))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({ "symbol": symbol })),
+                    )
+                    .mount(server)
+                    .await;
+            }
+        }
+
         #[tokio::test]
         async fn account_snapshot_reports_cash_positions_and_crypto_balances() {
             use crate::client::ExecutionClient;
@@ -10101,6 +10287,7 @@ mod tests {
 
             let server = MockServer::start().await;
             mount_account_and_positions(&server).await;
+            mount_listings(&server, &["XYZ"]).await;
 
             let usd = [AssetNameExchange::new("USD")];
             let instruments = [InstrumentNameExchange::new("XYZ")];
@@ -11751,12 +11938,17 @@ mod tests {
         }
 
         /// The query of every request `server` received.
+        /// Each request's query, but for the lookups of whether an instrument is listed.
         async fn query_pairs(server: &MockServer) -> Vec<Vec<(String, String)>> {
             let Some(requests) = server.received_requests().await else {
                 panic!("requests are recorded");
             };
             requests
                 .iter()
+                .filter(|request| {
+                    let path = request.url.path();
+                    !path.starts_with("/v2/assets/") && !path.starts_with("/v2/options/contracts/")
+                })
                 .map(|request| request.url.query_pairs().into_owned().collect())
                 .collect()
         }
@@ -12037,6 +12229,33 @@ mod tests {
             ] {
                 assert_eq!(occ_contract(not_occ), None, "{not_occ}");
             }
+        }
+
+        #[test]
+        fn occ_expiry_reads_the_date_after_the_root() {
+            let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d);
+            assert_eq!(occ_expiry("AAPL210115C00150000"), date(2021, 1, 15));
+            assert_eq!(occ_expiry("QS991231P00006500"), date(2099, 12, 31));
+            // An OCC root padded to six characters, as the OCC's own symbology spells it.
+            assert_eq!(occ_expiry("QS    240301C00006500"), date(2024, 3, 1));
+            for no_date in ["SPY", "BTC/USD", "QS241301C00006500", "QS240230C00006500"] {
+                assert_eq!(occ_expiry(no_date), None, "{no_date}");
+            }
+        }
+
+        #[test]
+        fn a_contract_expires_before_a_day_only_if_its_expiry_is_earlier() {
+            let day = |d| {
+                let Some(day) = NaiveDate::from_ymd_opt(2021, 1, d) else {
+                    panic!("2021-01-{d} exists");
+                };
+                day
+            };
+            assert!(expires_before("AAPL210115C00150000", day(16)));
+            // Expiring that day is not before it: such a contract is still looked up.
+            assert!(!expires_before("AAPL210115C00150000", day(15)));
+            assert!(!expires_before("AAPL210115C00150000", day(14)));
+            assert!(!expires_before("SPY", day(16)));
         }
 
         #[tokio::test]
@@ -12343,6 +12562,7 @@ mod tests {
                 }
             }
             let server = serve_activities(activities).await;
+            mount_listings(&server, &["SPY"]).await;
             let client = client_for(&server);
             let end = time("2025-04-18T15:00:00Z");
 
@@ -12360,10 +12580,11 @@ mod tests {
             assert!(
                 requests
                     .iter()
+                    .filter(|request| request.url.path() == "/v2/account/activities")
                     .all(|request| request.url.query_pairs().any(
                         |(name, value)| name == "until" && value == "2025-04-18T15:00:00.001Z"
                     )),
-                "every request is bounded by the span's end"
+                "every read of the activities is bounded by the span's end"
             );
         }
 
@@ -12382,6 +12603,7 @@ mod tests {
                 )
                 .mount(&server)
                 .await;
+            mount_listings(&server, &["QQQ"]).await;
 
             let qqq = [InstrumentNameExchange::new("QQQ")];
             let Ok(read) = client_for(&server)
@@ -12408,6 +12630,7 @@ mod tests {
                 fill_at("c", "SPY", at),
             ])
             .await;
+            mount_listings(&server, &["SPY", "QQQ"]).await;
             let client = client_for(&server);
             let names = |instruments: &[InstrumentNameExchange]| {
                 let client = &client;
@@ -12462,6 +12685,7 @@ mod tests {
                 ])))
                 .mount(&server)
                 .await;
+            mount_listings(&server, &["SPY", "BTC/USD"]).await;
 
             let requested = [
                 InstrumentNameExchange::new("spy"),
@@ -12503,6 +12727,358 @@ mod tests {
             assert!(
                 query.contains(&("symbols".into(), "SPY,BTC/USD".into())),
                 "{query:?}"
+            );
+        }
+
+        /// The path of every request `server` received, in order.
+        async fn request_paths(server: &MockServer) -> Vec<String> {
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            requests
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect()
+        }
+
+        /// The instrument and reason of an [`ApiError::InstrumentInvalid`], or what came instead.
+        fn refused<T: std::fmt::Debug>(
+            result: Result<T, UnindexedClientError>,
+        ) -> (String, String) {
+            match result {
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, reason))) => {
+                    (instrument.name().to_string(), reason)
+                }
+                other => panic!("expected InstrumentInvalid, got {other:?}"),
+            }
+        }
+
+        /// Each of the three filtered reads refuses an instrument Alpaca does not list, naming it
+        /// as requested, before reading anything.
+        #[tokio::test]
+        async fn filtered_reads_refuse_an_unlisted_instrument_before_reading() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            mount_listings(&server, &["SPY"]).await;
+            let requested = [
+                InstrumentNameExchange::new("SPY"),
+                InstrumentNameExchange::new("nope"),
+            ];
+            let client = client_for(&server);
+            let usd = [AssetNameExchange::new("USD")];
+
+            let refusals = [
+                refused(client.account_snapshot(&usd, &requested).await),
+                refused(client.fetch_open_orders(&requested).await),
+                refused(
+                    client
+                        .fetch_trades(recovery_after(), Utc::now(), &requested)
+                        .await,
+                ),
+                // Even a span holding nothing is refused, as nothing was said about the name.
+                refused(
+                    client
+                        .fetch_trades(Utc::now(), recovery_after(), &requested)
+                        .await,
+                ),
+            ];
+
+            for (instrument, reason) in refusals {
+                assert_eq!(instrument, "nope");
+                assert!(reason.contains("lists no asset"), "{reason}");
+            }
+            assert_eq!(
+                request_paths(&server).await,
+                [
+                    "/v2/assets/SPY",
+                    "/v2/assets/NOPE",
+                    "/v2/assets/NOPE",
+                    "/v2/assets/NOPE",
+                    "/v2/assets/NOPE"
+                ],
+                "SPY is looked up once; NOPE, upper-cased, on every read; nothing else is read"
+            );
+        }
+
+        /// An OCC symbol Alpaca does not list is refused on the options-contracts lookup's 404,
+        /// without asking the asset lookup, where options are not listed.
+        #[tokio::test]
+        async fn an_unlisted_option_contract_is_refused() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let (instrument, reason) = refused(
+                client_for(&server)
+                    .fetch_open_orders(&[InstrumentNameExchange::new("zzz250620c00100000")])
+                    .await,
+            );
+
+            assert_eq!(instrument, "zzz250620c00100000");
+            assert!(reason.contains("lists no asset"), "{reason}");
+            assert_eq!(
+                request_paths(&server).await,
+                ["/v2/options/contracts/ZZZ250620C00100000"]
+            );
+        }
+
+        /// `fetch_trades` reads a contract whose expiry, from its symbol, is past without looking
+        /// it up, as Alpaca drops long-expired contracts, and matches its fills ignoring case.
+        #[tokio::test]
+        async fn fetch_trades_reads_a_past_contract_without_looking_it_up() {
+            use crate::client::ExecutionClient;
+
+            let at = time("2025-04-18T14:30:00Z");
+            let server = serve_activities(vec![
+                fill_at("a", "AAPL210115C00150000", at),
+                fill_at("b", "SPY", at),
+            ])
+            .await;
+
+            let Ok(read) = client_for(&server)
+                .fetch_trades(
+                    recovery_after(),
+                    Utc::now(),
+                    &[InstrumentNameExchange::new("aapl210115c00150000")],
+                )
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+
+            let trades: Vec<_> = read
+                .trades
+                .iter()
+                .map(|trade| (trade.id.0.to_string(), trade.instrument.name().to_string()))
+                .collect();
+            assert_eq!(trades, [("a".to_owned(), "AAPL210115C00150000".to_owned())]);
+            assert_eq!(request_paths(&server).await, ["/v2/account/activities"]);
+        }
+
+        /// `fetch_trades` still looks up a contract that has not expired, and refuses it when
+        /// Alpaca does not list it.
+        #[tokio::test]
+        async fn fetch_trades_refuses_an_unlisted_contract_not_yet_expired() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let (instrument, reason) = refused(
+                client_for(&server)
+                    .fetch_trades(
+                        recovery_after(),
+                        Utc::now(),
+                        &[InstrumentNameExchange::new("zzz991231c00100000")],
+                    )
+                    .await,
+            );
+
+            assert_eq!(instrument, "zzz991231c00100000");
+            assert!(reason.contains("lists no asset"), "{reason}");
+            assert_eq!(
+                request_paths(&server).await,
+                ["/v2/options/contracts/ZZZ991231C00100000"]
+            );
+        }
+
+        /// `account_snapshot` and `fetch_open_orders` look up a past contract and refuse it when
+        /// Alpaca no longer lists it, even after `fetch_trades` read it unlooked-up: that read
+        /// does not remember it as listed.
+        #[tokio::test]
+        async fn snapshot_and_open_orders_refuse_a_past_contract_alpaca_dropped() {
+            use crate::client::ExecutionClient;
+
+            let server = serve_activities(Vec::new()).await;
+            let client = client_for(&server);
+            let requested = [InstrumentNameExchange::new("AAPL210115C00150000")];
+            assert!(
+                client
+                    .fetch_trades(recovery_after(), Utc::now(), &requested)
+                    .await
+                    .is_ok()
+            );
+
+            let refusals = [
+                refused(
+                    client
+                        .account_snapshot(&[AssetNameExchange::new("USD")], &requested)
+                        .await,
+                ),
+                refused(client.fetch_open_orders(&requested).await),
+            ];
+
+            for (instrument, reason) in refusals {
+                assert_eq!(instrument, "AAPL210115C00150000");
+                assert!(reason.contains("lists no asset"), "{reason}");
+            }
+            assert_eq!(
+                request_paths(&server).await,
+                [
+                    "/v2/account/activities",
+                    "/v2/options/contracts/AAPL210115C00150000",
+                    "/v2/options/contracts/AAPL210115C00150000",
+                ]
+            );
+        }
+
+        /// An empty name, `.` or `..` is refused without a request: a URL path keeps an empty
+        /// segment and drops a dot segment, so the lookup would read another endpoint.
+        #[tokio::test]
+        async fn a_name_no_path_segment_can_carry_is_refused_unasked() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+            for name in ["", ".", ".."] {
+                let (instrument, reason) = refused(
+                    client
+                        .fetch_open_orders(&[InstrumentNameExchange::new(name)])
+                        .await,
+                );
+                assert_eq!(instrument, name);
+                assert!(reason.contains("lists nothing"), "{reason}");
+            }
+            assert!(request_paths(&server).await.is_empty());
+        }
+
+        /// A crypto pair named without its `/` is refused, though Alpaca's lookup finds the pair,
+        /// since orders and trades on it are reported under `BASE/QUOTE`. The reason names it.
+        #[tokio::test]
+        async fn a_crypto_pair_named_without_its_slash_is_refused() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets/BTCUSD"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "symbol": "BTC/USD", "class": "crypto", "status": "active" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let (instrument, reason) = refused(
+                client_for(&server)
+                    .fetch_open_orders(&[InstrumentNameExchange::new("btcusd")])
+                    .await,
+            );
+
+            assert_eq!(instrument, "btcusd");
+            assert!(reason.contains("BTC/USD"), "{reason}");
+        }
+
+        /// An OCC symbol is looked up on the options-contracts endpoint, any other name on the
+        /// asset endpoint, each upper-cased and with a pair's `/` escaped. An expired contract is
+        /// still listed. A listed name is looked up once per client, by every clone, and names
+        /// differing only in case share one lookup.
+        #[tokio::test]
+        async fn listed_names_are_looked_up_upper_cased_once_per_client() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            mount_listings(&server, &["AAPL", "BTC/USD"]).await;
+            Mock::given(method("GET"))
+                .and(path("/v2/options/contracts/AAPL250620C00100000"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "AAPL250620C00100000",
+                    "status": "inactive",
+                    "tradable": false,
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&server)
+                .await;
+
+            let requested = [
+                InstrumentNameExchange::new("aapl"),
+                InstrumentNameExchange::new("aapl250620c00100000"),
+                InstrumentNameExchange::new("btc/usd"),
+                InstrumentNameExchange::new("AAPL"),
+            ];
+            let client = client_for(&server);
+            let clone = client.clone();
+            assert!(client.fetch_open_orders(&requested).await.is_ok());
+            assert!(clone.fetch_open_orders(&requested).await.is_ok());
+
+            let lookups: Vec<_> = request_paths(&server)
+                .await
+                .into_iter()
+                .filter(|path| path != "/v2/orders")
+                .collect();
+            assert_eq!(
+                lookups,
+                [
+                    "/v2/assets/AAPL",
+                    "/v2/options/contracts/AAPL250620C00100000",
+                    "/v2/assets/BTC%2FUSD",
+                ]
+            );
+        }
+
+        /// With several instruments refused, the error names the first requested, however long
+        /// each lookup takes.
+        #[tokio::test]
+        async fn the_first_refused_instrument_is_named() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets/FIRST"))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .set_delay(Duration::from_millis(200))
+                        .set_body_json(
+                            serde_json::json!({ "code": 40410000, "message": "asset not found" }),
+                        ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets/SECOND"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({ "code": 40410000, "message": "asset not found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let (instrument, _) = refused(
+                client_for(&server)
+                    .fetch_open_orders(&[
+                        InstrumentNameExchange::new("FIRST"),
+                        InstrumentNameExchange::new("SECOND"),
+                    ])
+                    .await,
+            );
+
+            assert_eq!(instrument, "FIRST");
+        }
+
+        /// A lookup that fails fails the read with its error, not as a refusal, and is asked again
+        /// by the next read, since nothing was learnt.
+        #[tokio::test]
+        async fn a_failed_lookup_fails_the_read() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets/SPY"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+            let spy = [InstrumentNameExchange::new("SPY")];
+
+            for _ in 0..2 {
+                let result = client.fetch_open_orders(&spy).await;
+                assert!(
+                    matches!(result, Err(UnindexedClientError::Connectivity(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                request_paths(&server).await,
+                ["/v2/assets/SPY", "/v2/assets/SPY"]
             );
         }
 
@@ -14323,6 +14899,22 @@ mod tests {
                             && reason.contains("option")
                 ),
                 "{result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_name_in_another_case_is_read_as_alpacas_symbol() {
+            let (result, paths) = shortability_with_asset(
+                "aapl",
+                serde_json::json!({ "class": "us_equity", "symbol": "AAPL", "shortable": true }),
+            )
+            .await;
+
+            assert_eq!(result.unwrap(), Shortability::new().with_shortable(true));
+            assert_eq!(
+                paths,
+                vec!["/v2/assets/AAPL"],
+                "Alpaca's lookup matches case"
             );
         }
 
