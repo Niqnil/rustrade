@@ -15,7 +15,9 @@ use crate::{
         book::{OrderBookEvent, OrderBookL1},
         candle::Candle,
         liquidation::Liquidation,
+        price_band::PriceBand,
         trade::PublicTrade,
+        trading_status::TradingStatus,
     },
 };
 use fnv::FnvHashMap;
@@ -38,7 +40,13 @@ pub mod indexed;
 
 mod plan;
 
+/// Market streams of every [`SubKind`], one per [`ExchangeId`] in each kind's map.
+///
+/// Built only by [`init`](Self::init), [`init_with`](Self::init_with) and
+/// [`init_with_options`](Self::init_with_options). It is `#[non_exhaustive]` because each kind
+/// added later gains a field: destructure it with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DynamicStreams<InstrumentKey> {
     pub trades:
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PublicTrade>>>,
@@ -52,6 +60,12 @@ pub struct DynamicStreams<InstrumentKey> {
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Liquidation>>>,
     pub candles:
         VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Candle>>>,
+    pub trading_statuses: VecMap<
+        ExchangeId,
+        UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>,
+    >,
+    pub price_bands:
+        VecMap<ExchangeId, UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>>,
 }
 
 /// The subscribers [`DynamicStreams`] cannot build for itself.
@@ -112,6 +126,11 @@ impl DynamicSubscribers {
     /// typed [`Streams`](crate::streams::Streams) builder serves it. A confirmed crypto
     /// subscription may stay silent for minutes: Alpaca publishes a crypto quote only when the top
     /// of book changes. See [`exchange::alpaca`](crate::exchange::alpaca).
+    ///
+    /// `SubKind::TradingStatuses` and `SubKind::PriceBands` read the stock feeds' `statuses` and
+    /// `lulds` channels; the crypto feed has neither. See
+    /// [`exchange::alpaca::status`](crate::exchange::alpaca::status) and
+    /// [`exchange::alpaca::luld`](crate::exchange::alpaca::luld) for how Alpaca's codes map.
     ///
     /// The `(channel, symbol)` pairs every stream on a feed holds count together against Alpaca's
     /// per-connection cap — 30 on the free IEX plan, as last measured. Trades and L1 on one symbol
@@ -420,6 +439,16 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                 .into_iter()
                 .map(|(exchange, rx)| (exchange, rx.into_stream()))
                 .collect(),
+            trading_statuses: rxs
+                .trading_statuses
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
+            price_bands: rxs
+                .price_bands
+                .into_iter()
+                .map(|(exchange, rx)| (exchange, rx.into_stream()))
+                .collect(),
         })
     }
 
@@ -532,6 +561,46 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         )
     }
 
+    /// Remove an exchange [`TradingStatus`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_trading_statuses(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>> {
+        self.trading_statuses.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`TradingStatus`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_trading_statuses(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, TradingStatus>>> {
+        futures_util::stream::select_all::select_all(
+            std::mem::take(&mut self.trading_statuses).into_values(),
+        )
+    }
+
+    /// Remove an exchange [`PriceBand`] `Stream` from the [`DynamicStreams`] collection.
+    ///
+    /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    pub fn select_price_bands(
+        &mut self,
+        exchange: ExchangeId,
+    ) -> Option<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>> {
+        self.price_bands.remove(&exchange)
+    }
+
+    /// Select and merge every exchange [`PriceBand`] `Stream` using
+    /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    pub fn select_all_price_bands(
+        &mut self,
+    ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, PriceBand>>> {
+        futures_util::stream::select_all::select_all(
+            std::mem::take(&mut self.price_bands).into_values(),
+        )
+    }
+
     /// Select and merge every exchange `Stream` for every data type using [`select_all`](futures_util::stream::select_all::select_all)
     ///
     /// Note that using [`MarketStreamResult<Instrument, DataKind>`] as the `Output` is suitable for most
@@ -545,6 +614,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         MarketStreamResult<InstrumentKey, OrderBookEvent>: Into<Output>,
         MarketStreamResult<InstrumentKey, Liquidation>: Into<Output>,
         MarketStreamResult<InstrumentKey, Candle>: Into<Output>,
+        MarketStreamResult<InstrumentKey, TradingStatus>: Into<Output>,
+        MarketStreamResult<InstrumentKey, PriceBand>: Into<Output>,
     {
         let Self {
             trades,
@@ -552,6 +623,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             l2s,
             liquidations,
             candles,
+            trading_statuses,
+            price_bands,
         } = self;
 
         let trades = trades
@@ -574,11 +647,21 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
             .into_values()
             .map(|stream| stream.map(MarketStreamResult::into).boxed());
 
+        let trading_statuses = trading_statuses
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
+        let price_bands = price_bands
+            .into_values()
+            .map(|stream| stream.map(MarketStreamResult::into).boxed());
+
         let all = trades
             .chain(l1s)
             .chain(l2s)
             .chain(liquidations)
-            .chain(candles);
+            .chain(candles)
+            .chain(trading_statuses)
+            .chain(price_bands);
 
         futures_util::stream::select_all::select_all(all)
     }
@@ -774,6 +857,26 @@ where
                         rxs.candles.insert(sub.exchange, rx);
                     }
                 }
+                SubKind::TradingStatuses => {
+                    if let (None, None) = (
+                        txs.trading_statuses.get(&sub.exchange),
+                        rxs.trading_statuses.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.trading_statuses.insert(sub.exchange, tx);
+                        rxs.trading_statuses.insert(sub.exchange, rx);
+                    }
+                }
+                SubKind::PriceBands => {
+                    if let (None, None) = (
+                        txs.price_bands.get(&sub.exchange),
+                        rxs.price_bands.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.price_bands.insert(sub.exchange, tx);
+                        rxs.price_bands.insert(sub.exchange, rx);
+                    }
+                }
                 sub_kind @ (SubKind::OrderBooksL3 | SubKind::Quotes) => {
                     return Err(DataError::Unsupported {
                         exchange: sub.exchange,
@@ -794,6 +897,9 @@ struct Rxs<InstrumentKey> {
     liquidations:
         FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, Liquidation>>>,
     candles: FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, Candle>>>,
+    trading_statuses:
+        FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, TradingStatus>>>,
+    price_bands: FnvHashMap<ExchangeId, UnboundedRx<MarketStreamResult<InstrumentKey, PriceBand>>>,
 }
 
 impl<InstrumentKey> Default for Rxs<InstrumentKey> {
@@ -804,6 +910,8 @@ impl<InstrumentKey> Default for Rxs<InstrumentKey> {
             l2s: Default::default(),
             liquidations: Default::default(),
             candles: Default::default(),
+            trading_statuses: Default::default(),
+            price_bands: Default::default(),
         }
     }
 }
@@ -1013,6 +1121,8 @@ mod tests {
             SubKind::OrderBooksL3,
             SubKind::Liquidations,
             SubKind::Quotes,
+            SubKind::TradingStatuses,
+            SubKind::PriceBands,
         ]
         .into_iter()
         .chain(
@@ -1032,7 +1142,9 @@ mod tests {
                 | SubKind::OrderBooksL3
                 | SubKind::Liquidations
                 | SubKind::Candles { .. }
-                | SubKind::Quotes => {}
+                | SubKind::Quotes
+                | SubKind::TradingStatuses
+                | SubKind::PriceBands => {}
             }
         }
 
@@ -1113,6 +1225,115 @@ mod tests {
             "hyperliquid" => cfg!(feature = "hyperliquid"),
             other => panic!("no dynamic route is gated on the `{other}` feature"),
         }
+    }
+
+    /// A `DynamicStreams` holding one trading status and one price band stream on `AlpacaIex`, each
+    /// with one event waiting.
+    fn streams_with_a_status_and_a_band() -> DynamicStreams<u8> {
+        use crate::{
+            event::MarketEvent, streams::reconnect::Event,
+            subscription::trading_status::TradingState,
+        };
+        fn event<Kind>(kind: Kind) -> MarketStreamResult<u8, Kind> {
+            Event::Item(Ok(MarketEvent {
+                time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                time_received: Utc.timestamp_opt(0, 0).unwrap(),
+                exchange: ExchangeId::AlpacaIex,
+                instrument: 1_u8,
+                kind,
+            }))
+        }
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (band_tx, band_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx
+            .send(event(TradingStatus::new(TradingState::Halted)))
+            .unwrap();
+        band_tx
+            .send(event(PriceBand::new(Some(Decimal::TEN), None)))
+            .unwrap();
+
+        DynamicStreams {
+            trades: VecMap::new(),
+            l1s: VecMap::new(),
+            l2s: VecMap::new(),
+            liquidations: VecMap::new(),
+            candles: VecMap::new(),
+            trading_statuses: [(
+                ExchangeId::AlpacaIex,
+                UnboundedReceiverStream::new(status_rx),
+            )]
+            .into_iter()
+            .collect(),
+            price_bands: [(ExchangeId::AlpacaIex, UnboundedReceiverStream::new(band_rx))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_status_and_band_stream_is_selected_once_by_its_exchange() {
+        let mut streams = streams_with_a_status_and_a_band();
+
+        assert!(
+            streams
+                .select_trading_statuses(ExchangeId::AlpacaSip)
+                .is_none()
+        );
+        let mut statuses = streams
+            .select_trading_statuses(ExchangeId::AlpacaIex)
+            .unwrap();
+        assert!(
+            streams
+                .select_trading_statuses(ExchangeId::AlpacaIex)
+                .is_none()
+        );
+        let mut bands = streams.select_price_bands(ExchangeId::AlpacaIex).unwrap();
+        assert!(streams.select_price_bands(ExchangeId::AlpacaIex).is_none());
+
+        assert!(matches!(
+            statuses.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+        assert!(matches!(
+            bands.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_all_of_one_kind_merges_its_streams_and_takes_them() {
+        let mut streams = streams_with_a_status_and_a_band();
+
+        let mut statuses = streams.select_all_trading_statuses();
+        let mut bands = streams.select_all_price_bands();
+
+        assert!(streams.trading_statuses.is_empty() && streams.price_bands.is_empty());
+        assert!(matches!(
+            statuses.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+        assert!(matches!(
+            bands.next().await,
+            Some(crate::streams::reconnect::Event::Item(Ok(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_all_carries_statuses_and_bands_as_data_kinds() {
+        use crate::{event::DataKind, streams::reconnect::Event};
+        let streams = streams_with_a_status_and_a_band();
+
+        let mut all = streams.select_all::<MarketStreamResult<u8, DataKind>>();
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let Some(Event::Item(Ok(event))) = all.next().await else {
+                panic!("expected an event");
+            };
+            kinds.push(event.kind.kind_name().to_owned());
+        }
+        kinds.sort();
+
+        assert_eq!(kinds, ["price_band", "trading_status"]);
     }
 
     #[test]

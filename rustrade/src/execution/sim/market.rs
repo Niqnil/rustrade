@@ -167,8 +167,8 @@ impl VenueMarketUpdate for DataKind {
     /// previous close carried forward. One reporting neither is fresh, since some feeds (spot FX)
     /// report no volume at all, and an unknown volume is not a zero one.
     ///
-    /// L2 depth, liquidations, greeks and trading statuses are never fresh: the state prices from
-    /// none of them.
+    /// L2 depth, liquidations, greeks, trading statuses and price bands are never fresh: the state
+    /// prices from none of them.
     fn fresh(state: &Self::State, event: &MarketEvent<InstrumentIndex, Self>) -> bool {
         match &event.kind {
             DataKind::Trade(_) => state.takes_trade(event.time_exchange),
@@ -181,7 +181,8 @@ impl VenueMarketUpdate for DataKind {
             DataKind::OrderBook(_)
             | DataKind::Liquidation(_)
             | DataKind::OptionGreeks(_)
-            | DataKind::TradingStatus(_) => false,
+            | DataKind::TradingStatus(_)
+            | DataKind::PriceBand(_) => false,
             // `DataKind` is `#[non_exhaustive]`: a kind added later prices nothing until it is
             // handled above, and says so.
             kind => {
@@ -373,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_liquidations_greeks_and_trading_statuses_are_never_fresh() {
+    fn depth_liquidations_greeks_statuses_and_bands_are_never_fresh() {
         let mut state = DefaultInstrumentMarketData::default();
         let liquidation =
             DataKind::Liquidation(rustrade_data::subscription::liquidation::Liquidation {
@@ -403,6 +404,14 @@ mod tests {
             &mut state,
             event(1, DataKind::TradingStatus(halted))
         ));
+        let band = rustrade_data::subscription::price_band::PriceBand::new(None, None);
+        let ((), logs) = rustrade_instrument::test_utils::logs::capture(|| {
+            assert!(!fresh(&mut state, event(1, DataKind::PriceBand(band))));
+        });
+        assert!(
+            logs.is_empty(),
+            "a price band is handled, not unknown: {logs:?}"
+        );
     }
 
     /// A kind that carries a last price and no bars, implementing only what it must.

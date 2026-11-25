@@ -374,6 +374,14 @@ user of the library would need it in the same form. If so, it belongs here.
 - Choosing a model's inputs (rates, dividends, which quote to solve on), and analytics built on its
   results, such as volatility surfaces and signals.
 
+**Instrument names.** The library never rewrites an instrument name, such as `BTCUSD` into
+`BTC/USD`. Each client matches a requested name by one rule, the venue's own spelling exactly or
+ignoring case, and documents that rule and the spelling it reports what it finds under (see the
+`ExecutionClient` docs). A requested instrument the client cannot match is refused with
+`ApiError::InstrumentInvalid`: it is never dropped from a read, nor reported flat or empty, since
+nothing was read about it. A simulated venue follows the same rule as the venue it stands in for.
+Mapping names between venues, or onto a consumer's own identifiers, is the consumer's.
+
 The library should make a policy possible without choosing it. It exposes what a consumer needs to
 decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
 decision to the consumer. When a venue rule needs a threshold, make it a documented default the

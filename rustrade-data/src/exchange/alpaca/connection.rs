@@ -423,6 +423,8 @@ fn classify(message: &WsMessage) -> Classified<'_> {
             // Corrections and cancel errors accompany trades, and belong to whoever holds them.
             "t" | "c" | "x" => AlpacaChannel::Trades,
             "q" => AlpacaChannel::Quotes,
+            "s" => AlpacaChannel::Statuses,
+            "l" => AlpacaChannel::Lulds,
             kind => {
                 debug!(kind, "Alpaca message of a type no stream subscribes to");
                 continue;
@@ -603,6 +605,25 @@ mod tests {
     }
 
     #[test]
+    fn statuses_and_bands_reach_only_the_streams_holding_their_channel() {
+        let mut registry = Registry::default();
+        let (_, mut statuses) = attach(&mut registry, &[(AlpacaChannel::Statuses, "AAPL")]);
+        let (_, mut bands) = attach(&mut registry, &[(AlpacaChannel::Lulds, "AAPL")]);
+        let (_, mut trades) = attach(&mut registry, &[(TRADES, "AAPL")]);
+
+        let status = json!({"T": "s", "S": "AAPL", "sc": "H", "rc": "T1", "t": "2026-09-25T10:00:00Z", "z": "C"});
+        let band = json!({"T": "l", "S": "AAPL", "u": 2.0, "d": 1.0, "i": "B", "t": "2026-09-25T10:00:00Z", "z": "C"});
+        deliver(
+            &mut registry,
+            &frame(&[status.clone(), band.clone(), trade("AAPL")]),
+        );
+
+        assert_eq!(received(&mut statuses), [vec![status]]);
+        assert_eq!(received(&mut bands), [vec![band]]);
+        assert_eq!(received(&mut trades), [vec![trade("AAPL")]]);
+    }
+
+    #[test]
     fn corrections_and_cancel_errors_reach_the_streams_holding_the_trades() {
         let mut registry = Registry::default();
         let (_, mut trades) = attach(&mut registry, &[(TRADES, "AAPL")]);
@@ -778,6 +799,8 @@ mod tests {
             slot(TRADES, "AAPL"),
             slot(QUOTES, "MSFT"),
             slot(TRADES, "SPY"),
+            slot(AlpacaChannel::Statuses, "TSLA"),
+            slot(AlpacaChannel::Lulds, "TSLA"),
         ];
 
         let parse = |message: &WsMessage| match message {
@@ -788,7 +811,13 @@ mod tests {
         let (subscribe, _) = Alpaca::subscribe(&mut Registry::default(), 0, &pairs);
         assert_eq!(
             parse(&only(subscribe)),
-            json!({"action": "subscribe", "trades": ["AAPL", "SPY"], "quotes": ["MSFT"]}),
+            json!({
+                "action": "subscribe",
+                "trades": ["AAPL", "SPY"],
+                "quotes": ["MSFT"],
+                "statuses": ["TSLA"],
+                "lulds": ["TSLA"],
+            }),
         );
 
         let (unsubscribe, awaiting) = Alpaca::release(&pairs[..1]);

@@ -41,6 +41,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connecting, a subscription built or deserialized past its constructor's check: depth rows
   outside 1-20, or a candle `since` later than one bar from now.
 
+- **Alpaca trading status and Limit Up-Limit Down bands** (`rustrade-data`, #881). Two new
+  subscription kinds read the Alpaca stock feeds' `statuses` and `lulds` channels, on the feed's
+  shared connection: `TradingStatuses` yields `TradingStatus`, and `PriceBands` yields the new
+  `PriceBand` (optional upper and lower limits, a `PriceBandUpdate` saying why it was published,
+  and the venue's code), also as the new `DataKind::PriceBand`. Both are served by the typed
+  `Streams` builder and by `DynamicStreams` (`SubKind::TradingStatuses`, `SubKind::PriceBands`,
+  with `select_trading_statuses` / `select_price_bands` and their `select_all_*` forms) on
+  `AlpacaIex` and `AlpacaSip` only: the crypto feed has neither, and a crypto subscription to one
+  does not compile. Status and reason codes are read by tape, since the two US tape plans spell
+  them differently: a halt is `Halted` with a typed reason, a Limit Up-Limit Down or volatility
+  pause is `Paused`, a quotation resumption `QuoteOnly`, and a resumption `Trading` with no reason.
+  Codes that report no trading state (imbalances, indications, the short sale restriction) are not
+  reported, so they cannot overwrite the real state; an undocumented code or tape is dropped with
+  a warning once per connection. A blank reason code is no reason. Tape B re-sends a halt every
+  few seconds with a blank reason while it lasts, so a tape A or B halt with a blank reason for a
+  symbol already halted or paused on that connection is a repeat and is not reported: without
+  this, each repeat would turn a Limit Up-Limit Down pause into a halt. A band's zero limit is
+  `None`.
+  Alpaca does not document the band indicator, so it is read by tape as each plan defines it: A–F
+  on tapes C and O; on tapes A and B a republished band is `Restated`, any other band `Other`, and
+  a limit-state message, which is not a band, is not reported. The raw codes are kept in
+  `venue_code` (`"<tape>:<sc>:<rc>"` for a status, `"<tape>:<i>"` for a band). The engine's
+  `DefaultInstrumentMarketData` and the simulated venue ignore price bands. Alpaca does not say
+  which stock feeds publish these channels; the IEX and delayed SIP feeds send both in session.
+
 - **IBKR market data: typed refusals and delayed data** (`rustrade-data`, `rustrade-instrument`,
   #877). A subscription IB refuses now ends with a typed error instead of a `DataError::Socket`
   string: `DataError::SubscriptionLimitReached` when the account's market data lines (IB code
@@ -732,6 +757,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: Alpaca reads refuse an instrument Alpaca does not list under that name**
+  (`rustrade-execution`, `alpaca`). `AlpacaClient::account_snapshot` reported a requested equity
+  or option Alpaca does not list (`NOPE`) as flat with no open orders, complete, without having
+  looked, and a crypto pair named without its `/` (`BTCUSD`) the same way while the pair had open
+  orders and a balance, which Alpaca reports under `BTC/USD`; `fetch_open_orders` and
+  `fetch_trades` returned nothing for either. All three now check, before reading anything, that
+  Alpaca lists each requested name, ignoring case, and fail with `ApiError::InstrumentInvalid` on
+  the first it does not; for a name Alpaca lists under another symbol, the reason names that
+  symbol. Each name not yet known costs one request, `GET /v2/options/contracts/{symbol}` for an
+  OCC symbol and `GET /v2/assets/{symbol}` for any other, against the rate limit shared with
+  orders; a listed name is remembered for the client's life, by every clone. An inactive asset
+  or an expired contract is still listed, so its history can be read. Alpaca does not keep
+  every expired contract (one that expired in January 2023 is no longer found), so
+  `fetch_trades` does not look up an OCC symbol whose expiry, read from the symbol, is before
+  today (UTC): it reads that contract's trades, and a misspelt past contract reads as having
+  none. `account_snapshot` and `fetch_open_orders` look up every name, so they refuse a contract
+  Alpaca no longer keeps. An empty `instruments` slice is not checked. An empty name, `.` or `..`
+  is refused without a request. The `ExecutionClient` documentation now tabulates how each client
+  matches instrument names, what spelling it reports, and what it does with a name it cannot
+  match, and `CONTRIBUTING.md` states the rule new clients follow.
 - **Breaking: `StockSplitSource::fetch_splits` returns a stream that borrows only the source**
   (`rustrade-integration`). The stream's type captured `filter` too, though every implementation
   copies what it needs from the filter first, so a caller could not pass a temporary filter and
@@ -842,6 +887,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on it outside `rustrade-data` needs a wildcard arm. The engine's `DefaultInstrumentMarketData` and
   the simulated venue ignore `TradingStatus`; a kind added later that reaches their wildcard arm is
   logged (a rate-limited warning naming it) rather than ignored silently.
+- **Breaking: `SubKind` and `DynamicStreams` are `#[non_exhaustive]`, and `SubKind` gains
+  `TradingStatuses` and `PriceBands`** (`rustrade-data`, #881). Kinds keep being added as venues
+  publish them, so a `match` on `SubKind` outside `rustrade-data` needs a wildcard arm.
+  `DynamicStreams` gains the public fields `trading_statuses` and `price_bands`; it is
+  `#[non_exhaustive]` so that a later kind's field is not a breaking change, which means
+  destructuring it outside `rustrade-data` needs `..` and only its `init*` constructors build it.
+  `DynamicStreams::select_all` requires `MarketStreamResult<_, TradingStatus>` and
+  `MarketStreamResult<_, PriceBand>` to convert into its output too;
+  `MarketStreamResult<_, DataKind>` does.
 - **Breaking: `BarterError` is renamed `RustradeError`, and `BarterStreamExt` is renamed
   `RustradeStreamExt`** (`rustrade`, `rustrade-integration`). The old names came from the project
   rustrade was forked from. There are no deprecated aliases: replace `rustrade::error::BarterError`
@@ -1315,6 +1369,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did for an unlisted symbol. Margin's refusal texts do not name the parameter, so on a lookup,
   which also sends a client order id, they count as the symbol's only when the symbol is
   miscased or empty; others, such as `BTC/USDT`, still fail the lookup.
+- **Alpaca's `fetch_shortability` matches the name ignoring case** (`rustrade-execution`,
+  `alpaca`). It sent the name to `GET /v2/assets/{symbol}` as spelled, and Alpaca's lookup matches
+  case, so `aapl` was refused as an unknown instrument. It now sends the name upper-cased, as the
+  client's other reads match names.
 - **Alpaca's trade and open-order reads match instrument names ignoring case**
   (`rustrade-execution`, `alpaca`). `AlpacaClient::fetch_trades` matched requested names exactly,
   so a name in another case than Alpaca's symbol (`spy` for `SPY`) read no trades, and
