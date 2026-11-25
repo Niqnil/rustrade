@@ -762,6 +762,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: Binance isolated margin reads refuse a pair the client is not configured for**
+  (`rustrade-execution`, `binance`). `BinanceMargin::account_snapshot`, `fetch_open_orders` and
+  `fetch_trades` on an isolated client left out, with a warning, a requested instrument not in
+  `BinanceMarginConfig::isolated_symbols` under that exact name, case included, so a read
+  filtered only to it returned nothing, as if it had no orders, fills or isolated balance. All
+  three now fail with `ApiError::InstrumentInvalid` on the first such instrument, before sending
+  anything to Binance. Add the pair to `isolated_symbols`, or correct the name. An empty
+  `instruments` slice still reads every configured pair.
 - **Breaking: IBKR reads refuse an instrument the client cannot match to IB's reports**
   (`rustrade-execution`, `ibkr`). `IbkrClient::account_snapshot`, `fetch_open_orders` and
   `fetch_trades` silently left out a requested instrument that is not in the client's contract

@@ -1121,33 +1121,36 @@ impl BinanceMargin {
     /// all" affordance), so every isolated snapshot/query iterates an explicit symbol set:
     /// - empty `instruments` (the "return all" sentinel) → the full configured
     ///   [`isolated_symbols`](BinanceMarginConfig::isolated_symbols);
-    /// - non-empty → `instruments ∩ isolated_symbols`; any requested instrument NOT in
-    ///   `isolated_symbols` is skipped with a `warn!` (there is no configured isolated
-    ///   token/stream/snapshot for it — returning it would be a silent mismatch).
+    /// - non-empty → `instruments`, each of which must be in `isolated_symbols` exactly, case
+    ///   included.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] on the first requested instrument not in
+    /// `isolated_symbols`: the client reads no isolated account for it, so a read filtered to it
+    /// would report it empty without having read anything about it.
     ///
     /// Shared by `account_snapshot`, `fetch_open_orders`, and `fetch_trades` so their instrument,
     /// open-order, and trade sets cannot drift apart.
     fn effective_isolated_set(
         &self,
         instruments: &[InstrumentNameExchange],
-    ) -> Vec<InstrumentNameExchange> {
+    ) -> Result<Vec<InstrumentNameExchange>, UnindexedClientError> {
         if instruments.is_empty() {
-            return self.config.isolated_symbols.clone();
+            return Ok(self.config.isolated_symbols.clone());
         }
-        instruments
+        match instruments
             .iter()
-            .filter(|inst| {
-                let in_set = self.config.isolated_symbols.contains(*inst);
-                if !in_set {
-                    warn!(
-                        instrument = %inst.name(),
-                        "BinanceMargin isolated: requested instrument not in configured isolated_symbols — skipping"
-                    );
-                }
-                in_set
-            })
-            .cloned()
-            .collect()
+            .find(|instrument| !self.config.isolated_symbols.contains(instrument))
+        {
+            Some(unconfigured) => Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                unconfigured.clone(),
+                format!(
+                    "{unconfigured} is not in this isolated margin client's isolated_symbols, \
+                     so it reads no isolated account of it"
+                ),
+            ))),
+            None => Ok(instruments.to_vec()),
+        }
     }
 
     /// Isolated-margin `account_snapshot`: per-pair balances + risk attached per-instrument, with
@@ -1159,16 +1162,8 @@ impl BinanceMargin {
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         use futures::{StreamExt as _, TryStreamExt as _};
 
-        let effective = self.effective_isolated_set(instruments);
-        if effective.is_empty() {
-            // No configured isolated pair matched: a no-symbol isolated call is invalid, so there is
-            // nothing to query — return an empty snapshot rather than an account-wide one.
-            return Ok(AccountSnapshot::new(
-                ExchangeId::BinanceMargin,
-                Vec::new(),
-                Vec::new(),
-            ));
-        }
+        // Never empty: `new` refuses an isolated client with no configured pair.
+        let effective = self.effective_isolated_set(instruments)?;
 
         // Per-pair isolated balances + risk (chunked ≤5 symbols/request), keyed by instrument,
         // each chunk's stamped by when its request was sent.
@@ -1477,8 +1472,10 @@ impl ExecutionClient for BinanceMargin {
     /// via [`InstrumentAccountSnapshot::isolated`] rather than folded into the asset-keyed
     /// top-level `balances` (which is left **empty**) — isolated sub-accounts are per-`(pair, asset)`
     /// and would collide in the asset-keyed model. The instrument set is the effective isolated set
-    /// (`isolated_symbols`, or `instruments ∩ isolated_symbols` with out-of-set instruments skipped);
-    /// each instrument's open orders and isolated balances are fetched over that same set.
+    /// (`isolated_symbols` for an empty `instruments`, or else `instruments`, each of which must be
+    /// in `isolated_symbols`); each instrument's open orders and isolated balances are fetched over
+    /// that same set. A requested instrument not in `isolated_symbols`, exactly, fails the read
+    /// with [`ApiError::InstrumentInvalid`] before anything is sent.
     ///
     /// # Known limitation: balances can lag a fill
     /// Binance's REST account view can trail its matching engine. A cross account read straight
@@ -1609,8 +1606,9 @@ impl ExecutionClient for BinanceMargin {
     /// instruments concurrently, per-symbol.
     ///
     /// **Isolated**: per-symbol on the venue — always iterates the effective isolated set (empty
-    /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
-    /// never issues a no-symbol isolated call.
+    /// `instruments` → configured `isolated_symbols`); never issues a no-symbol isolated call. A
+    /// requested instrument not in `isolated_symbols`, exactly, fails the read with
+    /// [`ApiError::InstrumentInvalid`] before anything is sent.
     ///
     /// **A conditional order is listed with the kind this client knows it by**, or else as
     /// [`OrderKind::ConditionalUnresolved`]: the REST row cannot tell a fixed from a trailing one
@@ -1625,7 +1623,7 @@ impl ExecutionClient for BinanceMargin {
         // isolated call, which would error). The empty-`instruments` sentinel resolves to the
         // configured isolated_symbols.
         if self.config.is_isolated {
-            let effective = self.effective_isolated_set(instruments);
+            let effective = self.effective_isolated_set(instruments)?;
             let capacity = effective.len();
             return futures::stream::iter(effective.into_iter().map(|instrument| {
                 fetch_margin_open_orders_for_instrument(
@@ -1694,9 +1692,9 @@ impl ExecutionClient for BinanceMargin {
     /// **Cross**: an empty `instruments` slice has nothing to query and reads nothing; callers
     /// wanting all trades must enumerate instruments explicitly.
     ///
-    /// **Isolated**: the empty sentinel resolves to the configured `isolated_symbols` (the effective
-    /// isolated set; out-of-set instruments skipped with a warning), iterated per-symbol (Design
-    /// decision #4).
+    /// **Isolated**: the empty sentinel resolves to the configured `isolated_symbols`, iterated
+    /// per-symbol. A requested instrument not in `isolated_symbols`, exactly, fails the read with
+    /// [`ApiError::InstrumentInvalid`] before anything is sent.
     ///
     /// **Complete:** each instrument is read to the span's end within the call, with no page cap,
     /// so the read is always complete (`resume: None`).
@@ -1728,16 +1726,15 @@ impl ExecutionClient for BinanceMargin {
         // Resolve the effective instrument set. Isolated resolves the empty sentinel to the
         // configured isolated_symbols; cross keeps the slice verbatim (no no-symbol "all" form).
         let effective: Vec<InstrumentNameExchange> = if self.config.is_isolated {
-            self.effective_isolated_set(instruments)
+            self.effective_isolated_set(instruments)?
         } else {
             instruments.to_vec()
         };
         if effective.is_empty() {
-            // Distinguish the two empty causes: cross with an empty `instruments` slice (the
-            // documented no-op sentinel) vs. isolated with no configured `isolated_symbols` matched.
+            // Only cross with an empty `instruments` slice (the documented no-op sentinel): the
+            // isolated set is never empty, since `new` refuses an isolated client with no pair.
             debug!(
-                is_isolated = self.config.is_isolated,
-                "BinanceMargin fetch_trades: empty effective instrument set — returning empty result"
+                "BinanceMargin fetch_trades: cross with no instruments — returning empty result"
             );
             return Ok(TradesRead::complete(Vec::new()));
         }
@@ -4888,7 +4885,7 @@ mod tests {
     fn effective_isolated_set_empty_returns_all_configured() {
         let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
         assert_eq!(
-            client.effective_isolated_set(&[]),
+            client.effective_isolated_set(&[]).unwrap(),
             vec![
                 InstrumentNameExchange::new("BTCUSDT"),
                 InstrumentNameExchange::new("ETHUSDT"),
@@ -4897,25 +4894,43 @@ mod tests {
     }
 
     #[test]
-    fn effective_isolated_set_intersects_requested() {
-        let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
+    fn effective_isolated_set_is_the_requested_configured_pairs() {
+        let client = isolated_client(&["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
         assert_eq!(
-            client.effective_isolated_set(&[InstrumentNameExchange::new("ETHUSDT")]),
-            vec![InstrumentNameExchange::new("ETHUSDT")]
+            client
+                .effective_isolated_set(&[
+                    InstrumentNameExchange::new("SOLUSDT"),
+                    InstrumentNameExchange::new("ETHUSDT"),
+                ])
+                .unwrap(),
+            vec![
+                InstrumentNameExchange::new("SOLUSDT"),
+                InstrumentNameExchange::new("ETHUSDT"),
+            ]
         );
     }
 
     #[test]
-    fn effective_isolated_set_skips_out_of_set() {
+    fn effective_isolated_set_refuses_the_first_unconfigured_pair() {
         let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
-        // DOGEUSDT is not configured → skipped (warn), only BTCUSDT survives.
-        assert_eq!(
-            client.effective_isolated_set(&[
-                InstrumentNameExchange::new("BTCUSDT"),
-                InstrumentNameExchange::new("DOGEUSDT"),
-            ]),
-            vec![InstrumentNameExchange::new("BTCUSDT")]
-        );
+        // Not configured, and configured only in another case.
+        for (requested, refused) in [
+            (&["BTCUSDT", "DOGEUSDT", "XRPUSDT"][..], "DOGEUSDT"),
+            (&["ethusdt", "BTCUSDT"][..], "ethusdt"),
+        ] {
+            let requested: Vec<_> = requested
+                .iter()
+                .map(|name| InstrumentNameExchange::new(*name))
+                .collect();
+            match client.effective_isolated_set(&requested) {
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, reason))) => {
+                    assert_eq!(instrument, InstrumentNameExchange::new(refused));
+                    assert!(reason.contains(refused), "{reason}");
+                    assert!(reason.contains("isolated_symbols"), "{reason}");
+                }
+                other => panic!("{requested:?}: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -6421,6 +6436,46 @@ mod tests {
                 }
                 other => panic!("{endpoint} {name:?}: {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_reads_refuse_an_unconfigured_pair_before_sending() {
+        // The client is configured for BTCUSDT only.
+        for name in ["ETHUSDT", "btcusdt"] {
+            let server = wiremock::MockServer::start().await;
+            let client = margin_client_at(&server, true);
+            let instruments = [
+                InstrumentNameExchange::new("BTCUSDT"),
+                InstrumentNameExchange::new(name),
+            ];
+            let end = Utc::now();
+            let reads = [
+                (
+                    "account_snapshot",
+                    client.account_snapshot(&[], &instruments).await.map(drop),
+                ),
+                (
+                    "fetch_open_orders",
+                    client.fetch_open_orders(&instruments).await.map(drop),
+                ),
+                (
+                    "fetch_trades",
+                    client
+                        .fetch_trades(end - chrono::Duration::hours(1), end, &instruments)
+                        .await
+                        .map(drop),
+                ),
+            ];
+            for (read, result) in reads {
+                match result {
+                    Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                        assert_eq!(instrument, InstrumentNameExchange::new(name), "{read}");
+                    }
+                    other => panic!("{read} {name}: {other:?}"),
+                }
+            }
+            assert_eq!(margin_requests(&server).await, vec![], "{name}");
         }
     }
 
