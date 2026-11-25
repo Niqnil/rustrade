@@ -145,6 +145,7 @@ use binance_sdk::{
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
+use itertools::Itertools as _;
 use loans::{MAX_LOANS, SharedLoans};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -226,8 +227,9 @@ pub struct BinanceMarginConfig {
     /// *after* `account_stream` is called is **not** picked up — reconfigure and restart the
     /// stream for it.
     ///
-    /// Ignored for cross margin (`is_isolated = false`). Empty by default; a `true` +
-    /// empty-set combination is a misconfiguration that panics in [`BinanceMargin::new`].
+    /// A pair named more than once is kept once, where first named. Ignored for cross margin
+    /// (`is_isolated = false`). Empty by default; a `true` + empty-set combination is a
+    /// misconfiguration that panics in [`BinanceMargin::new`].
     #[serde(default)]
     pub isolated_symbols: Vec<InstrumentNameExchange>,
     /// The [`MarginEffect`] of an order whose request carries none.
@@ -1121,8 +1123,8 @@ impl BinanceMargin {
     /// all" affordance), so every isolated snapshot/query iterates an explicit symbol set:
     /// - empty `instruments` (the "return all" sentinel) → the full configured
     ///   [`isolated_symbols`](BinanceMarginConfig::isolated_symbols);
-    /// - non-empty → `instruments`, each of which must be in `isolated_symbols` exactly, case
-    ///   included.
+    /// - non-empty → `instruments`, each named once, in the order first named; each must be in
+    ///   `isolated_symbols` exactly, case included.
     ///
     /// # Errors
     /// [`ApiError::InstrumentInvalid`] on the first requested instrument not in
@@ -1149,7 +1151,7 @@ impl BinanceMargin {
                      so no isolated account is read for it"
                 ),
             ))),
-            None => Ok(instruments.to_vec()),
+            None => Ok(instruments.iter().unique().cloned().collect()),
         }
     }
 
@@ -1256,7 +1258,7 @@ impl ExecutionClient for BinanceMargin {
     ///   `Deserialize`-only and a deserialized config bypasses the named constructor. The
     ///   `ExecutionClient::new` signature returns `Self`, not `Result`, so an unusable config is a
     ///   fail-fast panic (consistent with the credential `expect`s above), not a recoverable error.
-    fn new(config: Self::Config) -> Self {
+    fn new(mut config: Self::Config) -> Self {
         if config.testnet {
             warn!(
                 "BinanceMarginConfig.testnet = true is ignored: Binance margin has no testnet; \
@@ -1267,6 +1269,8 @@ impl ExecutionClient for BinanceMargin {
             !(config.is_isolated && config.isolated_symbols.is_empty()),
             "BinanceMarginConfig: is_isolated = true requires a non-empty isolated_symbols"
         );
+        // A pair named twice is one pair: kept once, so no read or stream covers it twice.
+        config.isolated_symbols = config.isolated_symbols.into_iter().unique().collect();
         // Built once and shared: one clone is consumed by each SDK `RestApi`, the original is
         // retained for the collateral ratio read via `send_request`.
         // `ConfigurationRestApi: Clone` and is cheap to copy (its `reqwest::Client` is
@@ -1521,7 +1525,7 @@ impl ExecutionClient for BinanceMargin {
         // fetch_margin_open_orders_for_instrument.
         use futures::{StreamExt as _, TryStreamExt as _};
         let instrument_snapshots: Vec<_> =
-            futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+            futures::stream::iter(instruments.iter().unique().cloned().map(|instrument| {
                 fetch_margin_open_orders_for_instrument(
                     self.rest.clone(),
                     self.rate_limiter.clone(),
@@ -1661,7 +1665,7 @@ impl ExecutionClient for BinanceMargin {
             self.remember_live(&orders);
             return Ok(orders);
         }
-        futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+        futures::stream::iter(instruments.iter().unique().cloned().map(|instrument| {
             fetch_margin_open_orders_for_instrument(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
@@ -1725,7 +1729,7 @@ impl ExecutionClient for BinanceMargin {
         let effective: Vec<InstrumentNameExchange> = if self.config.is_isolated {
             self.effective_isolated_set(instruments)?
         } else {
-            instruments.to_vec()
+            instruments.iter().unique().cloned().collect()
         };
         if start > end {
             return Ok(TradesRead::complete(Vec::new()));
@@ -4910,6 +4914,33 @@ mod tests {
         );
     }
 
+    /// A pair named twice, in the configuration or in a read's `instruments`, is one pair, kept
+    /// where first named.
+    #[test]
+    fn effective_isolated_set_names_each_pair_once() {
+        let client = isolated_client(&["BTCUSDT", "ETHUSDT", "BTCUSDT"]);
+        let names = |names: &[&str]| -> Vec<InstrumentNameExchange> {
+            names
+                .iter()
+                .map(|name| InstrumentNameExchange::new(*name))
+                .collect()
+        };
+        assert_eq!(
+            client.config.isolated_symbols,
+            names(&["BTCUSDT", "ETHUSDT"])
+        );
+        assert_eq!(
+            client.effective_isolated_set(&[]).unwrap(),
+            names(&["BTCUSDT", "ETHUSDT"])
+        );
+        assert_eq!(
+            client
+                .effective_isolated_set(&names(&["ETHUSDT", "BTCUSDT", "ETHUSDT"]))
+                .unwrap(),
+            names(&["ETHUSDT", "BTCUSDT"])
+        );
+    }
+
     #[test]
     fn effective_isolated_set_refuses_the_first_unconfigured_pair() {
         let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
@@ -6485,6 +6516,81 @@ mod tests {
                 }
             }
             assert_eq!(margin_requests(&server).await, vec![], "{name}");
+        }
+    }
+
+    /// A name repeated in `instruments` is read once, cross or isolated: each read sends what it
+    /// sends for the name named once and returns each order, trade and snapshot entry once.
+    #[tokio::test]
+    async fn a_repeated_instrument_name_is_read_once() {
+        async fn read(is_isolated: bool, instruments: &[InstrumentNameExchange]) -> [usize; 4] {
+            let now = Utc::now();
+            let asset = |name: &str| {
+                serde_json::json!({
+                    "asset": name, "free": "1", "locked": "0", "borrowed": "0", "interest": "0",
+                    "netAsset": "1",
+                })
+            };
+            let (account_path, body) = if is_isolated {
+                (
+                    "/sapi/v1/margin/isolated/account",
+                    serde_json::json!({ "assets": [{
+                        "symbol": "BTCUSDT", "baseAsset": asset("BTC"), "quoteAsset": asset("USDT"),
+                    }] }),
+                )
+            } else {
+                (
+                    "/sapi/v1/margin/account",
+                    serde_json::json!({ "userAssets": [] }),
+                )
+            };
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(account_path))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([margin_order_row("listed", "NEW")])),
+                )
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+                .respond_with(venue(vec![(
+                    1,
+                    (now - chrono::Duration::minutes(5)).timestamp_millis(),
+                )]))
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, is_isolated);
+
+            let orders = client.fetch_open_orders(instruments).await.unwrap();
+            let trades = client
+                .fetch_trades(now - chrono::Duration::minutes(10), now, instruments)
+                .await
+                .unwrap();
+            let snapshot = client.account_snapshot(&[], instruments).await.unwrap();
+            [
+                orders.len(),
+                trades.trades.len(),
+                snapshot.instruments.len(),
+                margin_requests(&server).await.len(),
+            ]
+        }
+
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        for is_isolated in [false, true] {
+            let once = read(is_isolated, std::slice::from_ref(&btc)).await;
+            assert_eq!(&once[..3], &[1, 1, 1], "isolated {is_isolated}: {once:?}");
+            assert_eq!(
+                read(is_isolated, &[btc.clone(), btc.clone()]).await,
+                once,
+                "isolated {is_isolated}"
+            );
         }
     }
 

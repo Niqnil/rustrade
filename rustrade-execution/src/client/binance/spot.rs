@@ -119,6 +119,7 @@ use binance_sdk::{
 };
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use futures::stream::BoxStream;
+use itertools::Itertools as _;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -1275,7 +1276,7 @@ impl ExecutionClient for BinanceSpot {
         // returns them without the wrapper — both use fetch_open_orders_for_instrument.
         use futures::{StreamExt as _, TryStreamExt};
         let instrument_snapshots: Vec<_> =
-            futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+            futures::stream::iter(instruments.iter().unique().cloned().map(|instrument| {
                 fetch_open_orders_for_instrument(
                     self.rest.clone(),
                     self.rate_limiter.clone(),
@@ -1988,7 +1989,7 @@ impl ExecutionClient for BinanceSpot {
         // try_fold into a flat Vec avoids the intermediate Vec<Vec<_>> that
         // try_collect().flatten() would allocate.
         use futures::{StreamExt as _, TryStreamExt as _};
-        futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+        futures::stream::iter(instruments.iter().unique().cloned().map(|instrument| {
             fetch_open_orders_for_instrument(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
@@ -2012,10 +2013,6 @@ impl ExecutionClient for BinanceSpot {
     ///
     /// Each instrument is paged by trade id to the span's end within the call, with no page cap,
     /// so the read is always complete (`resume: None`).
-    // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
-    // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
-    // the iterator machinery, even when the clone is moved inside the closure body.
-    #[allow(clippy::redundant_iter_cloned)]
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -2045,7 +2042,7 @@ impl ExecutionClient for BinanceSpot {
         // Binance requires per-symbol queries for trade history.
         // Limit concurrency to avoid bursting Binance's request weight limits
         // (each GET /api/v3/myTrades costs 20 weight; 8 concurrent = 160 weight).
-        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+        let mut stream = futures::stream::iter(instruments.iter().unique().cloned().map(|inst| {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
@@ -8635,6 +8632,67 @@ mod tests {
                 "{instruments:?}: held as live"
             );
         }
+    }
+
+    /// A name repeated in `instruments` is read once: each read sends what it sends for the name
+    /// named once and returns each order, trade and snapshot entry once.
+    #[tokio::test]
+    async fn a_repeated_instrument_name_is_read_once() {
+        async fn read(instruments: &[InstrumentNameExchange]) -> [usize; 4] {
+            let now = Utc::now();
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([order_row("listed", "NEW")])),
+                )
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/myTrades"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{
+                        "symbol": "BTCUSDT", "id": 1, "orderId": 7, "price": "100", "qty": "1",
+                        "commission": "0", "commissionAsset": "USDT",
+                        "time": (now - chrono::Duration::minutes(5)).timestamp_millis(),
+                        "isBuyer": true, "isMaker": false, "isBestMatch": true,
+                    }]),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/account"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "balances": [] })),
+                )
+                .mount(&server)
+                .await;
+            let mut client = <BinanceSpot as ExecutionClient>::new(
+                BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+            );
+            client.rest = rest_at(&server);
+
+            let orders = client.fetch_open_orders(instruments).await.unwrap();
+            let trades = client
+                .fetch_trades(now - chrono::Duration::minutes(10), now, instruments)
+                .await
+                .unwrap();
+            let snapshot = client.account_snapshot(&[], instruments).await.unwrap();
+            let sent = server.received_requests().await.unwrap().len();
+            [
+                orders.len(),
+                trades.trades.len(),
+                snapshot.instruments.len(),
+                sent,
+            ]
+        }
+
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let once = read(std::slice::from_ref(&btc)).await;
+        assert_eq!(&once[..3], &[1, 1, 1], "{once:?}");
+        assert_eq!(read(&[btc.clone(), btc]).await, once);
     }
 
     /// A balance read is stamped [`REST_BALANCE_LAG`] before the request that read it was sent,

@@ -189,6 +189,11 @@ impl<'a> ClientInstrument<'a> {
 /// and [`fetch_trades`](Self::fetch_trades), never left out or reported flat or empty, since
 /// nothing was read about it. The one exception is in Alpaca's row.
 ///
+/// A name repeated in `instruments` must be read once: the three reads answer as for that name
+/// given once, with one `account_snapshot` entry for it and each of its orders and trades once.
+/// This is about a name repeated exactly. Names that differ only in case are matched by each
+/// client's rule in the table below: Alpaca reads them as one symbol.
+///
 /// | Client | A name matches | What a read finds is reported under | A name it cannot match |
 /// |---|---|---|---|
 /// | Alpaca | Alpaca's symbol, ignoring case; a crypto pair as `BASE/QUOTE` | Alpaca's symbol; an `account_snapshot` entry takes the requested name | Refused, except a contract past its expiry in `fetch_trades`, which is read without a lookup |
