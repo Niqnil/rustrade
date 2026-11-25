@@ -406,6 +406,13 @@ mod tests {
         assert!(contracts.contains(&name));
         assert!(!contracts.contains(&InstrumentNameExchange::from("aapl")));
         assert_eq!(contracts.len(), 1);
+
+        contracts.insert(
+            InstrumentNameExchange::from("MSFT"),
+            stock_contract("MSFT", "SMART", "USD"),
+        );
+        assert_eq!(contracts.len(), 2);
+        assert!(!contracts.is_empty());
     }
 
     #[test]
