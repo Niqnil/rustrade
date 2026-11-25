@@ -769,7 +769,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ContractLookup` by value instead of an `Arc<ContractRegistry>`, so a market data stream can read
   an `IbkrClient`'s `contract_registry().clone()` without being able to change it. Migrate
   `registry.register_by_name_only(name, contract)` to `contracts.insert(name, contract)` on a
-  `ContractsByName`, and pass it (or the registry) to `init` without the `Arc`.
+  `ContractsByName`, and pass it (or the registry) to `init` without the `Arc`: a clone of either
+  shares its contents.
   `ContractRegistry::register` and `IbkrClient::register_contract` now document that registering a
   name again with another contract frees its earlier contract ID, so fills IB still reports under
   that ID are no longer attributed to the name.

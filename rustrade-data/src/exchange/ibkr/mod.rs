@@ -414,10 +414,9 @@ where
     /// * `config` - Connection configuration
     /// * `contracts` - Where each subscription's contract is looked up by its instrument name.
     ///   IB resolves each contract description on request, so a contract need not be resolved
-    ///   first: a [`ContractsByName`](rustrade_instrument::ibkr::ContractsByName) can hold one built locally. The stream only reads it, so
-    ///   an execution client's
-    ///   [`ContractRegistry`](rustrade_instrument::ibkr::ContractRegistry) can be passed as well. It is read again on
-    ///   each reconnect, so a contract added through a clone of it before then is used.
+    ///   first: a [`ContractsByName`] can hold one built locally. The stream only reads it, so an
+    ///   execution client's [`ContractRegistry`] can be passed as well. It is read again on each
+    ///   reconnect, so a contract added through a clone of it before then is used.
     /// * `subscriptions` - List of subscriptions to activate
     /// * `options` - How the stream reconnects, and whether it is ended when it stays silent; see
     ///   [`MarketStreamOptions`]. A silence timeout counts the market events of all subscriptions
@@ -444,6 +443,9 @@ where
     /// # Panics
     ///
     /// Outside a tokio runtime: the blocking connection is made on tokio's blocking thread pool.
+    ///
+    /// [`ContractsByName`]: rustrade_instrument::ibkr::ContractsByName
+    /// [`ContractRegistry`]: rustrade_instrument::ibkr::ContractRegistry
     pub async fn init(
         config: IbkrStreamConfig,
         contracts: impl ContractLookup + Send + Sync + 'static,
@@ -1437,7 +1439,7 @@ where
     ///
     /// A panic in `body` is sent to the stream as a terminal [`DataError::Socket`] naming the
     /// subscription; the stream's other subscriptions continue. Panic safety: parking_lot mutexes
-    /// do not poison on panic, so shared state (ContractRegistry, etc.) remains usable.
+    /// do not poison on panic, so shared state (the contract lookup, etc.) remains usable.
     fn spawn(self, body: impl FnOnce(&Self) + Send + 'static) -> Result<(), DataError> {
         let stage = self.stage;
         std::thread::Builder::new()

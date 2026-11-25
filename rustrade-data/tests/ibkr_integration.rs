@@ -1500,8 +1500,8 @@ async fn test_option_greeks_stream() {
     // before opening the streaming connection.
     let option = aapl_call_option().await;
 
-    // The stream looks contracts up by name only, and the chain's contract carries no contract ID,
-    // which `register` requires.
+    // The chain's contract carries no contract ID, so it goes in a `ContractsByName`, not a
+    // `ContractRegistry`.
     let registry = ContractsByName::new();
     registry.insert("AAPL_CALL".into(), option);
 
