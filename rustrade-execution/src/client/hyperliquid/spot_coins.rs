@@ -298,6 +298,18 @@ mod tests {
         server.received_requests().await.unwrap().len()
     }
 
+    /// Wait until `server` has had `count` requests. Fails rather than waits on without end, so a
+    /// lookup that never reads `spotMeta` again fails the test instead of hanging it.
+    async fn until_requests(server: &MockServer, count: usize) {
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            while requests(server).await < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(reached.is_ok(), "spotMeta was never read again");
+    }
+
     fn new_pair() -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_raw(spot_meta_with_new_pair(), "application/json")
     }
@@ -388,9 +400,7 @@ mod tests {
                 coins.covering(["@300"]).await;
             }
         });
-        while requests(&server).await < 2 {
-            tokio::task::yield_now().await;
-        }
+        until_requests(&server, 2).await;
         reading.abort();
         assert!(reading.await.unwrap_err().is_cancelled());
 
@@ -420,6 +430,20 @@ mod tests {
         // Within the interval of a read that answered, a pair it lacks is unlisted.
         assert_eq!(coins.find("FOO", "USDC").await.unwrap(), None);
         assert_eq!(requests(&server).await, 2);
+    }
+
+    /// Concurrent lookups of a new pair read `spotMeta` again once: the second, waiting while the
+    /// first reads, finds the pair in what the first read.
+    #[tokio::test]
+    async fn find_of_a_new_pair_reads_again_once_for_concurrent_callers() {
+        let server = serve(new_pair()).await;
+        let coins = spot_coins(&server).await;
+
+        let (first, second) = tokio::join!(coins.find("HYPE", "PURR"), coins.find("HYPE", "PURR"));
+
+        assert_eq!(first.unwrap().unwrap().quote(), "PURR");
+        assert_eq!(second.unwrap().unwrap().quote(), "PURR");
+        assert_eq!(requests(&server).await, 2, "one read again, shared");
     }
 
     /// A pair the pairs lack, when `spotMeta` cannot be read again, may have been listed since,
@@ -454,9 +478,7 @@ mod tests {
             let coins = coins.clone();
             async move { coins.find("HYPE", "PURR").await }
         });
-        while requests(&server).await < 2 {
-            tokio::task::yield_now().await;
-        }
+        until_requests(&server, 2).await;
         reading.abort();
         assert!(reading.await.unwrap_err().is_cancelled());
 
