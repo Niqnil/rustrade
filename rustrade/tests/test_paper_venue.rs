@@ -492,6 +492,45 @@ async fn a_cash_paper_venue_s_handle_answers_that_it_lends_against_no_instrument
     );
 }
 
+/// An exercise instruction sent through the handle reaches the venue, which refuses one for an
+/// instrument that is not an option, as a live venue's client does; and finds a stopped venue
+/// offline.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_s_handle_sends_an_exercise_instruction() {
+    use rustrade_execution::exercise::{ExerciseInstruction, ExerciseQuantity};
+
+    let instruments = instruments();
+    let name = InstrumentNameExchange::new("btc_usdt");
+    let lapse = ExerciseInstruction::Lapse {
+        contracts: ExerciseQuantity::WholePosition,
+    };
+    let (build, venue, _market_tx) = paper_build(&instruments, config());
+    let _execution = build.init().await.unwrap();
+
+    let answer = venue.instruct_exercise(&name, lapse).await;
+
+    assert!(
+        matches!(
+            &answer,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(instrument, _))) if *instrument == name
+        ),
+        "{answer:?}"
+    );
+
+    let (build, venue, _market_tx) = paper_build(&instruments, config());
+    drop(build);
+    let answer = venue.instruct_exercise(&name, lapse).await;
+    assert!(
+        matches!(
+            answer,
+            Err(ClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(EXCHANGE)
+            ))
+        ),
+        "{answer:?}"
+    );
+}
+
 /// A query sent through the handle before the venue starts waits for it, and is answered once it
 /// runs.
 #[tokio::test(start_paused = true)]

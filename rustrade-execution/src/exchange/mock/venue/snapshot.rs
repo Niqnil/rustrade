@@ -125,6 +125,11 @@ pub struct SimulatedVenueSnapshot {
     /// `corporate_actions_applied` is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     restated_strikes: Vec<(InstrumentNameExchange, Decimal)>,
+    /// Sorted. The options whose long the holder instructed to lapse. Left out when empty, and
+    /// read as empty when absent, as `corporate_actions_applied` is. A release from before the
+    /// field ignores it, so it restores such a snapshot with every instruction dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lapse_instructed: Vec<InstrumentNameExchange>,
 }
 
 impl SimulatedVenueSnapshot {
@@ -244,6 +249,13 @@ pub enum VenueRestoreError {
     )]
     OptionShortUnsecurable(InstrumentNameExchange),
 
+    /// The snapshot records a lapse instruction for an instrument it holds no long option position
+    /// in. A snapshot the venue wrote never does: an instruction leaves a position that closes.
+    #[error(
+        "venue snapshot records a lapse instruction for {0}, which is not a long option position"
+    )]
+    LapseWithoutLong(InstrumentNameExchange),
+
     /// The snapshot's balances do not hold the collateral its short options secure: what an
     /// asset's balance holds, net of what its open orders reserve, is less than that collateral.
     /// A snapshot the venue wrote always holds it.
@@ -270,8 +282,9 @@ pub enum VenueRestoreError {
     SessionCalendar(#[source] CalendarError),
 
     /// The anchor of one of the configuration's expiry-day rules, its
-    /// [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) or
-    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff), cannot place the rule for an
+    /// [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out),
+    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff) or
+    /// [`lapse_deadline`](MockExecutionConfig::lapse_deadline), cannot place the rule for an
     /// option the venue lists, as [`try_new`](SimulatedVenue::try_new) refuses.
     #[error(transparent)]
     ExpiryRule(#[from] ExpiryRuleUnplaceable),
@@ -364,6 +377,12 @@ impl SimulatedVenue {
                 .iter()
                 .map(|(option, strike)| (option.clone(), *strike))
                 .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
+                .collect(),
+            lapse_instructed: self
+                .lapse_instructed
+                .iter()
+                .cloned()
+                .sorted_unstable()
                 .collect(),
         }
     }
@@ -522,6 +541,7 @@ impl SimulatedVenue {
                     .iter()
                     .map(|(instrument, _)| instrument),
             )
+            .chain(&snapshot.lapse_instructed)
             .find(|instrument| !instruments.contains_key(*instrument))
         {
             return Err(VenueRestoreError::UnknownInstrument(unknown.clone()));
@@ -530,6 +550,7 @@ impl SimulatedVenue {
         if let Some(repeat) = first_repeat(snapshot.positions.iter().map(|(name, _)| name))
             .or_else(|| first_repeat(snapshot.borrow_prices.iter().map(|(name, _)| name)))
             .or_else(|| first_repeat(snapshot.restated_strikes.iter().map(|(name, _)| name)))
+            .or_else(|| first_repeat(&snapshot.lapse_instructed))
         {
             return Err(VenueRestoreError::DuplicateInstrument(repeat.clone()));
         }
@@ -570,6 +591,16 @@ impl SimulatedVenue {
         }) {
             return Err(VenueRestoreError::OptionShortUnsecurable(short.clone()));
         }
+        // An instruction lives only on a long option position, and leaves it when it closes.
+        if let Some(stray) = snapshot.lapse_instructed.iter().find(|name| {
+            !matches!(instruments[*name].kind, InstrumentKind::Option(_))
+                || !snapshot
+                    .positions
+                    .iter()
+                    .any(|(held, position)| held == *name && position.is_long())
+        }) {
+            return Err(VenueRestoreError::LapseWithoutLong(stray.clone()));
+        }
         if snapshot.account.margin() != config.spot_margin.is_some() {
             return Err(VenueRestoreError::MarginMismatch {
                 snapshot_margin: snapshot.account.margin(),
@@ -597,6 +628,7 @@ impl SimulatedVenue {
             checkpoint_sequence,
             corporate_actions_applied,
             restated_strikes,
+            lapse_instructed,
         } = snapshot;
 
         let mut venue = Self::assemble(
@@ -641,6 +673,7 @@ impl SimulatedVenue {
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.corporate_actions_applied = corporate_actions_applied.into_iter().collect();
         venue.restated_strikes = restated_strikes.into_iter().collect();
+        venue.lapse_instructed = lapse_instructed.into_iter().collect();
         venue.refresh_next_charge();
         venue.refresh_next_interest();
         venue.refresh_next_option_expiry();

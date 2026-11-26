@@ -95,10 +95,12 @@ pub use cash_flow::{
 pub mod client;
 pub mod error;
 pub mod exchange;
+pub mod exercise;
+pub use exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity};
 pub mod expiry;
 pub use expiry::{
-    ExpiryAnchor, ExpiryDayCutoff, ExpirySellOut, ExpirySellOutError, LongOptionExpiry,
-    SellOutAffordability,
+    ExpiryAnchor, ExpiryDayCutoff, ExpirySellOut, ExpirySellOutError, LapseDeadline,
+    LongOptionExpiry, SellOutAffordability,
 };
 pub mod fee;
 pub use fee::{

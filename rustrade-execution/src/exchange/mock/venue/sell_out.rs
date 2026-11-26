@@ -28,7 +28,8 @@ use tracing::warn;
 impl SimulatedVenue {
     /// Runs the [`ExpirySellOut`] check of each option in `instruments`, all due at `at`, in
     /// order, pushing what each sale moves onto `events`. Nothing without a configured sell-out,
-    /// and nothing for an option the account holds no long in.
+    /// nothing for an option the account holds no long in, and nothing for a long instructed to
+    /// lapse.
     ///
     /// The options share what the account has to exercise with: a budget per asset, read when it
     /// is first needed. Each option spends on what goes on to expiry, the contracts kept and any
@@ -53,6 +54,10 @@ impl SimulatedVenue {
             else {
                 continue;
             };
+            // A long instructed to lapse is not exercised, so it needs no money and is not sold.
+            if self.lapse_instructed.contains(instrument) {
+                continue;
+            }
             let Some((terms, contract)) = self.option_terms(instrument) else {
                 continue;
             };

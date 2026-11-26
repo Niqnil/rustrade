@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Option lapse instructions** (`rustrade-execution`, `rustrade`). The new optional
+  `OptionExerciseClient` trait sends a venue an instruction about how a held option is exercised:
+  so far `ExerciseInstruction::Lapse`, which lets a long option expire unexercised, in the money
+  or not, as a do-not-exercise instruction does. It covers an `ExerciseQuantity`: the whole
+  position, or a number of contracts on a venue that takes one. Accepted, it answers an
+  `ExerciseAck`; refused, `ApiError::ExerciseRefused` with an `ExerciseRefusal` (`NoPosition`,
+  `ShortPosition`, `QuantityUnsupported`, `Expired`, `PastDeadline`). The simulated venue honours
+  it (`SimulatedVenue::instruct_exercise`, the mock client, and `PaperVenue::instruct_exercise`):
+  an instructed long lapses at zero at expiry whatever `LongOptionExpiry` says, needs no price
+  for the underlying, and is not sold by an `ExpirySellOut`. It takes whole positions only, holds
+  for whatever long the position is at expiry, is dropped when the position goes flat or short,
+  and is kept in the venue's snapshot (an additive field; format version unchanged). The new
+  `MockExecutionConfig::lapse_deadline` (`LapseDeadline`, anchored as the other expiry-day rules
+  are) refuses instructions from a set time before each option's close or expiry; by default
+  they are taken until expiry. `ExpiryRule` gains `LapseDeadline` and `VenueRestoreError` gains
+  `LapseWithoutLong`.
+
 - **American option pricing benchmark** (`rustrade-pricing`, benches only). The new `american`
   benchmark times `price`, `greeks` and `implied_volatility` with `FiniteDifferenceModel` on
   grids of 400×200 (the default), 200×100 and 100×50, over 48 American calls and puts: expiries

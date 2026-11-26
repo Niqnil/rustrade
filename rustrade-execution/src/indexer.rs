@@ -721,6 +721,7 @@ impl AccountEventIndexer {
             UnindexedApiError::RequestRejected(reason) => ApiError::RequestRejected(reason),
             UnindexedApiError::BorrowRejected(reject) => ApiError::BorrowRejected(reject),
             UnindexedApiError::OpenRefused(refusal) => ApiError::OpenRefused(refusal),
+            UnindexedApiError::ExerciseRefused(refusal) => ApiError::ExerciseRefused(refusal),
         }
     }
 

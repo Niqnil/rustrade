@@ -4,6 +4,7 @@ use crate::{
     borrow_capacity::BorrowCapacity,
     error::{UnindexedApiError, UnindexedOrderError},
     exchange::mock::{CorporateActionResponse, ExternalChange},
+    exercise::{ExerciseAck, ExerciseInstruction},
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
         id::ClientOrderId,
@@ -95,6 +96,22 @@ impl MockExchangeRequest {
                 response_tx,
                 instrument,
                 side,
+            },
+        )
+    }
+
+    pub fn instruct_exercise(
+        time_request: DateTime<Utc>,
+        instrument: InstrumentNameExchange,
+        instruction: ExerciseInstruction,
+        response_tx: oneshot::Sender<Result<ExerciseAck, UnindexedApiError>>,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::InstructExercise {
+                response_tx,
+                instrument,
+                instruction,
             },
         )
     }
@@ -266,6 +283,13 @@ pub enum MockExchangeRequestKind {
         instrument: InstrumentNameExchange,
         side: Side,
         response_tx: oneshot::Sender<Result<BorrowCapacity, UnindexedApiError>>,
+    },
+    /// Send `instruction` for the long held in the option `instrument`: see
+    /// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::venue::SimulatedVenue::instruct_exercise).
+    InstructExercise {
+        instrument: InstrumentNameExchange,
+        instruction: ExerciseInstruction,
+        response_tx: oneshot::Sender<Result<ExerciseAck, UnindexedApiError>>,
     },
     /// Every trade from `start` to `end`, both inclusive, on `instruments`, empty for every
     /// instrument: see
