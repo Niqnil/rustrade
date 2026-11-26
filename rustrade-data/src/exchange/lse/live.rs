@@ -306,6 +306,7 @@ impl Subscriber for LseSubscriber {
                 markets,
                 underlyings,
                 timeout: Exchange::subscription_timeout(),
+                connect_timeout: Exchange::connect_timeout(),
                 resume: self.resume.clone(),
             })
             .await?;
@@ -1223,5 +1224,60 @@ mod tests {
         assert_eq!(expected_categories(ExchangeId::LseFx), vec!["Forex"]);
         assert_eq!(expected_categories(ExchangeId::LseCrypto), vec!["Crypto"]);
         assert!(!expected_categories(ExchangeId::LseCfd).contains(&"Forex"));
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use crate::{
+        exchange::{
+            ExchangeServer,
+            lse::{Lse, LseServer, LseSymbolShape},
+        },
+        subscription::trade::PublicTrades,
+        test_support::stalling_websocket_url,
+    };
+    use rustrade_instrument::instrument::market_data::{
+        MarketDataInstrument, kind::MarketDataInstrumentKind,
+    };
+
+    /// The crypto dataset at an endpoint that never completes a connection.
+    #[derive(Debug, Default, Clone)]
+    struct StallingCrypto;
+
+    impl ExchangeServer for StallingCrypto {
+        const ID: ExchangeId = ExchangeId::LseCrypto;
+        fn websocket_url() -> &'static str {
+            stalling_websocket_url()
+        }
+    }
+
+    impl LseServer for StallingCrypto {
+        const SYMBOL_SHAPE: LseSymbolShape = LseSymbolShape::Pair;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_fails_after_the_connectors_connect_timeout() {
+        let subscription: Subscription<Lse<StallingCrypto>, MarketDataInstrument, PublicTrades> =
+            Subscription::from((
+                Lse::<StallingCrypto>::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            ));
+        let started = tokio::time::Instant::now();
+
+        let result = LseSubscriber::new(LseCredentials::new("key"))
+            .subscribe(&[subscription])
+            .await;
+
+        let timeout = <Lse<StallingCrypto> as Connector>::connect_timeout();
+        assert!(
+            matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
     }
 }

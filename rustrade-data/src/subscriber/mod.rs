@@ -11,7 +11,7 @@ use crate::{
 use futures::SinkExt;
 use rustrade_integration::{
     error::SocketError,
-    protocol::websocket::{WebSocket, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsMessage, connect_with_timeout},
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, future::Future};
@@ -52,6 +52,17 @@ pub trait Subscriber: Clone + Send + Sync {
     /// `Send`, because a stream's transport is moved into the task that drives it.
     type Transport: Send;
 
+    /// Connect, or attach to a shared connection, and subscribe to `subscriptions`, waiting until
+    /// the venue has acknowledged them.
+    ///
+    /// # Bounds and cancellation
+    /// Each step that waits on the venue should be bounded: connect with
+    /// [`connect_with_timeout`] and
+    /// [`Connector::connect_timeout`], and wait for acknowledgements for at most
+    /// [`Connector::subscription_timeout`]. Whatever is left unbounded is caught only by the
+    /// stream's [`init_timeout`](crate::streams::consumer::MarketStreamOptions::init_timeout),
+    /// which drops the returned future where it waits: an implementation must allow that at any
+    /// `.await`, holding what it opens in the future itself.
     fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
@@ -109,7 +120,7 @@ impl Subscriber for WebSocketSubscriber {
         debug!(%exchange, %url, ?subscriptions, "subscribing to WebSocket");
 
         // Connect to exchange
-        let mut websocket = connect(url).await?;
+        let mut websocket = connect_with_timeout(url, Exchange::connect_timeout()).await?;
         debug!(%exchange, ?subscriptions, "connected to WebSocket");
 
         // Map &[Subscription<Exchange, Kind>] to SubscriptionMeta
@@ -141,5 +152,31 @@ impl Subscriber for WebSocketSubscriber {
             map,
             buffered_websocket_events,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        exchange::bybit::Bybit,
+        test_support::{StallingServer, stalling_bybit_trades},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_fails_after_the_connectors_connect_timeout() {
+        let started = tokio::time::Instant::now();
+
+        let result = WebSocketSubscriber
+            .subscribe(&[stalling_bybit_trades()])
+            .await;
+
+        let timeout = <Bybit<StallingServer> as Connector>::connect_timeout();
+        assert_eq!(timeout, std::time::Duration::from_secs(10));
+        assert!(
+            matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
     }
 }

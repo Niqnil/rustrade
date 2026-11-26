@@ -7,7 +7,7 @@ use crate::{
     exchange::{
         Connector,
         binance::{
-            book::l2::{BinanceOrderBookL2Meta, BinanceOrderBookL2Snapshot},
+            book::l2::{BinanceOrderBookL2Meta, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT, fetch_l2_snapshot},
             market::BinanceMarket,
             spot::BinanceSpot,
         },
@@ -56,12 +56,8 @@ impl SnapshotFetcher<BinanceSpot, OrderBooksL2> for BinanceSpotOrderBooksL2Snaps
 
             async move {
                 // Fetch initial OrderBook snapshot via HTTP
-                let snapshot = reqwest::get(snapshot_url)
-                    .await
-                    .map_err(SocketError::Http)?
-                    .json::<BinanceOrderBookL2Snapshot>()
-                    .await
-                    .map_err(SocketError::Http)?;
+                let snapshot =
+                    fetch_l2_snapshot(&snapshot_url, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT).await?;
 
                 Ok(MarketEvent::from((
                     ExchangeId::BinanceSpot,

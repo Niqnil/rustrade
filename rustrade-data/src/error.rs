@@ -156,6 +156,30 @@ pub enum DataError {
     #[error("no market event received for {threshold:?}, so the stream is reconnecting")]
     SilenceTimeout { threshold: Duration },
 
+    /// A connection to the venue was not established within `timeout`: the TCP connect, the TLS
+    /// handshake and the WebSocket upgrade together. The attempt was abandoned.
+    ///
+    /// `timeout` is the integration's
+    /// [`Connector::connect_timeout`](crate::exchange::Connector::connect_timeout). Returned by a
+    /// stream's first initialisation, and inside [`ReinitFailed`](Self::ReinitFailed) when a
+    /// re-initialisation's connect times out, which the stream then retries after its backoff.
+    #[error("connection to the venue not established within {timeout:?}")]
+    ConnectTimeout { timeout: Duration },
+
+    /// A stream initialisation attempt (connecting, subscribing and fetching any initial
+    /// snapshots) did not complete within `timeout`, so it was abandoned.
+    ///
+    /// `timeout` is the stream's
+    /// [`MarketStreamOptions::init_timeout`](crate::streams::consumer::MarketStreamOptions::init_timeout).
+    /// It is the backstop for a step with no bound of its own: steps that have one report their
+    /// own error, such as [`ConnectTimeout`](Self::ConnectTimeout) or
+    /// [`SubscriptionsUnacknowledged`](Self::SubscriptionsUnacknowledged), when it expires first.
+    /// Returned by a stream's first initialisation, and inside
+    /// [`ReinitFailed`](Self::ReinitFailed) for a re-initialisation, which the stream then retries
+    /// after its backoff.
+    #[error("stream initialisation did not complete within {timeout:?}")]
+    InitTimeout { timeout: Duration },
+
     /// The stream's connection to the venue was lost, so every subscription on it ended, and the
     /// stream will re-initialise.
     ///
@@ -250,6 +274,7 @@ impl From<SocketError> for DataError {
                 reason,
                 unacknowledged,
             },
+            SocketError::ConnectTimeout { timeout } => Self::ConnectTimeout { timeout },
             other => Self::Socket(other.to_string()),
         }
     }
@@ -268,6 +293,15 @@ impl From<crate::exchange::lse::error::LseError> for DataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connect_timeout_keeps_its_type_and_timeout_through_the_conversion() {
+        let timeout = Duration::from_secs(10);
+
+        let error = DataError::from(SocketError::ConnectTimeout { timeout });
+
+        assert_eq!(error, DataError::ConnectTimeout { timeout });
+    }
 
     #[test]
     fn an_unacknowledged_batch_keeps_its_subscriptions_through_the_conversion() {
@@ -334,6 +368,22 @@ mod tests {
                 input: DataError::ConnectionLost {
                     exchange: ExchangeId::Ibkr,
                     reason: "socket closed".to_owned(),
+                },
+                expected: false,
+            },
+            TestCase {
+                // TC5: not terminal w/ DataError::InitTimeout — an attempt that failed ended no
+                // stream, and the next attempt follows after the backoff.
+                input: DataError::InitTimeout {
+                    timeout: Duration::from_secs(60),
+                },
+                expected: false,
+            },
+            TestCase {
+                // TC6: not terminal w/ DataError::ConnectTimeout — as InitTimeout, the attempt
+                // failed and the next one follows after the backoff.
+                input: DataError::ConnectTimeout {
+                    timeout: Duration::from_secs(10),
                 },
                 expected: false,
             },

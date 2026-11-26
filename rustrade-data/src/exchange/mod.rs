@@ -209,6 +209,16 @@ where
     fn subscription_timeout() -> Duration {
         DEFAULT_SUBSCRIPTION_TIMEOUT
     }
+
+    /// How long establishing a connection to the venue may take (the TCP connect, the TLS
+    /// handshake and the WebSocket upgrade together) before the attempt is abandoned with
+    /// [`DataError::ConnectTimeout`](crate::error::DataError::ConnectTimeout).
+    ///
+    /// Defaults to
+    /// [`DEFAULT_CONNECT_TIMEOUT`](rustrade_integration::protocol::websocket::DEFAULT_CONNECT_TIMEOUT).
+    fn connect_timeout() -> Duration {
+        rustrade_integration::protocol::websocket::DEFAULT_CONNECT_TIMEOUT
+    }
 }
 
 /// Used when an exchange has servers different

@@ -144,10 +144,12 @@ pub(crate) trait Protocol: Debug + Sized + Send + 'static {
     /// Waits for the answers to one request.
     type Handshake: Handshake<Self::Answer>;
 
-    /// Open and authenticate a socket to `url`.
+    /// Open and authenticate a socket to `url`, giving up on establishing the connection after
+    /// `connect_timeout` ([`SocketError::ConnectTimeout`]).
     fn connect(
         credentials: &Self::Credentials,
         url: &Url,
+        connect_timeout: Duration,
     ) -> impl Future<Output = Result<(WebSocket, Self::Session), SocketError>> + Send;
 
     /// Refuse `request` before anything is sent on its behalf, if it cannot succeed.
@@ -256,7 +258,10 @@ pub(crate) struct AttachRequest<P: Protocol> {
     pub(crate) kind: &'static str,
     /// The distinct slots requested, in request order.
     pub(crate) slots: Vec<P::Slot>,
+    /// How long the subscription handshake may take.
     pub(crate) timeout: Duration,
+    /// How long opening the socket may take, should this attach have to open it.
+    pub(crate) connect_timeout: Duration,
     pub(crate) batch: P::Batch,
 }
 

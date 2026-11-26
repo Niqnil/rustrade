@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Market stream initialisation is bounded** (`rustrade-data`, `rustrade-integration`). An attempt
+  to initialise a market stream (connect, subscribe, wait for acknowledgements, fetch any initial
+  snapshots) that stalled left the stream waiting with nothing yielded and nothing retried, and a
+  silence timeout could not catch it because its timer starts only once the stream is up. Each
+  attempt built through `init_market_stream` (and so `StreamBuilder` and `DynamicStreams`) is now
+  abandoned after `MarketStreamOptions::init_timeout`, by default `DEFAULT_INIT_TIMEOUT` (60 s),
+  set with `with_init_timeout` (zero refused with `MarketStreamOptionsError::InitTimeoutZero`) or
+  removed with `without_init_timeout`. Expiry is the new `DataError::InitTimeout { timeout }`: the
+  `init` error on the first attempt, and inside `ReinitFailed` on a re-initialisation, which is
+  retried with the stream's backoff. Within an attempt:
+  - Establishing a WebSocket connection (TCP, TLS and upgrade together) is bounded by the new
+    `Connector::connect_timeout()` (default 10 s), for every exchange including the shared Alpaca,
+    LSE and Massive connections, and reported as the new `DataError::ConnectTimeout { timeout }`.
+  - `rustrade_integration::protocol::websocket::connect` now gives up after
+    `DEFAULT_CONNECT_TIMEOUT` (10 s), and the new `connect_with_timeout` takes the bound. Either
+    reports `SocketError::ConnectTimeout { timeout }`. This also bounds Alpaca's account stream
+    connect in `rustrade-execution`.
+  - Binance spot and futures order book snapshots are fetched with a timeout of
+    `HTTP_BOOK_L2_SNAPSHOT_TIMEOUT` (10 s), reported as `SocketError::HttpTimeout`.
+  The rustdoc of `MarketStream::init`, `Subscriber::subscribe` and `SnapshotFetcher` now states
+  that the future may be dropped at any `.await`. `IbkrMarketStream` does not apply the
+  initialisation timeout yet.
+
 - **Option lapse instructions** (`rustrade-execution`, `rustrade`). The new optional
   `OptionExerciseClient` trait sends a venue an instruction about how a held option is exercised:
   so far `ExerciseInstruction::Lapse`, which lets a long option expire unexercised, in the money
@@ -793,6 +816,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `SocketError` is `#[non_exhaustive]`** (`rustrade-integration`). It gains
+  `ConnectTimeout { timeout }`, and future failure kinds are added the same way, so a `match` on it
+  needs a wildcard arm.
 - **Breaking: IBKR name-only contracts move out of `ContractRegistry`** (`rustrade-instrument`,
   `rustrade-data`, `rustrade-execution`, `ibkr`). `ContractRegistry::register_by_name_only` put a
   contract under a name for lookups by name only and removed the name's contract ID mapping, so on
@@ -1436,6 +1462,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
+- **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
+  an exchange with application-level pings, an initialisation that failed after subscribing left
+  its ping task and the task writing to the socket running, and the connection open, until the
+  venue closed it. Both tasks are now started only once the initialisation can no longer fail.
 
 - **A name repeated in a read's `instruments` is read once** (`rustrade-execution`, `binance`,
   `alpaca`). Binance spot and margin, cross and isolated, queried once per listed name, so
