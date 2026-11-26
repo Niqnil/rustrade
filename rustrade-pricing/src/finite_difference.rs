@@ -83,7 +83,12 @@ pub enum FiniteDifferenceConfigError {
 /// The cost of one price grows with `space_steps × time_steps`; an implied-volatility solve prices
 /// around five to fifteen times, and [`greeks`](OptionModel::greeks) five times (vega and rho each
 /// re-solve twice on the same grid). Finer grids cost more and converge toward the exact value;
-/// coarser ones are faster and less accurate.
+/// coarser ones are faster and less accurate. Against the default grid's prices, a 200 × 100 grid
+/// gives implied volatilities within about 1.2e-4 (0.012 volatility points) and a 100 × 50 grid
+/// within about 5e-4. That holds for American options on a $100 stock at a 4% rate, from a week to
+/// a year out at 30% volatility, at and one standard deviation either side of the money, with no
+/// dividend or one $0.50 cash dividend halfway to expiry. Each halving of both step counts makes a
+/// solve about four times faster; from 200 × 100 to 100 × 50 the error grows about four times too.
 ///
 /// The grid is laid out for each volatility, so its error varies with the volatility. Where the
 /// price barely moves with volatility (deep in the money, or very close to expiry) that error can
