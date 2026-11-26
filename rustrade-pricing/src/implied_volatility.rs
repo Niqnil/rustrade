@@ -1143,4 +1143,49 @@ mod model_tests {
         let swamped = plain.with_dividends(vec![CashDividend::new(0.5, 150.0)]);
         assert_eq!(european_hint(&swamped, price, &config), None);
     }
+
+    #[test]
+    fn coarser_grids_imply_volatilities_close_to_the_default_grids() {
+        // American calls and puts a week to a year out, at and one standard deviation either side
+        // of the money, with and without a cash dividend halfway to expiry. Each is priced on the
+        // default grid at 30% and solved on a coarser grid; the bounds are the figures the
+        // model's "Accuracy and cost" rustdoc gives, with a little room.
+        let reference = FiniteDifferenceModel::default();
+        let config = ImpliedVolatilityConfig::default();
+        let volatility = 0.30;
+        for (space, time, bound) in [(200, 100, 1.5e-4), (100, 50, 6e-4)] {
+            let coarse = FiniteDifferenceModel::new(space, time).unwrap();
+            let mut worst: f64 = 0.0;
+            for days in [7.0, 30.0, 90.0, 365.0] {
+                let expiry: f64 = days / 365.0;
+                for dividend in [false, true] {
+                    for kind in [Call, Put] {
+                        for moneyness in [-1.0, 0.0, 1.0] {
+                            let strike = 100.0 * (moneyness * volatility * expiry.sqrt()).exp();
+                            let mut inputs =
+                                OptionInputs::new(kind, American, 100.0, strike, expiry, 0.04);
+                            if dividend {
+                                inputs = inputs
+                                    .with_dividends(vec![CashDividend::new(expiry / 2.0, 0.5)]);
+                            }
+                            let price = reference.price(&inputs, volatility).unwrap();
+                            let solved = implied_volatility(&coarse, &inputs, price, &config)
+                                .unwrap_or_else(|error| {
+                                    panic!("{space}x{time} {inputs:?}: {error:?}")
+                                });
+                            let error = (solved - volatility).abs();
+                            assert!(
+                                error <= bound,
+                                "{space}x{time} {kind} {days}d K{strike} dividend {dividend}: \
+                                 {solved}"
+                            );
+                            worst = worst.max(error);
+                        }
+                    }
+                }
+            }
+            // The coarse grid really is off the default one, so the bound is not met trivially.
+            assert!(worst > bound / 10.0, "{space}x{time}: worst {worst}");
+        }
+    }
 }
