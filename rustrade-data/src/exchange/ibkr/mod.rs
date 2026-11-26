@@ -446,10 +446,19 @@ where
     /// An attempt connects, completes IB's handshake, sends the market data type, reads IB's
     /// server time when the stream has a candle subscription, and starts the subscriptions. These
     /// steps block, so they run on tokio's blocking thread pool, where a step cannot be
-    /// interrupted. An attempt that times out is abandoned instead: it stops before its next step
-    /// and closes whatever it connected, holding its blocking thread until then. The stream's next
-    /// attempt waits for that, so that two connections never use the same client ID at once, and
-    /// the wait counts toward the next attempt's own timeout.
+    /// interrupted. An attempt that times out is abandoned instead: it stops at its next check
+    /// (before connecting, before sending the market data type, before reading the server time,
+    /// and before starting the subscriptions) and closes whatever it connected, holding its
+    /// blocking thread until then. The stream's next attempt waits for that, so that two of its
+    /// connections never use the same client ID at once, and the wait counts toward the next
+    /// attempt's own timeout.
+    ///
+    /// That wait is within one stream. When the first attempt times out, `init` returns while the
+    /// abandoned attempt may still be connecting. Calling `init` again at once with the same
+    /// client ID can then collide with it, which IB refuses: the new attempt fails with a
+    /// [`DataError::Socket`] saying the client ID is in use, and a later retry succeeds once the
+    /// abandoned attempt has closed. To avoid that, retry after the abandoned attempt can have
+    /// finished (the `ibapi` bounds below), or with another client ID.
     ///
     /// `ibapi` bounds each read of the handshake and the server time request (30 s each), but not
     /// the TCP connect, which waits as long as the operating system allows. Without an
@@ -766,18 +775,18 @@ impl QuoteTicks {
     }
 }
 
-/// The stream's attempt to open a connection, run one at a time: an attempt waits until the one
+/// The stream's attempts to open a connection, run one at a time: an attempt waits until the one
 /// before it has returned, including one abandoned while it was still blocked, so that it does not
 /// connect with the same client ID while the earlier connection may still open.
 #[derive(Debug, Clone, Default)]
 struct Opening(Arc<tokio::sync::Mutex<()>>);
 
 impl Opening {
-    /// Run `open` on tokio's blocking thread pool once the stream's previous open has returned and
-    /// its result has been dropped, and return its result.
+    /// Run `open` on tokio's blocking thread pool once the stream's previous open has returned,
+    /// and return its result. The turn passes on when this returns.
     ///
     /// If the returned future is dropped before `open` returns (an initialisation timeout, or the
-    /// stream dropped), `open`'s [`OpenAbandoned`] is set, so that it stops at its next step. The
+    /// stream dropped), `open`'s [`OpenAbandoned`] is set, so that it stops at its next check. The
     /// stream's next open then waits until `open` has returned and whatever it returned, such as a
     /// connection that opened just too late, has been dropped and so closed. Dropped while still
     /// waiting for its turn, the future runs no `open` at all.
@@ -792,12 +801,20 @@ impl Opening {
     where
         T: Send + 'static,
     {
-        let turn = self.0.clone().lock_owned().await;
+        let turn = match self.0.clone().try_lock_owned() {
+            Ok(turn) => turn,
+            Err(_) => {
+                info!("Waiting for an abandoned IB connection attempt to stop before connecting");
+                self.0.clone().lock_owned().await
+            }
+        };
         let abandoned = OpenAbandoned::default();
         let _abandon_on_drop = abandoned.on_drop();
         // `turn` goes back with the result, after it in the tuple, so that it is released only
-        // once the result is dropped: here, or by tokio on the blocking thread if this future has
-        // been dropped by then.
+        // once the result has been dropped. If this future was dropped first, tokio drops both:
+        // on the blocking thread when `open` returns, or, if `open` had already returned, on the
+        // thread that dropped this future, an async worker (so the result's `Drop` must not
+        // block).
         let (result, _turn) = tokio::task::spawn_blocking(move || (open(&abandoned), turn))
             .await
             .map_err(|e| DataError::Socket(format!("IB connect task: {e}")))?;
@@ -812,18 +829,14 @@ struct OpenAbandoned(Arc<AtomicBool>);
 
 impl OpenAbandoned {
     /// A guard that sets the flag when dropped.
-    fn on_drop(&self) -> impl Drop + use<> {
-        struct SetOnDrop(Arc<AtomicBool>);
-        impl Drop for SetOnDrop {
-            fn drop(&mut self) {
-                // A stop flag guarding no other data.
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-        SetOnDrop(self.0.clone())
+    fn on_drop(&self) -> AbandonOnDrop {
+        AbandonOnDrop(self.0.clone())
     }
 
     /// An error if the attempt has been abandoned, to stop the open before `step`.
+    ///
+    /// The error is never delivered: the attempt that would have returned it is gone. The log line
+    /// is what shows it.
     fn check(&self, step: &str) -> Result<(), DataError> {
         if !self.0.load(Ordering::Relaxed) {
             return Ok(());
@@ -835,6 +848,17 @@ impl OpenAbandoned {
         Err(DataError::Socket(format!(
             "IB connection attempt abandoned before {step}"
         )))
+    }
+}
+
+/// Sets an [`OpenAbandoned`] when dropped: held by the attempt, so that the open learns when the
+/// attempt is dropped.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        // A stop flag guarding no other data.
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -3431,6 +3455,9 @@ mod tests {
         .await;
 
         assert_eq!(result.err(), Some(abandon_after()));
+        // An open abandoned before it connected never reached the gateway: connect here so that
+        // its accept returns either way.
+        let _unblock = std::net::TcpStream::connect(("127.0.0.1", port));
         hang_up.send(()).unwrap();
         gateway.join().unwrap();
     }

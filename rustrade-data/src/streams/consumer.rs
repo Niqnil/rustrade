@@ -130,6 +130,9 @@ impl MarketStreamOptions {
 
     /// Abandons an attempt to initialise the stream that has not completed within `timeout`.
     ///
+    /// [`DEFAULT_INIT_TIMEOUT`] unless changed. Applies to streams built through
+    /// [`init_market_stream`], and to `IbkrMarketStream` (`ibkr` feature).
+    ///
     /// An attempt connects to the venue, subscribes, waits for the venue to acknowledge the
     /// subscriptions, and fetches any initial snapshots. An attempt that stalls would otherwise
     /// leave the stream waiting indefinitely, with nothing yielded and nothing retried.
@@ -153,13 +156,9 @@ impl MarketStreamOptions {
     ///   attaches. An attach whose stream is abandoned before its turn is skipped, but one already
     ///   under way runs to the end of its own bounds first. Allow for that when several streams
     ///   share a connection.
-    ///
     /// - **IBKR:** `IbkrMarketStream` (`ibkr` feature) opens its connection on a blocking thread,
-    ///   so an abandoned attempt stops at its next step rather than where it waits, and the
+    ///   so an abandoned attempt stops at its next check rather than where it waits, and the
     ///   stream's next attempt waits for it to stop; see `IbkrMarketStream::init`.
-    ///
-    /// [`DEFAULT_INIT_TIMEOUT`] unless changed. Applies to streams built through
-    /// [`init_market_stream`], and to `IbkrMarketStream`.
     ///
     /// # Errors
     /// [`MarketStreamOptionsError::InitTimeoutZero`] if `timeout` is zero.
