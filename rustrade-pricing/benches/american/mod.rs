@@ -16,7 +16,7 @@
 //!   vega and rho.
 //! - `american_implied_volatility`: `implied_volatility` with the default configuration, solving
 //!   for the price the default grid gives at 30%. On a coarser grid that price is slightly off the
-//!   grid's own, as a market price is off any model's, so the solve does not start at its answer.
+//!   grid's own, as a market price is off any model's, so the solve lands near 30%, not on it.
 //!   Setup checks that every case solves, so a failing solve is never what is timed.
 
 use criterion::{
