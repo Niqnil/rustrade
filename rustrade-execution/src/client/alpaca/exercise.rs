@@ -9,7 +9,7 @@ use crate::{
     error::{ApiError, ExerciseRefusal, UnindexedClientError},
     exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity},
 };
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone as _, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone as _, Timelike as _, Utc};
 use chrono_tz::America::New_York;
 use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
@@ -74,7 +74,7 @@ impl OptionExerciseClient for AlpacaClient {
     ///     [`ExerciseRefusal::NoPosition`] when it says no position is available, in Alpaca's
     ///     documented words; and otherwise [`ExerciseRefusal::Other`];
     ///   - [`ExerciseRefusal::Other`] for any other 4xx, with Alpaca's code and message, and for
-    ///     a 4xx whose body could not be read.
+    ///     a 4xx other than a 401 whose body could not be read.
     /// - [`ApiError::Unauthenticated`] for a 401, or a 403 without a code: a wrong key, secret or
     ///   host.
     /// - [`ApiError::RateLimit`] once the 429 retries are exhausted. A 429 means Alpaca did not
@@ -139,11 +139,15 @@ impl OptionExerciseClient for AlpacaClient {
             Ok(bytes) => bytes,
             // A 4xx is a refusal whatever its body says; only the reason is lost.
             Err(error) if status.is_client_error() => {
-                return Err(UnindexedClientError::Api(ApiError::ExerciseRefused(
-                    ExerciseRefusal::Other(format!(
-                        "{status}, with an error body that could not be read: {error}"
-                    )),
-                )));
+                let message =
+                    format!("{status}, with an error body that could not be read: {error}");
+                return Err(UnindexedClientError::Api(
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        parse_api_error(status, None, &message)
+                    } else {
+                        ApiError::ExerciseRefused(ExerciseRefusal::Other(message))
+                    },
+                ));
             }
             Err(error) => {
                 return Err(UnindexedClientError::Connectivity(transport_error(
@@ -208,19 +212,25 @@ fn generic_refusal(expiry_day: NaiveDate, code: Option<i64>, message: &str) -> E
 }
 
 /// The deadline a lower-cased refusal such as "dne requests are not accepted after 5:15pm"
-/// states: that time on `expiry_day` in New York, where Alpaca keeps its expiry-day times. The
-/// time may be in 12-hour form, as Alpaca writes it, or 24-hour, with or without spaces, and may
-/// be followed by other words, such as a time zone. `None` when the message states no time this
-/// reads.
+/// states: that time on `expiry_day` in New York, where Alpaca keeps its expiry-day times. `None`
+/// when the message states no time this reads unambiguously.
+///
+/// The time is read with spaces ignored, and may be followed by other words, such as a time zone,
+/// but not by a digit. It is in 12-hour form with `am` or `pm`, as Alpaca writes it, or 24-hour
+/// from 13:00, where no hour can be misread. A time that has the form of a 12-hour one is judged
+/// on that form alone, so "5:15pm" followed by a digit is not read as 05:15; nor is "5:15" with
+/// neither `am` nor `pm`.
 fn stated_deadline(lower: &str, expiry_day: NaiveDate) -> Option<DateTime<Utc>> {
     let (_, after) = lower.split_once(NOT_ACCEPTED_AFTER)?;
     let stated: String = after.chars().filter(|c| !c.is_whitespace()).collect();
-    // A time followed by more digits, such as "17:155", is not a time this reads.
-    let leading = |format| match NaiveTime::parse_and_remainder(&stated, format) {
-        Ok((time, rest)) if !rest.starts_with(|c: char| c.is_ascii_digit()) => Some(time),
-        _ => None,
+    let ends_well = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_digit());
+    let time = match NaiveTime::parse_and_remainder(&stated, "%I:%M%p") {
+        Ok((time, rest)) => ends_well(rest).then_some(time)?,
+        Err(_) => match NaiveTime::parse_and_remainder(&stated, "%H:%M") {
+            Ok((time, rest)) if time.hour() >= 13 && ends_well(rest) => time,
+            _ => return None,
+        },
     };
-    let time = leading("%I:%M%p").or_else(|| leading("%H:%M"))?;
     New_York
         .from_local_datetime(&expiry_day.and_time(time))
         .single()
@@ -473,6 +483,11 @@ mod tests {
             "accepted after 5:15pm",
             "not accepted after 25:00",
             "not accepted after 17:155",
+            // A 12-hour time judged on its own form, never re-read as a 24-hour one.
+            "not accepted after 5:15pm 2 days",
+            "not accepted after 5:15 p.m.",
+            "not accepted after 5:15 et",
+            "not accepted after 09:30",
         ] {
             assert_eq!(stated_deadline(no_time, day(11, 27)), None, "{no_time}");
         }
@@ -579,6 +594,25 @@ mod tests {
                     if message.starts_with("403 Forbidden, with an error body that could not be read")
             ),
             "a 4xx is a refusal whatever its body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_whose_body_cannot_be_read_is_unauthenticated() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(unreadable_body(401))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(api_error(result), ApiError::Unauthenticated(_)),
+            "a wrong key, secret or host, whatever its body"
         );
     }
 
