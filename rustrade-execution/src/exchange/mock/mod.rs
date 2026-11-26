@@ -429,6 +429,17 @@ impl MockExchange {
                     self.venue.borrow_capacity(&instrument, side),
                 );
             }
+            MockExchangeRequestKind::InstructExercise {
+                response_tx,
+                instrument,
+                instruction,
+            } => {
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.instruct_exercise(&instrument, instruction),
+                );
+            }
             MockExchangeRequestKind::FetchTrades {
                 response_tx,
                 start,
@@ -1522,6 +1533,56 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// The mock client's exercise instruction reaches the venue, and its refusal of an instrument
+    /// that is not an option comes back as the venue's API error.
+    #[tokio::test]
+    async fn an_exercise_instruction_is_answered_by_the_venue() {
+        use crate::{
+            client::{OptionExerciseClient, mock::MockExecution},
+            exercise::{ExerciseInstruction, ExerciseQuantity},
+        };
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("0", "10000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+        let client = MockExecution {
+            mocked_exchange: EXCHANGE,
+            clock: Utc::now,
+            request_tx,
+            event_rx,
+            amend_support: AmendSupport::NONE,
+        };
+
+        let error = client
+            .instruct_exercise(
+                &instrument_name(),
+                ExerciseInstruction::Lapse {
+                    contracts: ExerciseQuantity::WholePosition,
+                },
+            )
+            .await
+            .expect_err("BTCUSDT is not an option");
+
+        assert!(
+            matches!(
+                &error,
+                crate::error::ClientError::Api(crate::error::ApiError::InstrumentInvalid(
+                    instrument,
+                    _,
+                )) if *instrument == instrument_name()
+            ),
+            "{error:?}"
+        );
+        drop(client);
+        driver.await.unwrap();
     }
 
     /// A request-priced driver answers a fetch after the output booked before it, so a balance

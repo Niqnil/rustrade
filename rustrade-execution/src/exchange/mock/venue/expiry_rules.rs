@@ -1,8 +1,10 @@
 //! The expiry-day rules of a [`SimulatedVenue`]: where each rule's anchor places it for each
-//! option, and the [`ExpiryDayCutoff`] that refuses opening orders from there. The
+//! option, the [`ExpiryDayCutoff`] that refuses opening orders from there, and the
+//! [`LapseDeadline`] that refuses lapse instructions. The
 //! [`ExpirySellOut`] check itself runs in `sell_out`.
 //!
 //! [`ExpiryDayCutoff`]: crate::expiry::ExpiryDayCutoff
+//! [`LapseDeadline`]: crate::expiry::LapseDeadline
 //! [`ExpirySellOut`]: crate::expiry::ExpirySellOut
 
 use super::{ExpiryRule, ExpiryRuleUnplaceable, SimulatedVenue};
@@ -29,7 +31,8 @@ impl SimulatedVenue {
     /// Places each configured expiry-day rule for the options it covers, under each option's
     /// session calendar: the [`ExpirySellOut`](crate::expiry::ExpirySellOut) checks for every
     /// physically settled option (a cash-settled one is never sold out, since exercising it needs
-    /// no money), and the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) for every option.
+    /// no money), and the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) and
+    /// [`LapseDeadline`](crate::expiry::LapseDeadline) for every option.
     /// Then finds the next sell-out after the instant the clock has reached.
     ///
     /// An option with no calendar to place a rule is left in
@@ -49,6 +52,11 @@ impl SimulatedVenue {
             self.expiry_day_cutoff.map(|cutoff| cutoff.anchor()),
             |_| true,
         )?;
+        let lapse_deadlines = self.place(
+            ExpiryRule::LapseDeadline,
+            self.lapse_deadline.map(|deadline| deadline.anchor()),
+            |_| true,
+        )?;
         self.expiry_rules_unplaced = sell_outs
             .unplaced
             .into_iter()
@@ -59,6 +67,12 @@ impl SimulatedVenue {
                     .into_iter()
                     .map(|name| (ExpiryRule::DayCutoff, name)),
             )
+            .chain(
+                lapse_deadlines
+                    .unplaced
+                    .into_iter()
+                    .map(|name| (ExpiryRule::LapseDeadline, name)),
+            )
             .collect();
         self.sell_outs = sell_outs.placed;
         self.sell_outs.sort_unstable();
@@ -66,6 +80,11 @@ impl SimulatedVenue {
             .placed
             .into_iter()
             .map(|(cutoff, name)| (name, cutoff))
+            .collect();
+        self.lapse_deadlines = lapse_deadlines
+            .placed
+            .into_iter()
+            .map(|(deadline, name)| (name, deadline))
             .collect();
         self.refresh_next_sell_out();
         Ok(())
@@ -132,13 +151,19 @@ impl SimulatedVenue {
     /// before its expiry, since a venue restored from a snapshot has its clock moved already, so
     /// an order it took before a calendar was given could pass a cutoff not yet placed.
     pub(super) fn assert_cutoff_placed(&self, instrument: &InstrumentNameExchange) {
+        self.assert_rule_placed(ExpiryRule::DayCutoff, instrument);
+    }
+
+    /// Panics if `rule` is anchored before the session close and the option `instrument` has no
+    /// session calendar to place it.
+    pub(super) fn assert_rule_placed(&self, rule: ExpiryRule, instrument: &InstrumentNameExchange) {
         assert!(
             !self
                 .expiry_rules_unplaced
                 .iter()
-                .any(|(rule, name)| *rule == ExpiryRule::DayCutoff && name == instrument),
-            "SimulatedVenue's expiry-day cutoff is anchored before the session close, but the \
-             option {instrument} has no session calendar to place it. Configure \
+                .any(|(unplaced, name)| *unplaced == rule && name == instrument),
+            "SimulatedVenue's {rule} is anchored before the session close, but the option \
+             {instrument} has no session calendar to place it. Configure \
              MockExecutionConfig::session_close, a session_close_overrides entry, or \
              SimulatedVenue::with_session_calendar"
         );

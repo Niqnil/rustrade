@@ -60,6 +60,7 @@ use crate::{
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
     error::{AmendField, AmendRefusal, OrderError, UnindexedClientError},
+    exercise::{ExerciseAck, ExerciseInstruction},
     order::{
         Order, OrderEvent, UnindexedInactiveOrder, UnindexedOrderKey,
         amend::AmendSupport,
@@ -1275,6 +1276,53 @@ pub trait BorrowCapacityClient: ExecutionClient {
         instrument: &InstrumentNameExchange,
         side: Side,
     ) -> impl Future<Output = Result<BorrowCapacity, UnindexedClientError>> + Send;
+}
+
+/// Extension trait for clients that can instruct the venue how a held option is exercised.
+///
+/// At expiry, an option in the money is exercised automatically unless its holder instructs the
+/// broker otherwise. This sends that instruction: so far only
+/// [`Lapse`](ExerciseInstruction::Lapse), which lets a long option expire unexercised. Whether to
+/// send one, and for which positions, is the caller's decision.
+///
+/// # Type-Level Capability
+///
+/// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one: only a client
+/// whose venue takes such instructions implements it. The mock client implements it, and its
+/// simulated venue honours the instruction at expiry; see
+/// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::SimulatedVenue::instruct_exercise).
+pub trait OptionExerciseClient: ExecutionClient {
+    /// Sends `instruction` for the long position held in the option `instrument`.
+    ///
+    /// # Contract
+    ///
+    /// - **Accepted is not applied.** `Ok` means the venue took the instruction. It takes effect
+    ///   when the option expires, as the venue applies it; the account stream reports the
+    ///   position's settlement then, as the venue reports any expiry.
+    /// - **No undo.** Venues document no way to withdraw an instruction once accepted, so this
+    ///   trait offers none.
+    /// - **Not retried.** A request whose outcome is unknown, such as one that timed out, is
+    ///   reported as a [`ClientError::Connectivity`](crate::error::ClientError::Connectivity) error
+    ///   and not sent again. A lapse instruction sent twice has the effect of one, so the caller
+    ///   may send it again; what the venue answers a repeat with is each implementation's to say.
+    /// - **May outlive its future.** A request dropped before its answer may still have reached
+    ///   the venue and been accepted.
+    /// - **What a later change to the position does** to an instruction is the venue's rule; each
+    ///   implementation says what it knows of it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::ExerciseRefused`](crate::error::ApiError::ExerciseRefused) when the venue
+    ///   refuses the instruction, with an
+    ///   [`ExerciseRefusal`](crate::error::ExerciseRefusal) saying why; each implementation says
+    ///   which reasons its venue reports.
+    /// - [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an
+    ///   instrument the venue does not know, or one that is not an option.
+    fn instruct_exercise(
+        &self,
+        instrument: &InstrumentNameExchange,
+        instruction: ExerciseInstruction,
+    ) -> impl Future<Output = Result<ExerciseAck, UnindexedClientError>> + Send;
 }
 
 /// The capability table, pinned.

@@ -422,6 +422,20 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// closes the position may be accepted.
     #[error("open refused: {0}")]
     OpenRefused(OpenRefusal),
+
+    /// An instruction about how a held option is exercised was refused: see
+    /// [`OptionExerciseClient`](crate::client::OptionExerciseClient). [`ExerciseRefusal`] says
+    /// why.
+    ///
+    /// Distinct from [`OrderRejected`](Self::OrderRejected) and
+    /// [`RequestRejected`](Self::RequestRejected) because an exercise instruction is neither an
+    /// order nor a query, and its refusals have reasons a caller acts on differently: no position
+    /// to instruct, a quantity the venue cannot take, or a deadline passed.
+    ///
+    /// Not transient — the same instruction fails identically until the position, or the
+    /// instruction, changes.
+    #[error("exercise instruction refused: {0}")]
+    ExerciseRefused(ExerciseRefusal),
 }
 
 impl<AssetKey, InstrumentKey> ApiError<AssetKey, InstrumentKey> {
@@ -457,6 +471,39 @@ pub enum OpenRefusal {
     ExpiryDayCutoff {
         /// The instant from which the venue refuses the option's opening orders.
         cutoff: DateTime<Utc>,
+    },
+}
+
+/// Why a venue refused an exercise instruction, as carried by [`ApiError::ExerciseRefused`].
+///
+/// Each implementation of [`OptionExerciseClient`](crate::client::OptionExerciseClient) says which
+/// of these its venue reports.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum ExerciseRefusal {
+    /// The account holds no position in the option.
+    #[error("the account holds no position in the option")]
+    NoPosition,
+    /// The account is short the option: only its holder, the long, instructs how it is exercised.
+    #[error("the account is short the option, and only a long position can be instructed")]
+    ShortPosition,
+    /// The instruction names a quantity of contracts, and the venue instructs only a whole
+    /// position. Send
+    /// [`ExerciseQuantity::WholePosition`](crate::exercise::ExerciseQuantity::WholePosition), or
+    /// sell what is not to be instructed first.
+    #[error("the venue takes an instruction for the whole position only, not a quantity")]
+    QuantityUnsupported,
+    /// The option has expired.
+    #[error("the option expired at {expiry}")]
+    Expired {
+        /// The option's expiry.
+        expiry: DateTime<Utc>,
+    },
+    /// The venue's deadline for the instruction has passed.
+    #[error("the venue's deadline for the instruction, {deadline}, has passed")]
+    PastDeadline {
+        /// The instant from which the venue refuses the instruction.
+        deadline: DateTime<Utc>,
     },
 }
 

@@ -25,7 +25,9 @@ pub enum LongOptionExpiry {
     Exercise,
     /// Every long option lapses: the position settles at zero, in the money or not, and no
     /// underlying price is needed for it. This matches a holder who instructs the broker not to
-    /// exercise any option still held at expiry.
+    /// exercise any option still held at expiry. To lapse only some positions on the simulated
+    /// venue, keep [`Exercise`](Self::Exercise) and instruct those through
+    /// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::SimulatedVenue::instruct_exercise).
     Lapse,
 }
 
@@ -52,7 +54,9 @@ pub enum LongOptionExpiry {
 ///
 /// # What the venue does
 /// At the instant the [`anchor`](Self::anchor) places for each physically settled option, the
-/// venue looks at every long it holds in that option:
+/// venue looks at every long it holds in that option, except one instructed to lapse (see
+/// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::SimulatedVenue::instruct_exercise)),
+/// which needs no money:
 /// - **In the money?** Against the underlying's price as expiry settlement takes it, the mid of
 ///   its spot market, else its last price. Only an option in the money, by any amount, is sold.
 ///   Without a price for the underlying the venue cannot tell, warns, and sells nothing.
@@ -270,6 +274,54 @@ impl ExpiryDayCutoff {
     }
 
     /// When the venue starts refusing opening orders on each option.
+    pub const fn anchor(&self) -> ExpiryAnchor {
+        self.anchor
+    }
+}
+
+/// When a [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) stops taking
+/// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instructions for an option about to
+/// expire, as a broker sets a deadline on its expiry day for instructions not to exercise.
+///
+/// Set on [`MockExecutionConfig::lapse_deadline`]. For example, a broker that takes them until an
+/// hour before the expiry day's close:
+///
+/// ```
+/// use rustrade_execution::expiry::{ExpiryAnchor, LapseDeadline};
+/// use std::time::Duration;
+///
+/// let deadline = LapseDeadline::new(ExpiryAnchor::BeforeClose(Duration::from_secs(60 * 60)));
+/// ```
+///
+/// # What the venue does
+/// From the instant the [`anchor`](Self::anchor) places for an option, the venue refuses a lapse
+/// instruction for it with [`ApiError::ExerciseRefused`] carrying
+/// [`ExerciseRefusal::PastDeadline`]. An instruction it accepted before stays in force. Every
+/// option is covered, cash-settled or physically settled.
+///
+/// Without one, the venue takes a lapse instruction until the option expires.
+///
+/// # Known limitations
+/// - **One anchor for every option**, as for [`ExpiryDayCutoff`].
+/// - **No window start.** A venue that takes such instructions only on the expiry day itself
+///   cannot be modelled; this venue takes one at any time before the deadline.
+///
+/// [`MockExecutionConfig::lapse_deadline`]:
+///     crate::client::mock::MockExecutionConfig::lapse_deadline
+/// [`ApiError::ExerciseRefused`]: crate::error::ApiError::ExerciseRefused
+/// [`ExerciseRefusal::PastDeadline`]: crate::error::ExerciseRefusal::PastDeadline
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct LapseDeadline {
+    anchor: ExpiryAnchor,
+}
+
+impl LapseDeadline {
+    /// Refuses lapse instructions from the instant `anchor` places for each option.
+    pub const fn new(anchor: ExpiryAnchor) -> Self {
+        Self { anchor }
+    }
+
+    /// When the venue starts refusing lapse instructions for each option.
     pub const fn anchor(&self) -> ExpiryAnchor {
         self.anchor
     }

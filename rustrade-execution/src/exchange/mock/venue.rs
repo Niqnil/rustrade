@@ -16,7 +16,9 @@ use crate::{
         account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
         orders::{AlreadyResting, NotQueued, OpenOrder, Rank, Reservation, RestingOrder},
     },
-    expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry, SellOutAffordability},
+    expiry::{
+        ExpiryDayCutoff, ExpirySellOut, LapseDeadline, LongOptionExpiry, SellOutAffordability,
+    },
     fee::{
         FeeAssetConfig, FeeInput, FeeModel, FeeModelConfig, FeeModelOverrides, Liquidity,
         SpotFeeAsset,
@@ -75,6 +77,7 @@ use tracing::warn;
 mod config;
 mod corporate_action;
 mod expiry_rules;
+mod lapse;
 mod liquidation;
 mod price_window;
 mod sell_out;
@@ -446,8 +449,9 @@ pub enum VenueRegime {
 ///   option expiring that afternoon settles against the previous day's close: feed data that
 ///   reaches the expiry, or set the expiry no earlier than the candle that carries the closing
 ///   price.
-/// - **Out of the money, or a long lapsing** under [`LongOptionExpiry::Lapse`]: the option closes
-///   at zero, reported as a [`TradeOrigin::Expiry`] trade. A short's collateral is released, its
+/// - **Out of the money, or a long lapsing** under [`LongOptionExpiry::Lapse`] or a lapse
+///   instruction (see `## Lapse instructions` below): the option closes at zero, reported as a
+///   [`TradeOrigin::Expiry`] trade. A short's collateral is released, its
 ///   balance restated before the trade.
 /// - **A short in the money is assigned**, whatever [`LongOptionExpiry`] says, since the holder
 ///   decides. It is assigned whole, and pays out of the collateral it held, so it never needs more
@@ -458,8 +462,8 @@ pub enum VenueRegime {
 ///     the cash it held on the shares; a call delivers the shares it held for the strike's cash.
 ///   - [`Cash`](OptionSettlement::Cash): a put closes at its intrinsic value, paid out of the cash
 ///     it held, and the rest is released, as `[balance, trade]`.
-/// - **In the money, exercised** under [`LongOptionExpiry::Exercise`], the default, as the
-///   contract's [`OptionSettlement`] says:
+/// - **In the money, exercised** under [`LongOptionExpiry::Exercise`], the default, unless
+///   instructed to lapse, as the contract's [`OptionSettlement`] says:
 ///   - [`Physical`](OptionSettlement::Physical): the option closes at zero, and the underlying is
 ///     delivered at the strike through the spot ledger: a call pays `strike × quantity ×
 ///     contract_size` of quote and receives the shares, and a put the reverse. Both are
@@ -479,8 +483,8 @@ pub enum VenueRegime {
 ///   first later input that brings one, stamped at that input. An underlying no single spot
 ///   instrument on this venue trades, or any underlying on a
 ///   [`RequestPriced`](VenueRegime::RequestPriced) venue, is never priced, so the position stays
-///   open; only [`LongOptionExpiry::Lapse`] settles a long, since a lapse needs no price, and
-///   nothing settles a short.
+///   open; only a lapse, under [`LongOptionExpiry::Lapse`] or an instruction, settles a long,
+///   since a lapse needs no price, and nothing settles a short.
 ///
 /// ## Sold out before expiry
 /// Configured with [`MockExecutionConfig::expiry_sell_out`], the venue also checks each long in a
@@ -490,12 +494,24 @@ pub enum VenueRegime {
 /// [`next_deadline`](Self::next_deadline)), or before its expiry itself. The check is a boundary
 /// like the expiry and included in [`next_deadline`](Self::next_deadline), and first among the
 /// boundaries at its instant. A long in the money that the account cannot afford to exercise (the
-/// strike's cash for a call, free shares for a put) is sold, after the orders working on it are
-/// cancelled, as a market sell fills, less a haircut, reported as `[order.., balance.., trade]`
-/// with a [`TradeOrigin::Liquidation`] trade. What is not sold settles at expiry as above. See
-/// [`ExpirySellOut`] for what is affordable, how much is sold, and what is not modelled. A check
+/// strike's cash for a call, free shares for a put), and that is not instructed to lapse, is sold,
+/// after the orders working on it are cancelled, as a market sell fills, less a haircut, reported
+/// as `[order.., balance.., trade]` with a [`TradeOrigin::Liquidation`] trade. What is not sold
+/// settles at expiry as above. See [`ExpirySellOut`] for what is affordable, how much is sold, and
+/// what is not modelled. A check
 /// at or before the instant the clock first moves is not run: the venue then holds no market to
 /// sell at.
+///
+/// ## Lapse instructions
+/// [`instruct_exercise`](Self::instruct_exercise) takes a
+/// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instruction for a long held in an option,
+/// as a broker takes a do-not-exercise instruction. The instructed long lapses at expiry, in the
+/// money or not, whatever [`LongOptionExpiry`] says, and is left unsold by an expiry sell-out.
+/// The instruction holds for whatever long the position is at expiry and is dropped when the
+/// position goes flat or short. Configured with [`MockExecutionConfig::lapse_deadline`], the venue
+/// refuses an instruction from the instant its [`ExpiryAnchor`](crate::expiry::ExpiryAnchor)
+/// places, placed as the sell-out is. See [`instruct_exercise`](Self::instruct_exercise) for the
+/// refusals.
 ///
 /// ## Refused after the expiry-day cutoff
 /// Configured with [`MockExecutionConfig::expiry_day_cutoff`], the venue refuses an order on an
@@ -1062,6 +1078,18 @@ pub struct SimulatedVenue {
     /// Empty without an [`expiry_day_cutoff`](Self::expiry_day_cutoff). Placed with
     /// [`sell_outs`](Self::sell_outs).
     cutoffs: FnvHashMap<InstrumentNameExchange, DateTime<Utc>>,
+    /// When this venue stops taking lapse instructions for an option about to expire, or `None`
+    /// if it takes them until expiry. Fixed at construction from
+    /// [`MockExecutionConfig::lapse_deadline`].
+    lapse_deadline: Option<LapseDeadline>,
+    /// The instant from which each option this venue lists takes no lapse instruction, by name.
+    /// Empty without a [`lapse_deadline`](Self::lapse_deadline). Placed with
+    /// [`sell_outs`](Self::sell_outs).
+    lapse_deadlines: FnvHashMap<InstrumentNameExchange, DateTime<Utc>>,
+    /// The options whose long position the holder has instructed to lapse at expiry, by name: see
+    /// [`instruct_exercise`](Self::instruct_exercise). An option leaves it when its position goes
+    /// flat or short, so a position opened later carries no instruction.
+    lapse_instructed: FnvHashSet<InstrumentNameExchange>,
     /// The options, by rule then name, that an expiry-day rule anchored before the session close
     /// cannot yet place, having no session calendar. Left for
     /// [`with_session_calendar`](Self::with_session_calendar) to place; the venue refuses to run
@@ -1129,10 +1157,10 @@ impl SimulatedVenue {
     ///   [`MockExecutionConfig::session_close_overrides`]) cannot place the close of the order,
     ///   seeded in `initial_state`.
     /// - [`VenueConfigError::ExpiryRule`] if the anchor of
-    ///   [`MockExecutionConfig::expiry_sell_out`] or [`MockExecutionConfig::expiry_day_cutoff`]
-    ///   cannot place the rule for an option: its expiry falls on a date with no session, its
-    ///   expiry day closes after its expiry, or its calendar cannot answer. An option with no
-    ///   calendar at all is not refused here, so that
+    ///   [`MockExecutionConfig::expiry_sell_out`], [`MockExecutionConfig::expiry_day_cutoff`] or
+    ///   [`MockExecutionConfig::lapse_deadline`] cannot place the rule for an option: its expiry
+    ///   falls on a date with no session, its expiry day closes after its expiry, or its calendar
+    ///   cannot answer. An option with no calendar at all is not refused here, so that
     ///   [`with_session_calendar`](Self::with_session_calendar) can supply one: see the
     ///   `# Panics` of [`next_deadline`](Self::next_deadline).
     /// - [`VenueConfigError::OrderRules`] if [`MockExecutionConfig::order_rules`] gives rules for
@@ -1307,6 +1335,9 @@ impl SimulatedVenue {
             next_sell_out: None,
             expiry_day_cutoff: config.expiry_day_cutoff,
             cutoffs: FnvHashMap::default(),
+            lapse_deadline: config.lapse_deadline,
+            lapse_deadlines: FnvHashMap::default(),
+            lapse_instructed: FnvHashSet::default(),
             expiry_rules_unplaced: Vec::new(),
             corporate_actions_applied: FnvHashSet::default(),
             restated_strikes: FnvHashMap::default(),
@@ -1393,17 +1424,18 @@ impl SimulatedVenue {
     /// order, build the venue from a configuration with no `session_close` and no override
     /// matching those orders' instruments.
     ///
-    /// An [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out) or
-    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff) anchored
+    /// An [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out),
+    /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff) or
+    /// [`lapse_deadline`](MockExecutionConfig::lapse_deadline) anchored
     /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) is placed again under
     /// `calendar`, for every option without a close of its own.
     ///
     /// # Errors
     /// - [`VenueConfigError::SessionCalendar`] with the [`CalendarError`] of the first seeded day
     ///   order, by client order id, that `calendar` cannot answer for.
-    /// - [`VenueConfigError::ExpiryRule`] if the expiry sell-out or the expiry-day cutoff cannot
-    ///   be placed under `calendar` for an option, such as one whose expiry falls on a date with
-    ///   no session.
+    /// - [`VenueConfigError::ExpiryRule`] if the expiry sell-out, the expiry-day cutoff or the
+    ///   lapse deadline cannot be placed under `calendar` for an option, such as one whose expiry
+    ///   falls on a date with no session.
     ///
     /// # Panics
     /// If `calendar` answers a close not after the instant it was asked from, breaking the
@@ -1504,8 +1536,9 @@ impl SimulatedVenue {
     /// since that is where charging starts.
     ///
     /// # Panics
-    /// If the [expiry sell-out](MockExecutionConfig::expiry_sell_out) or the
-    /// [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) is anchored
+    /// If the [expiry sell-out](MockExecutionConfig::expiry_sell_out), the
+    /// [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or the
+    /// [lapse deadline](MockExecutionConfig::lapse_deadline) is anchored
     /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose) and an option this
     /// venue lists still has no session calendar to place it: neither
     /// [`session_close`](MockExecutionConfig::session_close), an entry of
@@ -1513,7 +1546,9 @@ impl SimulatedVenue {
     /// [`with_session_calendar`](Self::with_session_calendar). The venue is built without one, so
     /// that `with_session_calendar` can supply it, and refuses to run on without one, as do
     /// [`advance_time`](Self::advance_time) and [`apply_market`](Self::apply_market), and
-    /// [`open_order`](Self::open_order) for an option the cutoff is not placed for.
+    /// [`open_order`](Self::open_order) for an option the cutoff is not placed for, and
+    /// [`instruct_exercise`](Self::instruct_exercise) for one the lapse deadline is not placed
+    /// for.
     pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
         self.assert_expiry_rules_placed();
         let expiry = self.account.orders().next_expiry();
@@ -1647,9 +1682,10 @@ impl SimulatedVenue {
     /// # Panics
     /// - If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     ///   boundary not after the instant it was asked from, or a negative interest.
-    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out) or
-    ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) anchored before the session
-    ///   close still has an option with no session calendar: see
+    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out),
+    ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or
+    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) anchored before the session close
+    ///   still has an option with no session calendar: see
     ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
@@ -1897,8 +1933,8 @@ impl SimulatedVenue {
                 %expiry,
                 "SimulatedVenue cannot settle an expired option: no single spot instrument on \
                  this venue trades its underlying, so it has no price to settle against. The \
-                 position stays open; only LongOptionExpiry::Lapse settles a long, and nothing \
-                 settles a short"
+                 position stays open; only a lapse, under LongOptionExpiry::Lapse or an \
+                 instruction, settles a long, and nothing settles a short"
             ),
         }
         self.expiry_pending.insert(instrument.clone());
@@ -1958,7 +1994,7 @@ impl SimulatedVenue {
         match self.positions.get(instrument) {
             None => true,
             Some(position) => {
-                (position.is_long() && self.long_option_expiry == LongOptionExpiry::Lapse)
+                (position.is_long() && self.long_lapses(instrument))
                     || self.underlying_price(instrument).is_some()
             }
         }
@@ -1999,10 +2035,10 @@ impl SimulatedVenue {
     /// onto `events`. Returns `false`, having moved nothing, when settling needs the underlying's
     /// price and it has none; `true` otherwise, including when nothing is held.
     ///
-    /// A long settles as [`long_option_expiry`](Self::long_option_expiry) says. A short is
-    /// assigned whenever it expires in the money, whatever that policy, since the holder decides,
-    /// so it always needs the price. See the type's `# How an option is accounted` for what each
-    /// outcome does.
+    /// A long lapses if [`long_lapses`](Self::long_lapses) says so, and is exercised in the money
+    /// otherwise. A short is assigned whenever it expires in the money, whatever that policy or
+    /// instruction, since the holder decides, so it always needs the price. See the type's
+    /// `# How an option is accounted` for what each outcome does.
     fn settle_option(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -2019,9 +2055,11 @@ impl SimulatedVenue {
         let short = position.quantity.is_sign_negative();
         let contracts = position.quantity.abs();
 
-        let in_the_money = match (short, self.long_option_expiry) {
-            (false, LongOptionExpiry::Lapse) => None,
-            (true, _) | (false, LongOptionExpiry::Exercise) => {
+        // A long that lapses closes at zero, in the money or not, so only it needs no price.
+        let lapses = !short && self.long_lapses(instrument);
+        let in_the_money = match lapses {
+            true => None,
+            false => {
                 let Some((spot, price)) = self.underlying_price(instrument) else {
                     return false;
                 };
@@ -2990,9 +3028,10 @@ impl SimulatedVenue {
     /// # Panics
     /// - If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     ///   boundary not after the instant it was asked from, or a negative interest.
-    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out) or
-    ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) anchored before the session
-    ///   close still has an option with no session calendar: see
+    /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out),
+    ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or
+    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) anchored before the session close
+    ///   still has an option with no session calendar: see
     ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn apply_market(
@@ -7281,6 +7320,8 @@ impl SimulatedVenue {
                 opened
             }
         };
+
+        self.forget_lapse_unless_long(instrument);
 
         // A position opened or closed has boundaries of its own, or no longer has any. One that
         // only changed size keeps its boundaries, which depend on the instrument alone.
@@ -21390,6 +21431,7 @@ mod tests {
     mod corporate_action;
     mod expiry_day_cutoff;
     mod fees;
+    mod lapse;
     mod liquidation;
     mod options;
     mod order_rules;

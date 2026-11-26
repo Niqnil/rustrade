@@ -98,9 +98,9 @@ pub enum VenueConfigError {
     )]
     SessionCalendar(#[source] CalendarError),
 
-    /// The anchor of an expiry-day rule, [`MockExecutionConfig::expiry_sell_out`] or
-    /// [`MockExecutionConfig::expiry_day_cutoff`], cannot place the rule for an option the venue
-    /// lists.
+    /// The anchor of an expiry-day rule, [`MockExecutionConfig::expiry_sell_out`],
+    /// [`MockExecutionConfig::expiry_day_cutoff`] or [`MockExecutionConfig::lapse_deadline`],
+    /// cannot place the rule for an option the venue lists.
     #[error(transparent)]
     ExpiryRule(#[from] ExpiryRuleUnplaceable),
 
@@ -184,6 +184,8 @@ pub enum ExpiryRule {
     SellOut,
     /// [`MockExecutionConfig::expiry_day_cutoff`].
     DayCutoff,
+    /// [`MockExecutionConfig::lapse_deadline`].
+    LapseDeadline,
 }
 
 impl fmt::Display for ExpiryRule {
@@ -191,6 +193,7 @@ impl fmt::Display for ExpiryRule {
         f.write_str(match self {
             Self::SellOut => "expiry sell-out",
             Self::DayCutoff => "expiry-day cutoff",
+            Self::LapseDeadline => "lapse deadline",
         })
     }
 }

@@ -606,7 +606,10 @@ pub enum ExpiryHandling {
     /// venue that reports no trade at expiry.
     ///
     /// A future settles at its own last price. A short option settles at its intrinsic value,
-    /// standing in for assignment. A long option settles as the [`LongOptionExpiry`] says.
+    /// standing in for assignment. A long option settles as the [`LongOptionExpiry`] says, for
+    /// every long on the exchange alike: the engine does not see a lapse instruction sent to a
+    /// venue for one position. To lapse some positions and exercise others, leave expiry to a
+    /// venue that honours the instruction, with [`Venue`](Self::Venue).
     Engine(LongOptionExpiry),
     /// The venue settles. It reports its own trades for the expiry, exercise or assignment, and
     /// those trades move the positions. On `ContractExpiry` the engine cancels the instrument's

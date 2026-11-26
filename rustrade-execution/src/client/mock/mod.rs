@@ -2,13 +2,14 @@ use crate::{
     AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
-    client::{BorrowCapacityClient, ExecutionClient, OrderStatusClient},
+    client::{BorrowCapacityClient, ExecutionClient, OptionExerciseClient, OrderStatusClient},
     error::{
         ClientError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::{CorporateActionResponse, request::MockExchangeRequest},
-    expiry::{ExpiryDayCutoff, ExpirySellOut, LongOptionExpiry},
+    exercise::{ExerciseAck, ExerciseInstruction},
+    expiry::{ExpiryDayCutoff, ExpirySellOut, LapseDeadline, LongOptionExpiry},
     fee::{FeeAssetConfig, FeeModelConfig, FeeModelOverrides, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
@@ -242,6 +243,16 @@ pub struct MockExecutionConfig {
     /// Defaults to `None`: an option takes opening orders until its expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_day_cutoff: Option<ExpiryDayCutoff>,
+    /// Whether the mock exchange refuses a
+    /// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instruction for an option from a set
+    /// time before its expiry day's close, or before its expiry, as a broker sets a deadline for
+    /// instructions not to exercise. See [`LapseDeadline`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
+    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    ///
+    /// Defaults to `None`: an option takes lapse instructions until its expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lapse_deadline: Option<LapseDeadline>,
     /// What a stock split does to the mock exchange's open orders on the split equity: cancelled,
     /// or adjusted. See [`SplitConfig`].
     ///
@@ -304,6 +315,7 @@ impl MockExecutionConfig {
             fee_model_overrides: FeeModelOverrides::default(),
             expiry_sell_out: None,
             expiry_day_cutoff: None,
+            lapse_deadline: None,
             split: SplitConfig::default(),
             order_rules: BTreeMap::new(),
         }
@@ -459,6 +471,16 @@ impl MockExecutionConfig {
     pub fn with_expiry_day_cutoff(self, expiry_day_cutoff: ExpiryDayCutoff) -> Self {
         Self {
             expiry_day_cutoff: Some(expiry_day_cutoff),
+            ..self
+        }
+    }
+
+    /// This config refusing lapse instructions for an option about to expire, under
+    /// `lapse_deadline`: see [`lapse_deadline`](Self::lapse_deadline).
+    #[must_use]
+    pub fn with_lapse_deadline(self, lapse_deadline: LapseDeadline) -> Self {
+        Self {
+            lapse_deadline: Some(lapse_deadline),
             ..self
         }
     }
@@ -1347,6 +1369,73 @@ pub async fn request_borrow_capacity(
         .map_err(ClientError::Api)
 }
 
+/// Answered by the simulated venue, which honours a lapse instruction when the option expires: see
+/// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::venue::SimulatedVenue::instruct_exercise)
+/// for what it takes, what it refuses, and what a later trade does to an instruction. A repeat
+/// of an accepted instruction is accepted again.
+impl<FnTime> OptionExerciseClient for MockExecution<FnTime>
+where
+    FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
+{
+    async fn instruct_exercise(
+        &self,
+        instrument: &InstrumentNameExchange,
+        instruction: ExerciseInstruction,
+    ) -> Result<ExerciseAck, UnindexedClientError> {
+        request_exercise_instruction(
+            &self.request_tx,
+            self.mocked_exchange,
+            self.time_request(),
+            instrument,
+            instruction,
+        )
+        .await
+    }
+}
+
+/// Sends `instruction` for the long held in the option `instrument` to the
+/// [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx`, with the request
+/// stamped `time_request`.
+///
+/// What [`MockExecution`]'s [`OptionExerciseClient`] implementation sends, for a caller that holds
+/// the exchange's request channel without a client, such as a handle to a paper venue. The answer
+/// and its errors are the same.
+///
+/// The venue takes the instruction once the request reaches it, whether or not this call is
+/// still awaited.
+///
+/// # Errors
+/// - [`ConnectivityError::ExchangeOffline`] for `mocked_exchange` when the exchange is not running:
+///   it never started, or it has stopped.
+/// - [`ClientError::Api`] with the venue's own error, as
+///   [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::venue::SimulatedVenue::instruct_exercise)
+///   says.
+pub async fn request_exercise_instruction(
+    request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+    mocked_exchange: ExchangeId,
+    time_request: DateTime<Utc>,
+    instrument: &InstrumentNameExchange,
+    instruction: ExerciseInstruction,
+) -> Result<ExerciseAck, UnindexedClientError> {
+    let offline =
+        || UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(mocked_exchange));
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(MockExchangeRequest::instruct_exercise(
+            time_request,
+            instrument.clone(),
+            instruction,
+            response_tx,
+        ))
+        .map_err(|_| offline())?;
+
+    response_rx
+        .await
+        .map_err(|_| offline())?
+        .map_err(ClientError::Api)
+}
+
 /// Asks the [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx` to send a
 /// [`VenueCheckpoint`](crate::exchange::mock::venue::VenueCheckpoint) on its account stream, with
 /// the request stamped `time_request`.
@@ -1590,6 +1679,8 @@ mod tests {
             ExpirySellOut::new(ExpiryAnchor::BeforeClose(Duration::from_secs(3600)));
         let expiry_day_cutoff =
             ExpiryDayCutoff::new(ExpiryAnchor::BeforeClose(Duration::from_secs(2700)));
+        let lapse_deadline =
+            LapseDeadline::new(ExpiryAnchor::BeforeClose(Duration::from_secs(3600)));
 
         let config = MockExecutionConfig::new(ExchangeId::Mock, empty_snapshot(), 40)
             .with_fee_model(fee_model.clone())
@@ -1608,7 +1699,8 @@ mod tests {
             .with_session_close_overrides(session_close_overrides.clone())
             .with_fee_model_overrides(fee_model_overrides.clone())
             .with_expiry_sell_out(expiry_sell_out)
-            .with_expiry_day_cutoff(expiry_day_cutoff);
+            .with_expiry_day_cutoff(expiry_day_cutoff)
+            .with_lapse_deadline(lapse_deadline);
 
         assert_eq!(config.mocked_exchange, ExchangeId::Mock);
         assert_eq!(config.initial_state, empty_snapshot());
@@ -1635,6 +1727,7 @@ mod tests {
         assert_eq!(config.session_close_overrides, session_close_overrides);
         assert_eq!(config.expiry_sell_out, Some(expiry_sell_out));
         assert_eq!(config.expiry_day_cutoff, Some(expiry_day_cutoff));
+        assert_eq!(config.lapse_deadline, Some(lapse_deadline));
         assert_eq!(config.fee_model_overrides, fee_model_overrides);
     }
 

@@ -15,9 +15,13 @@ use futures::Stream;
 use rustrade_data::streams::{consumer::MarketStreamEvent, reconnect};
 use rustrade_execution::{
     borrow_capacity::BorrowCapacity,
-    client::mock::{request_borrow_capacity, request_checkpoint, request_corporate_action},
+    client::mock::{
+        request_borrow_capacity, request_checkpoint, request_corporate_action,
+        request_exercise_instruction,
+    },
     error::{ConnectivityError, UnindexedClientError},
     exchange::mock::{CorporateActionResponse, MockExchangeClock, request::MockExchangeRequest},
+    exercise::{ExerciseAck, ExerciseInstruction},
     market::MarketObservation,
 };
 use rustrade_instrument::{
@@ -372,6 +376,38 @@ impl PaperVenue {
             ));
         };
         request_borrow_capacity(&request_tx, self.exchange, (self.clock)(), instrument, side).await
+    }
+
+    /// Sends `instruction` for the long the paper account holds in the option `instrument`, as
+    /// [`OptionExerciseClient::instruct_exercise`](rustrade_execution::client::OptionExerciseClient::instruct_exercise)
+    /// sends it to a live venue.
+    ///
+    /// Taken and honoured at expiry by the simulated venue, as
+    /// [`SimulatedVenue::instruct_exercise`](rustrade_execution::exchange::mock::SimulatedVenue::instruct_exercise)
+    /// is in a backtest; see there for what it refuses and what a later trade does to an
+    /// instruction. The venue takes it when the request reaches it, ordered as a query is (see
+    /// `# Ordering` on this type), whether or not this call is still awaited.
+    ///
+    /// # Errors
+    /// As [`request_exercise_instruction`] says.
+    pub async fn instruct_exercise(
+        &self,
+        instrument: &InstrumentNameExchange,
+        instruction: ExerciseInstruction,
+    ) -> Result<ExerciseAck, UnindexedClientError> {
+        let Some(request_tx) = self.request_tx.upgrade() else {
+            return Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(self.exchange),
+            ));
+        };
+        request_exercise_instruction(
+            &request_tx,
+            self.exchange,
+            (self.clock)(),
+            instrument,
+            instruction,
+        )
+        .await
     }
 }
 
