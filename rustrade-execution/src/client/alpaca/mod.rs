@@ -7,7 +7,8 @@
 // Architecture:
 // - REST (reqwest): account_snapshot, fetch_balances, fetch_open_orders,
 //   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol}),
-//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close);
+//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close),
+//   instruct_exercise (POST /v2/positions/{symbol}/do-not-exercise, in exercise.rs);
 //   the filtered reads first check each requested name is listed (GET /v2/assets/{symbol} or
 //   GET /v2/options/contracts/{symbol}, once per listed name per client)
 // - WebSocket (tungstenite): account_stream via Alpaca's trade_updates stream
@@ -110,6 +111,7 @@ use std::{borrow::Cow, num::NonZeroUsize, pin::Pin, str::FromStr, sync::Arc, tim
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
+mod exercise;
 mod replace;
 
 use replace::{ReplaceEvent, ReplaceFacts, ReplaceTracker};

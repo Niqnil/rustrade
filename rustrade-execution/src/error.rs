@@ -15,7 +15,7 @@ use crate::{
     margin::MarginEffect,
     order::{TimeInForce, id::ClientOrderId},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use derive_more::{Constructor, Display};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -499,12 +499,26 @@ pub enum ExerciseRefusal {
         /// The option's expiry.
         expiry: DateTime<Utc>,
     },
+    /// The venue takes the instruction only on the option's expiry day, and this is not it: the
+    /// day has yet to come, or it has passed.
+    #[error("the venue takes the instruction only on the option's expiry day, {expiry_day}")]
+    NotExpiryDay {
+        /// The option's expiry day, as the venue dates it.
+        expiry_day: NaiveDate,
+    },
     /// The venue's deadline for the instruction has passed.
     #[error("the venue's deadline for the instruction, {deadline}, has passed")]
     PastDeadline {
         /// The instant from which the venue refuses the instruction.
         deadline: DateTime<Utc>,
     },
+    /// The venue refused the instruction for a reason none of the other variants names: its own
+    /// message, with its error code where it gave one.
+    ///
+    /// The text is the venue's, for a person to read, and may change without notice. A reason
+    /// that callers need to act on gets its own variant once a venue is seen to report it.
+    #[error("the venue refused the instruction: {0}")]
+    Other(String),
 }
 
 /// Formats a [`RateLimit`](ApiError::RateLimit)'s hint for its message: nothing when there is

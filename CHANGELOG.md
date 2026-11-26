@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or not, as a do-not-exercise instruction does. It covers an `ExerciseQuantity`: the whole
   position, or a number of contracts on a venue that takes one. Accepted, it answers an
   `ExerciseAck`; refused, `ApiError::ExerciseRefused` with an `ExerciseRefusal` (`NoPosition`,
-  `ShortPosition`, `QuantityUnsupported`, `Expired`, `PastDeadline`). The simulated venue honours
+  `ShortPosition`, `QuantityUnsupported`, `Expired`, `NotExpiryDay`, `PastDeadline`, and `Other`
+  with the venue's own message for a reason none of these names). The simulated venue honours
   it (`SimulatedVenue::instruct_exercise`, the mock client, and `PaperVenue::instruct_exercise`):
   an instructed long lapses at zero at expiry whatever `LongOptionExpiry` says, needs no price
   for the underlying, and is not sold by an `ExpirySellOut`. It takes whole positions only, holds
@@ -25,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are) refuses instructions from a set time before each option's close or expiry; by default
   they are taken until expiry. `ExpiryRule` gains `LapseDeadline` and `VenueRestoreError` gains
   `LapseWithoutLong`.
+
+- **Alpaca do-not-exercise** (`rustrade-execution`, feature `alpaca`). `AlpacaClient` implements
+  `OptionExerciseClient` with `POST /v2/positions/{symbol}/do-not-exercise`, for a whole position
+  only: a quantity of contracts is refused with `QuantityUnsupported` without sending anything,
+  as is a name that is not an OCC option symbol, with `InstrumentInvalid`. Alpaca's paper API
+  takes the instruction only on the contract's expiration day, until 5:15 PM New York time, and
+  judges that before the position. Its refusals, all but one under the same generic code, are
+  read by their message: `NotExpiryDay` (dated from the symbol), `PastDeadline` (the stated time
+  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code. Any
+  other is `Other` with Alpaca's code and message. A request whose outcome is unknown, such as
+  one that timed out, is reported as a connectivity error and not sent again.
 
 - **American option pricing benchmark** (`rustrade-pricing`, benches only). The new `american`
   benchmark times `price`, `greeks` and `implied_volatility` with `FiniteDifferenceModel` on
