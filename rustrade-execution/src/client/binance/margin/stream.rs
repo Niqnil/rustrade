@@ -52,7 +52,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::{
     error::SocketError,
-    protocol::websocket::{WebSocket, WsError, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsError, WsMessage, connect_with_timeout},
 };
 use serde::Deserialize;
 use smol_str::SmolStr;
@@ -819,16 +819,16 @@ async fn connect_and_subscribe(url: &str, listen_key: &str) -> anyhow::Result<Se
     let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
     let masked = |text: String| redact_listen_key(&text, listen_key).into_owned();
 
-    let mut ws = match tokio::time::timeout(timeout, connect(url)).await {
-        Err(_) => {
+    let mut ws = match connect_with_timeout(url, timeout).await {
+        Err(SocketError::ConnectTimeout { .. }) => {
             anyhow::bail!("BinanceMargin stream connect timed out after {CONNECT_TIMEOUT_SECS}s")
         }
-        Ok(Err(SocketError::WebSocket(e))) => {
+        Err(SocketError::WebSocket(e)) => {
             let message = format!("BinanceMargin stream connect failed: {e}");
             return Err(anyhow::Error::new(*e).context(message));
         }
-        Ok(Err(e)) => anyhow::bail!("BinanceMargin stream connect failed: {e}"),
-        Ok(Ok(ws)) => ws,
+        Err(e) => anyhow::bail!("BinanceMargin stream connect failed: {e}"),
+        Ok(ws) => ws,
     };
 
     let subscribe = serde_json::json!({

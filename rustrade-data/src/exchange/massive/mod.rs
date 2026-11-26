@@ -607,6 +607,7 @@ impl Subscriber for MassiveSubscriber {
                 kind,
                 slots,
                 timeout: Exchange::subscription_timeout(),
+                connect_timeout: Exchange::connect_timeout(),
             })
             .await?;
 

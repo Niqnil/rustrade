@@ -267,6 +267,14 @@ where
     Instrument: InstrumentData,
     Kind: SubscriptionKind,
 {
+    /// Connect, subscribe to `subscriptions` and fetch any initial snapshots, returning the stream.
+    ///
+    /// # Cancellation
+    /// [`init_market_stream`](streams::consumer::init_market_stream) drops the returned future
+    /// where it waits once the stream's
+    /// [`init_timeout`](streams::consumer::MarketStreamOptions::init_timeout) passes. An
+    /// implementation must allow that at any `.await`: hold what it opens in the future itself, so
+    /// that dropping it closes the connection, and spawn no task until nothing after it can fail.
     fn init<SnapFetcher>(
         subscriber: &Exchange::Subscriber,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
@@ -284,6 +292,13 @@ where
 /// See examples such as Binance OrderBooksL2: <br>
 /// - [`BinanceSpotOrderBooksL2SnapshotFetcher`](exchange::binance::spot::l2::BinanceSpotOrderBooksL2SnapshotFetcher)
 /// - [`BinanceFuturesUsdOrderBooksL2SnapshotFetcher`](exchange::binance::futures::l2::BinanceFuturesUsdOrderBooksL2SnapshotFetcher)
+///
+/// # Bounds and cancellation
+/// Fetching runs inside a stream initialisation attempt, so a fetch that never completes stalls the
+/// attempt until the stream's
+/// [`init_timeout`](streams::consumer::MarketStreamOptions::init_timeout) abandons it. Bound each
+/// request (as the Binance fetchers do) so that a slow venue reports its own error first. The
+/// returned future may be dropped at any `.await`.
 pub trait SnapshotFetcher<Exchange, Kind> {
     fn fetch_snapshots<Instrument>(
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
@@ -328,11 +343,20 @@ where
         // Fetch any required initial MarketEvent snapshots
         let initial_snapshots = SnapFetcher::fetch_snapshots(subscriptions).await?;
 
+        // Messages the Transformer sends to the exchange (eg/ custom pongs). Queued until the task
+        // distributing them is spawned below.
+        let (ws_sink_tx, ws_sink_rx) = mpsc::unbounded_channel();
+
+        // Initialise Transformer associated with this Exchange and SubscriptionKind. Before any task
+        // is spawned, so an initialisation that fails or is abandoned leaves none running: the
+        // ping task would otherwise keep the channel, and with it the distributing task, alive.
+        let mut transformer =
+            Transformer::init(instrument_map, &initial_snapshots, ws_sink_tx.clone()).await?;
+
         // Split WebSocket into WsStream & WsSink components
         let (ws_sink, ws_stream) = websocket.split();
 
-        // Spawn task to distribute Transformer messages (eg/ custom pongs) to the exchange
-        let (ws_sink_tx, ws_sink_rx) = mpsc::unbounded_channel();
+        // Spawn task to distribute Transformer messages to the exchange
         tokio::spawn(distribute_messages_to_exchange(
             Exchange::ID,
             ws_sink,
@@ -343,14 +367,10 @@ where
         if let Some(ping_interval) = Exchange::ping_interval() {
             tokio::spawn(schedule_pings_to_exchange(
                 Exchange::ID,
-                ws_sink_tx.clone(),
+                ws_sink_tx,
                 ping_interval,
             ));
         }
-
-        // Initialise Transformer associated with this Exchange and SubscriptionKind
-        let mut transformer =
-            Transformer::init(instrument_map, &initial_snapshots, ws_sink_tx).await?;
 
         // Process any buffered active subscription events received during Subscription validation
         let mut processed = process_buffered_events::<Parser, Transformer>(

@@ -306,6 +306,7 @@ impl Subscriber for LseSubscriber {
                 markets,
                 underlyings,
                 timeout: Exchange::subscription_timeout(),
+                connect_timeout: Exchange::connect_timeout(),
                 resume: self.resume.clone(),
             })
             .await?;

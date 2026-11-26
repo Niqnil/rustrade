@@ -480,7 +480,7 @@ mod tests {
         type Answer = ();
         type Handshake = Settled;
 
-        async fn connect(_: &(), _: &Url) -> Result<(WebSocket, ()), SocketError> {
+        async fn connect(_: &(), _: &Url, _: Duration) -> Result<(WebSocket, ()), SocketError> {
             Err(SocketError::Subscribe(
                 "the registry tests open no socket".to_owned(),
             ))
@@ -515,6 +515,7 @@ mod tests {
             kind,
             slots: slots.to_vec(),
             timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
             batch: Tag(tag),
         }
     }

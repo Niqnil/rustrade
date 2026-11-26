@@ -1,9 +1,13 @@
 use crate::subscription::{SubscriptionId, display_subscription_ids};
 use prost::DecodeError;
 use reqwest::Error;
+use std::time::Duration;
 use thiserror::Error;
 
 /// All socket IO related errors generated in `rustrade-integration`.
+///
+/// `#[non_exhaustive]`: new failure kinds are added as variants, so a `match` needs a wildcard arm.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SocketError {
     #[error("Sink error")]
@@ -65,6 +69,11 @@ pub enum SocketError {
 
     #[error("WebSocket error: {0}")]
     WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+
+    /// Establishing a WebSocket connection (the TCP connect, the TLS handshake and the HTTP
+    /// upgrade together) did not complete within `timeout`, so the attempt was abandoned.
+    #[error("WebSocket connection not established within {timeout:?}")]
+    ConnectTimeout { timeout: Duration },
 
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),

@@ -421,6 +421,8 @@ where
     /// * `options` - How the stream reconnects, and whether it is ended when it stays silent; see
     ///   [`MarketStreamOptions`]. A silence timeout counts the market events of all subscriptions
     ///   together, so set it longer than the quietest market the stream carries is ever silent.
+    ///   The options' [`init_timeout`](MarketStreamOptions::init_timeout) is not applied: a
+    ///   connection is opened on a blocking thread, which cannot be abandoned part-way.
     ///
     /// # Errors
     ///
