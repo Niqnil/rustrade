@@ -115,7 +115,10 @@ use crate::{
     error::DataError,
     event::{DataKind, MarketEvent},
     streams::{
-        consumer::{MarketStreamOptions, MarketStreamResult, StreamKey, market_stream_events},
+        consumer::{
+            MarketStreamOptions, MarketStreamResult, StreamKey, market_stream_events,
+            within_init_timeout,
+        },
         reconnect::{
             self,
             stream::{ReconnectionBackoffPolicy, init_reconnecting_stream},
@@ -421,8 +424,8 @@ where
     /// * `options` - How the stream reconnects, and whether it is ended when it stays silent; see
     ///   [`MarketStreamOptions`]. A silence timeout counts the market events of all subscriptions
     ///   together, so set it longer than the quietest market the stream carries is ever silent.
-    ///   The options' [`init_timeout`](MarketStreamOptions::init_timeout) is not applied: a
-    ///   connection is opened on a blocking thread, which cannot be abandoned part-way.
+    ///   The options' [`init_timeout`](MarketStreamOptions::init_timeout) bounds each attempt to
+    ///   open a connection; see below.
     ///
     /// # Errors
     ///
@@ -433,8 +436,26 @@ where
     ///   ([`IbkrCandleRequest::since`]). Nothing is connected.
     /// - [`DataError::Socket`] if the connection to IB fails, the configured market data type
     ///   cannot be sent, or no subscription could be activated (no contract found in `contracts`).
+    /// - [`DataError::InitTimeout`] if the connection is not open within the options'
+    ///   [`init_timeout`](MarketStreamOptions::init_timeout).
     ///
     /// A failed reconnect is not returned: the stream yields it, as above, and tries again.
+    ///
+    /// # Initialisation timeout
+    ///
+    /// An attempt connects, completes IB's handshake, sends the market data type, reads IB's
+    /// server time when the stream has a candle subscription, and starts the subscriptions. These
+    /// steps block, so they run on tokio's blocking thread pool, where a step cannot be
+    /// interrupted. An attempt that times out is abandoned instead: it stops before its next step
+    /// and closes whatever it connected, holding its blocking thread until then. The stream's next
+    /// attempt waits for that, so that two connections never use the same client ID at once, and
+    /// the wait counts toward the next attempt's own timeout.
+    ///
+    /// `ibapi` bounds each read of the handshake and the server time request (30 s each), but not
+    /// the TCP connect, which waits as long as the operating system allows. Without an
+    /// initialisation timeout an attempt can therefore stall that long on an unreachable host.
+    /// A timeout shorter than a healthy open takes abandons every attempt, so keep it well above
+    /// the time TWS/Gateway takes to answer.
     ///
     /// IB does not answer the market data type itself; what the account may receive shows per
     /// subscription. A subscription IB refuses ends with an error item on the stream instead:
@@ -477,6 +498,8 @@ where
             "IbkrMarketStream with auto reconnect initialising"
         );
 
+        let init_timeout = options.init_timeout();
+
         let attempts = init_reconnecting_stream(move || {
             let config = config.clone();
             let contracts = contracts.clone();
@@ -484,13 +507,24 @@ where
             let shared = shared.clone();
             let delay = shared.quick_ends.lock().take_delay(&backoff);
             async move {
+                // Outside the timeout: the wait is the stream's own backoff, which can be as long
+                // as the timeout itself.
                 wait_before_open(delay).await;
-                tokio::task::spawn_blocking(move || {
-                    Connection::open(&config, &shared, contracts.as_ref(), subscriptions)
-                })
+                let opening = shared.opening.clone();
+                within_init_timeout(
+                    init_timeout,
+                    opening.open(move |abandoned| {
+                        Connection::open(
+                            &config,
+                            &shared,
+                            contracts.as_ref(),
+                            subscriptions,
+                            abandoned,
+                        )
+                    }),
+                )
                 .await
-                .map_err(|e| DataError::Socket(format!("IB connect task: {e}")))?
-                .map(StreamExt::boxed)
+                .map(|connection| connection.handed_out().boxed())
             }
         })
         .await?
@@ -572,8 +606,9 @@ struct Connection<K> {
     /// What the stream's connections share: where [`close`](Self::close) leaves the close
     /// running, and how long connections last.
     shared: Shared,
-    /// When `open` handed the connection out; `None` while it is still being opened, so that a
-    /// failed open is not counted as a connection that ended.
+    /// When the connection was handed to the stream ([`handed_out`](Self::handed_out)); `None`
+    /// until then, so that neither a failed open nor one abandoned after it completed is counted
+    /// as a connection that ended.
     opened_at: Option<std::time::Instant>,
 }
 
@@ -583,6 +618,8 @@ struct Shared {
     /// Whether TWS/Gateway's link to IB's servers is down, as the last link notice any of the
     /// stream's connections read said: see [`link_notice`].
     link_down: Arc<AtomicBool>,
+    /// The connection being opened, which the next open waits for.
+    opening: Opening,
     pending_close: PendingClose,
     quick_ends: Arc<parking_lot::Mutex<QuickEnds>>,
     /// Each candle subscription's [`ResumePoint`], by its index in the stream's subscriptions:
@@ -729,6 +766,78 @@ impl QuoteTicks {
     }
 }
 
+/// The stream's attempt to open a connection, run one at a time: an attempt waits until the one
+/// before it has returned, including one abandoned while it was still blocked, so that it does not
+/// connect with the same client ID while the earlier connection may still open.
+#[derive(Debug, Clone, Default)]
+struct Opening(Arc<tokio::sync::Mutex<()>>);
+
+impl Opening {
+    /// Run `open` on tokio's blocking thread pool once the stream's previous open has returned and
+    /// its result has been dropped, and return its result.
+    ///
+    /// If the returned future is dropped before `open` returns (an initialisation timeout, or the
+    /// stream dropped), `open`'s [`OpenAbandoned`] is set, so that it stops at its next step. The
+    /// stream's next open then waits until `open` has returned and whatever it returned, such as a
+    /// connection that opened just too late, has been dropped and so closed. Dropped while still
+    /// waiting for its turn, the future runs no `open` at all.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime.
+    async fn open<T>(
+        &self,
+        open: impl FnOnce(&OpenAbandoned) -> Result<T, DataError> + Send + 'static,
+    ) -> Result<T, DataError>
+    where
+        T: Send + 'static,
+    {
+        let turn = self.0.clone().lock_owned().await;
+        let abandoned = OpenAbandoned::default();
+        let _abandon_on_drop = abandoned.on_drop();
+        // `turn` goes back with the result, after it in the tuple, so that it is released only
+        // once the result is dropped: here, or by tokio on the blocking thread if this future has
+        // been dropped by then.
+        let (result, _turn) = tokio::task::spawn_blocking(move || (open(&abandoned), turn))
+            .await
+            .map_err(|e| DataError::Socket(format!("IB connect task: {e}")))?;
+        result
+    }
+}
+
+/// Whether the attempt that started an open has been abandoned, so that the open stops at its next
+/// step; see [`Opening::open`].
+#[derive(Debug, Clone, Default)]
+struct OpenAbandoned(Arc<AtomicBool>);
+
+impl OpenAbandoned {
+    /// A guard that sets the flag when dropped.
+    fn on_drop(&self) -> impl Drop + use<> {
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                // A stop flag guarding no other data.
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        SetOnDrop(self.0.clone())
+    }
+
+    /// An error if the attempt has been abandoned, to stop the open before `step`.
+    fn check(&self, step: &str) -> Result<(), DataError> {
+        if !self.0.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        debug!(
+            step,
+            "IB connection attempt abandoned; stopping it before this step"
+        );
+        Err(DataError::Socket(format!(
+            "IB connection attempt abandoned before {step}"
+        )))
+    }
+}
+
 /// The close of a stream's last connection, which runs on a thread of its own, since
 /// `ibapi`'s disconnect blocks until the client's threads have exited: dropping a connection must
 /// not block the async task that drops it. The next connection waits for it, so that it does not
@@ -795,14 +904,18 @@ where
     /// Connect as `config` says and start a worker per subscription, plus the notice watcher,
     /// once the stream's previous connection has closed.
     ///
-    /// Blocks for the previous close and the handshake.
+    /// Blocks for the previous close, the handshake, and IB's server time if a subscription is for
+    /// candles. Once `abandoned` is set, it stops before its next step with an error, closing the
+    /// client if it has connected one.
     fn open(
         config: &IbkrStreamConfig,
         shared: &Shared,
         contracts: &dyn ContractLookup,
         subscriptions: Vec<IbkrSubscription<K>>,
+        abandoned: &OpenAbandoned,
     ) -> Result<Self, DataError> {
         shared.pending_close.wait();
+        abandoned.check("connecting")?;
 
         let url = format!("{}:{}", config.host, config.port);
         info!(%url, client_id = config.client_id, "Connecting to IB for market data");
@@ -825,6 +938,7 @@ where
             shared: shared.clone(),
             opened_at: None,
         };
+        abandoned.check("configuring the connection")?;
 
         // Live is what IB sends when nothing was asked for, so only another type is requested.
         if config.market_data_type != IbkrMarketDataType::Live {
@@ -854,8 +968,10 @@ where
             .iter()
             .any(|s| matches!(s.kind, IbkrSubscriptionKind::Candles(_)))
         {
+            abandoned.check("reading IB's server time")?;
             clock.sync(|| server_time(&connection.client));
         }
+        abandoned.check("starting the subscriptions")?;
 
         // Spawn a worker thread for each subscription
         for (
@@ -925,9 +1041,14 @@ where
             ));
         }
 
-        let mut connection = connection;
-        connection.opened_at = Some(std::time::Instant::now());
         Ok(connection)
+    }
+
+    /// The connection, as handed to the stream now: from here on its end counts toward
+    /// [`QuickEnds`].
+    fn handed_out(mut self) -> Self {
+        self.opened_at = Some(std::time::Instant::now());
+        self
     }
 
     fn run_quotes_subscription(
@@ -3154,5 +3275,188 @@ mod tests {
             assert_eq!(refused, InstrumentNameExchange::new(instrument));
             assert!(reason.contains(needle), "{reason}");
         }
+    }
+
+    /// How long the tests below give an attempt to open before abandoning it. Each attempt they
+    /// abandon stays blocked until the test releases it, so the length only sets how long they
+    /// take.
+    const ABANDON_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn abandon_after() -> DataError {
+        DataError::InitTimeout {
+            timeout: ABANDON_AFTER,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_open_that_returns_in_time_gives_its_result() {
+        let result = Opening::default()
+            .open(|abandoned| Ok(abandoned.check("the next step").is_ok()))
+            .await;
+
+        assert_eq!(result, Ok(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_open_blocked_past_the_init_timeout_is_abandoned_at_its_next_step() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (seen, saw) = tokio::sync::oneshot::channel();
+        let opening = Opening::default();
+        let attempt = opening.open(move |abandoned| {
+            let _ = released.recv();
+            let _ = seen.send(abandoned.check("the next step"));
+            Ok(())
+        });
+
+        let result = within_init_timeout(Some(ABANDON_AFTER), attempt).await;
+        assert_eq!(result, Err(abandon_after()));
+
+        release.send(()).unwrap();
+        let next_step = saw.await.unwrap();
+        assert!(
+            matches!(&next_step, Err(DataError::Socket(reason)) if reason.contains("abandoned")),
+            "{next_step:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_open_waits_until_an_abandoned_one_has_returned_and_its_result_is_dropped() {
+        /// A result that takes a while to drop, as a connection closing does, and records when it
+        /// has.
+        struct SlowDrop(Arc<parking_lot::Mutex<Vec<&'static str>>>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(ABANDON_AFTER);
+                self.0.lock().push("first dropped");
+            }
+        }
+
+        let opening = Opening::default();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let order = order.clone();
+            opening.open(move |_| {
+                let _ = released.recv();
+                Ok(SlowDrop(order))
+            })
+        };
+        assert!(
+            within_init_timeout(Some(ABANDON_AFTER), first)
+                .await
+                .is_err()
+        );
+
+        let second = {
+            let (opening, order) = (opening.clone(), order.clone());
+            tokio::spawn(async move {
+                opening
+                    .open(move |_| {
+                        order.lock().push("second opened");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(ABANDON_AFTER).await;
+        assert!(order.lock().is_empty(), "the second open ran first");
+
+        release.send(()).unwrap();
+        assert_eq!(second.await.unwrap(), Ok(()));
+        assert_eq!(*order.lock(), ["first dropped", "second opened"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attempt_abandoned_while_waiting_for_its_turn_runs_no_open() {
+        let opening = Opening::default();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let first = opening.open(move |_| {
+            let _ = released.recv();
+            Ok(())
+        });
+        assert!(
+            within_init_timeout(Some(ABANDON_AFTER), first)
+                .await
+                .is_err()
+        );
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = {
+            let ran = ran.clone();
+            opening.open(move |_| {
+                ran.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+        };
+        let result = within_init_timeout(Some(ABANDON_AFTER), second).await;
+        assert_eq!(result, Err(abandon_after()));
+
+        release.send(()).unwrap();
+        // Opens take turns in order, so a second still queued would run before this one.
+        assert_eq!(opening.open(|_| Ok(())).await, Ok(()));
+        assert!(!ran.load(Ordering::Relaxed), "the abandoned attempt opened");
+    }
+
+    /// A stand-in for TWS/Gateway on a local port that accepts connections and never answers,
+    /// and the port.
+    fn silent_gateway() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_whose_handshake_stalls_is_refused_at_the_init_timeout() {
+        let (listener, port) = silent_gateway();
+        let (hang_up, hung_up) = std::sync::mpsc::channel::<()>();
+        let gateway = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let _ = hung_up.recv();
+            // Closing the socket ends the abandoned handshake, rather than leaving it to `ibapi`'s
+            // own read timeout.
+            drop(socket);
+        });
+
+        let result = IbkrMarketStream::init(
+            IbkrStreamConfig::new("127.0.0.1", port, 1),
+            ContractsByName::new(),
+            vec![IbkrSubscription::quotes(
+                (),
+                InstrumentNameExchange::new("SPY"),
+            )],
+            MarketStreamOptions::default()
+                .with_init_timeout(ABANDON_AFTER)
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(abandon_after()));
+        hang_up.send(()).unwrap();
+        gateway.join().unwrap();
+    }
+
+    #[test]
+    fn an_open_abandoned_before_it_connects_makes_no_connection() {
+        // A port nothing listens on, so that an attempt to connect is refused at once, and says so.
+        let (listener, port) = silent_gateway();
+        drop(listener);
+        let abandoned = OpenAbandoned::default();
+        drop(abandoned.on_drop());
+
+        let result = Connection::<()>::open(
+            &IbkrStreamConfig::new("127.0.0.1", port, 1),
+            &Shared::default(),
+            &ContractsByName::new(),
+            vec![IbkrSubscription::quotes(
+                (),
+                InstrumentNameExchange::new("SPY"),
+            )],
+            &abandoned,
+        );
+
+        let Err(DataError::Socket(reason)) = &result else {
+            panic!("expected the open to stop: {:?}", result.err());
+        };
+        assert_eq!(reason, "IB connection attempt abandoned before connecting");
     }
 }

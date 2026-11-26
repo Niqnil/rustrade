@@ -154,8 +154,12 @@ impl MarketStreamOptions {
     ///   under way runs to the end of its own bounds first. Allow for that when several streams
     ///   share a connection.
     ///
+    /// - **IBKR:** `IbkrMarketStream` (`ibkr` feature) opens its connection on a blocking thread,
+    ///   so an abandoned attempt stops at its next step rather than where it waits, and the
+    ///   stream's next attempt waits for it to stop; see `IbkrMarketStream::init`.
+    ///
     /// [`DEFAULT_INIT_TIMEOUT`] unless changed. Applies to streams built through
-    /// [`init_market_stream`]; `IbkrMarketStream` (`ibkr` feature) does not apply it yet.
+    /// [`init_market_stream`], and to `IbkrMarketStream`.
     ///
     /// # Errors
     /// [`MarketStreamOptionsError::InitTimeoutZero`] if `timeout` is zero.
