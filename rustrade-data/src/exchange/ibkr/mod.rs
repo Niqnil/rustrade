@@ -453,12 +453,19 @@ where
     /// connections never use the same client ID at once, and the wait counts toward the next
     /// attempt's own timeout.
     ///
-    /// That wait is within one stream. When the first attempt times out, `init` returns while the
-    /// abandoned attempt may still be connecting. Calling `init` again at once with the same
-    /// client ID can then collide with it, which IB refuses: the new attempt fails with a
-    /// [`DataError::Socket`] saying the client ID is in use, and a later retry succeeds once the
-    /// abandoned attempt has closed. To avoid that, retry after the abandoned attempt can have
-    /// finished (the `ibapi` bounds below), or with another client ID.
+    /// That wait is within one stream. TWS/Gateway refuses a connection whose client ID another
+    /// connection holds, and it can go on holding the ID for a moment after that connection has
+    /// closed. So a new stream, or another `init` call, with the same client ID can be refused:
+    /// - when the first attempt times out, `init` returns while the abandoned attempt may still
+    ///   be connecting, which can last past the timeout by as long as the TCP connect waits (see
+    ///   below; the operating system's default is about two minutes on Linux);
+    /// - when a stream is dropped, its connection closes on a thread of its own, after the drop
+    ///   has returned.
+    ///
+    /// The refusal is a [`DataError::Socket`] saying the client ID is already in use. A retry
+    /// succeeds once the earlier connection has closed and TWS/Gateway has let the ID go, so
+    /// retry with a backoff, or use another client ID. The stream's own reconnects already retry
+    /// with its backoff.
     ///
     /// `ibapi` bounds each read of the handshake and the server time request (30 s each), but not
     /// the TCP connect, which waits as long as the operating system allows. Without an
@@ -778,6 +785,11 @@ impl QuoteTicks {
 /// The stream's attempts to open a connection, run one at a time: an attempt waits until the one
 /// before it has returned, including one abandoned while it was still blocked, so that it does not
 /// connect with the same client ID while the earlier connection may still open.
+///
+/// Scoped to one stream on purpose, as [`PendingClose`] is: a guard shared across streams could
+/// not cover the other holders of a client ID (an execution client, another process) nor the
+/// moment TWS/Gateway keeps an ID after its connection closes, and a client ID shared by two
+/// streams is the caller's configuration error.
 #[derive(Debug, Clone, Default)]
 struct Opening(Arc<tokio::sync::Mutex<()>>);
 
