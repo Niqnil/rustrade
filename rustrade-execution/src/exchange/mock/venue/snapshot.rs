@@ -251,7 +251,9 @@ pub enum VenueRestoreError {
 
     /// The snapshot records a lapse instruction for an instrument it holds no long option position
     /// in. A snapshot the venue wrote never does: an instruction leaves a position that closes.
-    #[error("venue snapshot records a lapse instruction for {0}, held as no long option")]
+    #[error(
+        "venue snapshot records a lapse instruction for {0}, which is not a long option position"
+    )]
     LapseWithoutLong(InstrumentNameExchange),
 
     /// The snapshot's balances do not hold the collateral its short options secure: what an

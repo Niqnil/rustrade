@@ -13,9 +13,10 @@ impl SimulatedVenue {
     /// [`OptionExerciseClient::instruct_exercise`] asks a simulated venue.
     ///
     /// A [`Lapse`](ExerciseInstruction::Lapse) for the whole position marks it to lapse at expiry,
-    /// in the money or not, as if [`LongOptionExpiry::Lapse`] held for it alone: it settles at
-    /// zero, needing no price for the underlying, and an [`expiry_sell_out`] leaves it unsold,
-    /// since exercising it needs no money. Nothing is reported when the instruction is taken; the
+    /// in the money or not: it settles at zero, as [`LongOptionExpiry::Lapse`] settles a long,
+    /// needing no price for the underlying. Unlike that venue-wide policy, which governs only what
+    /// reaches expiry, the instruction also spares the long from an [`expiry_sell_out`], since
+    /// lapsing it needs no money. Nothing is reported when the instruction is taken; the
     /// position's settlement is, at expiry, as a [`TradeOrigin::Expiry`] trade at zero. Taking the
     /// same instruction again changes nothing and is accepted again.
     ///
@@ -23,8 +24,9 @@ impl SimulatedVenue {
     /// The instruction holds for whatever long the position is at expiry: contracts sold after it
     /// leave the rest instructed, and contracts bought after it are instructed too. A position
     /// that goes flat, or short, loses the instruction, so a long opened later is exercised as
-    /// [`long_option_expiry`] says unless instructed again. A split that restates the position keeps it. Venues do not document what
-    /// a later trade does to a do-not-exercise instruction, so this is a modelling choice.
+    /// [`long_option_expiry`] says unless instructed again. A split that restates the position
+    /// keeps it. Venues do not document what a later trade does to a do-not-exercise instruction,
+    /// so this is a modelling choice.
     ///
     /// # Errors
     /// - [`ApiError::InstrumentInvalid`] for an instrument this venue does not list as an option.

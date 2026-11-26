@@ -1535,23 +1535,66 @@ mod tests {
         );
     }
 
-    /// The mock client's exercise instruction reaches the venue, and its refusal of an instrument
-    /// that is not an option comes back as the venue's API error.
+    /// The mock client's exercise instruction reaches the venue and comes back with its answer:
+    /// the ack for a held long, an exercise refusal for an option held flat, and the refusal of an
+    /// instrument that is not an option, each as the venue gave it.
     #[tokio::test]
     async fn an_exercise_instruction_is_answered_by_the_venue() {
         use crate::{
             client::{OptionExerciseClient, mock::MockExecution},
-            exercise::{ExerciseInstruction, ExerciseQuantity},
+            error::{ApiError, ClientError, ExerciseRefusal},
+            exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity},
+            expiry::LongOptionExpiry,
         };
+        use rustrade_instrument::{
+            Underlying,
+            instrument::{
+                kind::{
+                    InstrumentKind,
+                    option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
+                },
+                name::InstrumentNameInternal,
+                quote::InstrumentQuoteAsset,
+            },
+        };
+
+        // A call on the base asset, listed beside the spot pair. The venue prices requests, so it
+        // lapses its longs: it could never price the underlying to exercise one.
+        let option = |name: &str| Instrument {
+            exchange: EXCHANGE,
+            name_internal: InstrumentNameInternal::new(name.to_lowercase()),
+            name_exchange: InstrumentNameExchange::new(name),
+            underlying: Underlying {
+                base: base(),
+                quote: quote(),
+            },
+            quote: InstrumentQuoteAsset::UnderlyingQuote,
+            kind: InstrumentKind::Option(OptionContract {
+                contract_size: d("1"),
+                settlement_asset: quote(),
+                kind: OptionKind::Call,
+                exercise: OptionExercise::American,
+                settlement: OptionSettlement::Physical,
+                expiry: DateTime::<Utc>::from_timestamp(4_102_444_800, 0).unwrap(),
+                strike: d("50000"),
+            }),
+            spec: None,
+            data_venue: None,
+        };
+        let (held, flat) = (
+            InstrumentNameExchange::new("BTC-C50000"),
+            InstrumentNameExchange::new("BTC-C60000"),
+        );
+        let mut instruments = spot_instruments();
+        for name in [&held, &flat] {
+            instruments.insert(name.clone(), option(name.name()));
+        }
+        let mut config = spot_config("0", "10000", FeeModelConfig::default());
+        config.long_option_expiry = LongOptionExpiry::Lapse;
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = broadcast::channel(16);
-        let exchange = MockExchange::new(
-            spot_config("0", "10000", FeeModelConfig::default()),
-            request_rx,
-            event_tx,
-            spot_instruments(),
-        );
+        let exchange = MockExchange::new(config, request_rx, event_tx, instruments);
         let driver = tokio::spawn(exchange.run());
         let client = MockExecution {
             mocked_exchange: EXCHANGE,
@@ -1560,14 +1603,35 @@ mod tests {
             event_rx,
             amend_support: AmendSupport::NONE,
         };
+        let lapse = ExerciseInstruction::Lapse {
+            contracts: ExerciseQuantity::WholePosition,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        client
+            .request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                response_tx,
+                request(held.clone(), Side::Buy, "1", market_prices("100")),
+            ))
+            .unwrap();
+        let _ = response_rx.await.expect("the buy is answered");
 
+        assert_eq!(
+            client.instruct_exercise(&held, lapse).await,
+            Ok(ExerciseAck::new(lapse))
+        );
+        assert!(
+            matches!(
+                client.instruct_exercise(&flat, lapse).await,
+                Err(ClientError::Api(ApiError::ExerciseRefused(
+                    ExerciseRefusal::NoPosition
+                )))
+            ),
+            "an option held flat is refused"
+        );
         let error = client
-            .instruct_exercise(
-                &instrument_name(),
-                ExerciseInstruction::Lapse {
-                    contracts: ExerciseQuantity::WholePosition,
-                },
-            )
+            .instruct_exercise(&instrument_name(), lapse)
             .await
             .expect_err("BTCUSDT is not an option");
 

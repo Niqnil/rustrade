@@ -158,6 +158,31 @@ fn a_long_closed_and_opened_again_is_exercised() {
     assert_exercised(&venue.advance_time(expiry()));
 }
 
+/// A sale through the long to a short loses the instruction, so a long bought back is exercised.
+#[test]
+fn a_long_sold_through_to_a_short_loses_the_instruction() {
+    // A put, so the short is secured by cash, with shares held to deliver on exercise.
+    let mut venue = driven_venue(
+        OptionKind::Put,
+        OptionSettlement::Physical,
+        funds("20000", "100"),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    instruct_lapse(&mut venue);
+
+    let _ = sell(&mut venue, "2");
+    assert_eq!(option_position(&venue), Some(d("-1")));
+    assert!(
+        snapshot_json(&venue).get("lapse_instructed").is_none(),
+        "a short holds no instruction"
+    );
+
+    buy(&mut venue, "2");
+    feed(&mut venue, "80", "20", time(50));
+    assert_exercised(&venue.advance_time(expiry()));
+}
+
 /// Instructing the same long again is accepted again, and changes nothing.
 #[test]
 fn a_repeated_instruction_is_accepted() {
@@ -284,6 +309,66 @@ fn a_deadline_before_the_close_is_placed_under_the_session_calendar() {
         refusal(&mut venue, lapse()),
         ExerciseRefusal::PastDeadline { deadline: time(90) }
     );
+}
+
+/// Where several refusals apply, the first in the documented order wins: the quantity, then the
+/// expiry, then the deadline, and only then the position.
+#[test]
+fn the_first_refusal_in_the_documented_order_wins() {
+    let contracts = ExerciseInstruction::Lapse {
+        contracts: ExerciseQuantity::Contracts(d("1")),
+    };
+    let flat = || {
+        let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+            config.lapse_deadline = Some(deadline());
+        });
+        feed(&mut venue, "100", "1.5", time(2));
+        venue
+    };
+
+    let mut venue = flat();
+    assert_eq!(
+        refusal(&mut venue, contracts),
+        ExerciseRefusal::QuantityUnsupported,
+        "a quantity of contracts, held flat"
+    );
+
+    feed(&mut venue, "100", "1.5", time(90));
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::PastDeadline { deadline: time(90) },
+        "past the deadline, held flat"
+    );
+
+    let _ = venue.advance_time(expiry());
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::Expired { expiry: expiry() },
+        "past the deadline and the expiry, held flat"
+    );
+    assert_eq!(
+        refusal(&mut venue, contracts),
+        ExerciseRefusal::QuantityUnsupported,
+        "a quantity of contracts past the expiry"
+    );
+}
+
+/// A deadline anchored before the close, for an option given no session calendar, cannot be
+/// placed: an instruction panics rather than judge it against no deadline.
+#[test]
+#[should_panic(expected = "lapse deadline is anchored before the session close, but the option")]
+fn an_instruction_against_an_unplaced_deadline_panics() {
+    let mut config = super::options::config("10000", FeeModelConfig::default());
+    config.lapse_deadline = Some(LapseDeadline::new(ExpiryAnchor::BeforeClose(
+        Duration::from_secs(10),
+    )));
+    let mut venue = SimulatedVenue::try_new_market_driven(
+        &config,
+        driven_instruments(OptionKind::Call, OptionSettlement::Physical),
+    )
+    .expect("built without a calendar, for one given later");
+
+    let _ = venue.instruct_exercise(&option_name(), lapse());
 }
 
 /// An instructed long the account cannot afford to exercise is not sold at the sell-out check,

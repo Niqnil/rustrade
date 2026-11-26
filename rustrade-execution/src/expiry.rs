@@ -82,7 +82,10 @@ pub enum LongOptionExpiry {
 /// Whatever is not sold, because it was affordable or out of the money, or because the option or
 /// its underlying had no price, the depth ran out or the account could not pay the fee, goes on to
 /// expiry and settles under [`MockExecutionConfig::long_option_expiry`]. A cash-settled option is
-/// never sold: exercising it needs no money.
+/// never sold: exercising it needs no money. Nor is a long instructed to lapse through
+/// [`SimulatedVenue::instruct_exercise`](crate::exchange::mock::SimulatedVenue::instruct_exercise),
+/// since lapsing needs no money. Under [`LongOptionExpiry::Lapse`] the check still sells, as
+/// that policy governs only what reaches expiry.
 ///
 /// # Known limitations
 /// - **One anchor for every option.** A venue whose classes of option are sold out at different
