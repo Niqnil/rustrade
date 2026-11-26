@@ -22,3 +22,11 @@ libm = { version = "0.2.16" }
 # Misc
 chrono = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "american"
+path = "benches/american/mod.rs"
+harness = false
