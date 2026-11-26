@@ -25,6 +25,9 @@ alpaca = [
     "dep:serde_json",
     "serde_json/raw_value", # RawValue borrow for zero-copy WS data field parsing
     "dep:indexmap",
+    # To place Alpaca's expiry-day deadline, which it states in New York time, as an instant. No
+    # new crate enters the graph: rustrade-instrument depends on chrono-tz already.
+    "dep:chrono-tz",
 ]
 binance = [
     "dep:binance-sdk",

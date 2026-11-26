@@ -15,6 +15,10 @@
 //! - A market `day` buy to open and a market `day` sell to close of one option contract fill, and
 //!   the fills are read back, both through `fetch_trades` and on the account stream.
 //! - A `day` limit option order rests and cancels.
+//! - A do-not-exercise on a long expiring today is accepted, and a repeat is reported as Alpaca
+//!   answers it; the long then sells normally, and once it is closed a do-not-exercise is refused
+//!   for want of a position. Alpaca takes the instruction only on the contract's expiration day,
+//!   so this test trades a SPY call expiring today, chosen as below but for today's expiry.
 //! - Alpaca itself rejects the time in force `AlpacaClient` refuses unsent: `ioc` on an option
 //!   and `day` on crypto. These send the request directly rather than through the client, since
 //!   the client never sends them.
@@ -42,17 +46,18 @@
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use futures::{FutureExt, StreamExt};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind, UnindexedAccountEvent,
     client::{
-        ExecutionClient,
+        ExecutionClient, OptionExerciseClient,
         alpaca::{AlpacaClient, AlpacaConfig},
     },
-    error::OrderError,
+    error::{ApiError, ClientError, ExerciseRefusal, OrderError},
+    exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity},
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -281,10 +286,13 @@ async fn option_contract() -> (InstrumentNameExchange, Option<Decimal>) {
     if let Ok(symbol) = std::env::var("ALPACA_TEST_OPTION") {
         return (symbol.as_str().into(), None);
     }
-
     let today = Utc::now().date_naive();
-    let from = today + TimeDelta::days(1);
-    let to = today + TimeDelta::days(10);
+    spy_call(today + TimeDelta::days(1), today + TimeDelta::days(10)).await
+}
+
+/// A tradable SPY call with the nearest expiry from `from` to `to`, a last close between $0.50
+/// and $3.00, and the most open interest of those, with its last close.
+async fn spy_call(from: NaiveDate, to: NaiveDate) -> (InstrumentNameExchange, Option<Decimal>) {
     let listed = get_json(&format!(
         "/v2/options/contracts?underlying_symbols=SPY&status=active&type=call\
          &expiration_date_gte={from}&expiration_date_lte={to}&limit=10000"
@@ -312,10 +320,12 @@ async fn option_contract() -> (InstrumentNameExchange, Option<Decimal>) {
         .iter()
         .map(|(_, expiry, _, _)| *expiry)
         .min()
-        .expect(
-            "no SPY call between $0.50 and $3.00 expiring in the next 10 days: set \
-             ALPACA_TEST_OPTION to an OCC symbol to trade",
-        );
+        .unwrap_or_else(|| {
+            panic!(
+                "no SPY call between $0.50 and $3.00 expiring from {from} to {to}: set \
+                 ALPACA_TEST_OPTION to an OCC symbol to trade"
+            )
+        });
     let (symbol, _, close, _) = candidates
         .iter()
         .filter(|(_, expiry, _, _)| *expiry == nearest)
@@ -710,6 +720,91 @@ async fn option_day_limit_rests_then_cancels() {
         assert!(cancelled.state.is_ok(), "cancel: {:?}", cancelled.state);
         await_no_open_orders(&client, &contract).await;
         await_no_position(&contract).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn option_lapse_instruction_on_a_long_expiring_today() {
+    require_market_open().await;
+    let client = client();
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive();
+    let (contract, _) = spy_call(today, today).await;
+    require_no_position(&contract).await;
+    let lapse = ExerciseInstruction::Lapse {
+        contracts: ExerciseQuantity::WholePosition,
+    };
+    let market = |side| {
+        RequestOpen::new(
+            side,
+            None,
+            dec!(1),
+            OrderKind::Market,
+            TimeInForce::GoodUntilEndOfDay,
+        )
+    };
+
+    flattened_on_failure(&contract, async {
+        let bought = open(&client, &contract, cid("opt-dne-bto"), market(Side::Buy)).await;
+        await_filled(&placed_id(&bought.state)).await;
+        assert!(
+            within_ten_seconds(|| async { holds_position(&contract).await == Ok(true) }).await,
+            "the account holds no position in {contract} after buying it"
+        );
+
+        let accepted = client.instruct_exercise(&contract, lapse).await;
+        println!("Do-not-exercise on a long expiring today: {accepted:?}");
+        assert_eq!(accepted, Ok(ExerciseAck::new(lapse)));
+
+        let repeat = client.instruct_exercise(&contract, lapse).await;
+        println!("The same instruction again: {repeat:?}");
+        assert!(
+            matches!(
+                repeat,
+                Ok(_) | Err(ClientError::Api(ApiError::ExerciseRefused(_)))
+            ),
+            "{repeat:?}"
+        );
+
+        // Whether the position shows the instruction: its field names only, and any field that
+        // speaks of exercise.
+        let position = get_json(&format!("/v2/positions/{contract}")).await;
+        let fields = position.as_object().expect("a position object");
+        println!(
+            "Position fields after it: {:?}",
+            fields.keys().collect::<Vec<_>>()
+        );
+        for (name, value) in fields {
+            if name.contains("exerc") || name.contains("dne") {
+                println!("  {name}: {value}");
+            }
+        }
+
+        let sold = open(
+            &client,
+            &contract,
+            cid("opt-dne-stc"),
+            market(Side::Sell).with_reduce_only(ReduceOnly::Position),
+        )
+        .await;
+        await_filled(&placed_id(&sold.state)).await;
+        await_no_position(&contract).await;
+
+        let flat = client.instruct_exercise(&contract, lapse).await;
+        println!("Do-not-exercise once flat: {flat:?}");
+        assert!(
+            matches!(
+                flat,
+                Err(ClientError::Api(ApiError::ExerciseRefused(
+                    ExerciseRefusal::NoPosition
+                )))
+            ),
+            "{flat:?}"
+        );
     })
     .await;
 }

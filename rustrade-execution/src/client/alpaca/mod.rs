@@ -7,7 +7,8 @@
 // Architecture:
 // - REST (reqwest): account_snapshot, fetch_balances, fetch_open_orders,
 //   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol}),
-//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close);
+//   fetch_options_late_close_underlyings (GET /v2/assets?attributes=options_late_close),
+//   instruct_exercise (POST /v2/positions/{symbol}/do-not-exercise, in exercise.rs);
 //   the filtered reads first check each requested name is listed (GET /v2/assets/{symbol} or
 //   GET /v2/options/contracts/{symbol}, once per listed name per client)
 // - WebSocket (tungstenite): account_stream via Alpaca's trade_updates stream
@@ -110,6 +111,7 @@ use std::{borrow::Cow, num::NonZeroUsize, pin::Pin, str::FromStr, sync::Arc, tim
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
+mod exercise;
 mod replace;
 
 use replace::{ReplaceEvent, ReplaceFacts, ReplaceTracker};
@@ -1445,7 +1447,19 @@ fn observe_rate_limit_remaining(
     }
 }
 
-/// Execute a REST request with rate-limit awareness and retry.
+/// Why [`send_rate_limited`] has no response for its caller to read.
+#[derive(Debug)]
+enum SendFailure {
+    /// The request failed in transport, or ran past [`AlpacaConfig::request_timeout`]. The
+    /// caller names it with [`transport_error`].
+    Transport(reqwest::Error),
+    /// Alpaca answered every attempt with a 429, the last with this wait where its headers gave
+    /// one.
+    RateLimited(Option<Duration>),
+}
+
+/// Sends a request, waiting out a rate-limit pause first and retrying a 429, and returns the first
+/// response that is not a 429, its body unread.
 ///
 /// The `build_request` closure is called on every attempt so the caller doesn't
 /// need a clone of `RequestBuilder` (which may not be cloneable with streaming bodies).
@@ -1457,6 +1471,51 @@ fn observe_rate_limit_remaining(
 /// next call. Any other response reporting
 /// `X-Ratelimit-Remaining: 0` pauses later requests until that reset; see
 /// [`observe_rate_limit_remaining`].
+///
+/// `what` names the request in the log, such as "Alpaca REST request".
+async fn send_rate_limited(
+    rate_limiter: &RateLimitTracker,
+    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    what: &'static str,
+) -> Result<reqwest::Response, SendFailure> {
+    for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
+        rate_limiter.wait_if_blocked().await;
+        let response = build_request()
+            .send()
+            .await
+            .map_err(SendFailure::Transport)?;
+
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            observe_rate_limit_remaining(rate_limiter, response.headers());
+            return Ok(response);
+        }
+
+        let reset_delay = parse_rate_limit_delay(response.headers());
+        // Every refusal pauses the client, the last included, so the next request waits too.
+        rate_limiter.on_rate_limited(reset_delay);
+
+        if attempt + 1 < MAX_RATE_LIMIT_ATTEMPTS {
+            warn!(
+                what,
+                attempt = attempt + 1,
+                max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
+                "Alpaca rate-limited the request (429), retrying"
+            );
+            continue;
+        }
+
+        warn!(
+            what,
+            max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
+            "Alpaca rate-limit retries exhausted"
+        );
+        return Err(SendFailure::RateLimited(reset_delay));
+    }
+    unreachable!("Alpaca rate-limit retry loop exited without returning")
+}
+
+/// Execute a REST request with rate-limit awareness and retry, and decode its body: see
+/// [`send_rate_limited`] for how it waits and retries.
 ///
 /// # Errors
 ///
@@ -1509,166 +1568,118 @@ enum Fetched<T> {
 /// [`rest_with_retry`] and [`rest_lookup_with_retry`], which differ only in how they read a 404.
 async fn rest_request<T>(
     rate_limiter: &RateLimitTracker,
-    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<Fetched<T>, UnindexedClientError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
-        rate_limiter.wait_if_blocked().await;
-        let response = build_request().send().await.map_err(|e| {
-            UnindexedClientError::Connectivity(transport_error("Alpaca REST request failed", &e))
-        })?;
-
-        let status = response.status();
-
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let reset_delay = parse_rate_limit_delay(response.headers());
-            // Every refusal pauses the client, the last included, so the next request waits too.
-            rate_limiter.on_rate_limited(reset_delay);
-
-            if attempt + 1 < MAX_RATE_LIMIT_ATTEMPTS {
-                warn!(
-                    attempt = attempt + 1,
-                    max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
-                    "Alpaca REST rate-limited (429), retrying"
-                );
-                continue;
+    let response = send_rate_limited(rate_limiter, build_request, "Alpaca REST request")
+        .await
+        .map_err(|failure| match failure {
+            SendFailure::Transport(error) => UnindexedClientError::Connectivity(transport_error(
+                "Alpaca REST request failed",
+                &error,
+            )),
+            SendFailure::RateLimited(wait) => {
+                UnindexedClientError::Api(ApiError::rate_limited(wait))
             }
-
-            // Final attempt still rate-limited — return typed error.
-            warn!(
-                max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
-                "Alpaca REST rate-limit retries exhausted"
-            );
-            return Err(UnindexedClientError::Api(ApiError::rate_limited(
-                reset_delay,
-            )));
-        }
-
-        observe_rate_limit_remaining(rate_limiter, response.headers());
-
-        // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
-        // for those. Reaching here for a 204 indicates API misuse — return a clear error
-        // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
-        if status == reqwest::StatusCode::NO_CONTENT {
-            return Err(UnindexedClientError::Internal(
-                "Alpaca REST returned 204 No Content — use rest_delete_with_retry for DELETE endpoints"
-                    .to_string(),
-            ));
-        }
-
-        let bytes = response.bytes().await.map_err(|e| {
-            UnindexedClientError::Connectivity(transport_error("Alpaca REST read body failed", &e))
         })?;
+    let status = response.status();
 
-        // A 2xx body that does not fit the model is not transient: retrying returns the same
-        // body. An order path must still treat it as status unknown; see `order_post_error`.
-        if status.is_success() {
-            return serde_json::from_slice::<T>(&bytes)
-                .map(Fetched::Found)
-                .map_err(|e| {
-                    UnindexedClientError::Internal(format!(
-                        "Alpaca REST JSON parse error ({status}): {e} | body: {}",
-                        String::from_utf8_lossy(&bytes)
-                            .chars()
-                            .take(200)
-                            .collect::<String>()
-                    ))
-                });
-        }
+    // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
+    // for those. Reaching here for a 204 indicates API misuse — return a clear error
+    // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Err(UnindexedClientError::Internal(
+            "Alpaca REST returned 204 No Content — use rest_delete_with_retry for DELETE endpoints"
+                .to_string(),
+        ));
+    }
 
-        // Parse API error body for a better error message.
-        let api_err = AlpacaApiError::from_body(&bytes);
+    let bytes = response.bytes().await.map_err(|e| {
+        UnindexedClientError::Connectivity(transport_error("Alpaca REST read body failed", &e))
+    })?;
 
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Fetched::NotFound(api_err.message));
-        }
+    // A 2xx body that does not fit the model is not transient: retrying returns the same
+    // body. An order path must still treat it as status unknown; see `order_post_error`.
+    if status.is_success() {
+        return serde_json::from_slice::<T>(&bytes)
+            .map(Fetched::Found)
+            .map_err(|e| {
+                UnindexedClientError::Internal(format!(
+                    "Alpaca REST JSON parse error ({status}): {e} | body: {}",
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ))
+            });
+    }
 
-        // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
-        // 5xx / other = server-side failure treated as connectivity error.
-        // Callers that pattern-match on UnindexedClientError (e.g. open_order_inner) rely
-        // on Api(ApiError) to classify business rejections vs connectivity failures.
-        //
-        // Uses parse_api_error for consistent classification: 422 "insufficient funds"
-        // maps to BalanceInsufficient (not generic OrderRejected), enabling callers to
-        // trigger balance refresh on insufficient-funds rejections.
-        if status.is_client_error() {
-            return Err(UnindexedClientError::Api(parse_api_error(
-                status,
-                api_err.code,
-                &api_err.message,
-            )));
-        }
-        return Err(connectivity_err(format!(
-            "Alpaca REST error {status}: {}",
-            api_err.message
+    // Parse API error body for a better error message.
+    let api_err = AlpacaApiError::from_body(&bytes);
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Fetched::NotFound(api_err.message));
+    }
+
+    // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
+    // 5xx / other = server-side failure treated as connectivity error.
+    // Callers that pattern-match on UnindexedClientError (e.g. open_order_inner) rely
+    // on Api(ApiError) to classify business rejections vs connectivity failures.
+    //
+    // Uses parse_api_error for consistent classification: 422 "insufficient funds"
+    // maps to BalanceInsufficient (not generic OrderRejected), enabling callers to
+    // trigger balance refresh on insufficient-funds rejections.
+    if status.is_client_error() {
+        return Err(UnindexedClientError::Api(parse_api_error(
+            status,
+            api_err.code,
+            &api_err.message,
         )));
     }
-    unreachable!("Alpaca REST retry loop exited without returning")
+    Err(connectivity_err(format!(
+        "Alpaca REST error {status}: {}",
+        api_err.message
+    )))
 }
 
 /// Execute a DELETE request, returning an order error on rejection.
 ///
-/// Handles 204 No Content (success), other 4xx (API rejection, see [`parse_api_error`]), and 429
-/// (rate limit, retried and pausing later requests as in [`rest_with_retry`]). Any other response
-/// reporting `X-Ratelimit-Remaining: 0` pauses later requests,
-/// as in [`rest_with_retry`].
+/// Handles 204 No Content (success) and other 4xx (API rejection, see [`parse_api_error`]). It
+/// waits and retries as [`send_rate_limited`] says.
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
-    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<(), UnindexedOrderError> {
-    for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
-        rate_limiter.wait_if_blocked().await;
-        let response = build_request().send().await.map_err(|e| {
-            UnindexedOrderError::Connectivity(transport_error("Alpaca cancel request failed", &e))
-        })?;
-
-        let status = response.status();
-
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let reset_delay = parse_rate_limit_delay(response.headers());
-            // Every refusal pauses the client, the last included, so the next request waits too.
-            rate_limiter.on_rate_limited(reset_delay);
-
-            if attempt + 1 < MAX_RATE_LIMIT_ATTEMPTS {
-                warn!(
-                    attempt = attempt + 1,
-                    max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
-                    "Alpaca cancel rate-limited (429), retrying"
-                );
-                continue;
+    let response = send_rate_limited(rate_limiter, build_request, "Alpaca cancel request")
+        .await
+        .map_err(|failure| match failure {
+            SendFailure::Transport(error) => UnindexedOrderError::Connectivity(transport_error(
+                "Alpaca cancel request failed",
+                &error,
+            )),
+            SendFailure::RateLimited(wait) => {
+                UnindexedOrderError::Rejected(ApiError::rate_limited(wait))
             }
+        })?;
+    let status = response.status();
 
-            // Final attempt still rate-limited — return typed error.
-            warn!(
-                max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
-                "Alpaca cancel rate-limit retries exhausted"
-            );
-            return Err(UnindexedOrderError::Rejected(ApiError::rate_limited(
-                reset_delay,
-            )));
-        }
-
-        observe_rate_limit_remaining(rate_limiter, response.headers());
-
-        // 204 No Content: cancel succeeded.
-        if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
-            return Ok(());
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .inspect_err(
-                |e| warn!(%e, %status, "Alpaca cancel_order: failed to read error response body"),
-            )
-            .unwrap_or_default();
-        let api_err = AlpacaApiError::from_body(&bytes);
-
-        return Err(parse_order_error(status, api_err.code, &api_err.message));
+    // 204 No Content: cancel succeeded.
+    if status.is_success() {
+        return Ok(());
     }
-    unreachable!("Alpaca cancel retry loop exited without returning")
+
+    let bytes = response
+        .bytes()
+        .await
+        .inspect_err(
+            |e| warn!(%e, %status, "Alpaca cancel_order: failed to read error response body"),
+        )
+        .unwrap_or_default();
+    let api_err = AlpacaApiError::from_body(&bytes);
+
+    Err(parse_order_error(status, api_err.code, &api_err.message))
 }
 
 // ---------------------------------------------------------------------------

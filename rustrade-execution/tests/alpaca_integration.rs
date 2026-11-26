@@ -448,6 +448,129 @@ async fn test_fetch_option_events() {
     }
 }
 
+/// A GET to Alpaca's paper trading API, authenticated, without going through the client: its
+/// status and its body as JSON (`Null` when it is not JSON).
+async fn paper_get(path: &str) -> (reqwest::StatusCode, serde_json::Value) {
+    let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
+    let secret_key =
+        std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
+    let response = reqwest::Client::new()
+        .get(format!("https://paper-api.alpaca.markets{path}"))
+        .header("APCA-API-KEY-ID", api_key)
+        .header("APCA-API-SECRET-KEY", secret_key)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("send");
+    let status = response.status();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// The symbol of a listed SPY call expiring on `expiry` (any day from `expiry` on when `from_on`),
+/// which the account holds no position in; `None` when Alpaca lists none.
+async fn unheld_spy_call(
+    expiry: chrono::NaiveDate,
+    from_on: bool,
+) -> Option<InstrumentNameExchange> {
+    let dates = if from_on {
+        format!("expiration_date_gte={expiry}")
+    } else {
+        format!("expiration_date={expiry}")
+    };
+    let (status, listed) = paper_get(&format!(
+        "/v2/options/contracts?underlying_symbols=SPY&status=active&type=call&{dates}&limit=50"
+    ))
+    .await;
+    assert!(status.is_success(), "contract listing: {status} {listed}");
+    for symbol in listed["option_contracts"]
+        .as_array()
+        .expect("option_contracts")
+        .iter()
+        .filter_map(|listed| listed["symbol"].as_str())
+    {
+        match paper_get(&format!("/v2/positions/{symbol}")).await {
+            (reqwest::StatusCode::NOT_FOUND, _) => {
+                return Some(InstrumentNameExchange::new(symbol));
+            }
+            (status, _) if status.is_success() => continue,
+            (status, body) => panic!("position read for {symbol}: {status} {body}"),
+        }
+    }
+    None
+}
+
+/// What Alpaca refuses a do-not-exercise with when the account holds no position, so this changes
+/// nothing and runs at any hour. Alpaca takes one only on the contract's expiration day, until a
+/// deadline that day, and judges that before the position:
+/// - a contract expiring after today: not its expiry day, dated from the contract;
+/// - a contract Alpaca does not list: an invalid instrument;
+/// - on an expiration day, a contract expiring today: no position before the deadline, and past
+///   the deadline after it.
+#[tokio::test]
+#[ignore]
+async fn test_instruct_exercise_without_a_position() {
+    use chrono_tz::America::New_York;
+    use rustrade_execution::{
+        client::OptionExerciseClient,
+        error::{ApiError, ClientError, ExerciseRefusal},
+        exercise::{ExerciseInstruction, ExerciseQuantity},
+    };
+
+    init_logging();
+    let client = AlpacaClient::new(test_config());
+    let lapse = ExerciseInstruction::Lapse {
+        contracts: ExerciseQuantity::WholePosition,
+    };
+    let now = chrono::Utc::now();
+    let today = now.with_timezone(&New_York).date_naive();
+
+    let later = unheld_spy_call(today + chrono::TimeDelta::days(1), true)
+        .await
+        .expect("a listed SPY call expiring after today, not held");
+    let not_today = client.instruct_exercise(&later, lapse).await;
+    println!("{later}, expiring later: {not_today:?}");
+    let ClientError::Api(ApiError::ExerciseRefused(ExerciseRefusal::NotExpiryDay { expiry_day })) =
+        not_today.expect_err("refused")
+    else {
+        panic!("expected NotExpiryDay for {later}");
+    };
+    assert!(
+        later
+            .name()
+            .contains(&expiry_day.format("%y%m%d").to_string()),
+        "{expiry_day} is {later}'s expiry"
+    );
+
+    // Well formed, but no SPY call has a $9,999 strike.
+    let unlisted = InstrumentNameExchange::new("SPY301220C09999000");
+    let not_listed = client.instruct_exercise(&unlisted, lapse).await;
+    println!("{unlisted}, not listed: {not_listed:?}");
+    assert!(
+        matches!(
+            not_listed,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{not_listed:?}"
+    );
+
+    let Some(expiring) = unheld_spy_call(today, false).await else {
+        println!("No SPY call expires today ({today}): the expiry-day answers are not checked");
+        return;
+    };
+    let on_the_day = client.instruct_exercise(&expiring, lapse).await;
+    println!("{expiring}, expiring today, not held: {on_the_day:?}");
+    match on_the_day.expect_err("refused") {
+        ClientError::Api(ApiError::ExerciseRefused(ExerciseRefusal::NoPosition)) => {}
+        ClientError::Api(ApiError::ExerciseRefused(ExerciseRefusal::PastDeadline { deadline })) => {
+            println!("Deadline: {}", deadline.with_timezone(&New_York));
+            assert!(deadline <= chrono::Utc::now(), "the deadline has passed");
+            assert_eq!(deadline.with_timezone(&New_York).date_naive(), today);
+        }
+        other => panic!("expected NoPosition or PastDeadline for {expiring}, got {other:?}"),
+    }
+}
+
 // ============================================================================
 // Order Lifecycle Tests
 // ============================================================================
