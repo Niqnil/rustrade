@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **American option pricing benchmark** (`rustrade-pricing`, benches only). The new `american`
+  benchmark times `price`, `greeks` and `implied_volatility` with `FiniteDifferenceModel` on
+  grids of 400×200 (the default), 200×100 and 100×50, over 48 American calls and puts: expiries
+  from 7 to 365 days, strikes one standard deviation either side of the money and at it, with and
+  without a cash dividend. It reports cases per second, so the cost of a coarser grid, or of a
+  change to the solver, can be measured. Run it with `cargo bench -p rustrade-pricing`.
+
 - **Trading status from market data: halts and pauses** (`rustrade-data`, #881). The new
   `DataKind::TradingStatus` reports a change in whether an instrument can trade at its venue: a
   `TradingState` (`Trading`, `Halted`, `Paused` for a timed volatility pause, `QuoteOnly`,
