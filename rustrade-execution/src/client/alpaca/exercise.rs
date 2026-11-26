@@ -23,6 +23,10 @@ const SHORT_POSITION: i64 = 40_310_001;
 /// restricted to closing trades. Only the message tells them apart.
 const REFUSED: i64 = 40_310_000;
 
+/// How Alpaca's documentation words a refusal for want of a position under [`REFUSED`],
+/// lower-cased: "no available position for the specified contract".
+const NO_POSITION: &str = "no available position";
+
 /// Alpaca's code for a symbol it does not know.
 const INVALID_SYMBOL: i64 = 42_210_000;
 
@@ -67,16 +71,17 @@ impl OptionExerciseClient for AlpacaClient {
     ///     says the instruction is accepted only on the expiration day;
     ///     [`ExerciseRefusal::PastDeadline`] when it says the instruction is not accepted after a
     ///     time, which is read as that time on the expiration day in New York;
-    ///     [`ExerciseRefusal::NoPosition`] when it speaks of a position; and otherwise
-    ///     [`ExerciseRefusal::Other`];
-    ///   - [`ExerciseRefusal::Other`] for any other 4xx, with Alpaca's code and message.
+    ///     [`ExerciseRefusal::NoPosition`] when it says no position is available, in Alpaca's
+    ///     documented words; and otherwise [`ExerciseRefusal::Other`];
+    ///   - [`ExerciseRefusal::Other`] for any other 4xx, with Alpaca's code and message, and for
+    ///     a 4xx whose body could not be read.
     /// - [`ApiError::Unauthenticated`] for a 401, or a 403 without a code: a wrong key, secret or
     ///   host.
     /// - [`ApiError::RateLimit`] once the 429 retries are exhausted. A 429 means Alpaca did not
     ///   take the request, so it is retried, as every request of this client is.
     /// - [`ClientError::Connectivity`] for a request that failed in transport, ran past
-    ///   [`AlpacaConfig::request_timeout`], met a 5xx, or whose error body could not be read.
-    ///   Alpaca may have taken the instruction; it is not sent again.
+    ///   [`AlpacaConfig::request_timeout`], or met a 5xx. Alpaca may have taken the instruction;
+    ///   it is not sent again.
     ///
     /// [`ClientError::Connectivity`]: crate::error::ClientError::Connectivity
     /// [`AlpacaConfig::request_timeout`]: super::AlpacaConfig::request_timeout
@@ -130,12 +135,23 @@ impl OptionExerciseClient for AlpacaClient {
         if status.is_success() {
             return Ok(ExerciseAck::new(instruction));
         }
-        let bytes = response.bytes().await.map_err(|error| {
-            UnindexedClientError::Connectivity(transport_error(
-                "Alpaca do-not-exercise read body failed",
-                &error,
-            ))
-        })?;
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            // A 4xx is a refusal whatever its body says; only the reason is lost.
+            Err(error) if status.is_client_error() => {
+                return Err(UnindexedClientError::Api(ApiError::ExerciseRefused(
+                    ExerciseRefusal::Other(format!(
+                        "{status}, with an error body that could not be read: {error}"
+                    )),
+                )));
+            }
+            Err(error) => {
+                return Err(UnindexedClientError::Connectivity(transport_error(
+                    "Alpaca do-not-exercise read body failed",
+                    &error,
+                )));
+            }
+        };
         let body = AlpacaApiError::from_body(&bytes);
         Err(exercise_error(
             instrument,
@@ -184,7 +200,7 @@ fn generic_refusal(expiry_day: NaiveDate, code: Option<i64>, message: &str) -> E
         ExerciseRefusal::NotExpiryDay { expiry_day }
     } else if let Some(deadline) = stated_deadline(&lower, expiry_day) {
         ExerciseRefusal::PastDeadline { deadline }
-    } else if lower.contains("position") {
+    } else if lower.contains(NO_POSITION) {
         ExerciseRefusal::NoPosition
     } else {
         ExerciseRefusal::Other(with_alpaca_code(code, message))
@@ -193,15 +209,18 @@ fn generic_refusal(expiry_day: NaiveDate, code: Option<i64>, message: &str) -> E
 
 /// The deadline a lower-cased refusal such as "dne requests are not accepted after 5:15pm"
 /// states: that time on `expiry_day` in New York, where Alpaca keeps its expiry-day times. The
-/// time may be in 12-hour form, as Alpaca writes it, or 24-hour, with or without spaces. `None`
-/// when the message states no time this reads.
+/// time may be in 12-hour form, as Alpaca writes it, or 24-hour, with or without spaces, and may
+/// be followed by other words, such as a time zone. `None` when the message states no time this
+/// reads.
 fn stated_deadline(lower: &str, expiry_day: NaiveDate) -> Option<DateTime<Utc>> {
     let (_, after) = lower.split_once(NOT_ACCEPTED_AFTER)?;
     let stated: String = after.chars().filter(|c| !c.is_whitespace()).collect();
-    let stated = stated.trim_end_matches('.');
-    let time = NaiveTime::parse_from_str(stated, "%I:%M%p")
-        .or_else(|_| NaiveTime::parse_from_str(stated, "%H:%M"))
-        .ok()?;
+    // A time followed by more digits, such as "17:155", is not a time this reads.
+    let leading = |format| match NaiveTime::parse_and_remainder(&stated, format) {
+        Ok((time, rest)) if !rest.starts_with(|c: char| c.is_ascii_digit()) => Some(time),
+        _ => None,
+    };
+    let time = leading("%I:%M%p").or_else(|| leading("%H:%M"))?;
     New_York
         .from_local_datetime(&expiry_day.and_time(time))
         .single()
@@ -431,6 +450,19 @@ mod tests {
             "24-hour form"
         );
         assert_eq!(
+            stated_deadline(
+                "not accepted after 5:15pm et. please contact support",
+                day(11, 27)
+            ),
+            utc("2026-11-27T22:15:00Z"),
+            "words after the time"
+        );
+        assert_eq!(
+            stated_deadline("not accepted after 17:15 et", day(11, 27)),
+            utc("2026-11-27T22:15:00Z"),
+            "words after a 24-hour time"
+        );
+        assert_eq!(
             stated_deadline("not accepted after 9:05am", day(11, 27)),
             utc("2026-11-27T14:05:00Z"),
             "a morning time"
@@ -440,6 +472,7 @@ mod tests {
             "not accepted after",
             "accepted after 5:15pm",
             "not accepted after 25:00",
+            "not accepted after 17:155",
         ] {
             assert_eq!(stated_deadline(no_time, day(11, 27)), None, "{no_time}");
         }
@@ -466,6 +499,106 @@ mod tests {
 
         assert_eq!(ack, Ok(ExerciseAck::new(LAPSE)));
         assert_eq!(requests(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_a_connectivity_error_sent_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "code": 50310000,
+                "message": "service unavailable",
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Socket(_)
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests(&server).await.len(), 1, "not retried");
+    }
+
+    #[tokio::test]
+    async fn exhausted_429_retries_are_a_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(api_error(result), ApiError::RateLimit { .. }),
+            "a 429 on every attempt"
+        );
+        assert_eq!(
+            requests(&server).await.len(),
+            crate::client::alpaca::MAX_RATE_LIMIT_ATTEMPTS as usize
+        );
+    }
+
+    /// A body that claims gzip and is not: the status is read, the body is not.
+    fn unreadable_body(status: u16) -> ResponseTemplate {
+        ResponseTemplate::new(status)
+            .insert_header("content-encoding", "gzip")
+            .set_body_bytes(b"not gzip".to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_refusal_whose_body_cannot_be_read_is_still_a_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(unreadable_body(403))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(
+                api_error(result),
+                ApiError::ExerciseRefused(ExerciseRefusal::Other(ref message))
+                    if message.starts_with("403 Forbidden, with an error body that could not be read")
+            ),
+            "a 4xx is a refusal whatever its body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_5xx_whose_body_cannot_be_read_is_a_connectivity_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(unreadable_body(502))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(result, Err(UnindexedClientError::Connectivity(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -521,9 +654,24 @@ mod tests {
             refused(ExerciseRefusal::NoPosition)
         );
         assert_eq!(
-            map(403, Some(40310000), "No Position Found"),
+            map(
+                403,
+                Some(40310000),
+                "No Available Position for the contract"
+            ),
             refused(ExerciseRefusal::NoPosition),
             "the message is matched ignoring case"
+        );
+        assert_eq!(
+            map(
+                403,
+                Some(40310000),
+                "account is not allowed to open new positions"
+            ),
+            refused(ExerciseRefusal::Other(
+                "40310000 account is not allowed to open new positions".into()
+            )),
+            "a message that speaks of positions otherwise is not a missing position"
         );
         assert_eq!(
             map(403, Some(40310001), "cannot submit DNE for short position"),

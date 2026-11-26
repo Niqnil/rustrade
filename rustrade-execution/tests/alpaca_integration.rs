@@ -489,8 +489,12 @@ async fn unheld_spy_call(
         .iter()
         .filter_map(|listed| listed["symbol"].as_str())
     {
-        if paper_get(&format!("/v2/positions/{symbol}")).await.0 == reqwest::StatusCode::NOT_FOUND {
-            return Some(InstrumentNameExchange::new(symbol));
+        match paper_get(&format!("/v2/positions/{symbol}")).await {
+            (reqwest::StatusCode::NOT_FOUND, _) => {
+                return Some(InstrumentNameExchange::new(symbol));
+            }
+            (status, _) if status.is_success() => continue,
+            (status, body) => panic!("position read for {symbol}: {status} {body}"),
         }
     }
     None
