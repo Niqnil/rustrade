@@ -379,6 +379,14 @@ mod tests {
                 },
                 expected: false,
             },
+            TestCase {
+                // TC6: not terminal w/ DataError::ConnectTimeout — as InitTimeout, the attempt
+                // failed and the next one follows after the backoff.
+                input: DataError::ConnectTimeout {
+                    timeout: Duration::from_secs(10),
+                },
+                expected: false,
+            },
         ];
 
         for (index, test) in tests.into_iter().enumerate() {

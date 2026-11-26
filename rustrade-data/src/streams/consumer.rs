@@ -148,6 +148,11 @@ impl MarketStreamOptions {
     ///   implementation of [`Subscriber`](crate::subscriber::Subscriber),
     ///   [`SnapshotFetcher`](crate::SnapshotFetcher) or [`MarketStream`] must
     ///   allow that at any `.await`.
+    /// - **Shared connections:** where streams share one connection (Alpaca, LSE, Massive), its
+    ///   task serves one attach at a time, so `timeout` also covers waiting behind other streams'
+    ///   attaches. An attach whose stream is abandoned before its turn is skipped, but one already
+    ///   under way runs to the end of its own bounds first. Allow for that when several streams
+    ///   share a connection.
     ///
     /// [`DEFAULT_INIT_TIMEOUT`] unless changed. Applies to streams built through
     /// [`init_market_stream`]; `IbkrMarketStream` (`ibkr` feature) does not apply it yet.
