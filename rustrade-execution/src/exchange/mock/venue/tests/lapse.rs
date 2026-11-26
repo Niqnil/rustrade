@@ -15,6 +15,7 @@ use crate::{
     exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity},
     expiry::{ExpiryAnchor, ExpirySellOut, LapseDeadline},
 };
+use chrono::TimeZone as _;
 use rustrade_instrument::{
     calendar::DailyClose,
     instrument::kind::option::{OptionKind, OptionSettlement},
@@ -356,7 +357,10 @@ fn the_first_refusal_in_the_documented_order_wins() {
 /// A deadline anchored before the close, for an option given no session calendar, cannot be
 /// placed: an instruction panics rather than judge it against no deadline.
 #[test]
-#[should_panic(expected = "lapse deadline is anchored before the session close, but the option")]
+#[should_panic(
+    expected = "lapse deadline is anchored before the session close or held to the \
+                           expiry day, but the option SPY_C100 has no session calendar"
+)]
 fn an_instruction_against_an_unplaced_deadline_panics() {
     let mut config = super::options::config("10000", FeeModelConfig::default());
     config.lapse_deadline = Some(LapseDeadline::new(ExpiryAnchor::BeforeClose(
@@ -369,6 +373,185 @@ fn an_instruction_against_an_unplaced_deadline_panics() {
     .expect("built without a calendar, for one given later");
 
     let _ = venue.instruct_exercise(&option_name(), lapse());
+}
+
+/// Thursday 2023-11-16 22:00 New York, 03:00 UTC on the Friday: an expiry whose UTC date is the
+/// day after its New York date.
+fn evening_expiry() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2023, 11, 17, 3, 0, 0).unwrap()
+}
+
+/// Lapse instructions taken only on the expiry day, until an hour before the expiry.
+fn expiry_day_window() -> LapseDeadline {
+    LapseDeadline::new(ExpiryAnchor::BeforeExpiry(Duration::from_secs(60 * 60))).expiry_day_only()
+}
+
+/// New York's 16:00 close: the expiry day is dated in its zone.
+fn new_york_close() -> SessionCalendarConfig {
+    SessionCalendarConfig::Daily(DailyClose::new(
+        chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        chrono_tz::America::New_York,
+    ))
+}
+
+/// [`driven_instruments`], with the call expiring at [`evening_expiry`].
+fn evening_instruments()
+-> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+    let mut instruments = driven_instruments(OptionKind::Call, OptionSettlement::Physical);
+    match instruments
+        .get_mut(&option_name())
+        .map(|option| &mut option.kind)
+    {
+        Some(InstrumentKind::Option(contract)) => contract.expiry = evening_expiry(),
+        other => panic!("the call is listed: {other:?}"),
+    }
+    instruments
+}
+
+/// A market-driven venue listing SPY and a call expiring at [`evening_expiry`], taking lapse
+/// instructions in [`expiry_day_window`] under [`new_york_close`], with `configure` applied.
+fn evening_venue(configure: impl FnOnce(&mut MockExecutionConfig)) -> SimulatedVenue {
+    let mut config = super::options::config("10000", FeeModelConfig::default());
+    config.session_close = Some(new_york_close());
+    config.lapse_deadline = Some(expiry_day_window());
+    configure(&mut config);
+    let mut venue = SimulatedVenue::new_market_driven(&config, evening_instruments());
+    advance(&mut venue, time(1));
+    venue
+}
+
+/// The expiry day in New York.
+fn thursday() -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(2023, 11, 16).unwrap()
+}
+
+/// Refused on any day before the expiry day, dated in the calendar's zone, not UTC's; taken
+/// from the expiry day's first instant until the deadline; and the long instructed lapses.
+#[test]
+fn a_window_held_to_the_expiry_day_takes_instructions_only_on_it() {
+    let mut venue = evening_venue(|_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    feed(&mut venue, "120", "20", time(50));
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::NotExpiryDay {
+            expiry_day: thursday()
+        },
+        "the Tuesday"
+    );
+
+    // 23:59:59 on the Wednesday in New York, already the Thursday in UTC.
+    let wednesday_night = Utc.with_ymd_and_hms(2023, 11, 16, 4, 59, 59).unwrap();
+    feed(&mut venue, "120", "20", wednesday_night);
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::NotExpiryDay {
+            expiry_day: thursday()
+        },
+        "the Wednesday in New York"
+    );
+
+    feed(
+        &mut venue,
+        "120",
+        "20",
+        wednesday_night + chrono::TimeDelta::seconds(1),
+    );
+    instruct_lapse(&mut venue);
+
+    let deadline = evening_expiry() - chrono::TimeDelta::hours(1);
+    feed(&mut venue, "120", "20", deadline);
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::PastDeadline { deadline },
+        "the expiry day, at the deadline"
+    );
+
+    let events = venue.advance_time(evening_expiry());
+    let trades = trades(&events);
+    assert_eq!(trades.len(), 1, "only the option leaves: {events:?}");
+    assert_eq!(
+        (trades[0].origin, trades[0].price, trades[0].quantity),
+        (TradeOrigin::Expiry, d("0"), d("1"))
+    );
+}
+
+/// The day is judged before the position, as the deadline is: an account holding none is
+/// refused for the day, and only on the expiry day for want of a position.
+#[test]
+fn the_day_is_judged_before_the_position() {
+    let mut venue = evening_venue(|_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::NotExpiryDay {
+            expiry_day: thursday()
+        }
+    );
+
+    feed(
+        &mut venue,
+        "100",
+        "1.5",
+        Utc.with_ymd_and_hms(2023, 11, 16, 15, 0, 0).unwrap(),
+    );
+    assert_eq!(refusal(&mut venue, lapse()), ExerciseRefusal::NoPosition);
+}
+
+/// Without the window, the same venue takes the instruction days before the expiry.
+#[test]
+fn a_deadline_not_held_to_the_expiry_day_takes_instructions_before_it() {
+    let mut venue = evening_venue(|config| {
+        config.lapse_deadline = Some(LapseDeadline::new(ExpiryAnchor::BeforeExpiry(
+            Duration::from_secs(60 * 60),
+        )));
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    instruct_lapse(&mut venue);
+}
+
+/// A window held to the expiry day needs the option's session calendar to date the day, even
+/// with a deadline that needs none: an instruction panics rather than judge it on no day.
+#[test]
+#[should_panic(
+    expected = "lapse deadline is anchored before the session close or held to the \
+                           expiry day, but the option SPY_C100 has no session calendar"
+)]
+fn an_instruction_against_an_undated_window_panics() {
+    let mut config = super::options::config("10000", FeeModelConfig::default());
+    config.lapse_deadline = Some(expiry_day_window());
+    let mut venue = SimulatedVenue::try_new_market_driven(&config, evening_instruments())
+        .expect("built without a calendar, for one given later");
+
+    let _ = venue.instruct_exercise(&option_name(), lapse());
+}
+
+/// A calendar given after construction dates the window.
+#[test]
+fn a_calendar_given_later_dates_the_window() {
+    let mut config = super::options::config("10000", FeeModelConfig::default());
+    config.lapse_deadline = Some(expiry_day_window());
+    let mut venue = SimulatedVenue::try_new_market_driven(&config, evening_instruments())
+        .expect("built without a calendar, for one given later")
+        .with_session_calendar(Arc::new(DailyClose::new(
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            chrono_tz::America::New_York,
+        )))
+        .expect("the calendar places the window");
+    advance(&mut venue, time(1));
+    feed(&mut venue, "100", "1.5", time(2));
+
+    assert_eq!(
+        refusal(&mut venue, lapse()),
+        ExerciseRefusal::NotExpiryDay {
+            expiry_day: thursday()
+        }
+    );
 }
 
 /// An instructed long the account cannot afford to exercise is not sold at the sell-out check,

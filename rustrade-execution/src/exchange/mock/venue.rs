@@ -1082,16 +1082,18 @@ pub struct SimulatedVenue {
     /// if it takes them until expiry. Fixed at construction from
     /// [`MockExecutionConfig::lapse_deadline`].
     lapse_deadline: Option<LapseDeadline>,
-    /// The instant from which each option this venue lists takes no lapse instruction, by name.
-    /// Empty without a [`lapse_deadline`](Self::lapse_deadline). Placed with
+    /// The instant from which each option this venue lists takes no lapse instruction, and the
+    /// only day it takes one on where the deadline is held to the expiry day, by name. Empty
+    /// without a [`lapse_deadline`](Self::lapse_deadline). Placed with
     /// [`sell_outs`](Self::sell_outs).
-    lapse_deadlines: FnvHashMap<InstrumentNameExchange, DateTime<Utc>>,
+    lapse_deadlines: FnvHashMap<InstrumentNameExchange, lapse::LapseWindow>,
     /// The options whose long position the holder has instructed to lapse at expiry, by name: see
     /// [`instruct_exercise`](Self::instruct_exercise). An option leaves it when its position goes
     /// flat or short, so a position opened later carries no instruction.
     lapse_instructed: FnvHashSet<InstrumentNameExchange>,
-    /// The options, by rule then name, that an expiry-day rule anchored before the session close
-    /// cannot yet place, having no session calendar. Left for
+    /// The options, by rule then name, that an expiry-day rule needing a session calendar
+    /// (anchored before the session close, or a lapse deadline held to the expiry day) cannot yet
+    /// place, having none. Left for
     /// [`with_session_calendar`](Self::with_session_calendar) to place; the venue refuses to run
     /// while any remain.
     expiry_rules_unplaced: Vec<(ExpiryRule, InstrumentNameExchange)>,
@@ -1539,8 +1541,9 @@ impl SimulatedVenue {
     /// If the [expiry sell-out](MockExecutionConfig::expiry_sell_out), the
     /// [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or the
     /// [lapse deadline](MockExecutionConfig::lapse_deadline) is anchored
-    /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose) and an option this
-    /// venue lists still has no session calendar to place it: neither
+    /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose), or the lapse
+    /// deadline is [held to the expiry day](crate::expiry::LapseDeadline::expiry_day_only), and an
+    /// option this venue lists still has no session calendar to place it: neither
     /// [`session_close`](MockExecutionConfig::session_close), an entry of
     /// [`session_close_overrides`](MockExecutionConfig::session_close_overrides), nor
     /// [`with_session_calendar`](Self::with_session_calendar). The venue is built without one, so
@@ -1684,8 +1687,8 @@ impl SimulatedVenue {
     ///   boundary not after the instant it was asked from, or a negative interest.
     /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out),
     ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or
-    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) anchored before the session close
-    ///   still has an option with no session calendar: see
+    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) needing a session calendar still
+    ///   has an option with none: see
     ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
@@ -3030,8 +3033,8 @@ impl SimulatedVenue {
     ///   boundary not after the instant it was asked from, or a negative interest.
     /// - If an [expiry sell-out](MockExecutionConfig::expiry_sell_out),
     ///   [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or
-    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) anchored before the session close
-    ///   still has an option with no session calendar: see
+    ///   [lapse deadline](MockExecutionConfig::lapse_deadline) needing a session calendar still
+    ///   has an option with none: see
     ///   [`next_deadline`](Self::next_deadline).
     #[must_use]
     pub fn apply_market(

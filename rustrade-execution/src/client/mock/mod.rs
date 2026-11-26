@@ -245,10 +245,12 @@ pub struct MockExecutionConfig {
     pub expiry_day_cutoff: Option<ExpiryDayCutoff>,
     /// Whether the mock exchange refuses a
     /// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instruction for an option from a set
-    /// time before its expiry day's close, or before its expiry, as a broker sets a deadline for
-    /// instructions not to exercise. See [`LapseDeadline`]. One anchored
-    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
-    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    /// time before its expiry day's close, or before its expiry, and optionally on any day but its
+    /// expiry day, as a broker sets a window for instructions not to exercise. See
+    /// [`LapseDeadline`]. One anchored
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose), or
+    /// [held to the expiry day](LapseDeadline::expiry_day_only), needs a session calendar for each
+    /// option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
     ///
     /// Defaults to `None`: an option takes lapse instructions until its expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]

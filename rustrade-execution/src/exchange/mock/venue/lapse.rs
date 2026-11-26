@@ -6,7 +6,40 @@ use crate::{
     error::{ApiError, ExerciseRefusal, UnindexedApiError},
     exercise::{ExerciseAck, ExerciseInstruction, ExerciseQuantity},
 };
-use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use chrono::{DateTime, NaiveDate, Utc};
+use rustrade_instrument::{calendar::Tz, instrument::name::InstrumentNameExchange};
+
+/// Where the venue's [`LapseDeadline`](crate::expiry::LapseDeadline) places for one option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LapseWindow {
+    /// The instant from which the option takes no lapse instruction.
+    pub(super) deadline: DateTime<Utc>,
+    /// The only day the option takes one on, under
+    /// [`expiry_day_only`](crate::expiry::LapseDeadline::expiry_day_only).
+    pub(super) expiry_day: Option<ExpiryDay>,
+}
+
+/// An option's expiry day: the date its expiry instant falls on in its session calendar's zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExpiryDay {
+    date: NaiveDate,
+    zone: Tz,
+}
+
+impl ExpiryDay {
+    /// The day `expiry` falls on in `zone`.
+    pub(super) fn of(expiry: DateTime<Utc>, zone: Tz) -> Self {
+        Self {
+            date: expiry.with_timezone(&zone).date_naive(),
+            zone,
+        }
+    }
+
+    /// Whether `instant` falls on this day, in its zone.
+    fn contains(&self, instant: DateTime<Utc>) -> bool {
+        instant.with_timezone(&self.zone).date_naive() == self.date
+    }
+}
 
 impl SimulatedVenue {
     /// Takes `instruction` for the long position held in the option `instrument`: what
@@ -35,6 +68,9 @@ impl SimulatedVenue {
     ///     [`ExerciseQuantity::Contracts`]: this venue instructs only whole positions.
     ///   - [`ExerciseRefusal::Expired`] at or after the option's expiry, even while a position
     ///     waits for a price to settle against.
+    ///   - [`ExerciseRefusal::NotExpiryDay`] on a date other than the option's expiry day, where
+    ///     the [`LapseDeadline`](crate::expiry::LapseDeadline) is
+    ///     [`expiry_day_only`](crate::expiry::LapseDeadline::expiry_day_only).
     ///   - [`ExerciseRefusal::PastDeadline`] at or after the option's
     ///     [`LapseDeadline`](crate::expiry::LapseDeadline), where one is configured.
     ///   - [`ExerciseRefusal::NoPosition`] when the account holds none in the option.
@@ -43,8 +79,10 @@ impl SimulatedVenue {
     /// The instant judged is [`time_exchange`](Self::time_exchange).
     ///
     /// # Panics
-    /// If the [`LapseDeadline`](crate::expiry::LapseDeadline) is anchored before the session close
-    /// and the option has no session calendar to place it: see
+    /// If the [`LapseDeadline`](crate::expiry::LapseDeadline) needs a session calendar, being
+    /// anchored before the session close or
+    /// [`expiry_day_only`](crate::expiry::LapseDeadline::expiry_day_only), and the option has none
+    /// to place it: see
     /// [`next_deadline`](Self::next_deadline)'s `# Panics`.
     ///
     /// [`OptionExerciseClient::instruct_exercise`]: crate::client::OptionExerciseClient::instruct_exercise
@@ -75,10 +113,21 @@ impl SimulatedVenue {
             });
         }
         self.assert_rule_placed(ExpiryRule::LapseDeadline, instrument);
-        if let Some(&deadline) = self.lapse_deadlines.get(instrument)
-            && now >= deadline
+        if let Some(&LapseWindow {
+            deadline,
+            expiry_day,
+        }) = self.lapse_deadlines.get(instrument)
         {
-            return refuse(ExerciseRefusal::PastDeadline { deadline });
+            if let Some(day) = expiry_day
+                && !day.contains(now)
+            {
+                return refuse(ExerciseRefusal::NotExpiryDay {
+                    expiry_day: day.date,
+                });
+            }
+            if now >= deadline {
+                return refuse(ExerciseRefusal::PastDeadline { deadline });
+            }
         }
 
         match self.positions.get(instrument) {

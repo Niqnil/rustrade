@@ -282,18 +282,20 @@ impl ExpiryDayCutoff {
     }
 }
 
-/// When a [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) stops taking
+/// When a [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) takes
 /// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instructions for an option about to
-/// expire, as a broker sets a deadline on its expiry day for instructions not to exercise.
+/// expire: until a deadline on its expiry day, and optionally only on that day, as brokers set
+/// for instructions not to exercise.
 ///
-/// Set on [`MockExecutionConfig::lapse_deadline`]. For example, a broker that takes them until an
-/// hour before the expiry day's close:
+/// Set on [`MockExecutionConfig::lapse_deadline`]. For example, a broker that takes them only on
+/// the expiry day, until an hour before its close:
 ///
 /// ```
 /// use rustrade_execution::expiry::{ExpiryAnchor, LapseDeadline};
 /// use std::time::Duration;
 ///
-/// let deadline = LapseDeadline::new(ExpiryAnchor::BeforeClose(Duration::from_secs(60 * 60)));
+/// let deadline = LapseDeadline::new(ExpiryAnchor::BeforeClose(Duration::from_secs(60 * 60)))
+///     .expiry_day_only();
 /// ```
 ///
 /// # What the venue does
@@ -302,31 +304,66 @@ impl ExpiryDayCutoff {
 /// [`ExerciseRefusal::PastDeadline`]. An instruction it accepted before stays in force. Every
 /// option is covered, cash-settled or physically settled.
 ///
+/// [`expiry_day_only`](Self::expiry_day_only) also refuses an instruction sent on any date
+/// other than the option's expiry day, with [`ExerciseRefusal::NotExpiryDay`]. The expiry day is
+/// the date the option's expiry instant falls on in the time zone of its session calendar, which
+/// this then needs whatever the anchor (see [`ExpiryAnchor`]'s "The expiry instant"). Both are
+/// judged before the position, so an account holding none in the option is refused for the date
+/// or the deadline first, as Alpaca refuses one.
+///
 /// Without one, the venue takes a lapse instruction until the option expires.
 ///
 /// # Known limitations
 /// - **One anchor for every option**, as for [`ExpiryDayCutoff`].
-/// - **No window start.** A venue that takes such instructions only on the expiry day itself
-///   cannot be modelled; this venue takes one at any time before the deadline.
+/// - **The expiry is refused as expired.** From the option's expiry instant on, the venue
+///   refuses an instruction with [`ExerciseRefusal::Expired`], on its expiry day or after it. A
+///   venue that takes instructions only on the expiry day may answer a later day as not the
+///   expiry day instead.
 ///
 /// [`MockExecutionConfig::lapse_deadline`]:
 ///     crate::client::mock::MockExecutionConfig::lapse_deadline
 /// [`ApiError::ExerciseRefused`]: crate::error::ApiError::ExerciseRefused
 /// [`ExerciseRefusal::PastDeadline`]: crate::error::ExerciseRefusal::PastDeadline
+/// [`ExerciseRefusal::NotExpiryDay`]: crate::error::ExerciseRefusal::NotExpiryDay
+/// [`ExerciseRefusal::Expired`]: crate::error::ExerciseRefusal::Expired
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct LapseDeadline {
     anchor: ExpiryAnchor,
+    #[serde(default, skip_serializing_if = "is_false")]
+    expiry_day_only: bool,
+}
+
+/// Whether `value` is `false`: a flag left out of a serialised form when unset, so the form reads
+/// as one written before the flag existed.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl LapseDeadline {
-    /// Refuses lapse instructions from the instant `anchor` places for each option.
+    /// Refuses lapse instructions from the instant `anchor` places for each option, and takes
+    /// them on any date before it.
     pub const fn new(anchor: ExpiryAnchor) -> Self {
-        Self { anchor }
+        Self {
+            anchor,
+            expiry_day_only: false,
+        }
+    }
+
+    /// Takes lapse instructions only on each option's expiry day, until the deadline.
+    #[must_use]
+    pub const fn expiry_day_only(mut self) -> Self {
+        self.expiry_day_only = true;
+        self
     }
 
     /// When the venue starts refusing lapse instructions for each option.
     pub const fn anchor(&self) -> ExpiryAnchor {
         self.anchor
+    }
+
+    /// Whether the venue takes lapse instructions only on each option's expiry day.
+    pub const fn is_expiry_day_only(&self) -> bool {
+        self.expiry_day_only
     }
 }
 
@@ -531,6 +568,10 @@ mod tests {
         ) -> Result<Option<DateTime<Utc>>, CalendarError> {
             Err(CalendarError::unavailable("down"))
         }
+
+        fn zone(&self) -> rustrade_instrument::calendar::Tz {
+            chrono_tz::UTC
+        }
     }
 
     #[test]
@@ -564,5 +605,27 @@ mod tests {
                 Ok(DateTime::<Utc>::MIN_UTC)
             );
         }
+    }
+
+    /// A deadline not held to the expiry day writes no field for it, so its form reads as one
+    /// written before the field existed, and such a form reads back as one not held to it.
+    #[test]
+    fn a_lapse_deadline_serialises_the_expiry_day_only_when_held_to_it() {
+        let deadline = LapseDeadline::new(ExpiryAnchor::BeforeClose(HOUR));
+        let json = serde_json::to_value(deadline).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"anchor": {"before_close": {"secs": 3600, "nanos": 0}}})
+        );
+        assert_eq!(
+            serde_json::from_value::<LapseDeadline>(json).unwrap(),
+            deadline
+        );
+
+        let held = deadline.expiry_day_only();
+        assert!(held.is_expiry_day_only() && !deadline.is_expiry_day_only());
+        let json = serde_json::to_value(held).unwrap();
+        assert_eq!(json["expiry_day_only"], serde_json::json!(true));
+        assert_eq!(serde_json::from_value::<LapseDeadline>(json).unwrap(), held);
     }
 }

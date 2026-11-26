@@ -15,9 +15,11 @@ pub use chrono_tz::Tz;
 
 /// When a market's trading sessions close.
 ///
-/// Instants go in and come out in UTC. The time zone, the trading days and the close times are
-/// the implementation's own business, so a fixed daily rule ([`DailyClose`]) and an exchange
-/// calendar with holidays and early closes answer through the same methods.
+/// Instants go in and come out in UTC. The trading days and the close times are the
+/// implementation's own business, so a fixed daily rule ([`DailyClose`]) and an exchange calendar
+/// with holidays and early closes answer through the same methods. The time zone is given by
+/// [`zone`](Self::zone), for a rule set by local date or time of day, such as one that holds only
+/// on an option's expiry day.
 ///
 /// # Contract
 /// [`next_close_after`](Self::next_close_after) answers a close **strictly after** `after`: at
@@ -45,6 +47,10 @@ pub trait SessionCalendar: Debug + Send + Sync {
         &self,
         instant: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, CalendarError>;
+
+    /// The time zone the calendar dates its sessions in: the zone whose local date
+    /// [`session_close_on`](Self::session_close_on) reads an instant on.
+    fn zone(&self) -> Tz;
 }
 
 /// Why a [`SessionCalendar`] could not answer.
@@ -377,6 +383,10 @@ impl SessionCalendar for DailyClose {
                 instant_at_local(&self.zone, date, time).ok_or(CalendarError::out_of_range(instant))
             })
             .transpose()
+    }
+
+    fn zone(&self) -> Tz {
+        self.zone
     }
 }
 
@@ -916,6 +926,14 @@ mod tests {
         assert_eq!(
             close.session_close_on(utc(2026, 7, 3, 12, 0, 0)),
             Ok(Some(utc(2026, 7, 3, 17, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn the_calendar_gives_its_zone() {
+        assert_eq!(
+            SessionCalendar::zone(&new_york_close()),
+            chrono_tz::America::New_York
         );
     }
 }
