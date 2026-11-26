@@ -392,3 +392,23 @@ fn a_snapshot_instructing_no_long_option_is_refused() {
         Some(VenueRestoreError::LapseWithoutLong(spy_name()))
     );
 }
+
+/// An instruction for an option the snapshot holds short is refused: the instruction needs a
+/// long in that very option.
+#[test]
+fn a_snapshot_instructing_a_short_option_is_refused() {
+    let mut venue = holding_calls("1", |_| {});
+    instruct_lapse(&mut venue);
+    let mut snapshot = snapshot_json(&venue);
+    let positions = snapshot["positions"].as_array_mut().unwrap();
+    let held = positions
+        .iter_mut()
+        .find(|entry| entry[0] == serde_json::json!(option_name()))
+        .expect("the snapshot holds the option");
+    held[1]["quantity"] = serde_json::json!("-1");
+
+    assert_eq!(
+        restore(snapshot).err(),
+        Some(VenueRestoreError::LapseWithoutLong(option_name()))
+    );
+}
