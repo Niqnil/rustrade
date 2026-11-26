@@ -757,4 +757,49 @@ mod tests {
             Err(MarketStreamOptionsError::InitTimeoutZero)
         );
     }
+
+    mod through_init_market_stream {
+        use super::*;
+        use crate::test_support::stalling_bybit_trades;
+        use rustrade_integration::protocol::websocket::DEFAULT_CONNECT_TIMEOUT;
+
+        #[tokio::test(start_paused = true)]
+        async fn an_init_timeout_shorter_than_the_connect_abandons_the_first_attempt() {
+            let timeout = Duration::from_secs(1);
+            let options = MarketStreamOptions::default()
+                .with_init_timeout(timeout)
+                .unwrap();
+            let started = tokio::time::Instant::now();
+
+            let result =
+                init_market_stream(options, Default::default(), vec![stalling_bybit_trades()])
+                    .await;
+
+            assert!(
+                matches!(result, Err(DataError::InitTimeout { timeout: t }) if t == timeout),
+                "{:?}",
+                result.err()
+            );
+            assert_eq!(started.elapsed(), timeout);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn with_the_default_init_timeout_a_stalled_connect_reports_its_own_timeout() {
+            let result = init_market_stream(
+                MarketStreamOptions::default(),
+                Default::default(),
+                vec![stalling_bybit_trades()],
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(DataError::ConnectTimeout { timeout }) if timeout == DEFAULT_CONNECT_TIMEOUT
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+    }
 }

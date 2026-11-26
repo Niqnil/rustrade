@@ -169,6 +169,10 @@ use {hex as _, sha2 as _, tempfile as _};
 #[cfg(test)]
 use tokio_tungstenite as _;
 
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Test-only helpers: a failed local setup should panic the test.
+pub(crate) mod test_support;
+
 use crate::{
     error::DataError,
     event::MarketEvent,

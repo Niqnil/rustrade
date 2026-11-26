@@ -350,6 +350,28 @@ mod tests {
             );
         }
 
+        #[tokio::test(start_paused = true)]
+        async fn connect_gives_up_after_the_default_connect_timeout() {
+            let url = endpoint(|stream| async move {
+                let _held = stream;
+                std::future::pending::<()>().await;
+            })
+            .await;
+            let started = tokio::time::Instant::now();
+
+            let result = connect(url).await;
+
+            assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+            assert!(
+                matches!(
+                    result,
+                    Err(SocketError::ConnectTimeout { timeout }) if timeout == DEFAULT_CONNECT_TIMEOUT
+                ),
+                "{result:?}"
+            );
+            assert_eq!(started.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+        }
+
         #[tokio::test]
         async fn a_completed_upgrade_returns_the_connection() {
             let url = endpoint(|stream| async move {

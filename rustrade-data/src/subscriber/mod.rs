@@ -154,3 +154,29 @@ impl Subscriber for WebSocketSubscriber {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        exchange::bybit::Bybit,
+        test_support::{StallingServer, stalling_bybit_trades},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_fails_after_the_connectors_connect_timeout() {
+        let started = tokio::time::Instant::now();
+
+        let result = WebSocketSubscriber
+            .subscribe(&[stalling_bybit_trades()])
+            .await;
+
+        let timeout = <Bybit<StallingServer> as Connector>::connect_timeout();
+        assert_eq!(timeout, std::time::Duration::from_secs(10));
+        assert!(
+            matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
+    }
+}

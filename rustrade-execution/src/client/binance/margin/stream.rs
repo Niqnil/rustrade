@@ -2970,6 +2970,30 @@ mod tests {
         (listener, url)
     }
 
+    /// A peer that accepts the TCP connection and never answers the upgrade is given up on after
+    /// the stream's connect timeout, with an error saying so.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_times_out_after_the_connect_timeout() {
+        let (listener, url) = listen().await;
+        let held = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _tcp = tcp;
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+
+        let Err(error) = connect_and_subscribe(&url, "key-1").await else {
+            panic!("a connection that never completes was established")
+        };
+
+        assert_eq!(
+            error.to_string(),
+            format!("BinanceMargin stream connect timed out after {CONNECT_TIMEOUT_SECS}s")
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(CONNECT_TIMEOUT_SECS));
+        held.abort();
+    }
+
     /// How a stand-in connection behaves once it has sent its frames.
     #[derive(Clone, Copy)]
     enum After {
