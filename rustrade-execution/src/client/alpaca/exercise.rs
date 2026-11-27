@@ -27,6 +27,16 @@ const REFUSED: i64 = 40_310_000;
 /// lower-cased: "no available position for the specified contract".
 const NO_POSITION: &str = "no available position";
 
+/// Alpaca's generic code for something it did not find. On the do-not-exercise endpoint, its paper
+/// API, observed in November 2026, sends it with a 404 for a contract the account holds no long
+/// position in, on the expiration day before the deadline (see [`POSITION_NOT_FOUND`]).
+const NOT_FOUND: i64 = 40_410_000;
+
+/// How Alpaca's paper API words a 404 [`NOT_FOUND`] for a contract the account holds no long
+/// position in, lower-cased: "long position not found: `<symbol>`". Matched in full, so a "not
+/// found" that names anything else, such as a short position, is not read as no position.
+const POSITION_NOT_FOUND: &str = "long position not found";
+
 /// Alpaca's code for a symbol it does not know.
 const INVALID_SYMBOL: i64 = 42_210_000;
 
@@ -53,6 +63,14 @@ impl OptionExerciseClient for AlpacaClient {
     ///   [`ExerciseRefusal::PastDeadline`]. It judges the day before it looks at the position, so
     ///   [`ExerciseRefusal::NoPosition`] comes only on the expiration day. This client checks
     ///   neither rule itself: it reports what Alpaca answers.
+    /// - **Without a long position.** Alpaca documents a 403 with code `40310000`, "no available
+    ///   position for the specified contract". Its paper API, observed in November 2026, answers a
+    ///   contract the account does not hold with a 404 with code `40410000`, "long position not
+    ///   found". Both are [`ExerciseRefusal::NoPosition`].
+    /// - **Short the contract: not observed.** This client reports
+    ///   [`ExerciseRefusal::ShortPosition`] only for the documented 403 with code `40310001`. If
+    ///   Alpaca instead answers an account short the contract with the same 404 "long position not
+    ///   found", that is reported as `NoPosition`.
     /// - **Not documented:** what a sale or a purchase of the contract after the instruction does
     ///   to it; whether it keeps Alpaca from selling an expiring long that the account could not
     ///   afford to exercise, as Alpaca otherwise may on the expiration day; and what Alpaca
@@ -66,6 +84,8 @@ impl OptionExerciseClient for AlpacaClient {
     ///   - [`ExerciseRefusal::QuantityUnsupported`], without sending anything, for
     ///     [`ExerciseQuantity::Contracts`];
     ///   - [`ExerciseRefusal::ShortPosition`] for a 403 with code `40310001`;
+    ///   - [`ExerciseRefusal::NoPosition`] for a 404 with Alpaca's code `40410000` whose message
+    ///     says no long position was found;
     ///   - for a 403 with Alpaca's generic code `40310000`, by its message, as nothing else tells
     ///     these apart: [`ExerciseRefusal::NotExpiryDay`], dated from the OCC symbol, when it
     ///     says the instruction is accepted only on the expiration day;
@@ -181,6 +201,9 @@ fn exercise_error(
     match (status.as_u16(), code) {
         (403, Some(SHORT_POSITION)) => refused(ExerciseRefusal::ShortPosition),
         (403, Some(REFUSED)) => refused(generic_refusal(expiry_day, code, message)),
+        (404, Some(NOT_FOUND)) if message.to_ascii_lowercase().contains(POSITION_NOT_FOUND) => {
+            refused(ExerciseRefusal::NoPosition)
+        }
         (422, Some(INVALID_SYMBOL)) => UnindexedClientError::Api(ApiError::InstrumentInvalid(
             instrument.clone(),
             with_alpaca_code(code, message),
@@ -662,6 +685,63 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(requests(&server).await.len(), 1, "not retried");
+    }
+
+    #[test]
+    fn a_404_for_a_missing_long_position_is_no_position() {
+        use reqwest::StatusCode;
+        let instrument = InstrumentNameExchange::new(CONTRACT);
+        let map = |status: u16, code: Option<i64>, message: &str| {
+            exercise_error(
+                &instrument,
+                NaiveDate::from_ymd_opt(2026, 12, 18).unwrap(),
+                StatusCode::from_u16(status).unwrap(),
+                code,
+                message,
+            )
+        };
+        let refused = |refusal| UnindexedClientError::Api(ApiError::ExerciseRefused(refusal));
+
+        assert_eq!(
+            map(
+                404,
+                Some(40410000),
+                "long position not found: SPY261218C00600000"
+            ),
+            refused(ExerciseRefusal::NoPosition),
+            "the paper API's answer for a contract not held"
+        );
+        assert_eq!(
+            map(404, Some(40410000), "Long Position Not Found"),
+            refused(ExerciseRefusal::NoPosition),
+            "the message is matched ignoring case"
+        );
+        assert_eq!(
+            map(404, Some(40410000), "asset not found"),
+            refused(ExerciseRefusal::Other("40410000 asset not found".into())),
+            "a 404 that names no position is not a missing position"
+        );
+        assert_eq!(
+            map(404, Some(40410000), "short position not found"),
+            refused(ExerciseRefusal::Other(
+                "40410000 short position not found".into()
+            )),
+            "only a missing long position, as observed, reads as no position"
+        );
+        assert_eq!(
+            map(404, Some(40410001), "long position not found"),
+            refused(ExerciseRefusal::Other(
+                "40410001 long position not found".into()
+            )),
+            "only the generic not-found code reads as no position"
+        );
+        assert_eq!(
+            map(403, Some(40410000), "long position not found"),
+            refused(ExerciseRefusal::Other(
+                "40410000 long position not found".into()
+            )),
+            "only with a 404"
+        );
     }
 
     #[test]

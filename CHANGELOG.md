@@ -68,8 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes the instruction only on the contract's expiration day, until 5:15 PM New York time, and
   judges that before the position. Its refusals, all but one under the same generic code, are
   read by their message: `NotExpiryDay` (dated from the symbol), `PastDeadline` (the stated time
-  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code. Any
-  other is `Other` with Alpaca's code and message. A request whose outcome is unknown, such as
+  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code.
+  `NoPosition` is also read from the 404 "long position not found" that the paper API sends for a
+  contract the account does not hold, in place of the documented 403. Any other is `Other` with
+  Alpaca's code and message. A request whose outcome is unknown, such as
   one that timed out, is reported as a connectivity error and not sent again.
 
 - **American option pricing benchmark** (`rustrade-pricing`, benches only). The new `american`
