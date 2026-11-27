@@ -493,14 +493,13 @@ pub enum VenueRegime {
 /// its session calendar (a venue without one for the option panics when its clock first moves,
 /// see [`next_deadline`](Self::next_deadline)), or an offset before its expiry itself. The check
 /// is a boundary like the expiry and included in [`next_deadline`](Self::next_deadline), and first
-/// among the boundaries at its instant. A long in the money that the account cannot afford to exercise (the
-/// strike's cash for a call, free shares for a put), and that is not instructed to lapse, is sold,
-/// after the orders working on it are cancelled, as a market sell fills, less a haircut, reported
-/// as `[order.., balance.., trade]` with a [`TradeOrigin::Liquidation`] trade. What is not sold
-/// settles at expiry as above. See [`ExpirySellOut`] for what is affordable, how much is sold, and
-/// what is not modelled. A check
-/// at or before the instant the clock first moves is not run: the venue then holds no market to
-/// sell at.
+/// among the boundaries at its instant. A long in the money that the account cannot afford to
+/// exercise (the strike's cash for a call, free shares for a put), and that is not instructed to
+/// lapse, is sold, after the orders working on it are cancelled, as a market sell fills, less a
+/// haircut, reported as `[order.., balance.., trade]` with a [`TradeOrigin::Liquidation`] trade.
+/// What is not sold settles at expiry as above. See [`ExpirySellOut`] for what is affordable, how
+/// much is sold, and what is not modelled. A check at or before the instant the clock first moves
+/// is not run: the venue then holds no market to sell at.
 ///
 /// ## Lapse instructions
 /// [`instruct_exercise`](Self::instruct_exercise) takes a

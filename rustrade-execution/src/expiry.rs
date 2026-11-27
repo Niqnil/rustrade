@@ -486,14 +486,16 @@ impl ExpiryAnchor {
         match *self {
             Self::BeforeExpiry(offset) => Ok(before(expiry, offset)),
             Self::BeforeClose(offset) => {
-                let close = session_close(expiry, calendar)?.0;
+                let close = session_close(expiry, required(calendar)?)?;
                 if close > expiry {
                     return Err(ExpiryAnchorError::CloseAfterExpiry { close, expiry });
                 }
                 Ok(before(close, offset))
             }
             Self::AtLocalTime { time, early_close } => {
-                let calendar = session_close(expiry, calendar)?.1;
+                let calendar = required(calendar)?;
+                // The close itself is not needed, only that the date has a session.
+                session_close(expiry, calendar)?;
                 let time = match early_close {
                     Some(early_close) if calendar.closes_early_on(expiry)? => early_close,
                     _ => time,
@@ -511,16 +513,22 @@ impl ExpiryAnchor {
     }
 }
 
-/// The close of the session on the date `expiry` falls on, from `calendar`, with the calendar.
+/// The session calendar an anchor needs, or [`ExpiryAnchorError::NoCalendar`].
+fn required(
+    calendar: Option<&dyn SessionCalendar>,
+) -> Result<&dyn SessionCalendar, ExpiryAnchorError> {
+    calendar.ok_or(ExpiryAnchorError::NoCalendar)
+}
+
+/// The close of the session on the date `expiry` falls on, or
+/// [`ExpiryAnchorError::NoSession`] if that date has none.
 fn session_close(
     expiry: DateTime<Utc>,
-    calendar: Option<&dyn SessionCalendar>,
-) -> Result<(DateTime<Utc>, &dyn SessionCalendar), ExpiryAnchorError> {
-    let calendar = calendar.ok_or(ExpiryAnchorError::NoCalendar)?;
-    let close = calendar
+    calendar: &dyn SessionCalendar,
+) -> Result<DateTime<Utc>, ExpiryAnchorError> {
+    calendar
         .session_close_on(expiry)?
-        .ok_or(ExpiryAnchorError::NoSession { expiry })?;
-    Ok((close, calendar))
+        .ok_or(ExpiryAnchorError::NoSession { expiry })
 }
 
 /// `offset` before `reference`, clamped to the earliest instant a [`DateTime`] holds.

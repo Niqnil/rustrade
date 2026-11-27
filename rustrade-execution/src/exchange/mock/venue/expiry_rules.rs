@@ -27,8 +27,15 @@ use rustrade_instrument::instrument::{
 /// it could not for want of a session calendar, each by name.
 #[derive(Default)]
 struct Placement {
-    placed: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
+    placed: Vec<Placed>,
     unplaced: Vec<InstrumentNameExchange>,
+}
+
+/// One option a rule's anchor placed: the instant, and the option's name and expiry.
+struct Placed {
+    at: DateTime<Utc>,
+    name: InstrumentNameExchange,
+    expiry: DateTime<Utc>,
 }
 
 impl SimulatedVenue {
@@ -78,12 +85,16 @@ impl SimulatedVenue {
                     .map(|name| (ExpiryRule::LapseDeadline, name)),
             )
             .collect();
-        self.sell_outs = sell_outs.placed;
+        self.sell_outs = sell_outs
+            .placed
+            .into_iter()
+            .map(|placed| (placed.at, placed.name))
+            .collect();
         self.sell_outs.sort_unstable();
         self.cutoffs = cutoffs
             .placed
             .into_iter()
-            .map(|(cutoff, name)| (name, cutoff))
+            .map(|placed| (placed.name, placed.at))
             .collect();
         self.lapse_deadlines = lapse_windows;
         self.refresh_next_sell_out();
@@ -107,29 +118,20 @@ impl SimulatedVenue {
             .is_some_and(|deadline| deadline.is_expiry_day_only());
         let mut unplaced = deadlines.unplaced;
         let mut windows = FnvHashMap::default();
-        for (deadline, name) in deadlines.placed {
+        for Placed { at, name, expiry } in deadlines.placed {
             let expiry_day = if expiry_day_only {
-                let expiry =
-                    self.instruments
-                        .get(&name)
-                        .and_then(|instrument| match &instrument.kind {
-                            InstrumentKind::Option(contract) => Some(contract.expiry),
-                            _ => None,
-                        });
-                match (expiry, self.session_calendar_of(&name)) {
-                    (Some(expiry), Some(calendar)) => Some(ExpiryDay::of(expiry, calendar.zone())),
-                    _ => {
-                        unplaced.push(name);
-                        continue;
-                    }
-                }
+                let Some(calendar) = self.session_calendar_of(&name) else {
+                    unplaced.push(name);
+                    continue;
+                };
+                Some(ExpiryDay::of(expiry, calendar.zone()))
             } else {
                 None
             };
             windows.insert(
                 name,
                 LapseWindow {
-                    deadline,
+                    deadline: at,
                     expiry_day,
                 },
             );
@@ -163,7 +165,11 @@ impl SimulatedVenue {
         for (name, expiry) in options {
             let calendar = self.session_calendar_of(name).map(AsRef::as_ref);
             match anchor.instant(expiry, calendar) {
-                Ok(instant) => placement.placed.push((instant, name.clone())),
+                Ok(at) => placement.placed.push(Placed {
+                    at,
+                    name: name.clone(),
+                    expiry,
+                }),
                 Err(ExpiryAnchorError::NoCalendar) => placement.unplaced.push(name.clone()),
                 Err(source) => {
                     return Err(ExpiryRuleUnplaceable {
@@ -183,8 +189,8 @@ impl SimulatedVenue {
         assert!(
             self.expiry_rules_unplaced.is_empty(),
             "SimulatedVenue has expiry-day rules anchored to the session calendar or held to the \
-             expiry day, but these options have no session calendar to place them, by rule: {}. Configure \
-             MockExecutionConfig::session_close, a session_close_overrides entry, or \
+             expiry day, but these options have no session calendar to place them, by rule: {}. \
+             Configure MockExecutionConfig::session_close, a session_close_overrides entry, or \
              SimulatedVenue::with_session_calendar",
             self.expiry_rules_unplaced
                 .iter()

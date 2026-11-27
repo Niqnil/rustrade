@@ -675,6 +675,54 @@ fn a_restored_venue_keeps_the_instruction() {
     assert_lapsed(&restored.advance_time(expiry()), "1");
 }
 
+/// A venue restored from `venue`'s snapshot under [`evening_venue`]'s config, with
+/// `session_close` replaced by `calendar`.
+fn restore_evening(
+    venue: &SimulatedVenue,
+    calendar: Option<SessionCalendarConfig>,
+) -> SimulatedVenue {
+    let mut config = super::options::config("10000", FeeModelConfig::default());
+    config.session_close = calendar;
+    config.lapse_deadline = Some(expiry_day_window());
+    SimulatedVenue::from_snapshot(
+        &config,
+        evening_instruments(),
+        serde_json::from_value(snapshot_json(venue)).unwrap(),
+    )
+    .expect("its own snapshot restores")
+}
+
+/// The window is placed again on restore, from the config: nothing of it is in the snapshot.
+#[test]
+fn a_restored_venue_keeps_the_window() {
+    let venue = evening_venue(|_| {});
+
+    let mut restored = restore_evening(&venue, Some(new_york_close()));
+    feed(&mut restored, "100", "1.5", time(2));
+
+    assert_eq!(
+        refusal(&mut restored, lapse()),
+        ExerciseRefusal::NotExpiryDay {
+            expiry_day: thursday()
+        }
+    );
+}
+
+/// Restored with no calendar to date the day, the window is left unplaced: an instruction panics
+/// rather than judge it on no day, as on a venue built without one.
+#[test]
+#[should_panic(
+    expected = "lapse deadline is anchored to the session calendar or held to the expiry day, \
+                but the option SPY_C100 has no session calendar"
+)]
+fn a_venue_restored_without_a_calendar_panics_on_an_instruction() {
+    let venue = evening_venue(|_| {});
+
+    let mut restored = restore_evening(&venue, None);
+
+    let _ = restored.instruct_exercise(&option_name(), lapse());
+}
+
 /// A venue holding no instruction writes no field for it, so its snapshot reads as one written
 /// before the field existed; and such a snapshot restores with no instruction.
 #[test]

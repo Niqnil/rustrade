@@ -25,6 +25,9 @@ pub use chrono_tz::Tz;
 /// [`next_close_after`](Self::next_close_after) answers a close **strictly after** `after`: at
 /// exactly a close, it answers the next session's. A caller relies on this to step from one
 /// close to the next, and may treat an answer not after `after` as a broken calendar.
+///
+/// [`closes_early_on`](Self::closes_early_on) answers `true` only for a date that has a session:
+/// one [`session_close_on`](Self::session_close_on) answers a close for.
 pub trait SessionCalendar: Debug + Send + Sync {
     /// The first session close strictly after `after`.
     ///
