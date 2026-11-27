@@ -1476,6 +1476,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Alpaca clients no longer follow HTTP redirects** (`rustrade-execution`, `alpaca`;
+  `rustrade-data`). `AlpacaClient` and `AlpacaRestClient` send the API key and secret as custom
+  headers, which reqwest's default policy carries across a redirect to another host, and a 301 or
+  302 turned an order `POST` into a `GET`. A 3xx is now returned unfollowed: `AlpacaClient`
+  reports it as `ApiError::RequestRejected`, naming the status and where it pointed (an order so
+  answered was not placed), and `AlpacaRestClient` as `AlpacaRestError::Api` with the 3xx status.
+  `AlphaVantageClient` no longer follows redirects either: the `Referer` a followed redirect sends
+  holds the request's URL, whose query carries the API key. It reports a 3xx as
+  `AlphaVantageError::Api`.
+
 - **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
   an exchange with application-level pings, an initialisation that failed after subscribing left
   its ping task and the task writing to the socket running, and the connection open, until the

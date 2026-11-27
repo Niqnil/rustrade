@@ -213,6 +213,34 @@ async fn notices_and_error_statuses_keep_their_meaning_without_the_key() {
     assert!(down.is_transient());
 }
 
+/// A redirect is not followed: a followed one would carry a `Referer` holding the request's URL,
+/// API key included, to the host it names. The 3xx is reported as `Api` and is not transient.
+#[tokio::test]
+async fn a_redirect_is_reported_and_not_followed() {
+    let target = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&target)
+        .await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/query"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/query", target.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let error = client(&server).earnings_history("XYZ").await.unwrap_err();
+
+    assert!(
+        matches!(&error, AlphaVantageError::Api { status: 302, .. }),
+        "{error:?}"
+    );
+    assert!(!error.is_transient());
+    assert!(target.received_requests().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_key_cut_by_the_message_cap_leaves_no_part_behind() {
     // The key starts 505 bytes in, so a cap at 512 bytes would cut it.
