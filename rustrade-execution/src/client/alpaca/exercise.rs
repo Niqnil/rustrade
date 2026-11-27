@@ -1,8 +1,9 @@
 //! Do-not-exercise instructions: [`OptionExerciseClient`] for [`AlpacaClient`].
 
 use super::{
-    AlpacaApiError, AlpacaClient, SendFailure, connectivity_err, instrument_invalid, occ_expiry,
-    parse_api_error, rest_url, send_rate_limited, transport_error, upper_symbol, with_alpaca_code,
+    AlpacaApiError, AlpacaClient, NOT_FOUND, SendFailure, connectivity_err, instrument_invalid,
+    occ_expiry, parse_api_error, rest_url, send_rate_limited, transport_error, upper_symbol,
+    with_alpaca_code,
 };
 use crate::{
     client::OptionExerciseClient,
@@ -27,13 +28,9 @@ const REFUSED: i64 = 40_310_000;
 /// lower-cased: "no available position for the specified contract".
 const NO_POSITION: &str = "no available position";
 
-/// Alpaca's generic code for something it did not find. On the do-not-exercise endpoint, its paper
-/// API, observed in November 2026, sends it with a 404 for a contract the account holds no long
-/// position in, on the expiration day before the deadline (see [`POSITION_NOT_FOUND`]).
-const NOT_FOUND: i64 = 40_410_000;
-
 /// How Alpaca's paper API words a 404 [`NOT_FOUND`] for a contract the account holds no long
-/// position in, lower-cased: "long position not found: `<symbol>`". Matched in full, so a "not
+/// position in, on the expiration day before the deadline (observed in November 2026),
+/// lower-cased: "long position not found: `<symbol>`". Matched in full, so a "not
 /// found" that names anything else, such as a short position, is not read as no position.
 const POSITION_NOT_FOUND: &str = "long position not found";
 
