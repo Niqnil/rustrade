@@ -79,6 +79,8 @@ impl OptionExerciseClient for AlpacaClient {
     ///   host.
     /// - [`ApiError::RateLimit`] once the 429 retries are exhausted. A 429 means Alpaca did not
     ///   take the request, so it is retried, as every request of this client is.
+    /// - [`ApiError::RequestRejected`] for a redirect, which is not followed (see the client's
+    ///   "Redirects"). The instruction was not taken.
     /// - [`ClientError::Connectivity`] for a request that failed in transport, ran past
     ///   [`AlpacaConfig::request_timeout`], or met a 5xx. Alpaca may have taken the instruction;
     ///   it is not sent again.
@@ -126,9 +128,7 @@ impl OptionExerciseClient for AlpacaClient {
                 "Alpaca do-not-exercise request failed",
                 &error,
             )),
-            SendFailure::RateLimited(wait) => {
-                UnindexedClientError::Api(ApiError::rate_limited(wait))
-            }
+            SendFailure::Refused(error) => UnindexedClientError::Api(error),
         })?;
 
         let status = response.status();
@@ -805,5 +805,37 @@ mod tests {
             ),
             "a 5xx leaves the outcome unknown"
         );
+    }
+
+    /// A redirect is refused, not followed, so the key and secret never reach the host it names.
+    #[tokio::test]
+    async fn a_redirect_is_refused_and_not_followed() {
+        let server = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(dne_path(CONTRACT)))
+            .respond_with(ResponseTemplate::new(308).insert_header(
+                "location",
+                format!("{}{}", target.uri(), dne_path(CONTRACT)),
+            ))
+            .mount(&server)
+            .await;
+
+        let result = client_for(&server)
+            .instruct_exercise(&InstrumentNameExchange::new(CONTRACT), LAPSE)
+            .await;
+
+        assert!(
+            matches!(api_error(result), ApiError::RequestRejected(ref message) if message.contains("308")),
+        );
+        assert!(
+            requests(&target).await.is_empty(),
+            "the redirect was followed"
+        );
+        assert_eq!(requests(&server).await.len(), 1);
     }
 }

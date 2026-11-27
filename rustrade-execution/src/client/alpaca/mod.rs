@@ -1148,6 +1148,14 @@ struct AlpacaOrderWs<'a> {
 /// minute without one, and is retried. Once the retries are exhausted the request fails with
 /// [`ApiError::RateLimit`], carrying that wait, and later requests still wait for it.
 ///
+/// # Redirects
+/// The client does not follow HTTP redirects. Its key and secret travel in custom headers, which
+/// a followed redirect would hand to whatever host it names, and a 301 or 302 would turn an order
+/// `POST` into a `GET`. A 3xx answer fails the request with [`ApiError::RequestRejected`], naming
+/// the status and the target URL without its query; an order so answered was not placed. Alpaca's
+/// API is not expected to redirect, so a 3xx most likely means a wrong base URL (for example
+/// `http://` rather than `https://`) or something between the client and Alpaca.
+///
 /// # Instrument lookups
 /// Names match Alpaca's symbols ignoring case, and what a read finds is reported under Alpaca's
 /// symbol. Before [`account_snapshot`](ExecutionClient::account_snapshot),
@@ -1243,7 +1251,8 @@ impl AlpacaClient {
         TimeInForceKind::ImmediateOrCancel,
     ];
 
-    /// Build a `reqwest::Client` with Alpaca auth headers pre-set.
+    /// Build a `reqwest::Client` with Alpaca auth headers pre-set, which does not follow
+    /// redirects.
     ///
     /// # Panics
     ///
@@ -1268,6 +1277,12 @@ impl AlpacaClient {
             .default_headers(headers)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(config.request_timeout)
+            // reqwest's default follows up to 10 redirects, and on one to another host strips
+            // only the standard credential headers (`Authorization`, `Cookie`, ...): the key and
+            // secret above are custom headers, so they would go to whatever host Alpaca's answer
+            // named. A 301 or 302 would also turn an order `POST` into a `GET`. A 3xx is
+            // therefore returned unfollowed, and `send_rate_limited` refuses it.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build reqwest client for Alpaca")
     }
@@ -1453,13 +1468,18 @@ enum SendFailure {
     /// The request failed in transport, or ran past [`AlpacaConfig::request_timeout`]. The
     /// caller names it with [`transport_error`].
     Transport(reqwest::Error),
-    /// Alpaca answered every attempt with a 429, the last with this wait where its headers gave
-    /// one.
-    RateLimited(Option<Duration>),
+    /// The request was refused before its answer could be read: a 429 on every attempt
+    /// ([`ApiError::RateLimit`], with the last one's wait where its headers gave one), or a
+    /// redirect, which is not followed ([`ApiError::RequestRejected`]; see [`redirect_refusal`]).
+    Refused(UnindexedApiError),
 }
 
 /// Sends a request, waiting out a rate-limit pause first and retrying a 429, and returns the first
-/// response that is not a 429, its body unread.
+/// response that is not a 429 or a redirect, its body unread.
+///
+/// A redirect (3xx) is refused, not followed, with [`ApiError::RequestRejected`] from
+/// [`redirect_refusal`]: the client is built with redirects off, see
+/// [`AlpacaClient::build_http`].
 ///
 /// The `build_request` closure is called on every attempt so the caller doesn't
 /// need a clone of `RequestBuilder` (which may not be cloneable with streaming bodies).
@@ -1487,6 +1507,9 @@ async fn send_rate_limited(
 
         if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
             observe_rate_limit_remaining(rate_limiter, response.headers());
+            if response.status().is_redirection() {
+                return Err(SendFailure::Refused(redirect_refusal(&response)));
+            }
             return Ok(response);
         }
 
@@ -1509,9 +1532,42 @@ async fn send_rate_limited(
             max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
             "Alpaca rate-limit retries exhausted"
         );
-        return Err(SendFailure::RateLimited(reset_delay));
+        return Err(SendFailure::Refused(ApiError::rate_limited(reset_delay)));
     }
     unreachable!("Alpaca rate-limit retry loop exited without returning")
+}
+
+/// The refusal of a redirect `response`: [`ApiError::RequestRejected`] naming its status and the
+/// URL its `Location` header points to, if it has one that resolves.
+///
+/// The target is shown without its query, fragment or user info, which can carry a token. A
+/// redirect answers in place of the request, so the request was not carried out: an order so
+/// answered was not placed, and a retry meets the same redirect.
+fn redirect_refusal(response: &reqwest::Response) -> UnindexedApiError {
+    let target = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .and_then(|location| response.url().join(location).ok())
+        .map(|mut target| {
+            target.set_query(None);
+            target.set_fragment(None);
+            // Both fail only for a URL that cannot hold user info, which then has none.
+            let _ = target.set_username("");
+            let _ = target.set_password(None);
+            target
+        });
+    let status = response.status();
+    ApiError::RequestRejected(match target {
+        Some(target) => format!(
+            "Alpaca answered {status}, redirecting to {target}; redirects are not followed, so check \
+             the base URL"
+        ),
+        None => format!(
+            "Alpaca answered {status} without a usable Location; redirects are not followed, so \
+             check the base URL"
+        ),
+    })
 }
 
 /// Execute a REST request with rate-limit awareness and retry, and decode its body: see
@@ -1520,8 +1576,9 @@ async fn send_rate_limited(
 /// # Errors
 ///
 /// - [`UnindexedClientError::Connectivity`]: the request or its body read failed, or a 5xx.
-/// - [`UnindexedClientError::Api`]: a 4xx, classified by [`parse_api_error`], or 429 retries
-///   exhausted ([`ApiError::RateLimit`], with Alpaca's wait when its headers give one).
+/// - [`UnindexedClientError::Api`]: a 4xx, classified by [`parse_api_error`], 429 retries
+///   exhausted ([`ApiError::RateLimit`], with Alpaca's wait when its headers give one), or a
+///   redirect ([`ApiError::RequestRejected`], see [`redirect_refusal`]).
 /// - [`UnindexedClientError::Internal`]: a 2xx body that does not decode into `T`, or a 204 on a
 ///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
@@ -1580,9 +1637,7 @@ where
                 "Alpaca REST request failed",
                 &error,
             )),
-            SendFailure::RateLimited(wait) => {
-                UnindexedClientError::Api(ApiError::rate_limited(wait))
-            }
+            SendFailure::Refused(error) => UnindexedClientError::Api(error),
         })?;
     let status = response.status();
 
@@ -1647,7 +1702,7 @@ where
 /// Execute a DELETE request, returning an order error on rejection.
 ///
 /// Handles 204 No Content (success) and other 4xx (API rejection, see [`parse_api_error`]). It
-/// waits and retries as [`send_rate_limited`] says.
+/// waits and retries, and refuses a redirect, as [`send_rate_limited`] says.
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
     build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1659,9 +1714,7 @@ async fn rest_delete_with_retry(
                 "Alpaca cancel request failed",
                 &error,
             )),
-            SendFailure::RateLimited(wait) => {
-                UnindexedOrderError::Rejected(ApiError::rate_limited(wait))
-            }
+            SendFailure::Refused(error) => UnindexedOrderError::Rejected(error),
         })?;
     let status = response.status();
 
@@ -11022,6 +11075,199 @@ mod tests {
                 Err(OrderError::Connectivity(ConnectivityError::Timeout)),
                 "{cancel:?}"
             );
+        }
+
+        /// A mock server that would accept anything, and so records whether a redirect to it was
+        /// followed.
+        async fn redirect_target() -> MockServer {
+            let target = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&target)
+                .await;
+            target
+        }
+
+        /// The message of an [`ApiError::RequestRejected`], or a panic naming what came instead.
+        fn rejected_request<A: std::fmt::Debug, I: std::fmt::Debug>(
+            error: &ApiError<A, I>,
+        ) -> &str {
+            match error {
+                ApiError::RequestRejected(message) => message,
+                other => panic!("expected RequestRejected, got {other:?}"),
+            }
+        }
+
+        /// An order answered with a redirect to another host is refused unplaced, and the client
+        /// does not follow it, so its key and secret never reach that host. A 307 keeps the
+        /// method, so a followed one would re-send the order there.
+        #[tokio::test]
+        async fn an_order_answered_with_a_redirect_is_rejected_and_not_followed() {
+            use crate::client::ExecutionClient;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use crate::order::{OrderKind, TimeInForce};
+            use rustrade_instrument::Side;
+
+            let server = MockServer::start().await;
+            let target = redirect_target().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(307).insert_header(
+                    "location",
+                    format!("{}/v2/orders?token=hush#part", target.uri()),
+                ))
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let order = client_for(&server)
+                .open_order(OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &instrument,
+                        StrategyId::new("test-strategy"),
+                        ClientOrderId::new("test-cid"),
+                    ),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None,
+                        Decimal::new(10, 0),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
+                })
+                .await;
+
+            let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(error))) =
+                &order.state
+            else {
+                panic!("expected OpenFailed(Rejected), got {:?}", order.state);
+            };
+            let message = rejected_request(error);
+            assert!(
+                message.contains("307")
+                    && message.contains(&format!("{}/v2/orders;", target.uri())),
+                "{message}"
+            );
+            assert!(
+                !message.contains("hush") && !message.contains("part"),
+                "{message}"
+            );
+            assert!(
+                target.received_requests().await.unwrap().is_empty(),
+                "the redirect was followed"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        /// A cancel answered with a redirect is refused, and not followed.
+        #[tokio::test]
+        async fn a_cancel_answered_with_a_redirect_is_rejected_and_not_followed() {
+            use crate::client::ExecutionClient;
+            use crate::order::request::{OrderRequestCancel, RequestCancel};
+
+            let server = MockServer::start().await;
+            let target = redirect_target().await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/abc"))
+                .respond_with(
+                    ResponseTemplate::new(301)
+                        .insert_header("location", format!("{}/v2/orders/abc", target.uri())),
+                )
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let cancel = client_for(&server)
+                .cancel_order(OrderRequestCancel {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &instrument,
+                        StrategyId::new("test-strategy"),
+                        ClientOrderId::new("test-cid"),
+                    ),
+                    state: RequestCancel {
+                        id: Some(VenueOrderId::Assigned(OrderId::new("abc"))),
+                    },
+                })
+                .await;
+
+            let Err(OrderError::Rejected(error)) = &cancel.state else {
+                panic!("expected Rejected, got {:?}", cancel.state);
+            };
+            assert!(rejected_request(error).contains("301"), "{error:?}");
+            assert!(target.received_requests().await.unwrap().is_empty());
+        }
+
+        /// Every 3xx is refused, a relative `Location` is resolved against the request's URL, and
+        /// the target is named without its query, fragment or user info.
+        #[tokio::test]
+        async fn a_redirects_target_is_named_without_its_query_fragment_or_user_info() {
+            let server = MockServer::start().await;
+            let cases = [
+                (
+                    300,
+                    Some("/v2/elsewhere?k=v#f".to_owned()),
+                    format!("{}/v2/elsewhere;", server.uri()),
+                ),
+                (
+                    302,
+                    Some("https://user:pw@other.example/x?k=v".to_owned()),
+                    "https://other.example/x;".to_owned(),
+                ),
+                (303, None, "without a usable Location".to_owned()),
+                (
+                    308,
+                    Some("http://[bad".to_owned()),
+                    "without a usable Location".to_owned(),
+                ),
+                (
+                    399,
+                    Some("/v2/far".to_owned()),
+                    format!("{}/v2/far;", server.uri()),
+                ),
+            ];
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let rl = RateLimitTracker::new();
+            for (status, location, expected) in cases {
+                server.reset().await;
+                let response = ResponseTemplate::new(status);
+                let response = match &location {
+                    Some(location) => response.insert_header("location", location.as_str()),
+                    None => response,
+                };
+                Mock::given(method("GET"))
+                    .and(path("/v2/account"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+
+                let url = format!("{}/v2/account", server.uri());
+                let error = rest_with_retry::<serde_json::Value>(&rl, || http.get(&url))
+                    .await
+                    .unwrap_err();
+
+                let UnindexedClientError::Api(error) = &error else {
+                    panic!("{status}: expected Api, got {error:?}");
+                };
+                let message = rejected_request(error);
+                assert!(
+                    message.contains(&status.to_string()) && message.contains(&expected),
+                    "{status}: {message}"
+                );
+                for secret in ["k=v", "user", "pw", "#f"] {
+                    assert!(!message.contains(secret), "{status}: {message}");
+                }
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    1,
+                    "{status}"
+                );
+            }
         }
 
         /// A request that fails in transport for another reason than the timeout, here a refused
