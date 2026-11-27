@@ -1493,7 +1493,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other 404 fails the request with `ApiError::RequestRejected`, naming the answer: one without
   that code, and one worded "endpoint not found", which Alpaca sends for a path it serves nothing
   under. Other requests that met such a 404 reported `ApiError::OrderRejected("order not found:
-  …")` and now report the same `RequestRejected`.
+  …")`, and a do-not-exercise `ExerciseRefusal::Other`; both now report the same
+  `RequestRejected`.
 
 - **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
   an exchange with application-level pings, an initialisation that failed after subscribing left

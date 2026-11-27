@@ -1352,9 +1352,10 @@ impl AlpacaClient {
     /// Each name not yet known is looked up once, upper-cased, as Alpaca's lookups match case:
     /// an OCC symbol with `GET /v2/options/contracts/{symbol}`, any other with
     /// `GET /v2/assets/{symbol}`, up to [`LISTING_LOOKUPS_IN_FLIGHT`] at a time. Alpaca's
-    /// not-found answer is not listed. So is a listing under another symbol, as `GET /v2/assets/BTCUSD` finds `BTC/USD`.
-    /// A listed asset or contract counts whatever its status, an expired contract included, as
-    /// orders and trades on it can still be read. A lookup that fails fails the read.
+    /// not-found answer is not listed. So is a listing under another symbol, as
+    /// `GET /v2/assets/BTCUSD` finds `BTC/USD`. A listed asset or contract counts whatever its
+    /// status, an expired contract included, as orders and trades on it can still be read. A
+    /// lookup that fails fails the read.
     ///
     /// With `expired_before` set, an OCC symbol whose expiry is before that date is not looked up,
     /// nor remembered as listed: Alpaca drops long-expired contracts, and a read that must not
@@ -2050,10 +2051,10 @@ impl ExecutionClient for AlpacaClient {
     /// - **Looked up.** An order held that the lookup finds `replaced` is followed along each
     ///   `replaced_by` with `GET /v2/orders/{id}`, across any number of replaces up to 8, and the
     ///   last order is linked straight to the order held, not to the order before it. A
-    ///   replacement Alpaca does not know ([not found](AlpacaClient#not-found)), an order `replaced` that names no replacement,
-    ///   or a chain of more than 8 replaces leaves the order held reported ended as cancelled,
-    ///   logged at `warn`. A replacement this version cannot read leaves the order held, to be
-    ///   asked about again.
+    ///   replacement Alpaca does not know ([not found](AlpacaClient#not-found)), an order
+    ///   `replaced` that names no replacement, or a chain of more than 8 replaces leaves the order
+    ///   held reported ended as cancelled, logged at `warn`. A replacement this version cannot
+    ///   read leaves the order held, to be asked about again.
     ///
     /// Fills of a replacement that fill recovery reads before the check links it name an order
     /// the reader does not yet know, so they count towards its position and not towards the
@@ -2087,8 +2088,8 @@ impl ExecutionClient for AlpacaClient {
     ///   fails charges every instrument in it. Alpaca lists at most 500 open orders and has no
     ///   pagination for them, so a listing of 500 may be truncated and fails: an account with 500
     ///   or more open orders on the held instruments is not covered. An order Alpaca does not know
-    ///   ([not found](AlpacaClient#not-found)) stops being held, logged at `warn`; one still live, `done_for_day`, or in a state
-    ///   this version cannot read stays held.
+    ///   ([not found](AlpacaClient#not-found)) stops being held, logged at `warn`; one still
+    ///   live, `done_for_day`, or in a state this version cannot read stays held.
     ///
     /// The same lookup, without following replaces, is public as
     /// [`OrderStatusClient::fetch_ended_orders`].
@@ -4517,8 +4518,8 @@ async fn recover_fills(
 /// [`OrderStatusClient::fetch_ended_orders`]: how the order under that key ended, if it has. An
 /// order replaced is read as cancelled, not followed to its replacement.
 ///
-/// Alpaca's not-found answer is [`OrderLookup::Unknown`], and so is an order on another symbol than the key's (ignoring
-/// case, as Alpaca's symbols are upper case).
+/// Alpaca's not-found answer is [`OrderLookup::Unknown`], and so is an order on another symbol
+/// than the key's (ignoring case, as Alpaca's symbols are upper case).
 async fn fetch_order_lookup(
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
@@ -4552,8 +4553,9 @@ async fn fetch_order_lookup_following_replaces(
 }
 
 /// The order Alpaca holds under `key`'s client order id, read with
-/// `GET /v2/orders:by_client_order_id`. `None` for Alpaca's not-found answer, and, logged at `debug`, for an order on
-/// another symbol than the key's (ignoring case, as Alpaca's symbols are upper case).
+/// `GET /v2/orders:by_client_order_id`. `None` for Alpaca's not-found answer, and, logged at
+/// `debug`, for an order on another symbol than the key's (ignoring case, as Alpaca's symbols
+/// are upper case).
 async fn fetch_order_by_cid(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
@@ -4608,8 +4610,9 @@ const REPLACE_HOPS: usize = 8;
 /// seen.
 ///
 /// `None` when `asked` is not `replaced`, and, logged at `warn`, when an order on the chain is
-/// `replaced` but names no replacement, Alpaca does not know an order on the chain (its not-found answer), or the
-/// chain is longer than the bound: the order asked about is then read as cancelled, as before.
+/// `replaced` but names no replacement, Alpaca does not know an order on the chain (its not-found
+/// answer), or the chain is longer than the bound: the order asked about is then read as
+/// cancelled, as before.
 /// Also `None`, with the conversion's `warn`, for a final order this version cannot read, which
 /// then stays held and is asked about again. A read that fails fails the lookup.
 async fn follow_replaces(
