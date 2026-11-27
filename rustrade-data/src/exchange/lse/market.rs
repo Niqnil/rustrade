@@ -126,8 +126,12 @@ pub fn rest_symbol_for(market: LseMarketCode, symbol: &str) -> Result<SmolStr, L
         symbol
             .len()
             .checked_sub(suffix.len())
-            .filter(|&split| split > 0 && symbol[split..].eq_ignore_ascii_case(suffix))
-            .map(|split| SmolStr::new(&symbol[..split]))
+            .filter(|&split| split > 0)
+            .and_then(|split| {
+                let (head, tail) = (symbol.get(..split)?, symbol.get(split..)?);
+                tail.eq_ignore_ascii_case(suffix)
+                    .then(|| SmolStr::new(head))
+            })
     };
 
     match market {
@@ -867,6 +871,8 @@ mod tests {
         for (market, symbol) in [
             (LseMarketCode::UkStocks, "VOD"),
             (LseMarketCode::UkStocks, ".L"),
+            // The suffix's width from the end falls inside the three-byte `€`.
+            (LseMarketCode::UkStocks, "VOD€"),
             (LseMarketCode::Forex, "EUR_USD"),
             (LseMarketCode::Crypto, "BTCUSDT"),
             (LseMarketCode::Futures, "SP500"),

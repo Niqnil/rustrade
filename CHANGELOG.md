@@ -864,7 +864,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     window. `CursorOverflow`, `NonMonotonicCandlePage` and `OptionFlowWindowSaturated` are removed,
     and `UnexpectedOptionFlowRow` names the contract's `ticker` instead of a print id.
   - Each client admits one request at a time by default (was two): the provider allows one
-    download per key.
+    download per key. Requests start a second apart by default (was 300 ms), the free plan's 60
+    calls per minute; `with_pace` lowers it for a larger allowance.
 - **Breaking: `SocketError` is `#[non_exhaustive]`** (`rustrade-integration`). It gains
   `ConnectTimeout { timeout }`, and future failure kinds are added the same way, so a `match` on it
   needs a wildcard arm.

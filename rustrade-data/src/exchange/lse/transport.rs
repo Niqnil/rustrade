@@ -27,18 +27,19 @@ use tokio::{
 };
 use tracing::debug;
 
-/// Header carrying the API key. Identical on both hosts.
+/// Header carrying the API key. Identical on every host.
 const API_KEY_HEADER: &str = "x-api-key";
 
 /// Environment variable read by [`LseHttpCore::from_env`].
 ///
-/// One key authenticates both hosts, so both clients read this same variable.
+/// One key authenticates every host, so every client reads this same variable.
 pub(crate) const API_KEY_ENV: &str = "LSE_API_KEY";
 
 /// Total deadline for a JSON request: connect, send, and read the whole body.
 ///
 /// Sound for the JSON endpoints, whose bodies are a page of rows at most. It is **not** sound for
-/// an export artifact, which is why [`download_export`](super::export) overrides it per-request —
+/// a file answer, which is why [`get_file`](LseHttpCore::get_file) and
+/// [`download_export`](super::export) override it per request —
 /// `reqwest` applies this as a total deadline "from when the request starts connecting until the
 /// response body has finished", so a multi-gigabyte transfer would abort mid-body however healthy
 /// the connection.
@@ -63,10 +64,11 @@ const USER_AGENT: &str = concat!("rustrade-data/", env!("CARGO_PKG_VERSION"));
 
 /// Default minimum delay between the *starts* of two requests.
 ///
-/// Derived from the provider's documented allowance of 200 calls per minute, which is one call per
-/// 300ms. This is *proactive courtesy only* — it never inspects a `429`, never retries, and never
-/// adapts.
-pub(crate) const DEFAULT_PACE: Duration = Duration::from_millis(300);
+/// One second: the free plan's allowance of 60 calls per minute, which `/v3/usage` reports as
+/// `calls_per_minute`. Every call counts against it, refused ones included. A paid plan's figure
+/// is not documented; a caller on a larger allowance can lower the pace. This is *proactive
+/// courtesy only* — it never inspects a `429`, never retries, and never adapts.
+pub(crate) const DEFAULT_PACE: Duration = Duration::from_secs(1);
 
 /// Default ceiling on requests in flight at once.
 ///
@@ -94,8 +96,8 @@ const CHECKSUM_HEADER: &str = "x-checksum-sha256";
 /// Pacing a single paged fetch is a claim about that fetch only. A multi-instrument replay such as
 /// [`replay_candles`](super::backtest::replay_candles) drives N fetches concurrently, so N
 /// independently-paced streams produce an aggregate rate of N per `pace` — which is exactly what
-/// [`DEFAULT_PACE`]'s "200 calls per minute" derivation says must not happen, and N in-flight
-/// requests against a `vault_concurrency` of 2. Both bounds therefore belong to the client, not to
+/// [`DEFAULT_PACE`]'s calls-per-minute derivation says must not happen, and N in-flight
+/// requests against the provider's one download per key. Both bounds therefore belong to the client, not to
 /// any one call site, so that they hold for every entry point without the caller re-deriving them.
 #[derive(Debug)]
 struct RequestGate {
@@ -126,7 +128,7 @@ impl RequestGate {
     ///
     /// # The permit is acquired *before* the pacing wait, deliberately
     /// A caller therefore holds a permit while sleeping to its slot, so `concurrency` bounds
-    /// **admitted** callers rather than requests actually in flight — with a `pace` of 300ms and a
+    /// **admitted** callers rather than requests actually in flight — with a `pace` of one second and a
     /// concurrency of 2, the steady state is one request on the wire and one waiting, not two on
     /// the wire. Acquiring in the other order would let an unbounded number of callers queue on
     /// the pacing mutex and then release together, which is the burst the concurrency limit exists
@@ -331,19 +333,19 @@ impl LseHttpCore {
 
     /// Issue an authenticated `GET` for a file answer and verify it before handing it back.
     ///
-    /// The provider sends a file whole, with its SHA-256 in `x-checksum-sha256` and its size in
-    /// `Content-Length`. The body is held in memory, so callers must bound what they ask for;
+    /// The provider sends a file whole, with its SHA-256 in `x-checksum-sha256`. The body is held
+    /// in memory, so callers must bound what they ask for;
     /// [`fetch_candles`](super::client::LseClient::fetch_candles) asks for chunks of a bounded
     /// number of bars.
     ///
     /// `x-export-rows` is not checked: it is not the file's row count. A six-hour hourly read
     /// declared 6 rows and carried 6, but a three-day one declared 4,178 and carried 73 (measured
     /// 2026-11-27), so it appears to count the stored rows the bars were built from. The checksum
-    /// and the size already cover every byte of the body.
+    /// already covers every byte of the body.
     ///
     /// # Errors
     /// See [`checked`](Self::checked). A success answer without a checksum, or whose body disagrees
-    /// with its checksum or its declared size, is [`LseError::Api`] with the success status and no
+    /// with its checksum, is [`LseError::Api`] with the success status and no
     /// code: nothing from it is returned, so a cut or damaged transfer never becomes partial data.
     pub(crate) async fn get_file(
         &self,
@@ -368,17 +370,10 @@ impl LseHttpCore {
             .and_then(|value| value.to_str().ok())
             .map(|value| value.trim().to_ascii_lowercase())
             .ok_or_else(|| refuse(format!("the answer carries no {CHECKSUM_HEADER} header")))?;
-        let declared_length = response.content_length();
 
+        // A body cut short of its `Content-Length` is already an error from `bytes()`: the HTTP
+        // stack refuses it. The checksum covers every byte that does arrive.
         let body: Vec<u8> = response.bytes().await?.into();
-        if let Some(declared) = declared_length
-            && declared != body.len() as u64
-        {
-            return Err(refuse(format!(
-                "declared {declared} bytes but carried {}",
-                body.len()
-            )));
-        }
         let actual = hex::encode(Sha256::digest(&body));
         if actual != checksum {
             return Err(refuse(format!(

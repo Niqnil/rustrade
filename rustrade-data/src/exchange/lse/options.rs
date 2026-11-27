@@ -55,7 +55,7 @@ use crate::event::{DataKind, MarketEvent};
 use crate::exchange::lse::client::LseClient;
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::historical::{
-    LseCandleRequest, Window, cell, csv_records, parse_decimal, parse_provider_time, windows,
+    CsvColumns, LseCandleRequest, cell, csv_records, parse_decimal, parse_provider_time, windows,
 };
 use crate::exchange::lse::market::LseMarketCode;
 use crate::exchange::osi;
@@ -78,10 +78,11 @@ use tracing::debug;
 /// Ingestion lag on the print tape was measured as variable and **episodic** on the provider's
 /// pre-3.0 API: a window was usually complete about fifteen seconds after it closed, but one
 /// returned no rows at all thirty seconds after closing, and another sat at a fifth of its final
-/// count across two reads. Both answered `200`. It has not been re-measured on LSE Data 3.0, and a
-/// late print also shifts the offsets the walk pages by, so
+/// count across two reads. Both answered `200`. It has not been re-measured on LSE Data 3.0, so
 /// [`fetch_option_flow`](LseClient::fetch_option_flow) refuses a range ending inside this margin
-/// rather than return rows that look final and are not. A floor informed by observation, not a
+/// rather than return rows that look final and are not. The refusal is
+/// [`LseError::InvalidInput`]: the caller asked for a range that ends too recently, and an
+/// earlier `end` fixes it. A floor informed by observation, not a
 /// guarantee.
 pub const OPTION_FLOW_SETTLE_MARGIN: TimeDelta = TimeDelta::seconds(60);
 
@@ -460,62 +461,90 @@ impl TryFrom<ChainPage> for LseOptionChain {
     }
 }
 
-/// Parse one row of the `greeks` selection's CSV.
-fn minute_greeks(
-    columns: &crate::exchange::lse::historical::CsvColumns,
-    record: &csv::StringRecord,
-) -> Result<LseOptionMinuteGreeks, LseError> {
-    let float = |name: &str| -> Result<Option<f64>, LseError> {
-        columns
-            .optional(name)
-            .and_then(|index| cell(record, index))
-            .map(|cell| {
-                cell.parse::<f64>().map_err(|error| LseError::Deserialize {
-                    message: format!("column {name}: invalid number {cell:?}: {error}"),
-                })
-            })
-            .transpose()
-    };
-    let time = columns.required("time")?;
-    let open =
-        parse_provider_time(cell(record, time).ok_or(LseError::NullValue { column: "time" })?)?;
-    let close_time =
-        open.checked_add_signed(TimeDelta::minutes(1))
-            .ok_or(LseError::TimestampOverflow {
-                open,
-                interval: CandleInterval::Min1,
-            })?;
+/// The `greeks` selection's column positions, resolved once per chunk.
+struct GreeksColumns {
+    time: usize,
+    price_at: Option<usize>,
+    option_price: Option<usize>,
+    price_source: Option<usize>,
+    delta: Option<usize>,
+    gamma: Option<usize>,
+    theta: Option<usize>,
+    vega: Option<usize>,
+    iv: Option<usize>,
+    underlying_price: Option<usize>,
+    years_to_expiry: Option<usize>,
+    rate: Option<usize>,
+    dividends_pv: Option<usize>,
+}
 
-    Ok(LseOptionMinuteGreeks {
-        close_time,
-        price_at: optional_time(
-            columns
-                .optional("price_at")
-                .and_then(|index| cell(record, index)),
-        )?,
-        option_price: columns
-            .optional("option_price")
-            .and_then(|index| cell(record, index))
-            .map(|cell| parse_decimal("option_price", cell))
-            .transpose()?,
-        price_source: columns
-            .optional("price_source")
-            .and_then(|index| cell(record, index))
-            .map(SmolStr::new),
-        greeks: OptionGreeks {
-            delta: float("delta")?,
-            gamma: float("gamma")?,
-            theta: float("theta")?,
-            vega: float("vega")?,
-            rho: None,
-            implied_volatility: float("iv")?,
-            theoretical_price: None,
-            underlying_price: float("underlying_price")?,
-        },
-        years_to_expiry: float("years_to_expiry")?,
-        rate: float("rate")?,
-        dividends_pv: float("dividends_pv")?,
-    })
+impl GreeksColumns {
+    /// Resolve the positions from the header.
+    ///
+    /// # Errors
+    /// [`LseError::UnsupportedSchema`] when the header has no `time` column.
+    fn new(columns: &CsvColumns) -> Result<Self, LseError> {
+        Ok(Self {
+            time: columns.required("time")?,
+            price_at: columns.optional("price_at"),
+            option_price: columns.optional("option_price"),
+            price_source: columns.optional("price_source"),
+            delta: columns.optional("delta"),
+            gamma: columns.optional("gamma"),
+            theta: columns.optional("theta"),
+            vega: columns.optional("vega"),
+            iv: columns.optional("iv"),
+            underlying_price: columns.optional("underlying_price"),
+            years_to_expiry: columns.optional("years_to_expiry"),
+            rate: columns.optional("rate"),
+            dividends_pv: columns.optional("dividends_pv"),
+        })
+    }
+
+    /// Parse one row.
+    fn parse(&self, record: &csv::StringRecord) -> Result<LseOptionMinuteGreeks, LseError> {
+        let cell_at = |index: Option<usize>| index.and_then(|index| cell(record, index));
+        let float = |index: Option<usize>, name: &str| -> Result<Option<f64>, LseError> {
+            cell_at(index)
+                .map(|cell| {
+                    cell.parse::<f64>().map_err(|error| LseError::Deserialize {
+                        message: format!("column {name}: invalid number {cell:?}: {error}"),
+                    })
+                })
+                .transpose()
+        };
+        let open = parse_provider_time(
+            cell(record, self.time).ok_or(LseError::NullValue { column: "time" })?,
+        )?;
+        let close_time =
+            open.checked_add_signed(TimeDelta::minutes(1))
+                .ok_or(LseError::TimestampOverflow {
+                    open,
+                    interval: CandleInterval::Min1,
+                })?;
+
+        Ok(LseOptionMinuteGreeks {
+            close_time,
+            price_at: optional_time(cell_at(self.price_at))?,
+            option_price: cell_at(self.option_price)
+                .map(|cell| parse_decimal("option_price", cell))
+                .transpose()?,
+            price_source: cell_at(self.price_source).map(SmolStr::new),
+            greeks: OptionGreeks {
+                delta: float(self.delta, "delta")?,
+                gamma: float(self.gamma, "gamma")?,
+                theta: float(self.theta, "theta")?,
+                vega: float(self.vega, "vega")?,
+                rho: None,
+                implied_volatility: float(self.iv, "iv")?,
+                theoretical_price: None,
+                underlying_price: float(self.underlying_price, "underlying_price")?,
+            },
+            years_to_expiry: float(self.years_to_expiry, "years_to_expiry")?,
+            rate: float(self.rate, "rate")?,
+            dividends_pv: float(self.dividends_pv, "dividends_pv")?,
+        })
+    }
 }
 
 impl LseClient {
@@ -605,12 +634,11 @@ impl LseClient {
                 let (columns, records) = csv_records(&body)?;
                 debug!(%symbol, ?window, rows = records.len(), "lse option greeks chunk received");
 
-                let Window::Times { from: window_start, to: window_end } = window else {
-                    continue;
-                };
+                let columns = GreeksColumns::new(&columns)?;
+                let (window_start, window_end) = window.instants();
                 let mut minutes = Vec::with_capacity(records.len());
                 for record in &records {
-                    let minute = minute_greeks(&columns, record)?;
+                    let minute = columns.parse(record)?;
                     let open = minute.close_time - TimeDelta::minutes(1);
                     if open < window_start || open >= window_end {
                         Err(LseError::UnexpectedCandleRange {
@@ -672,8 +700,15 @@ impl LseClient {
     /// # Range and order
     /// The range is half-open and exact to the nanosecond. It is walked in windows of at most a
     /// day, each paged oldest first until the provider answers an empty page: a short page is not
-    /// taken as the end, so a cap lowered by the provider costs one more request instead of
-    /// silently dropping prints.
+    /// taken as the end, so a page cap lowered by the provider below the 5,000 asked for costs
+    /// more requests instead of dropping prints. The one case this cannot cover is a single
+    /// instant holding at least that lowered cap's prints: its page looks complete, and the rest
+    /// of that instant would be skipped. At the 5,000 cap such a page is an error (below).
+    ///
+    /// # Request count
+    /// One request per page, plus up to two per window: the re-read of the last page's held-back
+    /// instant and the empty page that ends the window. Requests are spaced by the client's
+    /// [pace](Self::with_pace).
     ///
     /// # Paged by time, not by offset
     /// The provider orders prints by time alone and returns prints sharing an instant in a
@@ -1026,7 +1061,10 @@ mod tests {
 underlying_price,years_to_expiry,rate,dividends_pv\n\
 2024-01-02 15:00:00,2024-01-02 15:00:30.5,0.2,\\N,0.1,-0.01,0.02,1.5,trade,11.0,0.01,0.04,0\n";
         let (columns, records) = csv_records(body).unwrap();
-        let minute = minute_greeks(&columns, &records[0]).unwrap();
+        let minute = GreeksColumns::new(&columns)
+            .unwrap()
+            .parse(&records[0])
+            .unwrap();
 
         assert_eq!(
             minute.close_time,

@@ -134,7 +134,8 @@ impl LseClient {
         self
     }
 
-    /// Override the minimum delay between the starts of two requests (default 300ms).
+    /// Override the minimum delay between the starts of two requests (default one second, the
+    /// free plan's 60 calls per minute).
     ///
     /// Applies to **every** request this client issues and is enforced against the
     /// [gate](Self#request-rationing-is-per-client-not-per-call) this client shares with its

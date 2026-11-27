@@ -556,3 +556,120 @@ async fn greeks_for_a_window_with_nothing_stored_are_empty_not_an_error() {
 
     assert!(minutes.is_empty(), "{minutes:?}");
 }
+
+/// A `greeks` answer with one row per opening minute (`HH:MM` on 2024-01-02). Figures invented.
+fn greeks_csv(opens: &[&str]) -> String {
+    let mut body = String::from(
+        "time,price_at,iv,delta,gamma,theta,vega,option_price,price_source,underlying_price,\
+years_to_expiry,rate,dividends_pv\n",
+    );
+    for open in opens {
+        body.push_str(&format!(
+            "2024-01-02 {open}:00,,0.3,0.6,0.1,-0.01,0.02,1.6,trade,10,0.01,0.04,0\n"
+        ));
+    }
+    body
+}
+
+async fn mount_greeks(server: &MockServer, from: &str, to: &str, opens: &[&str]) {
+    Mock::given(method("GET"))
+        .and(path("/v3/export"))
+        .and(query_param("data", "greeks"))
+        .and(query_param("from", from))
+        .and(query_param("to", to))
+        .respond_with(csv_answer(&greeks_csv(opens)))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Two chunks seam without gap or duplicate, a minute closing before `start` is trimmed, and one
+/// closing exactly at `end` is kept.
+#[tokio::test]
+async fn greeks_chunks_seam_and_trim_on_close_with_end_inclusive() {
+    let server = MockServer::start().await;
+    // Closes in [15:01:30, 15:03:00] → opens in [15:00:30, 15:02:00] → grid [15:00, 15:03).
+    mount_greeks(
+        &server,
+        "2024-01-02 15:00:00",
+        "2024-01-02 15:02:00",
+        &["15:00", "15:01"],
+    )
+    .await;
+    mount_greeks(
+        &server,
+        "2024-01-02 15:02:00",
+        "2024-01-02 15:03:00",
+        &["15:02"],
+    )
+    .await;
+
+    let minutes: Vec<_> = client(&server)
+        .with_chunk_bars(std::num::NonZeroU32::new(2).unwrap())
+        .fetch_option_greeks(
+            "TEST240105C00010000",
+            utc("2024-01-02T15:01:30Z"),
+            utc("2024-01-02T15:03:00Z"),
+        )
+        .collect()
+        .await;
+
+    let closes: Vec<_> = minutes
+        .into_iter()
+        .map(|minute| minute.unwrap().close_time)
+        .collect();
+    assert_eq!(
+        closes,
+        [utc("2024-01-02T15:02:00Z"), utc("2024-01-02T15:03:00Z")]
+    );
+}
+
+#[tokio::test]
+async fn greeks_stepping_backwards_fail_their_chunk_with_nothing_yielded() {
+    let server = MockServer::start().await;
+    mount_greeks(
+        &server,
+        "2024-01-02 15:00:00",
+        "2024-01-02 15:02:00",
+        &["15:01", "15:00"],
+    )
+    .await;
+
+    let minutes: Vec<_> = client(&server)
+        .fetch_option_greeks(
+            "TEST240105C00010000",
+            utc("2024-01-02T15:01:00Z"),
+            utc("2024-01-02T15:02:00Z"),
+        )
+        .collect()
+        .await;
+
+    let [Err(LseError::NonMonotonicCandles { .. })] = &minutes[..] else {
+        panic!("one NonMonotonicCandles expected, got {minutes:?}");
+    };
+}
+
+#[tokio::test]
+async fn a_greeks_row_outside_its_window_fails_its_chunk_with_nothing_yielded() {
+    let server = MockServer::start().await;
+    mount_greeks(
+        &server,
+        "2024-01-02 15:01:00",
+        "2024-01-02 15:02:00",
+        &["15:01", "15:05"],
+    )
+    .await;
+
+    let minutes: Vec<_> = client(&server)
+        .fetch_option_greeks(
+            "TEST240105C00010000",
+            utc("2024-01-02T15:02:00Z"),
+            utc("2024-01-02T15:02:00Z"),
+        )
+        .collect()
+        .await;
+
+    let [Err(LseError::UnexpectedCandleRange { .. })] = &minutes[..] else {
+        panic!("one UnexpectedCandleRange expected, got {minutes:?}");
+    };
+}

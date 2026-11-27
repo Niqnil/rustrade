@@ -134,7 +134,7 @@ impl Window {
         }
     }
 
-    /// The window as instants, for an error report: `[from, to)`.
+    /// The window as instants: `[from, to)`.
     pub(super) fn instants(&self) -> (DateTime<Utc>, DateTime<Utc>) {
         match self {
             Self::Times { from, to } => (*from, *to),
@@ -224,11 +224,15 @@ pub(super) fn windows(
                 return windows;
             };
             let to = last.checked_add_signed(width).unwrap_or(last);
-            let span = width * i32::try_from(chunk_bars).unwrap_or(i32::MAX);
+            // `None` when `chunk_bars` periods overflow a `TimeDelta`: one window then spans the
+            // whole range, which is what so many bars per chunk asks for.
+            let span = i32::try_from(chunk_bars)
+                .ok()
+                .and_then(|bars| width.checked_mul(bars));
             let mut cursor = from;
             while cursor < to {
-                let next = cursor
-                    .checked_add_signed(span)
+                let next = span
+                    .and_then(|span| cursor.checked_add_signed(span))
                     .map_or(to, |next| next.min(to));
                 windows.push(Window::Times {
                     from: cursor,
@@ -654,8 +658,8 @@ impl LseClient {
 pub(crate) mod test_support {
     use sha2::{Digest, Sha256};
 
-    /// A verified CSV answer: the body with its SHA-256 and data row count in the headers the
-    /// provider sends.
+    /// A verified CSV answer: the body with its SHA-256, and its data row count in the
+    /// `x-export-rows` header the provider sends (which the client does not check).
     pub(crate) fn csv_answer(body: &str) -> wiremock::ResponseTemplate {
         let rows = body.lines().count().saturating_sub(1);
         wiremock::ResponseTemplate::new(200)
@@ -743,6 +747,24 @@ mod tests {
         assert_eq!(
             (from, to),
             (t("2026-11-20 00:00:00"), t("2026-11-20 12:00:00"))
+        );
+    }
+
+    #[test]
+    fn chunk_bars_too_many_for_a_time_delta_give_one_window() {
+        // Four hours times `i32::MAX` overflows a `TimeDelta`.
+        let [Window::Times { from, to }] = windows(
+            CandleInterval::Hour4,
+            t("2026-11-20 05:00:00"),
+            t("2026-11-22 13:00:00"),
+            u32::MAX,
+        )[..] else {
+            panic!("one window expected");
+        };
+
+        assert_eq!(
+            (from, to),
+            (t("2026-11-20 00:00:00"), t("2026-11-22 12:00:00"))
         );
     }
 

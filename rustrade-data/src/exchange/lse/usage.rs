@@ -122,13 +122,14 @@ pub struct LseHistoryWindow {
 /// Read a cap the provider writes as `-1` when there is none.
 ///
 /// Any negative figure is read as "no cap" rather than rejected: only `-1` is documented, and a
-/// cap is not negative, so a different negative sentinel means the same thing.
+/// cap is not negative, so a different negative sentinel means the same thing. `null`, which is
+/// how this crate serialises `None`, is also no cap, so a serialised value reads back unchanged.
 fn deserialize_cap<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let raw = i64::deserialize(deserializer)?;
-    Ok(u64::try_from(raw).ok())
+    let raw = Option::<i64>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| u64::try_from(raw).ok()))
 }
 
 #[cfg(test)]
@@ -178,6 +179,17 @@ mod tests {
         assert_eq!(usage.weekly.remaining_bytes(), None);
         let cme = &usage.history["cme"];
         assert_eq!((cme.l1, cme.l2, cme.l3), (None, Some(12), Some(0)));
+    }
+
+    #[test]
+    fn a_serialised_usage_reads_back_unchanged_uncapped_figures_included() {
+        let json = FREE.replace("\"per_day\": 12500000", "\"per_day\": -1");
+        let usage: LseUsage = serde_json::from_str(&json).unwrap();
+        let round_trip: LseUsage =
+            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+
+        assert_eq!(round_trip, usage);
+        assert_eq!(round_trip.rows.per_day, None);
     }
 
     #[test]

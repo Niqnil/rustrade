@@ -38,12 +38,12 @@ pub enum LseError {
     UnknownMarket(String),
 
     /// A required environment variable is not set, or does not hold valid UTF-8 (see
-    /// [`LseVaultClient::from_env`]).
+    /// [`LseClient::from_env`]).
     ///
     /// The message names the variable and never its value, so a mis-encoded key cannot reach a log
     /// line through this error.
     ///
-    /// [`LseVaultClient::from_env`]: super::vault::LseVaultClient::from_env
+    /// [`LseClient::from_env`]: super::client::LseClient::from_env
     #[error("environment variable error: {0}")]
     EnvVar(String),
 
@@ -62,7 +62,7 @@ pub enum LseError {
     /// match on it rather than on `message`, whose wording the provider changes. `message` is the
     /// provider's own sentence, truncated to a bounded length — or, where `status` is a success
     /// code, this integration's own diagnostic for a response that violated the contract that
-    /// status implies (a download whose checksum or row count disagrees with its headers, say). The
+    /// status implies (a download whose checksum disagrees with its header, say). The
     /// status is the one the provider sent, so it stays reportable, but the fault is one only the
     /// client can see; `code` is `None` then.
     #[error("API error ({status}{}): {message}", match .code {
