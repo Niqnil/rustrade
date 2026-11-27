@@ -1,8 +1,9 @@
 //! Do-not-exercise instructions: [`OptionExerciseClient`] for [`AlpacaClient`].
 
 use super::{
-    AlpacaApiError, AlpacaClient, SendFailure, connectivity_err, instrument_invalid, occ_expiry,
-    parse_api_error, rest_url, send_rate_limited, transport_error, upper_symbol, with_alpaca_code,
+    AlpacaApiError, AlpacaClient, NOT_FOUND, SendFailure, connectivity_err, instrument_invalid,
+    not_found_refusal, occ_expiry, parse_api_error, rest_url, send_rate_limited, transport_error,
+    upper_symbol, with_alpaca_code,
 };
 use crate::{
     client::OptionExerciseClient,
@@ -27,13 +28,9 @@ const REFUSED: i64 = 40_310_000;
 /// lower-cased: "no available position for the specified contract".
 const NO_POSITION: &str = "no available position";
 
-/// Alpaca's generic code for something it did not find. On the do-not-exercise endpoint, its paper
-/// API, observed in November 2026, sends it with a 404 for a contract the account holds no long
-/// position in, on the expiration day before the deadline (see [`POSITION_NOT_FOUND`]).
-const NOT_FOUND: i64 = 40_410_000;
-
 /// How Alpaca's paper API words a 404 [`NOT_FOUND`] for a contract the account holds no long
-/// position in, lower-cased: "long position not found: `<symbol>`". Matched in full, so a "not
+/// position in, on the expiration day before the deadline (observed in November 2026),
+/// lower-cased: "long position not found: `<symbol>`". Matched in full, so a "not
 /// found" that names anything else, such as a short position, is not read as no position.
 const POSITION_NOT_FOUND: &str = "long position not found";
 
@@ -94,13 +91,15 @@ impl OptionExerciseClient for AlpacaClient {
     ///     [`ExerciseRefusal::NoPosition`] when it says no position is available, in Alpaca's
     ///     documented words; and otherwise [`ExerciseRefusal::Other`];
     ///   - [`ExerciseRefusal::Other`] for any other 4xx, with Alpaca's code and message, and for
-    ///     a 4xx other than a 401 whose body could not be read.
+    ///     a 4xx other than a 401 whose body could not be read. A 404 is `Other` only when it is
+    ///     Alpaca's [not-found answer](AlpacaClient#not-found).
     /// - [`ApiError::Unauthenticated`] for a 401, or a 403 without a code: a wrong key, secret or
     ///   host.
     /// - [`ApiError::RateLimit`] once the 429 retries are exhausted. A 429 means Alpaca did not
     ///   take the request, so it is retried, as every request of this client is.
     /// - [`ApiError::RequestRejected`] for a redirect, which is not followed (see the client's
-    ///   "Redirects"). The instruction was not taken.
+    ///   "Redirects"), and for a 404 that is not Alpaca's not-found answer, which most likely
+    ///   means a wrong base URL (see the client's "Not found"). The instruction was not taken.
     /// - [`ClientError::Connectivity`] for a request that failed in transport, ran past
     ///   [`AlpacaConfig::request_timeout`], or met a 5xx. Alpaca may have taken the instruction;
     ///   it is not sent again.
@@ -176,27 +175,25 @@ impl OptionExerciseClient for AlpacaClient {
                 )));
             }
         };
-        let body = AlpacaApiError::from_body(&bytes);
         Err(exercise_error(
             instrument,
             expiry_day,
             status,
-            body.code,
-            &body.message,
+            &AlpacaApiError::from_body(&bytes),
         ))
     }
 }
 
 /// The error for Alpaca's answer `status` to a do-not-exercise for `instrument`, which expires
-/// on `expiry_day`, other than a success or a 429, with the body's `code` and `message`: see
+/// on `expiry_day`, other than a success or a 429, with the body `answer`: see
 /// [`AlpacaClient::instruct_exercise`](OptionExerciseClient::instruct_exercise)'s `# Errors`.
 fn exercise_error(
     instrument: &InstrumentNameExchange,
     expiry_day: NaiveDate,
     status: reqwest::StatusCode,
-    code: Option<i64>,
-    message: &str,
+    answer: &AlpacaApiError,
 ) -> UnindexedClientError {
+    let (code, message) = (answer.code, answer.message.as_str());
     let refused = |refusal| UnindexedClientError::Api(ApiError::ExerciseRefused(refusal));
     match (status.as_u16(), code) {
         (403, Some(SHORT_POSITION)) => refused(ExerciseRefusal::ShortPosition),
@@ -204,6 +201,7 @@ fn exercise_error(
         (404, Some(NOT_FOUND)) if message.to_ascii_lowercase().contains(POSITION_NOT_FOUND) => {
             refused(ExerciseRefusal::NoPosition)
         }
+        (404, _) if !answer.is_not_found() => UnindexedClientError::Api(not_found_refusal(answer)),
         (422, Some(INVALID_SYMBOL)) => UnindexedClientError::Api(ApiError::InstrumentInvalid(
             instrument.clone(),
             with_alpaca_code(code, message),
@@ -696,8 +694,10 @@ mod tests {
                 &instrument,
                 NaiveDate::from_ymd_opt(2026, 12, 18).unwrap(),
                 StatusCode::from_u16(status).unwrap(),
-                code,
-                message,
+                &AlpacaApiError {
+                    code,
+                    message: message.to_owned(),
+                },
             )
         };
         let refused = |refusal| UnindexedClientError::Api(ApiError::ExerciseRefused(refusal));
@@ -728,13 +728,24 @@ mod tests {
             )),
             "only a missing long position, as observed, reads as no position"
         );
-        assert_eq!(
-            map(404, Some(40410001), "long position not found"),
-            refused(ExerciseRefusal::Other(
-                "40410001 long position not found".into()
-            )),
-            "only the generic not-found code reads as no position"
+        assert!(
+            matches!(
+                map(404, Some(40410001), "long position not found"),
+                UnindexedClientError::Api(ApiError::RequestRejected(message))
+                    if message.contains("40410001 long position not found")
+            ),
+            "only the generic not-found code reads as no position; any other 404 is not Alpaca's"
         );
+        for (code, message) in [(None, "Not Found"), (Some(40410000), "endpoint not found")] {
+            assert!(
+                matches!(
+                    map(404, code, message),
+                    UnindexedClientError::Api(ApiError::RequestRejected(refusal))
+                        if refusal.contains("check the base URL")
+                ),
+                "a 404 that is not Alpaca's not-found answer points at the URL: {message}"
+            );
+        }
         assert_eq!(
             map(403, Some(40410000), "long position not found"),
             refused(ExerciseRefusal::Other(
@@ -753,8 +764,10 @@ mod tests {
                 &instrument,
                 NaiveDate::from_ymd_opt(2026, 12, 18).unwrap(),
                 StatusCode::from_u16(status).unwrap(),
-                code,
-                message,
+                &AlpacaApiError {
+                    code,
+                    message: message.to_owned(),
+                },
             )
         };
         let refused = |refusal| UnindexedClientError::Api(ApiError::ExerciseRefused(refusal));
@@ -860,8 +873,9 @@ mod tests {
             ))
         );
         assert_eq!(
-            map(404, None, "position does not exist"),
-            refused(ExerciseRefusal::Other("position does not exist".into()))
+            map(400, None, "position does not exist"),
+            refused(ExerciseRefusal::Other("position does not exist".into())),
+            "any other 4xx, with or without a code"
         );
         assert!(
             matches!(

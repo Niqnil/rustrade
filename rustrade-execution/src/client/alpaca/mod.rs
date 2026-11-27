@@ -834,6 +834,39 @@ impl AlpacaApiError {
             message: String::from_utf8_lossy(bytes).into_owned(),
         })
     }
+
+    /// Whether this body, on a 404, is Alpaca saying it knows nothing under the id or symbol
+    /// asked for: code [`NOT_FOUND`], and not worded [`UNKNOWN_ENDPOINT`], which says the URL is
+    /// wrong. See [Not found](AlpacaClient#not-found).
+    fn is_not_found(&self) -> bool {
+        self.code == Some(NOT_FOUND)
+            && !self.message.to_ascii_lowercase().contains(UNKNOWN_ENDPOINT)
+    }
+}
+
+/// Alpaca's code for something it did not find: an order, asset, option contract or position
+/// under the id or symbol asked for. Its API sends it too for a path it serves nothing under,
+/// worded [`UNKNOWN_ENDPOINT`].
+const NOT_FOUND: i64 = 40_410_000;
+
+/// How Alpaca words a 404 [`NOT_FOUND`] for a path it serves nothing under, lower-cased:
+/// "endpoint not found", as its paper API answered `GET /v2/nope` in November 2026.
+const UNKNOWN_ENDPOINT: &str = "endpoint not found";
+
+/// The refusal of a 404 that is not Alpaca's answer for an id it knows nothing under (see
+/// [`AlpacaApiError::is_not_found`]): [`ApiError::RequestRejected`] naming the answer, cut to 200
+/// characters, as the body of a 404 from something other than Alpaca may be a whole page.
+fn not_found_refusal(answer: &AlpacaApiError) -> UnindexedApiError {
+    let answer = with_alpaca_code(answer.code, answer.message.trim());
+    let answer = if answer.is_empty() {
+        "no body".to_owned()
+    } else {
+        answer.chars().take(200).collect()
+    };
+    ApiError::RequestRejected(format!(
+        "Alpaca answered 404 Not Found ({answer}), which is not its answer for an unknown id or \
+         symbol, so check the base URL"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1189,14 @@ struct AlpacaOrderWs<'a> {
 /// API is not expected to redirect, so a 3xx most likely means a wrong base URL (for example
 /// `http://` rather than `https://`) or something between the client and Alpaca.
 ///
+/// # Not found
+/// A lookup reads Alpaca's not-found answer, a 404 with code `40410000`, as Alpaca knowing nothing
+/// under the id or symbol asked for: an unknown order, asset or option contract. Any other 404
+/// fails the request with [`ApiError::RequestRejected`], naming the answer: one without that code,
+/// and one worded "endpoint not found", which Alpaca sends for a path it serves nothing under.
+/// Either most likely means a wrong base URL or something between the client and Alpaca, so it is
+/// not read as an order or listing that does not exist.
+///
 /// # Instrument lookups
 /// Names match Alpaca's symbols ignoring case, and what a read finds is reported under Alpaca's
 /// symbol. Before [`account_snapshot`](ExecutionClient::account_snapshot),
@@ -1171,7 +1212,8 @@ struct AlpacaOrderWs<'a> {
 ///   than the window has left uses it up: the rest of its lookups, and every order, then wait for
 ///   the window to reset (see "Rate limits"). A caller with a large universe can spread its first
 ///   reads, or read with fewer instruments at a time.
-/// - **Not listed.** A 404, or a listing under another symbol: `GET /v2/assets/BTCUSD` finds
+/// - **Not listed.** Alpaca's [not-found answer](AlpacaClient#not-found), or a listing under
+///   another symbol: `GET /v2/assets/BTCUSD` finds
 ///   `BTC/USD`, but orders and trades on that pair are reported as `BTC/USD`, so `BTCUSD` is
 ///   refused, and the error names the symbol to use. A failed lookup fails the read.
 /// - **Listed.** An asset or contract counts as listed whatever its status, so an inactive asset
@@ -1309,10 +1351,11 @@ impl AlpacaClient {
     ///
     /// Each name not yet known is looked up once, upper-cased, as Alpaca's lookups match case:
     /// an OCC symbol with `GET /v2/options/contracts/{symbol}`, any other with
-    /// `GET /v2/assets/{symbol}`, up to [`LISTING_LOOKUPS_IN_FLIGHT`] at a time. A 404 is not
-    /// listed. So is a listing under another symbol, as `GET /v2/assets/BTCUSD` finds `BTC/USD`.
-    /// A listed asset or contract counts whatever its status, an expired contract included, as
-    /// orders and trades on it can still be read. A lookup that fails fails the read.
+    /// `GET /v2/assets/{symbol}`, up to [`LISTING_LOOKUPS_IN_FLIGHT`] at a time. Alpaca's
+    /// not-found answer is not listed. So is a listing under another symbol, as
+    /// `GET /v2/assets/BTCUSD` finds `BTC/USD`. A listed asset or contract counts whatever its
+    /// status, an expired contract included, as orders and trades on it can still be read. A
+    /// lookup that fails fails the read.
     ///
     /// With `expired_before` set, an OCC symbol whose expiry is before that date is not looked up,
     /// nor remembered as listed: Alpaca drops long-expired contracts, and a read that must not
@@ -1577,8 +1620,9 @@ fn redirect_refusal(response: &reqwest::Response) -> UnindexedApiError {
 ///
 /// - [`UnindexedClientError::Connectivity`]: the request or its body read failed, or a 5xx.
 /// - [`UnindexedClientError::Api`]: a 4xx, classified by [`parse_api_error`], 429 retries
-///   exhausted ([`ApiError::RateLimit`], with Alpaca's wait when its headers give one), or a
-///   redirect ([`ApiError::RequestRejected`], see [`redirect_refusal`]).
+///   exhausted ([`ApiError::RateLimit`], with Alpaca's wait when its headers give one), a
+///   redirect ([`ApiError::RequestRejected`], see [`redirect_refusal`]), or a 404 that is not
+///   Alpaca's not-found answer ([`ApiError::RequestRejected`], see [`not_found_refusal`]).
 /// - [`UnindexedClientError::Internal`]: a 2xx body that does not decode into `T`, or a 204 on a
 ///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
@@ -1598,8 +1642,9 @@ where
     }
 }
 
-/// [`rest_with_retry`] for a lookup by id: a 404 is `Ok(None)`, Alpaca knowing nothing under the
-/// id asked for, rather than an error.
+/// [`rest_with_retry`] for a lookup by id: Alpaca's not-found answer is `Ok(None)`, Alpaca knowing
+/// nothing under the id asked for, rather than an error. Any other 404 still fails, as
+/// [`rest_with_retry`] says.
 async fn rest_lookup_with_retry<T>(
     rate_limiter: &RateLimitTracker,
     build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1618,11 +1663,12 @@ where
 enum Fetched<T> {
     /// A 2xx body, decoded.
     Found(T),
-    /// A 404, with Alpaca's message.
+    /// Alpaca's not-found answer (see [`AlpacaApiError::is_not_found`]), with its message.
     NotFound(String),
 }
 
-/// [`rest_with_retry`] and [`rest_lookup_with_retry`], which differ only in how they read a 404.
+/// [`rest_with_retry`] and [`rest_lookup_with_retry`], which differ only in how they read Alpaca's
+/// not-found answer.
 async fn rest_request<T>(
     rate_limiter: &RateLimitTracker,
     build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1674,8 +1720,15 @@ where
     // Parse API error body for a better error message.
     let api_err = AlpacaApiError::from_body(&bytes);
 
+    // Only Alpaca's own not-found answer says it knows nothing under the id. A 404 without its
+    // code, or with its answer for an unknown path, more likely means a wrong base URL, and read
+    // as not found it would report an order unknown, or a replacement cancelled, without error.
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Fetched::NotFound(api_err.message));
+        return if api_err.is_not_found() {
+            Ok(Fetched::NotFound(api_err.message))
+        } else {
+            Err(UnindexedClientError::Api(not_found_refusal(&api_err)))
+        };
     }
 
     // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
@@ -1998,10 +2051,10 @@ impl ExecutionClient for AlpacaClient {
     /// - **Looked up.** An order held that the lookup finds `replaced` is followed along each
     ///   `replaced_by` with `GET /v2/orders/{id}`, across any number of replaces up to 8, and the
     ///   last order is linked straight to the order held, not to the order before it. A
-    ///   replacement Alpaca does not know (404), an order `replaced` that names no replacement,
-    ///   or a chain of more than 8 replaces leaves the order held reported ended as cancelled,
-    ///   logged at `warn`. A replacement this version cannot read leaves the order held, to be
-    ///   asked about again.
+    ///   replacement Alpaca does not know ([not found](AlpacaClient#not-found)), an order
+    ///   `replaced` that names no replacement, or a chain of more than 8 replaces leaves the order
+    ///   held reported ended as cancelled, logged at `warn`. A replacement this version cannot
+    ///   read leaves the order held, to be asked about again.
     ///
     /// Fills of a replacement that fill recovery reads before the check links it name an order
     /// the reader does not yet know, so they count towards its position and not towards the
@@ -2035,8 +2088,8 @@ impl ExecutionClient for AlpacaClient {
     ///   fails charges every instrument in it. Alpaca lists at most 500 open orders and has no
     ///   pagination for them, so a listing of 500 may be truncated and fails: an account with 500
     ///   or more open orders on the held instruments is not covered. An order Alpaca does not know
-    ///   (404) stops being held, logged at `warn`; one still live, `done_for_day`, or in a state
-    ///   this version cannot read stays held.
+    ///   ([not found](AlpacaClient#not-found)) stops being held, logged at `warn`; one still
+    ///   live, `done_for_day`, or in a state this version cannot read stays held.
     ///
     /// The same lookup, without following replaces, is public as
     /// [`OrderStatusClient::fetch_ended_orders`].
@@ -4034,7 +4087,7 @@ const REPLACEMENT_READ_TIMEOUT: Duration =
     Duration::from_secs(replace::REPLACED_HOLD.as_secs() * 3);
 
 /// Read the replacement `id` with `GET /v2/orders/{id}`, for [`ReplaceTracker::take_reads`],
-/// returning `id` with the order read, or `None` for a 404. Fails with
+/// returning `id` with the order read, or `None` for Alpaca's not-found answer. Fails with
 /// [`ConnectivityError::Timeout`] after [`REPLACEMENT_READ_TIMEOUT`].
 async fn read_replacement(
     http: reqwest::Client,
@@ -4465,8 +4518,8 @@ async fn recover_fills(
 /// [`OrderStatusClient::fetch_ended_orders`]: how the order under that key ended, if it has. An
 /// order replaced is read as cancelled, not followed to its replacement.
 ///
-/// A 404 is [`OrderLookup::Unknown`], and so is an order on another symbol than the key's (ignoring
-/// case, as Alpaca's symbols are upper case).
+/// Alpaca's not-found answer is [`OrderLookup::Unknown`], and so is an order on another symbol
+/// than the key's (ignoring case, as Alpaca's symbols are upper case).
 async fn fetch_order_lookup(
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
@@ -4500,8 +4553,9 @@ async fn fetch_order_lookup_following_replaces(
 }
 
 /// The order Alpaca holds under `key`'s client order id, read with
-/// `GET /v2/orders:by_client_order_id`. `None` for a 404, and, logged at `debug`, for an order on
-/// another symbol than the key's (ignoring case, as Alpaca's symbols are upper case).
+/// `GET /v2/orders:by_client_order_id`. `None` for Alpaca's not-found answer, and, logged at
+/// `debug`, for an order on another symbol than the key's (ignoring case, as Alpaca's symbols
+/// are upper case).
 async fn fetch_order_by_cid(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
@@ -4556,8 +4610,9 @@ const REPLACE_HOPS: usize = 8;
 /// seen.
 ///
 /// `None` when `asked` is not `replaced`, and, logged at `warn`, when an order on the chain is
-/// `replaced` but names no replacement, Alpaca does not know an order on the chain (404), or the
-/// chain is longer than the bound: the order asked about is then read as cancelled, as before.
+/// `replaced` but names no replacement, Alpaca does not know an order on the chain (its not-found
+/// answer), or the chain is longer than the bound: the order asked about is then read as
+/// cancelled, as before.
 /// Also `None`, with the conversion's `warn`, for a final order this version cannot read, which
 /// then stays held and is asked about again. A read that fails fails the lookup.
 async fn follow_replaces(
@@ -6610,7 +6665,8 @@ impl OrderStatusClient for AlpacaClient {
     /// replacement linked to it while it is open, and the reconnect's check of
     /// [`account_stream`](ExecutionClient::account_stream) follows it. `done_for_day` is not
     /// ended: Alpaca works the order again the next trading day.
-    /// A 404, or an order on another symbol than the key's (ignoring case), is unknown.
+    /// Alpaca's [not-found answer](AlpacaClient#not-found), or an order on another symbol than the
+    /// key's (ignoring case), is unknown.
     async fn fetch_ended_orders(
         &self,
         orders: &[UnindexedOrderKey],
@@ -10278,6 +10334,22 @@ mod tests {
                     .mount(server)
                     .await;
             }
+            mount_unlisted(server).await;
+        }
+
+        /// Serve Alpaca's not-found answer on the asset and options-contracts lookups for every
+        /// name no other mock serves.
+        async fn mount_unlisted(server: &MockServer) {
+            use wiremock::matchers::path_regex;
+            Mock::given(method("GET"))
+                .and(path_regex("^/v2/(assets|options/contracts)/"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "code": 40410000,
+                    "message": "asset not found"
+                })))
+                .with_priority(u8::MAX)
+                .mount(server)
+                .await;
         }
 
         #[tokio::test]
@@ -10799,6 +10871,151 @@ mod tests {
                 matches!(result, Err(UnindexedClientError::Internal(_))),
                 "{result:?}"
             );
+        }
+
+        /// How the REST helpers read a 404: only Alpaca's own not-found answer means it knows
+        /// nothing under the id; any other 404 is refused, naming what came back.
+        mod not_found {
+            use super::*;
+
+            /// Serve `answer` to `GET /v2/orders/abc` and read it with `read`.
+            async fn read_with<T>(
+                answer: ResponseTemplate,
+                read: impl AsyncFnOnce(
+                    &RateLimitTracker,
+                    &reqwest::Client,
+                    &str,
+                ) -> Result<T, UnindexedClientError>,
+            ) -> Result<T, UnindexedClientError> {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v2/orders/abc"))
+                    .respond_with(answer)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let url = format!("{}/v2/orders/abc", server.uri());
+                read(&RateLimitTracker::new(), &reqwest::Client::new(), &url).await
+            }
+
+            /// What `rest_lookup_with_retry` makes of `answer`.
+            async fn look_up(
+                answer: ResponseTemplate,
+            ) -> Result<Option<serde_json::Value>, UnindexedClientError> {
+                read_with(answer, async |rl, http, url| {
+                    rest_lookup_with_retry(rl, || http.get(url)).await
+                })
+                .await
+            }
+
+            /// A 404 whose JSON body carries `code`, if any, and `message`.
+            fn answer(code: Option<i64>, message: &str) -> ResponseTemplate {
+                let mut body = serde_json::json!({ "message": message });
+                if let Some(code) = code {
+                    body["code"] = code.into();
+                }
+                ResponseTemplate::new(404).set_body_json(body)
+            }
+
+            /// The message of a [`ApiError::RequestRejected`], panicking on anything else.
+            fn rejected<T: std::fmt::Debug>(result: Result<T, UnindexedClientError>) -> String {
+                match result {
+                    Err(UnindexedClientError::Api(ApiError::RequestRejected(message))) => message,
+                    other => panic!("expected RequestRejected, got {other:?}"),
+                }
+            }
+
+            #[tokio::test]
+            async fn alpacas_not_found_answer_is_none() {
+                for message in ["order not found for abc", "asset not found for NOPE"] {
+                    let result = look_up(answer(Some(40410000), message)).await;
+                    assert!(matches!(result, Ok(None)), "{message}: {result:?}");
+                }
+            }
+
+            /// A 404 without Alpaca's code, as a proxy or a wrong path answers, is not Alpaca
+            /// knowing nothing under the id.
+            #[tokio::test]
+            async fn a_404_without_alpacas_code_is_refused() {
+                for (response, shown) in [
+                    (
+                        ResponseTemplate::new(404).set_body_string("Not Found"),
+                        "(Not Found)",
+                    ),
+                    (answer(None, "asset not found"), "(asset not found)"),
+                    (
+                        answer(Some(40410001), "order not found"),
+                        "(40410001 order not found)",
+                    ),
+                ] {
+                    let message = rejected(look_up(response).await);
+                    assert!(
+                        message.contains(shown) && message.contains("check the base URL"),
+                        "{message}"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn a_404_with_no_body_says_so() {
+                for body in ["", " \n"] {
+                    let message =
+                        rejected(look_up(ResponseTemplate::new(404).set_body_string(body)).await);
+                    assert!(message.contains("(no body)"), "{body:?}: {message}");
+                }
+            }
+
+            /// Alpaca answers a path it serves nothing under with its not-found code, worded
+            /// "endpoint not found": the URL is wrong, not the id unknown.
+            #[tokio::test]
+            async fn alpacas_unknown_endpoint_answer_is_refused() {
+                for message in ["endpoint not found", "Endpoint Not Found"] {
+                    let refusal = rejected(look_up(answer(Some(40410000), message)).await);
+                    assert!(
+                        refusal.contains(&format!("(40410000 {message})")),
+                        "{refusal}"
+                    );
+                }
+            }
+
+            /// A page served in place of Alpaca's answer is cut, so the error stays readable.
+            #[tokio::test]
+            async fn a_long_404_body_is_cut_to_200_characters() {
+                let page = "x".repeat(1_000);
+                let message =
+                    rejected(look_up(ResponseTemplate::new(404).set_body_string(page)).await);
+                assert!(
+                    message.contains(&format!("({})", "x".repeat(200))),
+                    "{message}"
+                );
+            }
+
+            /// `rest_with_retry` still reads Alpaca's not-found answer as an order not found, and
+            /// refuses any other 404 as a lookup does.
+            #[tokio::test]
+            async fn rest_with_retry_tells_the_two_404s_apart() {
+                async fn fetch(answer: ResponseTemplate) -> Result<(), UnindexedClientError> {
+                    read_with(answer, async |rl, http, url| {
+                        rest_with_retry::<serde_json::Value>(rl, || http.get(url))
+                            .await
+                            .map(drop)
+                    })
+                    .await
+                }
+
+                let result = fetch(answer(Some(40410000), "order not found for abc")).await;
+                assert!(
+                    matches!(
+                        &result,
+                        Err(UnindexedClientError::Api(ApiError::OrderRejected(message)))
+                            if message.contains("order not found for abc")
+                    ),
+                    "{result:?}"
+                );
+                let message =
+                    rejected(fetch(ResponseTemplate::new(404).set_body_string("Not Found")).await);
+                assert!(message.contains("check the base URL"), "{message}");
+            }
         }
 
         /// Whether `rl` still holds requests back after 50 ms.
@@ -13097,6 +13314,7 @@ mod tests {
             use crate::client::ExecutionClient;
 
             let server = MockServer::start().await;
+            mount_unlisted(&server).await;
             let (instrument, reason) = refused(
                 client_for(&server)
                     .fetch_open_orders(&[InstrumentNameExchange::new("zzz250620c00100000")])
@@ -13151,6 +13369,7 @@ mod tests {
             use crate::client::ExecutionClient;
 
             let server = MockServer::start().await;
+            mount_unlisted(&server).await;
             let (instrument, reason) = refused(
                 client_for(&server)
                     .fetch_trades(
@@ -13177,6 +13396,7 @@ mod tests {
             use crate::client::ExecutionClient;
 
             let server = serve_activities(Vec::new()).await;
+            mount_unlisted(&server).await;
             let client = client_for(&server);
             let requested = [InstrumentNameExchange::new("AAPL210115C00150000")];
             assert!(
@@ -13829,6 +14049,14 @@ mod tests {
             ResponseTemplate::new(200).set_body_json(body)
         }
 
+        /// Alpaca's not-found answer for an order looked up by `id`.
+        fn order_not_found(id: &str) -> ResponseTemplate {
+            ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "code": 40410000,
+                "message": format!("order not found for {id}")
+            }))
+        }
+
         fn alpaca_key(instrument: &str, cid: &str) -> UnindexedOrderKey {
             OrderKey::new(
                 ExchangeId::AlpacaBroker,
@@ -13873,16 +14101,7 @@ mod tests {
                 1,
             )
             .await;
-            mount_lookup(
-                &server,
-                "gone",
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "code": 40410000,
-                    "message": "order not found for gone"
-                })),
-                1,
-            )
-            .await;
+            mount_lookup(&server, "gone", order_not_found("gone"), 1).await;
 
             let keys: Vec<_> = [
                 "filled",
@@ -13962,6 +14181,32 @@ mod tests {
 
             assert!(
                 matches!(result, Err(UnindexedClientError::Connectivity(_))),
+                "{result:?}"
+            );
+        }
+
+        /// A 404 that is not Alpaca's not-found answer, as from a wrong base URL, fails the lookup
+        /// rather than reporting the order unknown.
+        #[tokio::test]
+        async fn fetch_ended_orders_fails_on_a_404_that_is_not_alpacas_not_found() {
+            let server = MockServer::start().await;
+            mount_lookup(
+                &server,
+                "a",
+                ResponseTemplate::new(404).set_body_string("Not Found"),
+                1,
+            )
+            .await;
+
+            let result = client_for(&server)
+                .fetch_ended_orders(&[alpaca_key("SPY", "a")])
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Api(ApiError::RequestRejected(_)))
+                ),
                 "{result:?}"
             );
         }
@@ -14348,7 +14593,7 @@ mod tests {
                 1,
             )
             .await;
-            mount_read(&server, "b", ResponseTemplate::new(404), 1).await;
+            mount_read(&server, "b", order_not_found("id-b"), 1).await;
 
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
             let held = alpaca_key("SPY", "a");
@@ -15214,11 +15459,10 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v2/assets/NOPE"))
-                .respond_with(
-                    ResponseTemplate::new(404).set_body_json(
-                        serde_json::json!({ "message": "asset not found for NOPE" }),
-                    ),
-                )
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "code": 40410000,
+                    "message": "asset not found for NOPE"
+                })))
                 .mount(&server)
                 .await;
 
@@ -15548,6 +15792,9 @@ mod tests {
 
         const OLD: &str = "id-old";
         const NEW: &str = "id-new";
+
+        /// Alpaca's not-found answer for an order read by id.
+        const ORDER_NOT_FOUND: &str = r#"{"code":40410000,"message":"order not found"}"#;
 
         fn frame(
             event: &str,
@@ -16033,7 +16280,8 @@ mod tests {
             use super::replace::REPLACED_HOLD;
 
             let (ws_url, sent_rx) = serve_a_replaced_alone().await;
-            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            let rest_url =
+                crate::client::test_http::serve(|_, _| (404, ORDER_NOT_FOUND.to_string())).await;
             let mut rx = spawn_stream(ws_url, rest_url);
 
             let sent = sent_rx.await.expect("the server sent the `replaced`");
@@ -16067,7 +16315,7 @@ mod tests {
                     let order = r#"{"id":"id-new","client_order_id":"c-new","symbol":"BTC/USD","qty":"2","filled_qty":"0","status":"new","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"1001","stop_price":null,"trail_percent":null,"trail_price":null,"created_at":"2026-11-17T01:43:00Z","updated_at":"2026-11-17T01:43:00Z","replaces":"id-old"}"#;
                     (200, order.to_string())
                 } else {
-                    (404, String::new())
+                    (404, ORDER_NOT_FOUND.to_string())
                 }
             })
             .await;

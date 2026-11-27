@@ -1485,6 +1485,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AlphaVantageClient` no longer follows redirects either: the `Referer` a followed redirect sends
   holds the request's URL, whose query carries the API key. It reports a 3xx as
   `AlphaVantageError::Api`.
+- **`AlpacaClient` reads a 404 as "not found" only when Alpaca sent it** (`rustrade-execution`,
+  `alpaca`). Every 404 used to count as Alpaca knowing nothing under the id or symbol asked for,
+  so a wrong base URL, or a proxy answering 404, made an order lookup report the order unknown, a
+  followed replacement read as cancelled, and an instrument refused as unlisted, with no error
+  saying the URL was wrong. Now only Alpaca's not-found answer (code `40410000`) counts. Any
+  other 404 fails the request with `ApiError::RequestRejected`, naming the answer: one without
+  that code, and one worded "endpoint not found", which Alpaca sends for a path it serves nothing
+  under. Other requests that met such a 404 reported `ApiError::OrderRejected("order not found:
+  …")`, and a do-not-exercise `ExerciseRefusal::Other`; both now report the same
+  `RequestRejected`.
 
 - **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
   an exchange with application-level pings, an initialisation that failed after subscribing left
