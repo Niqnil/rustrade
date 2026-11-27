@@ -195,6 +195,18 @@ pub enum DataError {
         reason: String,
     },
 
+    /// Interactive Brokers' TWS/Gateway refused the connection because another connection holds
+    /// `client_id` (IB code 326).
+    ///
+    /// TWS/Gateway can go on holding a client ID for a moment after the connection that held it
+    /// has closed, so a retry after a backoff can succeed once it lets the ID go. A refusal that
+    /// persists means another connection, in this process or another, is using the same client
+    /// ID: give each IB connection its own. Returned by a stream's first initialisation, and
+    /// inside [`ReinitFailed`](Self::ReinitFailed) when a re-initialisation is refused, which the
+    /// stream then retries after its backoff.
+    #[error("IB refused the connection: client ID {client_id} is already in use")]
+    IbkrClientIdInUse { client_id: i32 },
+
     /// A one-shot request, named by `operation`, got no complete answer within the time set for
     /// it, so it was given up.
     ///
@@ -385,6 +397,12 @@ mod tests {
                 input: DataError::ConnectTimeout {
                     timeout: Duration::from_secs(10),
                 },
+                expected: false,
+            },
+            TestCase {
+                // TC7: not terminal w/ DataError::IbkrClientIdInUse — the refused attempt opened
+                // no stream, and TWS/Gateway may free the ID before the next one.
+                input: DataError::IbkrClientIdInUse { client_id: 7 },
                 expected: false,
             },
         ];
