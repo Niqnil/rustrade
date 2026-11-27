@@ -97,8 +97,9 @@ const CHECKSUM_HEADER: &str = "x-checksum-sha256";
 /// [`replay_candles`](super::backtest::replay_candles) drives N fetches concurrently, so N
 /// independently-paced streams produce an aggregate rate of N per `pace` — which is exactly what
 /// [`DEFAULT_PACE`]'s calls-per-minute derivation says must not happen, and N in-flight
-/// requests against the provider's one download per key. Both bounds therefore belong to the client, not to
-/// any one call site, so that they hold for every entry point without the caller re-deriving them.
+/// requests against the provider's one download per key. Both bounds therefore belong to the
+/// client, not to any one call site, so that they hold for every entry point without the caller
+/// re-deriving them.
 #[derive(Debug)]
 struct RequestGate {
     /// Configured in-flight ceiling. Retained separately because [`Semaphore`] reports only the
@@ -128,12 +129,12 @@ impl RequestGate {
     ///
     /// # The permit is acquired *before* the pacing wait, deliberately
     /// A caller therefore holds a permit while sleeping to its slot, so `concurrency` bounds
-    /// **admitted** callers rather than requests actually in flight — with a `pace` of one second and a
-    /// concurrency of 2, the steady state is one request on the wire and one waiting, not two on
-    /// the wire. Acquiring in the other order would let an unbounded number of callers queue on
-    /// the pacing mutex and then release together, which is the burst the concurrency limit exists
-    /// to prevent. The cost is that `concurrency` reads as a slightly stricter limit than its name
-    /// suggests; the benefit is that neither bound can be exceeded.
+    /// **admitted** callers rather than requests actually in flight — with a `pace` of one second
+    /// and a concurrency raised to 2, the steady state is one request on the wire and one waiting,
+    /// not two on the wire. Acquiring in the other order would let an unbounded number of callers
+    /// queue on the pacing mutex and then release together, which is the burst the concurrency
+    /// limit exists to prevent. The cost is that `concurrency` reads as a slightly stricter limit
+    /// than its name suggests; the benefit is that neither bound can be exceeded.
     ///
     /// `None` is returned only if the semaphore were closed, which cannot happen: it is private to
     /// this type and nothing closes it. Degrading to an unpaced-but-still-spaced request beats
