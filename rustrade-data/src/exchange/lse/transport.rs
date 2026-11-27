@@ -1,29 +1,25 @@
-//! Authenticated, rationed REST transport shared by the London Strategic Edge hosts. Internal: the
-//! host clients are the public surface.
+//! Authenticated, rationed REST transport shared by the London Strategic Edge REST clients.
+//! Internal: the clients are the public surface.
 //!
-//! The provider serves from **two hosts** that differ in path, payload shape and symbol key but
-//! agree on everything this module covers: the `x-api-key` header, the `LSE_API_KEY` variable
-//! behind it, the `User-Agent` their shared CDN demands, the redirect policy that keeps the key
-//! off a server-supplied host, the request rationing, and the mapping from a non-success status to
-//! an [`LseError`].
+//! [`LseHttpCore`] holds what every client shares: the `x-api-key` header, the `LSE_API_KEY`
+//! variable behind it, the `User-Agent` the provider's CDN demands, the redirect policy that keeps
+//! the key off a server-supplied host, the request rationing, the mapping from a non-success status
+//! to an [`LseError`], and the verified download of a file answer.
 //!
-//! [`LseHttpCore`] holds exactly that common part. The host-specific clients —
-//! [`LseVaultClient`](super::vault::LseVaultClient) for the vault data plane and
-//! [`LseDataApiClient`](super::data_api::LseDataApiClient) for the reference host — wrap one and
-//! add their own endpoints and their own configuration on top.
+//! [`LseClient`](super::client::LseClient) wraps one for LSE Data 3.0
+//! (`https://download.londonstrategicedge.com/v3`). The pre-3.0 clients still wrap one each until
+//! they are removed.
 //!
 //! # ⚠️ One core is one ration pool
 //!
 //! Rationing belongs to a core, so two clients built separately ration **independently** and their
-//! aggregate rate is the sum of theirs. That is the right default for two hosts, whose limits are
-//! enforced separately, but it is not a claim that the provider's *allowance* is per-host: the
-//! vault reports a single [`calls_per_minute`](super::quota::QuotaStatus::calls_per_minute) and
-//! whether the other host draws on the same pool has not been measured. A consumer driving both
-//! should budget as though it were shared.
+//! aggregate rate is the sum of theirs. The provider's limits are per key, not per client: a
+//! consumer driving several clients with one key should clone one client instead.
 
 use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
-use crate::exchange::lse::error::{LseError, extract_detail};
+use crate::exchange::lse::error::{LseError, extract_refusal};
 use reqwest::header::{HeaderMap, HeaderValue};
+use sha2::{Digest, Sha256};
 use std::{env, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, Semaphore, SemaphorePermit},
@@ -74,9 +70,20 @@ pub(crate) const DEFAULT_PACE: Duration = Duration::from_millis(300);
 
 /// Default ceiling on requests in flight at once.
 ///
-/// The provider reports its own ceiling as
-/// [`vault_concurrency`](super::quota::QuotaStatus::vault_concurrency), measured at 2.
-pub(crate) const DEFAULT_CONCURRENCY: usize = 2;
+/// One, because the provider holds **one download open per key** on every plan and refuses a
+/// second with `429 connections-exhausted` (or `exports-busy`). A JSON call does not take that
+/// slot, so a caller issuing only JSON calls may raise it with `with_concurrency`.
+pub(crate) const DEFAULT_CONCURRENCY: usize = 1;
+
+/// Total deadline for a file download: connect, send, and read the whole body.
+///
+/// Far above any chunk this integration requests by default (a few megabytes), and bounded so a
+/// trickling transfer cannot hold the key's single download slot indefinitely. A *stalled* transfer
+/// is caught much sooner by [`READ_TIMEOUT`].
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Header carrying the SHA-256 of a file answer, as lowercase hex.
+const CHECKSUM_HEADER: &str = "x-checksum-sha256";
 
 /// Shared gate every request passes through: bounds concurrency, then spaces request starts.
 ///
@@ -296,9 +303,7 @@ impl LseHttpCore {
     /// not have to pace them itself.
     ///
     /// # Errors
-    /// Maps a `429` to [`LseError::RateLimited`] (carrying `Retry-After` when present), any other
-    /// non-success status to [`LseError::Api`] with the provider's diagnostic unwrapped from its
-    /// envelope, and a body that will not decode to [`LseError::Deserialize`].
+    /// See [`checked`](Self::checked); a body that will not decode is [`LseError::Deserialize`].
     pub(crate) async fn get_json<T>(
         &self,
         path: &str,
@@ -312,42 +317,112 @@ impl LseHttpCore {
         let _permit = self.enter_gate().await;
 
         let url = format!("{}/{path}", self.base_url);
-        let response = self.http.get(&url).query(query).send().await?;
-        let status = response.status();
+        let response = Self::checked(self.http.get(&url).query(query).send().await?).await?;
 
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Surfaced and terminal: pacing policy belongs to the caller, so this never sleeps and
-            // retries on their behalf.
-            let retry_after = parse_retry_after(response.headers());
-
-            // Drain before dropping, so the connection can go back to the pool. A 429 body is a
-            // short JSON detail; dropping the response unread closes the connection instead, and
-            // the caller's retry then pays a fresh TLS handshake for nothing. Discarded rather
-            // than reported -- `retry_after` is already the actionable part, and a read failure
-            // here must not mask the rate limit.
-            let _ = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await;
-
-            return Err(LseError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
-            return Err(LseError::Api {
-                status: status.as_u16(),
-                message: extract_detail(&body),
-            });
-        }
-
-        // `bytes()`, not `text()`: `text()` copies the whole body out of the response's buffer into a
-        // fresh `String` first, purely to validate UTF-8 that `serde_json` validates again. A
-        // multi-year one-minute backfill runs to hundreds of pages, so that copy is not free, and
-        // `len` for the log line is available either way.
+        // `bytes()`, not `text()`: `text()` copies the whole body into a fresh `String` purely to
+        // validate UTF-8 that `serde_json` validates again.
         let body = response.bytes().await?;
         debug!(len = body.len(), path, "lse response received");
 
         serde_json::from_slice(&body).map_err(|error| LseError::Deserialize {
             message: format!("{path}: {error}"),
         })
+    }
+
+    /// Issue an authenticated `GET` for a file answer and verify it before handing it back.
+    ///
+    /// The provider sends a file whole, with its SHA-256 in `x-checksum-sha256` and its size in
+    /// `Content-Length`. The body is held in memory, so callers must bound what they ask for;
+    /// [`fetch_candles`](super::client::LseClient::fetch_candles) asks for chunks of a bounded
+    /// number of bars.
+    ///
+    /// `x-export-rows` is not checked: it is not the file's row count. A six-hour hourly read
+    /// declared 6 rows and carried 6, but a three-day one declared 4,178 and carried 73 (measured
+    /// 2026-11-27), so it appears to count the stored rows the bars were built from. The checksum
+    /// and the size already cover every byte of the body.
+    ///
+    /// # Errors
+    /// See [`checked`](Self::checked). A success answer without a checksum, or whose body disagrees
+    /// with its checksum or its declared size, is [`LseError::Api`] with the success status and no
+    /// code: nothing from it is returned, so a cut or damaged transfer never becomes partial data.
+    pub(crate) async fn get_file(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<u8>, LseError> {
+        let _permit = self.enter_gate().await;
+
+        let url = format!("{}/{path}", self.base_url);
+        let request = self.http.get(&url).query(query).timeout(DOWNLOAD_TIMEOUT);
+        let response = Self::checked(request.send().await?).await?;
+        let status = response.status().as_u16();
+        let refuse = |message: String| LseError::Api {
+            status,
+            code: None,
+            message: format!("{path}: {message}"),
+        };
+
+        let headers = response.headers();
+        let checksum = headers
+            .get(CHECKSUM_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .ok_or_else(|| refuse(format!("the answer carries no {CHECKSUM_HEADER} header")))?;
+        let declared_length = response.content_length();
+
+        let body: Vec<u8> = response.bytes().await?.into();
+        if let Some(declared) = declared_length
+            && declared != body.len() as u64
+        {
+            return Err(refuse(format!(
+                "declared {declared} bytes but carried {}",
+                body.len()
+            )));
+        }
+        let actual = hex::encode(Sha256::digest(&body));
+        if actual != checksum {
+            return Err(refuse(format!(
+                "SHA-256 {actual} does not match the declared {checksum}"
+            )));
+        }
+        debug!(len = body.len(), path, "lse file received and verified");
+
+        Ok(body)
+    }
+
+    /// Pass a success response through, or turn a refusal into its typed error.
+    ///
+    /// # Errors
+    /// A `429` is [`LseError::RateLimited`], carrying `Retry-After` and the provider's code when
+    /// present. Any other non-success status, an unfollowed redirect included, is
+    /// [`LseError::Api`] with the provider's code and sentence.
+    async fn checked(response: reqwest::Response) -> Result<reqwest::Response, LseError> {
+        let status = response.status();
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Surfaced and terminal: pacing policy belongs to the caller, so this never sleeps and
+            // retries on their behalf.
+            let retry_after = parse_retry_after(response.headers());
+            // A read failure here must not mask the rate limit, so it costs only the code.
+            let code = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES)
+                .await
+                .ok()
+                .and_then(|body| extract_refusal(&body).0);
+
+            return Err(LseError::RateLimited { retry_after, code });
+        }
+
+        if !status.is_success() {
+            let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+            let (code, message) = extract_refusal(&body);
+            return Err(LseError::Api {
+                status: status.as_u16(),
+                code,
+                message,
+            });
+        }
+
+        Ok(response)
     }
 }
 
@@ -498,7 +573,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn clones_of_one_core_share_its_gate() {
         // The counterpart claim: cloning a client must not multiply its rate.
-        let core = LseHttpCore::new("k", TEST_BASE).unwrap();
+        // Two permits, so the second caller waits on the pace alone; with the default one it
+        // would wait for the first permit, which this test never releases.
+        let mut core = LseHttpCore::new("k", TEST_BASE).unwrap();
+        core.set_concurrency(2);
         let clone = core.clone();
 
         let start = Instant::now();

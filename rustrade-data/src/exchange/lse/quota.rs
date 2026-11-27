@@ -50,9 +50,8 @@ pub struct QuotaStatus {
     pub calls_per_minute: u32,
     /// Maximum rows a single request may return.
     ///
-    /// Note this is a **silent** cap: an over-large range returns exactly this many rows with a
-    /// `200` and no truncation marker of any kind. See
-    /// [`fetch_candles`](super::vault::LseVaultClient::fetch_candles).
+    /// Note this was a **silent** cap on the pre-3.0 vault: an over-large range returned exactly
+    /// this many rows with a `200` and no truncation marker of any kind.
     pub max_rows_per_request: u32,
     /// Maximum concurrent vault requests.
     pub vault_concurrency: u32,

@@ -146,8 +146,8 @@ impl LseDataApiClient {
     /// [`new`](Self::new) configures a 30s total timeout and a 30s read timeout; `reqwest`'s
     /// default is **neither**. Replacing the client drops both, and a timeout-less client
     /// interacts badly with the [request gate](Self#request-rationing-is-per-client-not-per-call):
-    /// a permit is held for the whole request, so with the default concurrency of 2, two stalled
-    /// connections exhaust the gate *permanently* — for this client and every clone of it, with no
+    /// a permit is held for the whole request, so with the default concurrency of 1, one stalled
+    /// connection exhausts the gate *permanently* — for this client and every clone of it, with no
     /// error, no log, and nothing to observe but a run that stops making progress. Set
     /// [`timeout`](reqwest::ClientBuilder::timeout) and
     /// [`read_timeout`](reqwest::ClientBuilder::read_timeout) on any client passed here.
@@ -236,7 +236,7 @@ mod tests {
         let rendered = format!("{client:?}");
 
         assert!(rendered.contains(DATA_API_BASE_URL), "{rendered}");
-        assert!(rendered.contains("concurrency: 2"), "{rendered}");
+        assert!(rendered.contains("concurrency: 1"), "{rendered}");
     }
 
     /// The core is host-agnostic, so pointing at this host is entirely this type's contribution —
@@ -304,7 +304,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cloned_client_queues_at_the_same_gate_as_its_original() {
         let pace = Duration::from_millis(300);
-        let client = LseDataApiClient::new("key").unwrap().with_pace(pace);
+        // Two permits, so the second caller waits on the pace alone; with the default one it
+        // would wait for the first permit, which this test never releases.
+        let client = LseDataApiClient::new("key")
+            .unwrap()
+            .with_concurrency(2)
+            .with_pace(pace);
         let clone = client.clone();
         let started = Instant::now();
 

@@ -97,8 +97,8 @@
 //! they contend for the one slot: whichever connects first proceeds and the rest fail inside their
 //! `expect`, before asserting anything at all.
 //!
-//! That failure is worse than an ordinary flake, for the reason the vault canary gives about its
-//! own cap: it presents as four red tests on the surface this file exists to watch, it is not a
+//! That failure is worse than an ordinary flake, for the reason the client canary gives about
+//! its own cap: it presents as four red tests on the surface this file exists to watch, it is not a
 //! provider-side change, and it reads exactly like one. A drift detector that cries wolf is one
 //! people learn to ignore.
 //!
@@ -176,12 +176,12 @@ use rustrade_data::{
     event::{DataKind, MarketEvent},
     exchange::lse::{
         LseCfd, LseCrypto, LseOptions,
+        client::LseClient,
         live::LseSubscriber,
         market::LseMarket,
         options::{LseOptionContract, LseOptionPrint},
         resume::LseResumeState,
         stream::LseStream,
-        vault::LseVaultClient,
     },
     streams::{
         Streams,
@@ -982,8 +982,8 @@ const OPTION_CONTRACTS: usize = 10;
 
 /// How far before now the open-market probe window ends.
 ///
-/// Past the vault's settle margin, which refuses a range ending closer to now than that because the
-/// provider can serve one incomplete, with a margin on top for clock skew.
+/// Past the print tape's settle margin, which refuses a range ending closer to now than that
+/// because the provider can serve one incomplete, with a margin on top for clock skew.
 const OPEN_PROBE_END: ChronoDuration = ChronoDuration::seconds(90);
 
 /// 15:00 UTC is inside the US options session on both sides of the DST change, so a minute there
@@ -1016,9 +1016,9 @@ fn option_instrument(contract: &LseOptionContract) -> MarketDataInstrument {
 /// A settled minute ending just before now holding prints means the market is open. An empty one
 /// means it is shut — or that ingestion is lagging, which the provider does episodically — and either
 /// way the print signal cannot be judged, so contracts are taken from a recent session instead.
-async fn option_tape(vault: &LseVaultClient) -> (Vec<LseOptionPrint>, bool) {
+async fn option_tape(client: &LseClient) -> (Vec<LseOptionPrint>, bool) {
     let end = Utc::now() - OPEN_PROBE_END;
-    let recent = vault
+    let recent = client
         .collect_option_flow(
             Some(OPTIONS_UNDERLYING),
             end - ChronoDuration::minutes(1),
@@ -1039,7 +1039,7 @@ async fn option_tape(vault: &LseVaultClient) -> (Vec<LseOptionPrint>, bool) {
         }
 
         let start = day.and_time(CLOSED_PROBE_TIME).and_utc();
-        let prints = vault
+        let prints = client
             .collect_option_flow(
                 Some(OPTIONS_UNDERLYING),
                 start,
@@ -1067,10 +1067,10 @@ async fn option_contracts_spell_subscribe_and_print_as_expected() {
     let Some(subscriber) = subscriber() else {
         return;
     };
-    let vault = LseVaultClient::from_env()
+    let client = LseClient::from_env()
         .unwrap_or_else(|error| panic!("{KEY_ENV} is set but unusable: {error}"));
 
-    let (tape, open) = option_tape(&vault).await;
+    let (tape, open) = option_tape(&client).await;
 
     // Spelling: every contract on the tape, rebuilt from its parts, must name the provider's ticker.
     // A wrong spelling is the quietest failure this dataset has: the contract is accepted, its prints

@@ -153,7 +153,7 @@ pub struct LseBondYieldRow {
     ///
     /// Kept as the provider's string and parsed on demand by
     /// [`observation_date`](Self::observation_date), following the same rule as
-    /// [`LseCatalogEntry`](super::reference::LseCatalogEntry)'s timestamps: one malformed row then
+    /// the pre-3.0 catalog entry's timestamps: one malformed row then
     /// fails at the row rather than taking the whole fetch down with it.
     pub date: String,
     /// Provider symbol for the series, formed by concatenating country and tenor **without
@@ -599,6 +599,7 @@ impl LseDataApiClient {
         if envelope.count != envelope.data.len() {
             return Err(LseError::Api {
                 status: 200,
+                code: None,
                 message: format!(
                     "bond-yield response declared {} rows but carried {}: the response appears to \
                      have been truncated",

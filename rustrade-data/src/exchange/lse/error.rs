@@ -1,6 +1,7 @@
 use crate::exchange::lse::quota::QuotaStatus;
 use crate::subscription::candle::CandleInterval;
 use chrono::{DateTime, NaiveDate, Utc};
+use smol_str::SmolStr;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -32,6 +33,10 @@ pub enum LseError {
     #[error("unknown dataset {0:?}")]
     UnknownDataset(String),
 
+    /// A market folder name this integration does not know, such as one the provider added since.
+    #[error("unknown LSE market {0:?}")]
+    UnknownMarket(String),
+
     /// A required environment variable is not set, or does not hold valid UTF-8 (see
     /// [`LseVaultClient::from_env`]).
     ///
@@ -52,33 +57,45 @@ pub enum LseError {
 
     /// The API returned a non-success status, or a success response this integration cannot use.
     ///
-    /// `message` is the provider's own diagnostic, unwrapped from its response envelope and
-    /// truncated to a bounded length — or, where `status` is a success code, this integration's own
-    /// diagnostic for a response that violated the contract that status implies. A `206` whose
-    /// `Content-Range` is missing, unparseable, or does not resume where the `Range` asked, and a
-    /// `200` page that repeats the cursor it was given, all arrive here: the status is the one the
-    /// provider sent, so it stays reportable, but the fault is one only the client can see.
-    #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    /// `code` is the provider's machine-readable refusal code where it sent one (`symbol-unknown`,
+    /// `plan-required`, `history-limit`, `rows-exhausted`, `export-too-wide`, `date-missing`, ...):
+    /// match on it rather than on `message`, whose wording the provider changes. `message` is the
+    /// provider's own sentence, truncated to a bounded length — or, where `status` is a success
+    /// code, this integration's own diagnostic for a response that violated the contract that
+    /// status implies (a download whose checksum or row count disagrees with its headers, say). The
+    /// status is the one the provider sent, so it stays reportable, but the fault is one only the
+    /// client can see; `code` is `None` then.
+    #[error("API error ({status}{}): {message}", match .code {
+        Some(code) => format!(" {code}"),
+        None => String::new(),
+    })]
+    Api {
+        status: u16,
+        code: Option<SmolStr>,
+        message: String,
+    },
 
-    /// The request rate was exceeded.
+    /// The provider answered `429`: a limit of the key's plan is reached.
     ///
-    /// Terminal — this integration never sleeps and retries on the caller's behalf. A paged fetch
-    /// yields this and **ends**; resume by re-requesting from the last `close_time` received.
+    /// Terminal — this integration never sleeps and retries on the caller's behalf. A chunked
+    /// fetch yields this and **ends**; resume by re-requesting from the last `close_time` received.
     ///
-    /// The provider permits [`calls_per_minute`](QuotaStatus::calls_per_minute) requests per
-    /// minute, reported by [`usage`](super::vault::LseVaultClient::usage).
-    ///
-    /// # Caveat
-    /// On the *export* endpoints an exhausted allowance is distinguished and reported as
-    /// [`QuotaExceeded`](Self::QuotaExceeded). On the candle path the provider offers no way to
-    /// tell a per-minute rate limit from an exhausted byte allowance, so both arrive here. Either
-    /// way it is observable and terminal, and never silently retried.
-    #[error("rate limited{}", match .retry_after {
+    /// `code` says which limit, where the provider named it: `calls-exhausted` (calls per minute),
+    /// `connections-exhausted` or `exports-busy` (one download at a time per key), `rows-exhausted`
+    /// (the plan's rows per day) or `allowance-exhausted` (bytes per week). `retry_after` is the
+    /// provider's `Retry-After`, where it sent one in seconds. The figures are in
+    /// [`usage`](super::client::LseClient::usage).
+    #[error("rate limited{}{}", match .code {
+        Some(code) => format!(" ({code})"),
+        None => String::new(),
+    }, match .retry_after {
         Some(delay) => format!("; retry after {}s", delay.as_secs()),
         None => String::new(),
     })]
-    RateLimited { retry_after: Option<Duration> },
+    RateLimited {
+        retry_after: Option<Duration>,
+        code: Option<SmolStr>,
+    },
 
     /// A response body could not be decoded into the expected shape.
     #[error("invalid response: {message}")]
@@ -230,63 +247,35 @@ pub enum LseError {
         interval: CandleInterval,
     },
 
-    /// The pagination cursor could not be advanced past the last bar received.
+    /// The provider served a candle opening outside the window this integration asked it for.
     ///
-    /// The cursor steps one second past the newest open time on a page, which is not representable
-    /// within a second of [`DateTime::MAX_UTC`]. Distinct from
-    /// [`TimestampOverflow`](Self::TimestampOverflow), which is a *candle's* period end: the addend
-    /// here is the cursor step, not the interval, and naming the interval would send a reader
-    /// looking at arithmetic the code never performed.
-    #[error("pagination cursor overflow: open time {last_open} + 1s is not representable")]
-    CursorOverflow { last_open: DateTime<Utc> },
-
-    /// The vault served a candle closing past the requested `end`.
-    ///
-    /// The upper bound sent to the vault is exact by construction: it is `end - interval + 1s`
-    /// against a parameter that is *exclusive* on open time, so the newest bar a compliant page can
-    /// carry is the one whose close falls exactly on `end`. A later one means the range parameters
-    /// were not honoured — the same silently-ignored-parameter failure as a page that repeats the
-    /// cursor it was given, which is why both are terminal rather than quietly repaired.
-    ///
-    /// # Not symmetric with the lower bound, deliberately
-    /// The lower bound is widened by one interval *on purpose*, to readmit the bar whose close
-    /// equals `start`, so a page legitimately carries bars closing before `start` and those are
-    /// trimmed without comment. Nothing widens the upper bound, so there is no benign reading of a
-    /// bar past it.
-    ///
-    /// Every in-range bar on the offending page is yielded **before** this arrives: the page is
-    /// scanned to the end first, so failing here costs none of the data the response did contain.
+    /// Each chunk of a candle fetch asks for a window whose bounds sit on the interval's grid, and
+    /// the provider aggregates exactly that window, so every bar it returns opens inside it. One
+    /// that does not means the window was not honoured, and the bar may be a fragment of a period
+    /// cut by the window's edge. Terminal rather than trimmed away.
     #[error(
-        "page {page} for {symbol:?} returned a candle closing after {end} (cursor {cursor}): the \
-         range parameters appear to have been ignored"
+        "a candle for {symbol:?} opens at {open}, outside the window [{window_start}, \
+         {window_end}) it was asked for: the range parameters appear to have been ignored"
     )]
     UnexpectedCandleRange {
         symbol: String,
-        cursor: DateTime<Utc>,
-        page: usize,
-        end: DateTime<Utc>,
+        open: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
     },
 
-    /// A candle page stepped **backwards** in open time.
+    /// Candles stepped **backwards**, or repeated a period, within a fetch.
     ///
-    /// Ascending order is how the vault answers today, not something it guarantees, and the
-    /// pagination cursor depends on it being at least non-descending *across* pages: the cursor
-    /// advances past the newest open a page carried, so a page served newest-first advances it to
-    /// the end of the range immediately. The next page is then empty, which is the documented
-    /// end-of-data signal, and `collect_candles` returns `Ok` with the last page of a multi-million
-    /// bar range and no indication that the rest was skipped.
-    ///
-    /// Terminal rather than repaired by sorting: a page arriving in an order the cursor arithmetic
-    /// was not built for means the vault changed behaviour, and every later assumption in this
-    /// module — the trim bounds, the cursor step, the end-of-data signal — was derived from the old
-    /// one. The same property is a typed rejection on the Parquet path
+    /// Compared on the bar's open for an intraday interval and on its session date for a daily,
+    /// weekly or monthly one, across the chunks of one fetch as well as within each. Terminal
+    /// rather than repaired by sorting: an order the chunking was not built for means the provider
+    /// changed behaviour. The same property is a typed rejection on the Parquet path
     /// ([`NonMonotonicTimestamps`](Self::NonMonotonicTimestamps)).
     #[error(
-        "page {page} for {symbol:?} stepped backwards in open time: {open} follows {previous_open}"
+        "candles for {symbol:?} are not ascending: a bar opening {open} follows one opening {previous_open}"
     )]
-    NonMonotonicCandlePage {
+    NonMonotonicCandles {
         symbol: String,
-        page: usize,
         previous_open: DateTime<Utc>,
         open: DateTime<Utc>,
     },
@@ -295,16 +284,16 @@ pub enum LseError {
     ///
     /// Impossible for a compliant fixed-interval series: consecutive bars are exactly one interval
     /// apart, and a gap (a weekend, a holiday, a quiet symbol) only ever makes the spacing *wider*.
-    /// Spacing narrower than the interval means the candles are at a **finer resolution than the one
-    /// requested**, so every `close_time` derived for them overlaps the bars that follow.
+    /// Spacing narrower than the interval means the candles are at a **finer resolution than the
+    /// one requested**, so every `close_time` derived for them overlaps the bars that follow.
     ///
-    /// # The failure this exists to catch, on the vault path
-    /// The vault answers `200` to a misspelled resolution parameter and silently defaults to
-    /// 1-minute bars, in a byte-identical response shape (see the `vault` module docs). A `Day1`
-    /// request would then receive 1,440 one-minute rows per day, each stamped with a `close_time` of
-    /// `open + 24h` by the `historical` module's boundary arithmetic — overlapping, wrong, and
-    /// invisible to every other check there, because the range bounds are still satisfied and the
-    /// series still ascends. Spacing is the one property that distinguishes it.
+    /// # The failure this exists to catch, on the REST path
+    /// A provider that answered a resolution it does not recognise with its default of 1-minute
+    /// bars, in the same response shape, would hand an `Hour1` request 60 rows an hour, each stamped
+    /// with a `close_time` of `open + 1h` by the boundary arithmetic: overlapping, wrong, and
+    /// invisible to every other check, because the bars ascend and fall inside the window. Spacing
+    /// is the one property that distinguishes it. Checked for intraday intervals only: a daily or
+    /// longer bar opens at its session's first trade, so the gap between two opens varies.
     ///
     /// # And on the export path
     /// `parquet::read_export` derives `close_time` from a **caller-supplied** interval, since
@@ -338,28 +327,13 @@ pub enum LseError {
         actual: chrono::TimeDelta,
     },
 
-    /// A single second of the option print tape holds more prints than one page can carry.
-    ///
-    /// The flow endpoint truncates silently at its row cap and accepts only whole-second bounds, so
-    /// a one-second window that still comes back full cannot be narrowed further, and the prints
-    /// beyond the cap cannot be read at all. Terminal rather than returned short: the alternative is
-    /// a tape missing prints with nothing to say so.
-    #[error(
-        "the option print tape holds at least {rows} prints in the one second from {window_start}, \
-         more than one page can carry"
-    )]
-    OptionFlowWindowSaturated {
-        window_start: DateTime<Utc>,
-        rows: usize,
-    },
-
     /// An option print came back outside the window or underlying it was requested for.
     ///
-    /// Means the provider ignored a request parameter, which it is known to do silently — the flow
-    /// endpoint answers a `ticker` filter by returning every contract. Raised before any print of
-    /// the offending window is yielded.
-    #[error("option print {id} does not match its request: {message}")]
-    UnexpectedOptionFlowRow { id: u64, message: String },
+    /// Means the provider ignored a request parameter (the window, the underlying or the order),
+    /// or sent a whole page of prints at one instant, which paging by time cannot get past. Raised
+    /// before any print of the offending page is yielded.
+    #[error("option print of {ticker} does not match its request: {message}")]
+    UnexpectedOptionFlowRow { ticker: SmolStr, message: String },
 
     /// The shared allowance is exhausted.
     ///
@@ -709,15 +683,14 @@ impl LseError {
             Self::Http(_) => LseErrorKind::Network,
             Self::ExportTimeout { .. } => LseErrorKind::Timeout,
             // The request was valid and the provider cannot serve it whole; retrying changes nothing.
-            Self::Api { .. }
-            | Self::ExportFailed { .. }
-            | Self::OptionFlowWindowSaturated { .. } => LseErrorKind::Api,
+            Self::Api { .. } | Self::ExportFailed { .. } => LseErrorKind::Api,
             Self::Io { .. } => LseErrorKind::Io,
 
             // The caller's request or registry, not the provider's answer.
             Self::InvalidInput { .. }
             | Self::UnsupportedInterval { .. }
             | Self::UnknownDataset(_)
+            | Self::UnknownMarket(_)
             | Self::AmbiguousSlug { .. }
             | Self::UnknownInstrument { .. }
             | Self::AmbiguousInstrument { .. }
@@ -734,9 +707,8 @@ impl LseError {
             // accepted and answered, and it is the payload that does not hold up.
             Self::Deserialize { .. }
             | Self::TimestampOverflow { .. }
-            | Self::CursorOverflow { .. }
             | Self::UnexpectedCandleRange { .. }
-            | Self::NonMonotonicCandlePage { .. }
+            | Self::NonMonotonicCandles { .. }
             | Self::UnexpectedCandleResolution { .. }
             | Self::UnexpectedOptionFlowRow { .. }
             | Self::IntegrityMismatch { .. }
@@ -760,23 +732,31 @@ impl LseError {
 /// Well above any real message, and far below a pathological proxy error page.
 const MAX_DETAIL_BYTES: usize = 2 * 1024;
 
-/// Extract the provider's human-readable diagnostic from an error response body.
+/// Extract the provider's refusal code and sentence from an error response body.
 ///
-/// # Why this is not `body["detail"].as_str()`
+/// # Shapes read
 ///
-/// The provider encodes errors inconsistently, and both forms are measured:
+/// LSE Data 3.0 answers every refusal as one JSON object, measured on `/v3`:
 ///
 /// ```text
-/// 400/404: {"detail":"{\"detail\":\"invalid timeframe '7q'; valid: 1s, 5s, ...\"}"}
-/// 401:     {"detail":"invalid api key"}
+/// 404: {"code": "symbol-unknown", "message": "symbol is not available"}
 /// ```
 ///
-/// On `400`/`404` the value of `detail` is *itself* a JSON document encoded as a string, so
-/// reading one level surfaces raw JSON in a user-facing error message. This unwraps repeatedly
-/// until `detail` stops being re-encoded, and falls back to the whole body when the response is
-/// not in either shape (a proxy or CDN page, say). The result is always truncated.
-pub(crate) fn extract_detail(body: &str) -> String {
+/// Some refusals add figures (`required_plan`, `retry_after`, `earliest`, ...); those are left out
+/// here, and the sentence names what matters. The pre-3.0 hosts answer with a `detail` that may be
+/// a JSON document encoded as a string, one level inside another:
+///
+/// ```text
+/// 410:     {"detail": "Look at the new documentation: ...", "status": 410}
+/// 400/404: {"detail":"{\"detail\":\"invalid timeframe '7q'; valid: 1s, 5s, ...\"}"}
+/// ```
+///
+/// so `detail` is unwrapped repeatedly until it stops being re-encoded. A body in neither shape (a
+/// proxy or CDN page, say) is returned whole as the sentence, with no code. The sentence is always
+/// truncated.
+pub(crate) fn extract_refusal(body: &str) -> (Option<SmolStr>, String) {
     let mut current = body.trim().to_owned();
+    let mut code = None;
 
     // Bounded rather than `loop`: two levels are measured, and a handful of iterations is ample for
     // any further nesting the provider might add without risking a pathological input spinning here.
@@ -786,13 +766,21 @@ pub(crate) fn extract_detail(body: &str) -> String {
         else {
             break;
         };
-        let Some(serde_json::Value::String(detail)) = object.get("detail") else {
-            break;
+        if let Some(serde_json::Value::String(found)) = object.get("code") {
+            code = Some(SmolStr::new(found.trim()));
+        }
+        let sentence = match (object.get("message"), object.get("detail")) {
+            (Some(serde_json::Value::String(message)), _) => message,
+            (_, Some(serde_json::Value::String(detail))) => detail,
+            _ => break,
         };
-        current = detail.trim().to_owned();
+        current = sentence.trim().to_owned();
     }
 
-    crate::exchange::http::truncate_str(&current, MAX_DETAIL_BYTES)
+    (
+        code.filter(|code| !code.is_empty()),
+        crate::exchange::http::truncate_str(&current, MAX_DETAIL_BYTES),
+    )
 }
 
 #[cfg(test)]
@@ -800,13 +788,56 @@ pub(crate) fn extract_detail(body: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The sentence alone, for the shapes that carry no code.
+    fn detail(body: &str) -> String {
+        extract_refusal(body).1
+    }
+
+    #[test]
+    fn a_v3_refusal_yields_its_code_and_sentence() {
+        // The measured `/v3` shape.
+        assert_eq!(
+            extract_refusal(r#"{"code": "symbol-unknown", "message": "symbol is not available"}"#),
+            (
+                Some(SmolStr::new("symbol-unknown")),
+                "symbol is not available".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_v3_refusal_with_figures_keeps_its_code_and_sentence() {
+        let body = r#"{"code": "plan-required", "message": "This market needs a plan.",
+            "required_plan": {"name": "Nasdaq Lite"}}"#;
+
+        assert_eq!(
+            extract_refusal(body),
+            (
+                Some(SmolStr::new("plan-required")),
+                "This market needs a plan.".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_retired_host_answer_carries_no_code() {
+        // The measured 410 from the pre-3.0 data host: `status` is a number, not a code.
+        assert_eq!(
+            extract_refusal(r#"{"detail": "Look at the new documentation", "status": 410}"#),
+            (None, "Look at the new documentation".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_empty_or_non_string_code_is_no_code() {
+        assert_eq!(extract_refusal(r#"{"code": "", "message": "m"}"#).0, None);
+        assert_eq!(extract_refusal(r#"{"code": 7, "message": "m"}"#).0, None);
+    }
+
     #[test]
     fn single_encoded_detail_is_read_directly() {
         // The measured 401 shape.
-        assert_eq!(
-            extract_detail(r#"{"detail":"invalid api key"}"#),
-            "invalid api key"
-        );
+        assert_eq!(detail(r#"{"detail":"invalid api key"}"#), "invalid api key");
     }
 
     #[test]
@@ -815,10 +846,7 @@ mod tests {
         // level would put raw JSON in front of the user.
         let body = r#"{"detail":"{\"detail\":\"invalid timeframe '7q'; valid: 1s, 5s, 15s\"}"}"#;
 
-        assert_eq!(
-            extract_detail(body),
-            "invalid timeframe '7q'; valid: 1s, 5s, 15s"
-        );
+        assert_eq!(detail(body), "invalid timeframe '7q'; valid: 1s, 5s, 15s");
     }
 
     #[test]
@@ -828,7 +856,7 @@ mod tests {
             r#"{"detail":"{\"detail\":\"'NOPE_XYZ' has no candle data; browse /catalog\"}"}"#;
 
         assert_eq!(
-            extract_detail(body),
+            detail(body),
             "'NOPE_XYZ' has no candle data; browse /catalog"
         );
     }
@@ -837,21 +865,21 @@ mod tests {
     fn a_non_json_body_is_returned_as_is() {
         // A proxy or CDN error page is not in either shape, and is still the best diagnostic there is.
         assert_eq!(
-            extract_detail("<html>502 Bad Gateway</html>"),
+            detail("<html>502 Bad Gateway</html>"),
             "<html>502 Bad Gateway</html>"
         );
     }
 
     #[test]
     fn json_without_a_detail_field_is_returned_whole() {
-        assert_eq!(extract_detail(r#"{"error":"nope"}"#), r#"{"error":"nope"}"#);
+        assert_eq!(detail(r#"{"error":"nope"}"#), r#"{"error":"nope"}"#);
     }
 
     #[test]
     fn a_non_string_detail_is_not_unwrapped() {
         // Only a re-encoded *string* is a nesting level; an object is already the message.
         assert_eq!(
-            extract_detail(r#"{"detail":{"code":7}}"#),
+            detail(r#"{"detail":{"code":7}}"#),
             r#"{"detail":{"code":7}}"#
         );
     }
@@ -860,7 +888,7 @@ mod tests {
     fn an_oversized_diagnostic_is_truncated() {
         let body = format!(r#"{{"detail":"{}"}}"#, "a".repeat(MAX_DETAIL_BYTES * 3));
 
-        assert_eq!(extract_detail(&body).len(), MAX_DETAIL_BYTES);
+        assert_eq!(detail(&body).len(), MAX_DETAIL_BYTES);
     }
 
     #[test]
@@ -883,12 +911,12 @@ mod tests {
             expected = wrap(&expected);
         }
 
-        assert_eq!(extract_detail(&body), expected);
+        assert_eq!(detail(&body), expected);
     }
 
     #[test]
     fn an_empty_body_yields_an_empty_diagnostic() {
-        assert_eq!(extract_detail(""), "");
+        assert_eq!(detail(""), "");
     }
 
     /// The classification a consumer actually branches on.
@@ -920,6 +948,7 @@ mod tests {
         // abandon a fetch that a 60-second wait would have completed.
         let rate_limited = LseError::RateLimited {
             retry_after: Some(Duration::from_secs(60)),
+            code: None,
         };
         assert_eq!(rate_limited.kind(), LseErrorKind::RateLimit);
         assert!(rate_limited.kind().is_resumable());
@@ -986,6 +1015,7 @@ mod tests {
         assert_eq!(
             LseError::Api {
                 status: 404,
+                code: Some(SmolStr::new("symbol-unknown")),
                 message: "no candle data".to_owned(),
             }
             .kind(),
@@ -1027,7 +1057,10 @@ mod tests {
         // The reason `DataError::Lse` is a struct variant at all. Once an LSE failure is flattened
         // for the generic stream helpers, `message` is a `String` and the classification would be
         // unrecoverable from it -- so `kind` has to be carried alongside, not derived later.
-        let error = crate::error::DataError::from(LseError::RateLimited { retry_after: None });
+        let error = crate::error::DataError::from(LseError::RateLimited {
+            retry_after: None,
+            code: None,
+        });
 
         let crate::error::DataError::Lse { kind, message } = &error else {
             panic!("unexpected error variant: {error:?}")
