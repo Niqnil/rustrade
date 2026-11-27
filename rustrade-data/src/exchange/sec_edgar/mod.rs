@@ -33,15 +33,16 @@
 //!   which Item 2.02 filing is its release, so it is left out rather than guessed. Large companies
 //!   often file the 10-Q with the release or days later; a 10-Q is due 40 to 45 days after the
 //!   quarter ends and a 10-K 60 to 90 days after the year ends.
-//! - **Dated by the 8-K's acceptance.** The release's [`date`](crate::earnings::EarningsRelease::date),
-//!   [`timing`](crate::earnings::EarningsRelease::timing) (against the regular session, 09:30 to 16:00 New York
-//!   time) and [`known_at`](crate::earnings::EarningsRelease::known_at) come from the acceptance time in the
-//!   filing's header, so they describe the filing. Companies usually furnish the 8-K with the
-//!   release, minutes after it, but Item 2.02 allows up to four business days: a late filing dates
-//!   its release late, and even a filing on the same day can move its timing (a release before the
-//!   open whose 8-K is accepted after the close reads as
-//!   [`AfterClose`](crate::earnings::ReleaseTiming::AfterClose)). Early closes
-//!   are not known here, so a release after an early close but before 16:00 reads as
+//! - **Dated by the 8-K's acceptance.** The release's
+//!   [`date`](crate::earnings::EarningsRelease::date),
+//!   [`timing`](crate::earnings::EarningsRelease::timing) (against the regular session, 09:30 to
+//!   16:00 New York time) and [`known_at`](crate::earnings::EarningsRelease::known_at) come from
+//!   the acceptance time in the filing's header, so they describe the filing. Companies usually
+//!   furnish the 8-K with the release, minutes after it, but Item 2.02 allows up to four business
+//!   days: a late filing dates its release late, and even a filing on the same day can move its
+//!   timing (a release before the open whose 8-K is accepted after the close reads as
+//!   [`AfterClose`](crate::earnings::ReleaseTiming::AfterClose)). Early closes are not known here,
+//!   so a release after an early close but before 16:00 reads as
 //!   [`DuringSession`](crate::earnings::ReleaseTiming::DuringSession).
 //!
 //! What it misses:
