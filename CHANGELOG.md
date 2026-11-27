@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one that times out stops at its next step and closes what it connected, and the stream's next
   attempt waits for it, so that no two of the stream's connections use the same client ID at once.
 
+- **A refused IB client ID has its own error** (`rustrade-data`, `ibkr` feature). When TWS/Gateway
+  refuses an `IbkrMarketStream` connection because another connection holds its client ID (IB code
+  326), the error is now the new `DataError::IbkrClientIdInUse { client_id }` instead of a
+  `DataError::Socket` string, so a caller can tell it from an unreachable host without matching
+  text. `init` returns it for the first attempt without retrying; a started stream yields it inside
+  `ReinitFailed` and retries after its backoff. TWS/Gateway can hold an ID briefly after its
+  connection closes, so a retry after a backoff can succeed; a refusal that persists means the ID
+  is shared with another connection.
+
 - **Option lapse instructions** (`rustrade-execution`, `rustrade`). The new optional
   `OptionExerciseClient` trait sends a venue an instruction about how a held option is exercised:
   so far `ExerciseInstruction::Lapse`, which lets a long option expire unexercised, in the money

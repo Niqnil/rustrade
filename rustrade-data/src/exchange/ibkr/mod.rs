@@ -462,10 +462,11 @@ where
     /// - when a stream is dropped, its connection closes on a thread of its own, after the drop
     ///   has returned.
     ///
-    /// The refusal is a [`DataError::Socket`] saying the client ID is already in use. A retry
-    /// succeeds once the earlier connection has closed and TWS/Gateway has let the ID go, so
-    /// retry with a backoff, or use another client ID. The stream's own reconnects already retry
-    /// with its backoff.
+    /// The refusal is a [`DataError::IbkrClientIdInUse`]. `init` returns the first attempt's
+    /// refusal without retrying it; a retry succeeds once the earlier connection has closed and
+    /// TWS/Gateway has let the ID go, so retry with a backoff, or use another client ID. Once the
+    /// stream has started, a refused reconnect is yielded and retried after the stream's backoff,
+    /// as any other failed reconnect.
     ///
     /// `ibapi` bounds each read of the handshake and the server time request (30 s each), but not
     /// the TCP connect, which waits as long as the operating system allows. Without an
@@ -963,7 +964,7 @@ where
                 config.max_messages_per_second.get(),
             ))
             .connect_with_notice_stream()
-            .map_err(|e| DataError::Socket(format!("IB connect: {e}")))?;
+            .map_err(connect_error)?;
         let (tx, rx) = mpsc::unbounded_channel();
         // Built before anything else can fail, so that its `Drop` closes the client on every
         // early return below.
@@ -1809,6 +1810,15 @@ where
     }
 }
 
+/// The stream error for an `ibapi` error that failed the connect: [`DataError::IbkrClientIdInUse`]
+/// for TWS/Gateway's client ID refusal, else [`DataError::Socket`], `"IB connect: {error}"`.
+fn connect_error(error: ibapi::Error) -> DataError {
+    match error {
+        ibapi::Error::ClientIdInUse { client_id } => DataError::IbkrClientIdInUse { client_id },
+        other => DataError::Socket(format!("IB connect: {other}")),
+    }
+}
+
 /// Whether `error` says the connection itself is gone, rather than one subscription refused: the
 /// socket closed (whether `ibapi` would reconnect it or not), or the client shut down.
 fn ends_connection(error: &ibapi::Error) -> bool {
@@ -2483,6 +2493,21 @@ mod tests {
                 "code {code}"
             );
         }
+    }
+
+    #[test]
+    fn a_client_id_refusal_keeps_its_type_and_client_id() {
+        let error = connect_error(ibapi::Error::ClientIdInUse { client_id: 7 });
+
+        assert_eq!(error, DataError::IbkrClientIdInUse { client_id: 7 });
+    }
+
+    #[test]
+    fn another_connect_failure_is_a_socket_error_naming_the_connect() {
+        let error = ibapi::Error::Simple("connection refused".to_owned());
+        let expected = format!("IB connect: {error}");
+
+        assert_eq!(connect_error(error), DataError::Socket(expected));
     }
 
     #[test]
