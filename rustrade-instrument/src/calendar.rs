@@ -48,6 +48,17 @@ pub trait SessionCalendar: Debug + Send + Sync {
         instant: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, CalendarError>;
 
+    /// Whether the session on the date `instant` falls on, in the calendar's own time zone, closes
+    /// early: `false` for a regular session and for a date with no session.
+    ///
+    /// For a rule set at a time of day that a venue moves on its half days, such as a deadline
+    /// that is later on a regular day than on an early-close day.
+    ///
+    /// # Errors
+    /// A [`CalendarError`] if the calendar cannot say, as for
+    /// [`session_close_on`](Self::session_close_on).
+    fn closes_early_on(&self, instant: DateTime<Utc>) -> Result<bool, CalendarError>;
+
     /// The time zone the calendar dates its sessions in: the zone whose local date
     /// [`session_close_on`](Self::session_close_on) reads an instant on.
     fn zone(&self) -> Tz;
@@ -383,6 +394,12 @@ impl SessionCalendar for DailyClose {
                 instant_at_local(&self.zone, date, time).ok_or(CalendarError::out_of_range(instant))
             })
             .transpose()
+    }
+
+    fn closes_early_on(&self, instant: DateTime<Utc>) -> Result<bool, CalendarError> {
+        let date = local_date(&self.zone, instant).ok_or(CalendarError::out_of_range(instant))?;
+        // `SessionDates` refuses a weekend or holiday early close, so a listed date has a session.
+        Ok(self.dates.early_closes.contains(&date))
     }
 
     fn zone(&self) -> Tz {
@@ -738,6 +755,34 @@ mod tests {
         assert_eq!(
             close.next_close_after(utc(2026, 10, 30, 21, 0, 0)),
             Ok(utc(2026, 11, 23, 21, 0, 0))
+        );
+    }
+
+    #[test]
+    fn only_a_listed_early_close_day_closes_early_by_its_local_date() {
+        let close = thanksgiving_close();
+
+        // The day after Thanksgiving, in its morning and after its close.
+        assert_eq!(close.closes_early_on(utc(2026, 11, 27, 14, 0, 0)), Ok(true));
+        assert_eq!(close.closes_early_on(utc(2026, 11, 27, 23, 0, 0)), Ok(true));
+        // A regular day, the holiday, a weekend: none closes early.
+        for instant in [
+            utc(2026, 11, 24, 14, 0, 0),
+            utc(2026, 11, 26, 15, 0, 0),
+            utc(2026, 11, 28, 15, 0, 0),
+        ] {
+            assert_eq!(close.closes_early_on(instant), Ok(false));
+        }
+        // The date is New York's: Saturday 03:00 UTC is still the early-close Friday there, and
+        // Friday 03:00 UTC is still Thanksgiving.
+        assert_eq!(close.closes_early_on(utc(2026, 11, 28, 3, 0, 0)), Ok(true));
+        assert_eq!(close.closes_early_on(utc(2026, 11, 27, 3, 0, 0)), Ok(false));
+        // Out of range is an error, not a panic.
+        let ahead = DailyClose::new(at(16, 0), chrono_tz::Etc::GMTMinus14);
+        let last = DateTime::<Utc>::MAX_UTC;
+        assert_eq!(
+            ahead.closes_early_on(last),
+            Err(CalendarError::out_of_range(last))
         );
     }
 

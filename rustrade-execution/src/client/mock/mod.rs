@@ -222,8 +222,9 @@ pub struct MockExecutionConfig {
     /// Whether the mock exchange sells a long option the account cannot afford to exercise, at a
     /// set time before its expiry day's close or before its expiry, as a broker sells out an
     /// account short of the cash or shares. See [`ExpirySellOut`]. One anchored
-    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
-    /// each option: [`session_close`](Self::session_close), an entry of
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) or
+    /// [at a local time](crate::expiry::ExpiryAnchor::AtLocalTime) on the expiry day needs a
+    /// session calendar for each option: [`session_close`](Self::session_close), an entry of
     /// [`session_close_overrides`](Self::session_close_overrides), or one the venue is given
     /// later.
     ///
@@ -236,21 +237,19 @@ pub struct MockExecutionConfig {
     /// Whether the mock exchange refuses an order that would open or increase a position in an
     /// option from a set time before its expiry day's close, or before its expiry, until it
     /// expires, as a broker stops taking new exposure in an expiring option. See
-    /// [`ExpiryDayCutoff`]. One anchored
-    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) needs a session calendar for
-    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    /// [`ExpiryDayCutoff`]. One anchored to the session calendar needs one for each option, as
+    /// [`expiry_sell_out`](Self::expiry_sell_out) does.
     ///
     /// Defaults to `None`: an option takes opening orders until its expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_day_cutoff: Option<ExpiryDayCutoff>,
     /// Whether the mock exchange refuses a
     /// [`Lapse`](crate::exercise::ExerciseInstruction::Lapse) instruction for an option from a set
-    /// time before its expiry day's close, or before its expiry, and optionally on any day but its
-    /// expiry day, as a broker sets a window for instructions not to exercise. See
-    /// [`LapseDeadline`]. One anchored
-    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose), or
-    /// [held to the expiry day](LapseDeadline::expiry_day_only), needs a session calendar for each
-    /// option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
+    /// time before its expiry day's close or before its expiry, or at a local time on its expiry
+    /// day, and optionally on any day but its expiry day, as a broker sets a window for
+    /// instructions not to exercise. See [`LapseDeadline`]. One anchored to the session calendar,
+    /// or [held to the expiry day](LapseDeadline::expiry_day_only), needs a session calendar for
+    /// each option, as [`expiry_sell_out`](Self::expiry_sell_out) does.
     ///
     /// Defaults to `None`: an option takes lapse instructions until its expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]

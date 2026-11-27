@@ -182,7 +182,7 @@ impl SimulatedVenue {
     pub(super) fn assert_expiry_rules_placed(&self) {
         assert!(
             self.expiry_rules_unplaced.is_empty(),
-            "SimulatedVenue has expiry-day rules anchored before the session close or held to the \
+            "SimulatedVenue has expiry-day rules anchored to the session calendar or held to the \
              expiry day, but these options have no session calendar to place them, by rule: {}. Configure \
              MockExecutionConfig::session_close, a session_close_overrides entry, or \
              SimulatedVenue::with_session_calendar",
@@ -193,8 +193,8 @@ impl SimulatedVenue {
         );
     }
 
-    /// Panics if the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) is anchored before the
-    /// session close and the option `instrument` has no session calendar to place it: see
+    /// Panics if the [`ExpiryDayCutoff`](crate::expiry::ExpiryDayCutoff) is anchored to the
+    /// session calendar and the option `instrument` has no session calendar to place it: see
     /// [`next_deadline`](Self::next_deadline)'s `# Panics`. Checked on every order on the option
     /// before its expiry, since a venue restored from a snapshot has its clock moved already, so
     /// an order it took before a calendar was given could pass a cutoff not yet placed.
@@ -202,14 +202,15 @@ impl SimulatedVenue {
         self.assert_rule_placed(ExpiryRule::DayCutoff, instrument);
     }
 
-    /// Panics if `rule` needs a session calendar, being anchored before the session close or a
-    /// lapse deadline held to the expiry day, and the option `instrument` has none to place it.
+    /// Panics if `rule` needs a session calendar, being anchored to it (before the close or at a
+    /// local time) or a lapse deadline held to the expiry day, and the option `instrument` has
+    /// none to place it.
     pub(super) fn assert_rule_placed(&self, rule: ExpiryRule, instrument: &InstrumentNameExchange) {
         let why = match rule {
             ExpiryRule::LapseDeadline => {
-                "anchored before the session close or held to the expiry day"
+                "anchored to the session calendar or held to the expiry day"
             }
-            ExpiryRule::SellOut | ExpiryRule::DayCutoff => "anchored before the session close",
+            ExpiryRule::SellOut | ExpiryRule::DayCutoff => "anchored to the session calendar",
         };
         assert!(
             !self

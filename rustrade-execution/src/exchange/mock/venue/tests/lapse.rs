@@ -358,7 +358,7 @@ fn the_first_refusal_in_the_documented_order_wins() {
 /// placed: an instruction panics rather than judge it against no deadline.
 #[test]
 #[should_panic(
-    expected = "lapse deadline is anchored before the session close or held to the \
+    expected = "lapse deadline is anchored to the session calendar or held to the \
                            expiry day, but the option SPY_C100 has no session calendar"
 )]
 fn an_instruction_against_an_unplaced_deadline_panics() {
@@ -478,6 +478,63 @@ fn a_window_held_to_the_expiry_day_takes_instructions_only_on_it() {
     );
 }
 
+/// A deadline at a local time, as Alpaca's do-not-exercise deadline: 17:15 New York on a regular
+/// day, 14:30 on one closing early at 13:00. Taken until the deadline, refused from it, on each.
+#[test]
+fn a_deadline_at_a_local_time_moves_to_its_early_close_time_on_an_early_close_day() {
+    let at = |h, m| chrono::NaiveTime::from_hms_opt(h, m, 0).unwrap();
+    let deadline_anchor = ExpiryAnchor::AtLocalTime {
+        time: at(17, 15),
+        early_close: Some(at(14, 30)),
+    };
+    let regular = new_york_close();
+    let SessionCalendarConfig::Daily(close) = new_york_close() else {
+        unreachable!("a daily close")
+    };
+    let early = SessionCalendarConfig::Daily(
+        close
+            .with_dates(
+                rustrade_instrument::calendar::SessionDates::new([], [thursday()]).unwrap(),
+                Some(at(13, 0)),
+            )
+            .unwrap(),
+    );
+    // Thursday 2023-11-16 in EST: 17:15 is 22:15 UTC, 14:30 is 19:30 UTC.
+    for (calendar, deadline, label) in [
+        (
+            regular,
+            Utc.with_ymd_and_hms(2023, 11, 16, 22, 15, 0).unwrap(),
+            "regular",
+        ),
+        (
+            early,
+            Utc.with_ymd_and_hms(2023, 11, 16, 19, 30, 0).unwrap(),
+            "early close",
+        ),
+    ] {
+        let mut venue = evening_venue(|config| {
+            config.session_close = Some(calendar);
+            config.lapse_deadline = Some(LapseDeadline::new(deadline_anchor).expiry_day_only());
+        });
+        feed(&mut venue, "100", "1.5", time(2));
+        buy(&mut venue, "1");
+
+        feed(
+            &mut venue,
+            "120",
+            "20",
+            deadline - chrono::TimeDelta::seconds(1),
+        );
+        instruct_lapse(&mut venue);
+        feed(&mut venue, "120", "20", deadline);
+        assert_eq!(
+            refusal(&mut venue, lapse()),
+            ExerciseRefusal::PastDeadline { deadline },
+            "{label}"
+        );
+    }
+}
+
 /// The day is judged before the position, as the deadline is: an account holding none is
 /// refused for the day, and only on the expiry day for want of a position.
 #[test]
@@ -519,7 +576,7 @@ fn a_deadline_not_held_to_the_expiry_day_takes_instructions_before_it() {
 /// with a deadline that needs none: an instruction panics rather than judge it on no day.
 #[test]
 #[should_panic(
-    expected = "lapse deadline is anchored before the session close or held to the \
+    expected = "lapse deadline is anchored to the session calendar or held to the \
                            expiry day, but the option SPY_C100 has no session calendar"
 )]
 fn an_instruction_against_an_undated_window_panics() {

@@ -489,11 +489,11 @@ pub enum VenueRegime {
 /// ## Sold out before expiry
 /// Configured with [`MockExecutionConfig::expiry_sell_out`], the venue also checks each long in a
 /// physically settled option at the instant its [`ExpiryAnchor`](crate::expiry::ExpiryAnchor)
-/// places: an offset before the session close of its expiry day, from its session calendar (a
-/// venue without one for the option panics when its clock first moves, see
-/// [`next_deadline`](Self::next_deadline)), or before its expiry itself. The check is a boundary
-/// like the expiry and included in [`next_deadline`](Self::next_deadline), and first among the
-/// boundaries at its instant. A long in the money that the account cannot afford to exercise (the
+/// places: an offset before the session close of its expiry day or a local time on that day, from
+/// its session calendar (a venue without one for the option panics when its clock first moves,
+/// see [`next_deadline`](Self::next_deadline)), or an offset before its expiry itself. The check
+/// is a boundary like the expiry and included in [`next_deadline`](Self::next_deadline), and first
+/// among the boundaries at its instant. A long in the money that the account cannot afford to exercise (the
 /// strike's cash for a call, free shares for a put), and that is not instructed to lapse, is sold,
 /// after the orders working on it are cancelled, as a market sell fills, less a haircut, reported
 /// as `[order.., balance.., trade]` with a [`TradeOrigin::Liquidation`] trade. What is not sold
@@ -522,7 +522,7 @@ pub enum VenueRegime {
 /// its side of the option filled first, so an order closes only what those orders leave; one
 /// that would close the position and open the other side is refused whole. Orders accepted before
 /// the cutoff are left working. The cutoff is placed as the sell-out is, and needs a session
-/// calendar likewise when anchored before the close. See [`ExpiryDayCutoff`].
+/// calendar likewise when anchored to one. See [`ExpiryDayCutoff`].
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual) and [`Future`](InstrumentKind::Future) need funding and
 /// futures margin, which this venue does not model. They are **rejected at
@@ -1092,7 +1092,7 @@ pub struct SimulatedVenue {
     /// flat or short, so a position opened later carries no instruction.
     lapse_instructed: FnvHashSet<InstrumentNameExchange>,
     /// The options, by rule then name, that an expiry-day rule needing a session calendar
-    /// (anchored before the session close, or a lapse deadline held to the expiry day) cannot yet
+    /// (anchored to the session calendar, or a lapse deadline held to the expiry day) cannot yet
     /// place, having none. Left for
     /// [`with_session_calendar`](Self::with_session_calendar) to place; the venue refuses to run
     /// while any remain.
@@ -1429,7 +1429,8 @@ impl SimulatedVenue {
     /// An [`expiry_sell_out`](MockExecutionConfig::expiry_sell_out),
     /// [`expiry_day_cutoff`](MockExecutionConfig::expiry_day_cutoff) or
     /// [`lapse_deadline`](MockExecutionConfig::lapse_deadline) anchored
-    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) is placed again under
+    /// [before the close](crate::expiry::ExpiryAnchor::BeforeClose) or
+    /// [at a local time](crate::expiry::ExpiryAnchor::AtLocalTime) is placed again under
     /// `calendar`, for every option without a close of its own.
     ///
     /// # Errors
@@ -1541,9 +1542,10 @@ impl SimulatedVenue {
     /// If the [expiry sell-out](MockExecutionConfig::expiry_sell_out), the
     /// [expiry-day cutoff](MockExecutionConfig::expiry_day_cutoff) or the
     /// [lapse deadline](MockExecutionConfig::lapse_deadline) is anchored
-    /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose), or the lapse
-    /// deadline is [held to the expiry day](crate::expiry::LapseDeadline::expiry_day_only), and an
-    /// option this venue lists still has no session calendar to place it: neither
+    /// [before the session close](crate::expiry::ExpiryAnchor::BeforeClose) or
+    /// [at a local time](crate::expiry::ExpiryAnchor::AtLocalTime), or the lapse deadline is
+    /// [held to the expiry day](crate::expiry::LapseDeadline::expiry_day_only), and an option this
+    /// venue lists still has no session calendar to place it: neither
     /// [`session_close`](MockExecutionConfig::session_close), an entry of
     /// [`session_close_overrides`](MockExecutionConfig::session_close_overrides), nor
     /// [`with_session_calendar`](Self::with_session_calendar). The venue is built without one, so

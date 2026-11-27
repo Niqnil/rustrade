@@ -80,7 +80,7 @@ impl SimulatedVenue {
     ///
     /// # Panics
     /// If the [`LapseDeadline`](crate::expiry::LapseDeadline) needs a session calendar, being
-    /// anchored before the session close or
+    /// anchored to the session calendar or
     /// [`expiry_day_only`](crate::expiry::LapseDeadline::expiry_day_only), and the option has none
     /// to place it: see
     /// [`next_deadline`](Self::next_deadline)'s `# Panics`.
