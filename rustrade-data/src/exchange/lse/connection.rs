@@ -86,7 +86,7 @@ use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Validator,
     error::SocketError,
-    protocol::websocket::{WebSocket, WsError, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsError, WsMessage, connect_with_timeout},
     subscription::SubscriptionId,
 };
 use serde::Deserialize;
@@ -157,6 +157,7 @@ pub(super) struct AttachRequest {
     /// The distinct option underlyings, on the options dataset only.
     pub(super) underlyings: Option<Vec<SmolStr>>,
     pub(super) timeout: Duration,
+    pub(super) connect_timeout: Duration,
     pub(super) resume: Option<Arc<LseResumeState>>,
 }
 
@@ -169,6 +170,7 @@ impl From<AttachRequest> for shared::AttachRequest<Lse> {
             markets,
             underlyings,
             timeout,
+            connect_timeout,
             resume,
         } = request;
 
@@ -184,6 +186,7 @@ impl From<AttachRequest> for shared::AttachRequest<Lse> {
             kind,
             slots,
             timeout,
+            connect_timeout,
             batch: LseBatch {
                 kind,
                 markets,
@@ -315,8 +318,9 @@ impl Protocol for Lse {
     async fn connect(
         credentials: &LseCredentials,
         url: &Url,
+        connect_timeout: Duration,
     ) -> Result<(WebSocket, Session), SocketError> {
-        let mut websocket = connect(url.clone()).await?;
+        let mut websocket = connect_with_timeout(url.clone(), connect_timeout).await?;
         let authenticated = authenticate(&mut websocket, credentials).await?;
         debug!(
             %url,
@@ -694,6 +698,7 @@ mod tests {
             markets: markets.iter().map(SmolStr::new).collect(),
             underlyings: None,
             timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
             resume: resume.cloned(),
         }
     }

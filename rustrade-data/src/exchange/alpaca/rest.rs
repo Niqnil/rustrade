@@ -11,6 +11,12 @@
 //! variables when constructed via [`AlpacaRestClient::from_env`], or explicit credentials via
 //! [`AlpacaRestClient::new`]. Credentials are sent as the `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY`
 //! headers on every request.
+//!
+//! # Redirects
+//!
+//! Redirects are not followed. The credential headers are custom ones, which a followed redirect
+//! would hand to whatever host it names. A 3xx answer fails the request with
+//! [`AlpacaRestError::Api`] carrying the 3xx status.
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::{env, time::Duration};
@@ -150,6 +156,11 @@ impl AlpacaRestClient {
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            // reqwest's default follows up to 10 redirects, and on one to another host strips
+            // only the standard credential headers (`Authorization`, `Cookie`, ...): the key and
+            // secret above are custom headers and would survive the hop. A 3xx is therefore
+            // returned unfollowed, and the request helper reports it as `Api`.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let broker_base = if paper {
@@ -388,5 +399,44 @@ mod tests {
 
         assert!(!debug_str.contains("test-key-id"));
         assert!(!debug_str.contains("test-secret-value"));
+    }
+
+    /// A redirect is not followed, so the credential headers never reach the host it names: the
+    /// 3xx is reported as `Api` with its status. A 307 keeps the method and headers, so a
+    /// followed one would send the key and secret to the other host.
+    #[tokio::test]
+    async fn a_redirect_is_reported_and_not_followed() {
+        use super::AlpacaRestError;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+        let target = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&target)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/v2", target.uri())),
+            )
+            .mount(&server)
+            .await;
+        let client = AlpacaRestClient::new("test-key-id", "test-secret-value", true)
+            .unwrap()
+            .with_base_urls(server.uri(), server.uri());
+
+        let result = client
+            .request_with_retry::<serde_json::Value>(
+                client.http.get(format!("{}/v2", server.uri())),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AlpacaRestError::Api { status: 307, .. })),
+            "{result:?}"
+        );
+        assert!(target.received_requests().await.unwrap().is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

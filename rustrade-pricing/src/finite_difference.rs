@@ -15,11 +15,11 @@
 //! price and for constants. The deep in- and out-of-the-money values, which combine the two, then
 //! carry no grid error.
 //!
-//! - **Grid.** Centred on the spot, `std_devs` standard deviations of `ln(S)` over the option's life
-//!   each side (at least a quarter of the dividends' total drop, so a low volatility does not
+//! - **Grid.** Centred on the spot, `std_devs` standard deviations of `ln(S)` over the option's
+//!   life each side (at least a quarter of the dividends' total drop, so a low volatility does not
 //!   leave the spot at an edge), widened by the drift left in `y` over the option's life and
-//!   downward by the dividends' drops, with the strike placed on a node when it falls inside. Values beyond the
-//!   edges come from the option's deep in- or out-of-the-money limit.
+//!   downward by the dividends' drops, with the strike placed on a node when it falls inside.
+//!   Values beyond the edges come from the option's deep in- or out-of-the-money limit.
 //! - **Time stepping.** Crank-Nicolson, with the first `damping_steps` steps each replaced by two
 //!   implicit half steps, which damps the oscillation the payoff's kink at the strike would
 //!   otherwise cause. Ex-dividend instants are step boundaries.

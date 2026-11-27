@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Market stream initialisation is bounded** (`rustrade-data`, `rustrade-integration`). An attempt
+  to initialise a market stream (connect, subscribe, wait for acknowledgements, fetch any initial
+  snapshots) that stalled left the stream waiting with nothing yielded and nothing retried, and a
+  silence timeout could not catch it because its timer starts only once the stream is up. Each
+  attempt built through `init_market_stream` (and so `StreamBuilder` and `DynamicStreams`) is now
+  abandoned after `MarketStreamOptions::init_timeout`, by default `DEFAULT_INIT_TIMEOUT` (60 s),
+  set with `with_init_timeout` (zero refused with `MarketStreamOptionsError::InitTimeoutZero`) or
+  removed with `without_init_timeout`. Expiry is the new `DataError::InitTimeout { timeout }`: the
+  `init` error on the first attempt, and inside `ReinitFailed` on a re-initialisation, which is
+  retried with the stream's backoff. Within an attempt:
+  - Establishing a WebSocket connection (TCP, TLS and upgrade together) is bounded by the new
+    `Connector::connect_timeout()` (default 10 s), for every exchange including the shared Alpaca,
+    LSE and Massive connections, and reported as the new `DataError::ConnectTimeout { timeout }`.
+  - `rustrade_integration::protocol::websocket::connect` now gives up after
+    `DEFAULT_CONNECT_TIMEOUT` (10 s), and the new `connect_with_timeout` takes the bound. Either
+    reports `SocketError::ConnectTimeout { timeout }`. This also bounds Alpaca's account stream
+    connect in `rustrade-execution`.
+  - Binance spot and futures order book snapshots are fetched with a timeout of
+    `HTTP_BOOK_L2_SNAPSHOT_TIMEOUT` (10 s), reported as `SocketError::HttpTimeout`.
+  The rustdoc of `MarketStream::init`, `Subscriber::subscribe` and `SnapshotFetcher` now states
+  that the future may be dropped at any `.await`. `IbkrMarketStream` (`ibkr` feature) applies the
+  timeout to each attempt to open its connection. That attempt blocks on a thread of its own, so
+  one that times out stops at its next step and closes what it connected, and the stream's next
+  attempt waits for it, so that no two of the stream's connections use the same client ID at once.
+
+- **A refused IB client ID has its own error** (`rustrade-data`, `ibkr` feature). When TWS/Gateway
+  refuses an `IbkrMarketStream` connection because another connection holds its client ID (IB code
+  326), the error is now the new `DataError::IbkrClientIdInUse { client_id }` instead of a
+  `DataError::Socket` string, so a caller can tell it from an unreachable host without matching
+  text. `init` returns it for the first attempt without retrying; a started stream yields it inside
+  `ReinitFailed` and retries after its backoff. TWS/Gateway can hold an ID briefly after its
+  connection closes, so a retry after a backoff can succeed; a refusal that persists means the ID
+  is shared with another connection.
+
 - **Option lapse instructions** (`rustrade-execution`, `rustrade`). The new optional
   `OptionExerciseClient` trait sends a venue an instruction about how a held option is exercised:
   so far `ExerciseInstruction::Lapse`, which lets a long option expire unexercised, in the money
@@ -37,8 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes the instruction only on the contract's expiration day, until 5:15 PM New York time, and
   judges that before the position. Its refusals, all but one under the same generic code, are
   read by their message: `NotExpiryDay` (dated from the symbol), `PastDeadline` (the stated time
-  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code. Any
-  other is `Other` with Alpaca's code and message. A request whose outcome is unknown, such as
+  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code.
+  `NoPosition` is also read from the 404 "long position not found" that the paper API sends for a
+  contract the account does not hold, in place of the documented 403. Any other is `Other` with
+  Alpaca's code and message. A request whose outcome is unknown, such as
   one that timed out, is reported as a connectivity error and not sent again.
 
 - **American option pricing benchmark** (`rustrade-pricing`, benches only). The new `american`
@@ -797,6 +833,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: `SocketError` is `#[non_exhaustive]`** (`rustrade-integration`). It gains
+  `ConnectTimeout { timeout }`, and future failure kinds are added the same way, so a `match` on it
+  needs a wildcard arm.
 - **Breaking: IBKR name-only contracts move out of `ContractRegistry`** (`rustrade-instrument`,
   `rustrade-data`, `rustrade-execution`, `ibkr`). `ContractRegistry::register_by_name_only` put a
   contract under a name for lookups by name only and removed the name's contract ID mapping, so on
@@ -1440,6 +1479,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 
 ### Fixed
+
+- **The Alpaca clients no longer follow HTTP redirects** (`rustrade-execution`, `alpaca`;
+  `rustrade-data`). `AlpacaClient` and `AlpacaRestClient` send the API key and secret as custom
+  headers, which reqwest's default policy carries across a redirect to another host, and a 301 or
+  302 turned an order `POST` into a `GET`. A 3xx is now returned unfollowed: `AlpacaClient`
+  reports it as `ApiError::RequestRejected`, naming the status and where it pointed (an order so
+  answered was not placed), and `AlpacaRestClient` as `AlpacaRestError::Api` with the 3xx status.
+  `AlphaVantageClient` no longer follows redirects either: the `Referer` a followed redirect sends
+  holds the request's URL, whose query carries the API key. It reports a 3xx as
+  `AlphaVantageError::Api`.
+- **`AlpacaClient` reads a 404 as "not found" only when Alpaca sent it** (`rustrade-execution`,
+  `alpaca`). Every 404 used to count as Alpaca knowing nothing under the id or symbol asked for,
+  so a wrong base URL, or a proxy answering 404, made an order lookup report the order unknown, a
+  followed replacement read as cancelled, and an instrument refused as unlisted, with no error
+  saying the URL was wrong. Now only Alpaca's not-found answer (code `40410000`) counts. Any
+  other 404 fails the request with `ApiError::RequestRejected`, naming the answer: one without
+  that code, and one worded "endpoint not found", which Alpaca sends for a path it serves nothing
+  under. Other requests that met such a 404 reported `ApiError::OrderRejected("order not found:
+  …")`, and a do-not-exercise `ExerciseRefusal::Other`; both now report the same
+  `RequestRejected`.
+
+- **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
+  an exchange with application-level pings, an initialisation that failed after subscribing left
+  its ping task and the task writing to the socket running, and the connection open, until the
+  venue closed it. Both tasks are now started only once the initialisation can no longer fail.
 
 - **A name repeated in a read's `instruments` is read once** (`rustrade-execution`, `binance`,
   `alpaca`). Binance spot and margin, cross and isolated, queried once per listed name, so

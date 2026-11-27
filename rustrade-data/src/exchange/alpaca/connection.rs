@@ -71,7 +71,7 @@ use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Validator,
     error::SocketError,
-    protocol::websocket::{WebSocket, WsError, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsError, WsMessage, connect_with_timeout},
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -129,6 +129,7 @@ impl AlpacaConnections {
             kind,
             slots,
             timeout,
+            connect_timeout,
         } = request;
 
         self.0
@@ -138,6 +139,7 @@ impl AlpacaConnections {
                 kind,
                 slots,
                 timeout,
+                connect_timeout,
                 batch: (),
             })
             .await
@@ -155,6 +157,7 @@ pub(super) struct AttachRequest {
     /// The distinct pairs requested, in request order.
     pub(super) slots: Vec<Slot>,
     pub(super) timeout: Duration,
+    pub(super) connect_timeout: Duration,
 }
 
 /// What a handshake waits for Alpaca to report.
@@ -254,8 +257,9 @@ impl Protocol for Alpaca {
     async fn connect(
         credentials: &AlpacaCredentials,
         url: &Url,
+        connect_timeout: Duration,
     ) -> Result<(WebSocket, ()), SocketError> {
-        let mut websocket = connect(url.clone()).await?;
+        let mut websocket = connect_with_timeout(url.clone(), connect_timeout).await?;
         alpaca_authenticate(&mut websocket, credentials)
             .await
             .map_err(connection_limit_context)?;
@@ -506,6 +510,7 @@ mod tests {
                 .map(|(channel, symbol)| slot(*channel, symbol))
                 .collect(),
             timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
             batch: (),
         };
 

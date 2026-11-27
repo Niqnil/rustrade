@@ -1,7 +1,7 @@
 use crate::{Message, error::SocketError, protocol::StreamParser};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, connect_async,
@@ -199,16 +199,49 @@ pub fn process_frame<ExchangeMessage>(
     None
 }
 
-/// Connect asynchronously to a [`WebSocket`] server.
+/// How long [`connect`] waits for a WebSocket connection to be established.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect asynchronously to a [`WebSocket`] server, giving up after [`DEFAULT_CONNECT_TIMEOUT`].
+///
+/// See [`connect_with_timeout`].
+///
+/// # Errors
+/// As [`connect_with_timeout`].
 pub async fn connect<R>(request: R) -> Result<WebSocket, SocketError>
 where
     R: IntoClientRequest + Unpin + Debug,
 {
-    debug!(?request, "attempting to establish WebSocket connection");
-    connect_async(request)
-        .await
-        .map(|(websocket, _)| websocket)
-        .map_err(|error| SocketError::WebSocket(Box::new(error)))
+    connect_with_timeout(request, DEFAULT_CONNECT_TIMEOUT).await
+}
+
+/// Connect asynchronously to a [`WebSocket`] server, giving up after `timeout`.
+///
+/// `timeout` bounds establishing the connection as a whole: the TCP connect, the TLS handshake
+/// and the HTTP upgrade. A peer that accepts the TCP connection but never completes the handshake
+/// would otherwise hold the attempt open indefinitely. On expiry the attempt is dropped, which
+/// closes whatever part of the connection was open.
+///
+/// # Errors
+/// - [`SocketError::ConnectTimeout`] if the connection is not established within `timeout`.
+/// - [`SocketError::WebSocket`] if establishing it fails.
+pub async fn connect_with_timeout<R>(
+    request: R,
+    timeout: Duration,
+) -> Result<WebSocket, SocketError>
+where
+    R: IntoClientRequest + Unpin + Debug,
+{
+    debug!(
+        ?request,
+        ?timeout,
+        "attempting to establish WebSocket connection"
+    );
+    match tokio::time::timeout(timeout, connect_async(request)).await {
+        Ok(Ok((websocket, _))) => Ok(websocket),
+        Ok(Err(error)) => Err(SocketError::WebSocket(Box::new(error))),
+        Err(_elapsed) => Err(SocketError::ConnectTimeout { timeout }),
+    }
 }
 
 /// Determine whether a [`WsError`] indicates the [`WebSocket`] has disconnected.
@@ -278,5 +311,100 @@ mod tests {
         let msg = Err(WsError::ConnectionClosed);
         let result = WsParser::parse(msg);
         assert!(matches!(result, Message::Admin(AdminWs::WsError(_))));
+    }
+
+    mod connect_with_timeout {
+        use super::*;
+        use tokio::net::TcpListener;
+
+        /// A local endpoint whose server runs `serve` on the first accepted TCP connection.
+        async fn endpoint<F, Fut>(serve: F) -> String
+        where
+            F: FnOnce(TcpStream) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve(stream).await;
+            });
+            format!("ws://{address}")
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_never_completes_the_upgrade_times_out() {
+            // Accepts the TCP connection, then holds it open without answering the upgrade.
+            let url = endpoint(|stream| async move {
+                let _held = stream;
+                std::future::pending::<()>().await;
+            })
+            .await;
+            let timeout = Duration::from_millis(200);
+
+            let result = connect_with_timeout(url, timeout).await;
+
+            assert!(
+                matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+                "{result:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn connect_gives_up_after_the_default_connect_timeout() {
+            let url = endpoint(|stream| async move {
+                let _held = stream;
+                std::future::pending::<()>().await;
+            })
+            .await;
+            let started = tokio::time::Instant::now();
+
+            let result = connect(url).await;
+
+            assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+            assert!(
+                matches!(
+                    result,
+                    Err(SocketError::ConnectTimeout { timeout }) if timeout == DEFAULT_CONNECT_TIMEOUT
+                ),
+                "{result:?}"
+            );
+            assert_eq!(started.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+        }
+
+        #[tokio::test]
+        async fn a_completed_upgrade_returns_the_connection() {
+            let url = endpoint(|stream| async move {
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                // Keep the server side open until the client is done with it.
+                let _ = futures::StreamExt::next(&mut websocket).await;
+            })
+            .await;
+
+            let result = connect_with_timeout(url, Duration::from_secs(10)).await;
+
+            assert!(result.is_ok(), "{result:?}");
+        }
+
+        #[tokio::test]
+        async fn a_refused_upgrade_is_a_websocket_error_not_a_timeout() {
+            // Answers the upgrade with a plain HTTP error, so the handshake fails at once.
+            let url = endpoint(|mut stream| async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            })
+            .await;
+
+            let result = connect_with_timeout(url, Duration::from_secs(10)).await;
+
+            assert!(
+                matches!(result, Err(SocketError::WebSocket(_))),
+                "{result:?}"
+            );
+        }
     }
 }

@@ -65,6 +65,11 @@ impl CalendarHorizon {
 ///
 /// # Errors and retries
 /// The client does not retry; see [`AlphaVantageError::is_transient`].
+///
+/// # Redirects
+/// Redirects are not followed: a followed redirect can send a `Referer` holding the previous URL,
+/// whose query carries the API key, to whatever host it names. A 3xx answer fails the request
+/// with [`AlphaVantageError::Api`] carrying the 3xx status, which is not transient.
 #[derive(Clone)]
 pub struct AlphaVantageClient {
     http: reqwest::Client,
@@ -90,6 +95,9 @@ impl AlphaVantageClient {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
+            // On a followed redirect reqwest sends a `Referer` holding the previous URL, query
+            // included, so the `apikey` parameter would reach whatever host the answer named.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
                 AlphaVantageError::invalid_input(format!("building the HTTP client: {e}"))

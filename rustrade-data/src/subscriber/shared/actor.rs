@@ -113,9 +113,20 @@ impl<P: Protocol> Actor<P> {
 
             match event {
                 Event::Command(Some(Command::Attach(request, reply))) => {
+                    // A caller that stopped waiting before its turn, such as a stream whose
+                    // initialisation timed out, is not attached: attaching it could mean opening a
+                    // socket nobody reads, and its stream retries with a request of its own.
+                    if reply.is_closed() {
+                        debug!(
+                            exchange = %request.exchange,
+                            "skipped an attach to the {} connection whose caller stopped waiting",
+                            P::NAME,
+                        );
+                        continue;
+                    }
                     let attached = self.attach(*request).await;
-                    // A caller that stopped waiting drops the attachment with the reply, and its
-                    // detach follows.
+                    // A caller that stopped waiting during the attach drops the attachment with
+                    // the reply, and its detach follows.
                     let _ = reply.send(attached);
                 }
                 Event::Command(Some(Command::Detach(id))) => self.detach(id).await,
@@ -168,7 +179,7 @@ impl<P: Protocol> Actor<P> {
             }
             None => {
                 self.registry.forget_lost(&request);
-                self.connect(&request.url).await?;
+                self.connect(&request.url, request.connect_timeout).await?;
                 self.registry.hold_lost();
 
                 true
@@ -422,8 +433,8 @@ impl<P: Protocol> Actor<P> {
         }
     }
 
-    async fn connect(&mut self, url: &Url) -> Result<(), SocketError> {
-        let (websocket, session) = P::connect(&self.credentials, url).await?;
+    async fn connect(&mut self, url: &Url, connect_timeout: Duration) -> Result<(), SocketError> {
+        let (websocket, session) = P::connect(&self.credentials, url, connect_timeout).await?;
 
         self.endpoint = Some(url.clone());
         self.socket = Some(Socket {
@@ -630,7 +641,9 @@ mod tests {
     use crate::subscriber::shared::{Connections, Frame};
     use futures::FutureExt;
     use rustrade_instrument::exchange::ExchangeId;
-    use rustrade_integration::{protocol::websocket::connect, subscription::SubscriptionId};
+    use rustrade_integration::{
+        protocol::websocket::connect_with_timeout, subscription::SubscriptionId,
+    };
     use tokio::net::TcpListener;
     use tokio_tungstenite::WebSocketStream;
 
@@ -661,6 +674,7 @@ mod tests {
             kind: "public_trades",
             slots: vec!["AAPL", "MSFT"],
             timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
             batch: (),
         }
     }
@@ -696,8 +710,15 @@ mod tests {
         type Answer = ();
         type Handshake = Settled;
 
-        async fn connect(_: &(), url: &Url) -> Result<(WebSocket, ()), SocketError> {
-            Ok((connect(url.clone()).await?, ()))
+        async fn connect(
+            _: &(),
+            url: &Url,
+            connect_timeout: Duration,
+        ) -> Result<(WebSocket, ()), SocketError> {
+            Ok((
+                connect_with_timeout(url.clone(), connect_timeout).await?,
+                (),
+            ))
         }
 
         fn subscribe(
@@ -715,6 +736,59 @@ mod tests {
         fn read(_: &mut Registry<Self>, _: &WsMessage) -> Frame<()> {
             Frame::Answers(Vec::new())
         }
+    }
+
+    /// A local endpoint that accepts TCP connections and never completes an upgrade, counting the
+    /// connections it accepted.
+    async fn stalling_endpoint() -> (Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        (url, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_connect_times_out_and_an_attach_abandoned_meanwhile_is_skipped() {
+        use std::sync::atomic::Ordering;
+        const CONNECT: Duration = Duration::from_millis(300);
+        let (url, accepted) = stalling_endpoint().await;
+        let connections = Connections::<Pinged>::new(());
+        let stalled = AttachRequest {
+            connect_timeout: CONNECT,
+            ..request::<Pinged>(url.clone())
+        };
+        let abandoned = AttachRequest {
+            connect_timeout: CONNECT,
+            ..request::<Pinged>(url)
+        };
+
+        // The first attach holds the connection task in its connect; the second is queued behind
+        // it, and its caller gives up before the task reaches it.
+        let (stalled, abandoned) = futures::join!(connections.attach(stalled), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::timeout(Duration::from_millis(50), connections.attach(abandoned)).await
+        });
+
+        assert!(
+            matches!(stalled, Err(SocketError::ConnectTimeout { timeout }) if timeout == CONNECT),
+            "{stalled:?}"
+        );
+        assert!(abandoned.is_err(), "the abandoned attach completed");
+        // Had the task attached the abandoned request, it would have dialled a second time.
+        tokio::time::sleep(CONNECT * 2).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -809,8 +883,15 @@ mod tests {
         type Answer = ();
         type Handshake = Counted;
 
-        async fn connect(_: &(), url: &Url) -> Result<(WebSocket, ()), SocketError> {
-            Ok((connect(url.clone()).await?, ()))
+        async fn connect(
+            _: &(),
+            url: &Url,
+            connect_timeout: Duration,
+        ) -> Result<(WebSocket, ()), SocketError> {
+            Ok((
+                connect_with_timeout(url.clone(), connect_timeout).await?,
+                (),
+            ))
         }
 
         fn subscribe(

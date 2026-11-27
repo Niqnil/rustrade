@@ -548,6 +548,7 @@ impl Subscriber for AlpacaSubscriber {
                 kind,
                 slots,
                 timeout: Exchange::subscription_timeout(),
+                connect_timeout: Exchange::connect_timeout(),
             })
             .await?;
 
@@ -710,4 +711,56 @@ fn check_alpaca_auth_response(text: &str) -> Option<Result<(), SocketError>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use crate::{
+        exchange::alpaca::market::{AlpacaServer, AlpacaSymbolShape},
+        subscription::trade::PublicTrades,
+        test_support::stalling_websocket_url,
+    };
+    use rustrade_instrument::instrument::market_data::{
+        MarketDataInstrument, kind::MarketDataInstrumentKind,
+    };
+
+    /// The IEX feed at an endpoint that never completes a connection.
+    #[derive(Debug, Default, Clone)]
+    struct StallingIex;
+
+    impl ExchangeServer for StallingIex {
+        const ID: ExchangeId = ExchangeId::AlpacaIex;
+        fn websocket_url() -> &'static str {
+            stalling_websocket_url()
+        }
+    }
+
+    impl AlpacaServer for StallingIex {
+        const SYMBOL_SHAPE: AlpacaSymbolShape = AlpacaSymbolShape::Ticker;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_fails_after_the_connectors_connect_timeout() {
+        let subscription: Subscription<Alpaca<StallingIex>, MarketDataInstrument, PublicTrades> =
+            Subscription::from((
+                Alpaca::<StallingIex>::default(),
+                "aapl",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            ));
+        let started = tokio::time::Instant::now();
+
+        let result = AlpacaSubscriber::new(AlpacaCredentials::new("key", "secret"))
+            .subscribe(&[subscription])
+            .await;
+
+        let timeout = <Alpaca<StallingIex> as Connector>::connect_timeout();
+        assert!(
+            matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
+    }
 }

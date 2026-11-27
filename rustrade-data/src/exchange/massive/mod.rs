@@ -607,6 +607,7 @@ impl Subscriber for MassiveSubscriber {
                 kind,
                 slots,
                 timeout: Exchange::subscription_timeout(),
+                connect_timeout: Exchange::connect_timeout(),
             })
             .await?;
 
@@ -841,5 +842,61 @@ mod tests {
             MassiveForex::default()
         );
         assert!(serde_json::from_str::<MassiveCrypto>(&json).is_err());
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use crate::{subscription::trade::PublicTrades, test_support::stalling_websocket_url};
+    use rustrade_instrument::instrument::market_data::{
+        MarketDataInstrument, kind::MarketDataInstrumentKind,
+    };
+
+    /// The stocks cluster at an endpoint that never completes a connection.
+    #[derive(Debug, Default, Clone)]
+    struct StallingStocks;
+
+    impl ExchangeServer for StallingStocks {
+        const ID: ExchangeId = ExchangeId::MassiveStocks;
+        fn websocket_url() -> &'static str {
+            stalling_websocket_url()
+        }
+    }
+
+    impl MassiveServer for StallingStocks {
+        const SYMBOLS: MassiveSymbols = MassiveSymbols::Ticker;
+        const QUOTES: &'static str = "Q";
+        const SECOND_AGGREGATES: &'static str = "A";
+        const MINUTE_AGGREGATES: &'static str = "AM";
+    }
+
+    impl MassiveTradeServer for StallingStocks {
+        const TRADES: &'static str = "T";
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_fails_after_the_connectors_connect_timeout() {
+        let subscription: Subscription<
+            Massive<StallingStocks>,
+            MarketDataInstrument,
+            PublicTrades,
+        > = Subscription::new(
+            Massive::default(),
+            MarketDataInstrument::new("aapl", "usd", MarketDataInstrumentKind::Spot),
+            PublicTrades,
+        );
+        let started = tokio::time::Instant::now();
+
+        let result = MassiveSubscriber::new(MassiveCredentials::new("key"))
+            .subscribe(&[subscription])
+            .await;
+
+        let timeout = <Massive<StallingStocks> as Connector>::connect_timeout();
+        assert!(
+            matches!(result, Err(SocketError::ConnectTimeout { timeout: t }) if t == timeout),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
     }
 }

@@ -28,8 +28,16 @@ pub const STREAM_RECONNECTION_POLICY: ReconnectionBackoffPolicy = ReconnectionBa
     backoff_ms_max: 60000,
 };
 
-/// How one market stream connection keeps going: how it reconnects once it ends, and whether it
-/// is ended when it stays silent.
+/// Default [`MarketStreamOptions::init_timeout`]: how long one attempt to initialise a market
+/// stream may take.
+///
+/// Longer than the steps bounded within an attempt take together by default (the connect, the
+/// subscription acknowledgements and any initial snapshot, ten seconds each), so that a step with a
+/// bound of its own reports its own error first.
+pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How one market stream connection keeps going: how long each attempt to initialise it may take,
+/// how it reconnects once it ends, and whether it is ended when it stays silent.
 ///
 /// Set per connection, through [`init_market_stream`],
 /// [`StreamBuilder::subscribe_with_options`](crate::streams::builder::StreamBuilder::subscribe_with_options)
@@ -44,14 +52,18 @@ pub struct MarketStreamOptions {
     // Private, unlike `reconnect`, so it can only be set through `with_silence_timeout`, which
     // refuses zero.
     silence_timeout: Option<Duration>,
+    // Private for the same reason: set through `with_init_timeout`, which refuses zero.
+    init_timeout: Option<Duration>,
 }
 
 impl Default for MarketStreamOptions {
-    /// [`STREAM_RECONNECTION_POLICY`] and no silence timeout.
+    /// [`STREAM_RECONNECTION_POLICY`], an initialisation timeout of [`DEFAULT_INIT_TIMEOUT`], and
+    /// no silence timeout.
     fn default() -> Self {
         Self {
             reconnect: STREAM_RECONNECTION_POLICY,
             silence_timeout: None,
+            init_timeout: Some(DEFAULT_INIT_TIMEOUT),
         }
     }
 }
@@ -84,6 +96,8 @@ impl MarketStreamOptions {
     ///   which includes the venue acknowledging its subscriptions. A successful initialisation
     ///   resets the backoff, so a connection that initialises but stays silent reconnects once
     ///   per `threshold` until the caller stops it.
+    ///   An initialisation that stalls before the stream is up is not this timeout's: it is
+    ///   abandoned after the [`init_timeout`](Self::init_timeout).
     /// - **A shared connection:** for a subscriber whose streams share one connection (see
     ///   [`Subscriber::Transport`](crate::subscriber::Subscriber::Transport)), the stream is a view
     ///   of that connection, and ending it does not close the socket while another stream is
@@ -113,6 +127,70 @@ impl MarketStreamOptions {
     pub fn silence_timeout(&self) -> Option<Duration> {
         self.silence_timeout
     }
+
+    /// Abandons an attempt to initialise the stream that has not completed within `timeout`.
+    ///
+    /// [`DEFAULT_INIT_TIMEOUT`] unless changed. Applies to streams built through
+    /// [`init_market_stream`], and to `IbkrMarketStream` (`ibkr` feature).
+    ///
+    /// An attempt connects to the venue, subscribes, waits for the venue to acknowledge the
+    /// subscriptions, and fetches any initial snapshots. An attempt that stalls would otherwise
+    /// leave the stream waiting indefinitely, with nothing yielded and nothing retried.
+    ///
+    /// - **When it expires:** the first initialisation returns [`DataError::InitTimeout`]. A
+    ///   re-initialisation yields it inside [`DataError::ReinitFailed`] and is retried with the
+    ///   backoff in [`reconnect`](Self::reconnect), as any failed attempt is.
+    /// - **A backstop:** the connect and the acknowledgements have bounds of their own,
+    ///   [`Connector::connect_timeout`](crate::exchange::Connector::connect_timeout) and
+    ///   [`Connector::subscription_timeout`](crate::exchange::Connector::subscription_timeout), which
+    ///   report what stalled ([`DataError::ConnectTimeout`],
+    ///   [`DataError::SubscriptionsUnacknowledged`]). Set `timeout` longer than those together with
+    ///   any snapshot fetch, or this timeout expires first and reports only that the attempt as a
+    ///   whole did not complete.
+    /// - **Abandoning:** the attempt is dropped where it waits, which closes its connection. An
+    ///   implementation of [`Subscriber`](crate::subscriber::Subscriber),
+    ///   [`SnapshotFetcher`](crate::SnapshotFetcher) or [`MarketStream`] must
+    ///   allow that at any `.await`.
+    /// - **Shared connections:** where streams share one connection (Alpaca, LSE, Massive), its
+    ///   task serves one attach at a time, so `timeout` also covers waiting behind other streams'
+    ///   attaches. An attach whose stream is abandoned before its turn is skipped, but one already
+    ///   under way runs to the end of its own bounds first. Allow for that when several streams
+    ///   share a connection.
+    /// - **IBKR:** `IbkrMarketStream` (`ibkr` feature) opens its connection on a blocking thread,
+    ///   so an abandoned attempt stops at its next check rather than where it waits, and the
+    ///   stream's next attempt waits for it to stop; see `IbkrMarketStream::init`.
+    ///
+    /// # Errors
+    /// [`MarketStreamOptionsError::InitTimeoutZero`] if `timeout` is zero.
+    pub fn with_init_timeout(self, timeout: Duration) -> Result<Self, MarketStreamOptionsError> {
+        if timeout.is_zero() {
+            return Err(MarketStreamOptionsError::InitTimeoutZero);
+        }
+        Ok(Self {
+            init_timeout: Some(timeout),
+            ..self
+        })
+    }
+
+    /// Lets an attempt to initialise the stream take as long as it takes.
+    ///
+    /// Steps with bounds of their own keep them (see
+    /// [`with_init_timeout`](Self::with_init_timeout)); a step without one can then wait
+    /// indefinitely.
+    #[must_use]
+    pub fn without_init_timeout(self) -> Self {
+        Self {
+            init_timeout: None,
+            ..self
+        }
+    }
+
+    /// The initialisation timeout: [`DEFAULT_INIT_TIMEOUT`], the one set by
+    /// [`with_init_timeout`](Self::with_init_timeout), or `None` after
+    /// [`without_init_timeout`](Self::without_init_timeout).
+    pub fn init_timeout(&self) -> Option<Duration> {
+        self.init_timeout
+    }
 }
 
 /// A [`MarketStreamOptions`] setting that was refused.
@@ -122,6 +200,10 @@ pub enum MarketStreamOptionsError {
     /// A zero silence timeout would end the stream as soon as it started.
     #[error("a market stream's silence timeout must be longer than zero")]
     SilenceTimeoutZero,
+
+    /// A zero initialisation timeout would abandon every attempt before it could complete.
+    #[error("a market stream's initialisation timeout must be longer than zero")]
+    InitTimeoutZero,
 }
 
 /// Convenient type alias for a [`MarketEvent`] [`Result`] consumed via a
@@ -137,8 +219,8 @@ pub type MarketStreamEvent<InstrumentKey, Kind> =
 /// Initialises a [`reconnecting`](`ReconnectingStream`) [`MarketStream`] using a collection of
 /// [`Subscription`]s.
 ///
-/// `options` sets how the stream reconnects and whether a silent stream is ended; see
-/// [`MarketStreamOptions`].
+/// `options` sets how long each initialisation attempt may take, how the stream reconnects, and
+/// whether a silent stream is ended; see [`MarketStreamOptions`].
 ///
 /// The `subscriber` is cloned into the reconnect closure, so authenticated subscribers
 /// will have their credentials available on reconnection.
@@ -146,7 +228,10 @@ pub type MarketStreamEvent<InstrumentKey, Kind> =
 /// # Errors
 /// Returns the first initialisation's error. A batch the venue did not fully acknowledge is
 /// [`DataError::SubscriptionsUnacknowledged`], naming the subscriptions that received no
-/// acknowledgement.
+/// acknowledgement. A connection not established within the connector's
+/// [`connect_timeout`](crate::exchange::Connector::connect_timeout) is
+/// [`DataError::ConnectTimeout`], and an attempt not complete within the options'
+/// [`init_timeout`](MarketStreamOptions::init_timeout) is [`DataError::InitTimeout`].
 ///
 /// # Re-initialisation
 /// When the stream ends it yields one [`reconnect::Event::Reconnecting`] and re-initialises with
@@ -191,14 +276,15 @@ where
     // kind. Those names are almost all of this crate's debug info: they took a full-debug build
     // of it to several GB in one rustc. Boxed, the combinators are instantiated once per event
     // type. The cost is one allocation per connection attempt and a virtual call per poll.
+    let init_timeout = options.init_timeout;
     let attempts = init_reconnecting_stream(move || {
         let subscriber = subscriber.clone();
         let subscriptions = subscriptions.clone();
-        async move {
+        within_init_timeout(init_timeout, async move {
             Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriber, &subscriptions)
                 .await
                 .map(StreamExt::boxed)
-        }
+        })
     })
     .await?
     .boxed();
@@ -206,6 +292,20 @@ where
     Ok(market_stream_events(
         attempts, options, stream_key, exchange,
     ))
+}
+
+/// Runs one initialisation `attempt`, abandoning it with [`DataError::InitTimeout`] if `timeout`
+/// passes first. With no timeout the attempt runs to completion.
+pub(crate) async fn within_init_timeout<T>(
+    timeout: Option<Duration>,
+    attempt: impl Future<Output = Result<T, DataError>>,
+) -> Result<T, DataError> {
+    match timeout {
+        None => attempt.await,
+        Some(timeout) => tokio::time::timeout(timeout, attempt)
+            .await
+            .unwrap_or(Err(DataError::InitTimeout { timeout })),
+    }
 }
 
 /// Turns a market stream's initialisation attempts into the events its consumer receives.
@@ -222,6 +322,8 @@ pub(crate) fn market_stream_events<T>(
     let MarketStreamOptions {
         reconnect,
         silence_timeout,
+        // Applied to each attempt before it reaches here, by whoever makes the attempts.
+        init_timeout: _,
     } = options;
     attempts
         .with_reconnect_backoff_reporting(reconnect, stream_key)
@@ -542,5 +644,170 @@ mod tests {
         let options = options.with_reconnect(POLICY);
         assert_eq!(options.reconnect, POLICY);
         assert_eq!(options.silence_timeout(), Some(SILENCE));
+    }
+
+    const INIT: Duration = Duration::from_secs(60);
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_not_complete_within_the_init_timeout_is_abandoned_at_the_timeout() {
+        let started = tokio::time::Instant::now();
+
+        let result =
+            within_init_timeout(Some(INIT), std::future::pending::<Result<u8, DataError>>()).await;
+
+        assert_eq!(result, Err(DataError::InitTimeout { timeout: INIT }));
+        assert_eq!(started.elapsed(), INIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_complete_within_the_init_timeout_returns_its_own_result() {
+        let attempt = async {
+            tokio::time::sleep(INIT - Duration::from_millis(1)).await;
+            Err::<u8, _>(unacknowledged())
+        };
+
+        assert_eq!(
+            within_init_timeout(Some(INIT), attempt).await,
+            Err(unacknowledged())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_an_init_timeout_an_attempt_runs_to_completion() {
+        let attempt = async {
+            tokio::time::sleep(INIT * 10).await;
+            Ok::<u8, DataError>(1)
+        };
+
+        assert_eq!(within_init_timeout(None, attempt).await, Ok(1));
+    }
+
+    /// Initialisation attempts that each run `plan`'s next step under an init timeout of
+    /// [`INIT`]: `Some(items)` initialises at once with `items`, `None` never completes.
+    async fn planned_attempts(
+        plan: Vec<Option<Vec<Item>>>,
+    ) -> Result<BoxStream<'static, Result<BoxStream<'static, Item>, DataError>>, DataError> {
+        let plan = std::sync::Arc::new(std::sync::Mutex::new(plan.into_iter()));
+        init_reconnecting_stream(move || {
+            let step = plan.lock().unwrap().next().flatten();
+            within_init_timeout(Some(INIT), async move {
+                match step {
+                    Some(items) => initialised(items),
+                    None => std::future::pending().await,
+                }
+            })
+        })
+        .await
+        .map(StreamExt::boxed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_first_initialisation_that_stalls_returns_init_timeout() {
+        let result = planned_attempts(vec![None]).await;
+
+        assert!(
+            matches!(result, Err(DataError::InitTimeout { timeout }) if timeout == INIT),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reinitialisation_that_stalls_yields_init_timeout_and_is_retried() {
+        let exchange = ExchangeId::BinanceFuturesUsd;
+        let attempts = planned_attempts(vec![Some(vec![Ok(1)]), None, Some(vec![Ok(2)])])
+            .await
+            .unwrap();
+        let options = MarketStreamOptions::default().with_reconnect(POLICY);
+
+        let events = first(timed_events(attempts, options), 5).await;
+
+        // The stalled attempt starts as soon as the first stream ends and is abandoned one
+        // init timeout later; the next follows after the initial backoff.
+        let backoff = Duration::from_millis(POLICY.backoff_ms_initial);
+        assert_eq!(
+            events,
+            [
+                (Duration::ZERO, Event::Item(Ok(1))),
+                (Duration::ZERO, Event::Reconnecting(exchange)),
+                (
+                    INIT,
+                    Event::Item(Err(DataError::ReinitFailed {
+                        attempt: 1,
+                        error: Box::new(DataError::InitTimeout { timeout: INIT }),
+                    }))
+                ),
+                (INIT + backoff, Event::Item(Ok(2))),
+                (INIT + backoff, Event::Reconnecting(exchange)),
+            ]
+        );
+    }
+
+    #[test]
+    fn options_default_to_the_default_init_timeout() {
+        let options = MarketStreamOptions::default();
+        assert_eq!(options.init_timeout(), Some(DEFAULT_INIT_TIMEOUT));
+        assert_eq!(DEFAULT_INIT_TIMEOUT, Duration::from_secs(60));
+
+        let options = options.with_init_timeout(INIT * 2).unwrap();
+        assert_eq!(options.init_timeout(), Some(INIT * 2));
+        assert_eq!(options.reconnect, STREAM_RECONNECTION_POLICY);
+        assert_eq!(options.silence_timeout(), None);
+
+        let options = options.without_init_timeout();
+        assert_eq!(options.init_timeout(), None);
+    }
+
+    #[test]
+    fn a_zero_init_timeout_is_refused() {
+        assert_eq!(
+            MarketStreamOptions::default().with_init_timeout(Duration::ZERO),
+            Err(MarketStreamOptionsError::InitTimeoutZero)
+        );
+    }
+
+    mod through_init_market_stream {
+        use super::*;
+        use crate::test_support::stalling_bybit_trades;
+        use rustrade_integration::protocol::websocket::DEFAULT_CONNECT_TIMEOUT;
+
+        #[tokio::test(start_paused = true)]
+        async fn an_init_timeout_shorter_than_the_connect_abandons_the_first_attempt() {
+            let timeout = Duration::from_secs(1);
+            let options = MarketStreamOptions::default()
+                .with_init_timeout(timeout)
+                .unwrap();
+            let started = tokio::time::Instant::now();
+
+            let result =
+                init_market_stream(options, Default::default(), vec![stalling_bybit_trades()])
+                    .await;
+
+            assert!(
+                matches!(result, Err(DataError::InitTimeout { timeout: t }) if t == timeout),
+                "{:?}",
+                result.err()
+            );
+            assert_eq!(started.elapsed(), timeout);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn with_the_default_init_timeout_a_stalled_connect_reports_its_own_timeout() {
+            let result = init_market_stream(
+                MarketStreamOptions::default(),
+                Default::default(),
+                vec![stalling_bybit_trades()],
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(DataError::ConnectTimeout { timeout }) if timeout == DEFAULT_CONNECT_TIMEOUT
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
     }
 }

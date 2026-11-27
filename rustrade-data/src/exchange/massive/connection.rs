@@ -69,7 +69,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     error::SocketError,
-    protocol::websocket::{WebSocket, WsError, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsError, WsMessage, connect_with_timeout},
     subscription::SubscriptionId,
 };
 use serde::{Deserialize, Deserializer};
@@ -173,6 +173,7 @@ impl MassiveConnections {
             kind,
             slots,
             timeout,
+            connect_timeout,
         } = request;
 
         self.0
@@ -182,6 +183,7 @@ impl MassiveConnections {
                 kind,
                 slots,
                 timeout,
+                connect_timeout,
                 batch: (),
             })
             .await
@@ -199,6 +201,7 @@ pub(super) struct AttachRequest {
     /// The distinct subscriptions requested, in request order.
     pub(super) slots: Vec<Slot>,
     pub(super) timeout: Duration,
+    pub(super) connect_timeout: Duration,
 }
 
 /// Waits for Massive to confirm each subscription sent, by name.
@@ -280,8 +283,9 @@ impl Protocol for Massive {
     async fn connect(
         credentials: &MassiveCredentials,
         url: &Url,
+        connect_timeout: Duration,
     ) -> Result<(WebSocket, ()), SocketError> {
-        let mut websocket = connect(url.clone()).await?;
+        let mut websocket = connect_with_timeout(url.clone(), connect_timeout).await?;
         authenticate(&mut websocket, credentials).await?;
         debug!(%url, "authenticated to Massive WebSocket");
 
@@ -645,6 +649,7 @@ mod tests {
                 .map(|(event, market)| slot(event, market))
                 .collect(),
             timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
             batch: (),
         };
 
