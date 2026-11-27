@@ -29,8 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Binance spot and futures order book snapshots are fetched with a timeout of
     `HTTP_BOOK_L2_SNAPSHOT_TIMEOUT` (10 s), reported as `SocketError::HttpTimeout`.
   The rustdoc of `MarketStream::init`, `Subscriber::subscribe` and `SnapshotFetcher` now states
-  that the future may be dropped at any `.await`. `IbkrMarketStream` does not apply the
-  initialisation timeout yet.
+  that the future may be dropped at any `.await`. `IbkrMarketStream` (`ibkr` feature) applies the
+  timeout to each attempt to open its connection. That attempt blocks on a thread of its own, so
+  one that times out stops at its next step and closes what it connected, and the stream's next
+  attempt waits for it, so that no two of the stream's connections use the same client ID at once.
 
 - **Option lapse instructions** (`rustrade-execution`, `rustrade`). The new optional
   `OptionExerciseClient` trait sends a venue an instruction about how a held option is exercised:
