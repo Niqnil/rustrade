@@ -383,26 +383,23 @@ async fn create_part_file(
             process,
             sequence.fetch_add(1, Ordering::Relaxed),
         );
-        // Armed before the open: a future dropped while the open runs on the blocking pool removes
-        // the file if the open has created it by then.
-        let mut guard = PartFile::new(path);
         match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&guard.path)
+            .open(&path)
             .await
         {
-            Ok(file) => return Ok((guard, file)),
-            Err(error) => {
-                // A failed open created nothing, and a name that already exists belongs to someone
-                // else: removing it would destroy their file.
-                guard.disarm();
+            // Armed only once this call has created the file, so the guard can never remove a file
+            // that belongs to someone else. The cost: a future dropped while the open runs on the
+            // blocking pool leaves the empty file it then creates behind.
+            Ok(file) => return Ok((PartFile::new(path), file)),
+            Err(error)
                 if error.kind() != std::io::ErrorKind::AlreadyExists
-                    || attempt == PART_NAME_ATTEMPTS
-                {
-                    return Err(io_error("creating", &guard.path)(error));
-                }
+                    || attempt == PART_NAME_ATTEMPTS =>
+            {
+                return Err(io_error("creating", &path)(error));
             }
+            Err(_) => {}
         }
         attempt += 1;
     }
@@ -485,20 +482,22 @@ impl LseClient {
     /// for it.
     ///
     /// The body streams to a `.part` file beside `destination`, named
-    /// `<destination>.<process id>-<n>.part` so that no two downloads share one, and is hashed as it
-    /// arrives, so memory stays flat whatever the file's size. Only once every byte has matched the declared length and SHA-256
-    /// is the file synced, renamed to `destination` and the rename synced: `destination` either
-    /// holds a whole, verified file or is as it was before the call.
+    /// `<destination>.<process id>-<n>.part` so that no two downloads share one, and is hashed as
+    /// it arrives, so memory stays flat whatever the file's size. Only once every byte has matched
+    /// the declared length and SHA-256 is the file synced, renamed to `destination` and the rename
+    /// synced: `destination` either holds a whole, verified file or is as it was before the call.
     ///
     /// # Cancellation
     /// Dropping the returned future (a timeout, a `select!`) removes the `.part` file. A process
-    /// that dies mid-download leaves its `.part` file behind, as can, rarely, a future dropped
-    /// while the file is being created. No later download removes or reuses one: delete them by
-    /// that pattern.
+    /// that dies mid-download leaves its `.part` file behind, and so, rarely, does a future dropped
+    /// while the file is being created (an empty one). A download removes only a `.part` file it
+    /// created, never one left by another: delete those by that pattern.
     ///
     /// # Concurrency
     /// Two downloads to one destination each write their own `.part` file, and each places a whole,
-    /// verified file; the last to finish is the one left at `destination`.
+    /// verified file; the last to finish is the one left at `destination`. That holds under
+    /// [`LseExistingFile::Refuse`] too: it checks `destination` once, before the request, so two
+    /// downloads started together both pass it.
     ///
     /// # Arguments
     /// - `destination`: the file to place. Its directory must exist. See
@@ -810,7 +809,14 @@ mod tests {
             .join("gone")
             .join("AAPL.parquet");
 
-        let result = create_part_file(&missing, 42, &AtomicU64::new(0)).await;
+        // Bounded, so retrying an error other than a name in use (which would never end here)
+        // fails the test rather than hanging it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            create_part_file(&missing, 42, &AtomicU64::new(0)),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(result, Err(LseError::Io { .. })));
     }
