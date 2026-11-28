@@ -850,20 +850,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
-- **Breaking: reconnect waits are jittered, by 50 % by default** (`rustrade-data`).
+- **Breaking: reconnect waits are jittered, fully by default** (`rustrade-data`).
   `ReconnectionBackoffPolicy` gains `backoff_jitter_percent`: each wait is drawn at random from
-  the top that many percent of the backoff, so from half the backoff to all of it at the new
-  `DEFAULT_BACKOFF_JITTER_PERCENT` (50). Streams that drop together, such as every stream to a
-  venue that dropped them all at once, no longer reconnect at the same instants, in bursts against
-  the venue's connection limits. A wait the policy draws is still never longer than
-  `backoff_ms_max`, and `0` gives exactly the old waits. A retry-after hint given to
-  `with_reconnect_backoff_reporting_hinted` that is longer than the drawn wait is still waited
-  exactly, with no jitter. `STREAM_RECONNECTION_POLICY` uses 50, so market streams and
-  `AccountStreamOptions` (`rustrade`) jitter by default, and a configuration deserialized without
-  the field gets 50. Building the policy with a struct literal or `::new` now needs the
-  fourth value. IBKR's wait after a connection that ends at once is jittered the same way. The
-  backoff no longer overflows a very large `backoff_ms_max`, and a `backoff_ms_initial` above the
-  cap now waits the cap.
+  the top that many percent of the backoff. At the new `DEFAULT_BACKOFF_JITTER_PERCENT` (100) a
+  wait falls anywhere from no wait to all of the backoff. Streams that drop together, such as
+  every stream to a venue that dropped them all at once, no longer reconnect at the same instants,
+  in bursts against the venue's connection limits. A wait the policy draws is still never longer
+  than `backoff_ms_max`, and `0` gives exactly the old waits. On average a wait is now half the
+  backoff, so a stream retries sooner than before, and about twice as often once the backoff
+  reaches its cap; a lower percent keeps a floor under each wait, and a higher `backoff_ms_max`
+  retries less often. A retry-after hint given to `with_reconnect_backoff_reporting_hinted` that
+  is longer than the drawn wait is still waited exactly, with no jitter.
+  `STREAM_RECONNECTION_POLICY` uses the default, so market streams and `AccountStreamOptions`
+  (`rustrade`) jitter by default, and a configuration deserialized without the field gets it.
+  Building the policy with a struct literal or `::new` now needs the fourth value. IBKR's wait
+  after a connection that ends at once is jittered the same way. The backoff no longer overflows
+  a very large `backoff_ms_max`, and a `backoff_ms_initial` above the cap now waits the cap.
 - **Breaking: a refused IB client ID has its own error when `IbkrClient` connects**
   (`rustrade-execution`, `ibkr` feature). When TWS/Gateway refuses the connection because another
   connection holds the client ID (IB code 326), `IbkrClient::connect_sync` and

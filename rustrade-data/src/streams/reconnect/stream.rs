@@ -365,8 +365,11 @@ pub struct ReconnectionBackoffPolicy {
 
 /// The [`ReconnectionBackoffPolicy::backoff_jitter_percent`] of
 /// [`STREAM_RECONNECTION_POLICY`](crate::streams::consumer::STREAM_RECONNECTION_POLICY), and of a
-/// configuration deserialized without one: each wait falls between half the backoff and all of it.
-pub const DEFAULT_BACKOFF_JITTER_PERCENT: u8 = 50;
+/// configuration deserialized without one: each wait falls anywhere from no wait to all of the
+/// backoff, which spreads streams that failed together the most and gives the shortest waits on
+/// average, half the backoff. A lower percent keeps a floor under each wait, at the cost of a
+/// longer one.
+pub const DEFAULT_BACKOFF_JITTER_PERCENT: u8 = 100;
 
 fn default_backoff_jitter_percent() -> u8 {
     DEFAULT_BACKOFF_JITTER_PERCENT
