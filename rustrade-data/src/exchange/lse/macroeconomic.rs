@@ -111,9 +111,10 @@ pub struct LseMacroSummary {
 #[serde(untagged)]
 pub enum LseMacroValue {
     /// A number.
-    // As a JSON number: a figure read from one is its float's shortest text, which the float
-    // gives back exactly.
-    Number(#[serde(serialize_with = "rust_decimal::serde::float::serialize")] Decimal),
+    ///
+    /// Serialized as a JSON number, through the nearest `f64`: a figure of up to 15 significant
+    /// digits, or a float's shortest text as the provider writes its figures, reads back the same.
+    Number(#[serde(serialize_with = "serialize_json_number")] Decimal),
     /// Text, as a release's figures are (`"5.3%"`, `"337.51Index"`); see [`LseReleaseValue`].
     Text(SmolStr),
 }
@@ -121,44 +122,64 @@ pub enum LseMacroValue {
 impl<'de> Deserialize<'de> for LseMacroValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Read by JSON type rather than by trying a decimal first, so the text `"5"` stays text.
-        match serde_json::Value::deserialize(deserializer)? {
-            serde_json::Value::Number(number) => decimal_from_json(&number)
-                .map(Self::Number)
-                .map_err(serde::de::Error::custom),
-            serde_json::Value::String(text) => Ok(Self::Text(SmolStr::new(text))),
-            other => Err(serde::de::Error::custom(format!(
-                "a macro figure must be a number or text, not {other}"
-            ))),
+        match read_figure(deserializer)? {
+            Figure::Number(number) => Ok(Self::Number(number)),
+            Figure::Text(text) => Ok(Self::Text(text)),
         }
     }
 }
 
-/// A JSON number as a [`Decimal`], through its shortest text: exact for an integer and for the
-/// decimal the provider wrote.
-fn decimal_from_json(number: &serde_json::Number) -> Result<Decimal, String> {
-    let text = number.to_string();
-    Decimal::from_str(&text)
-        .or_else(|_| Decimal::from_scientific(&text))
-        .map_err(|error| format!("{text} is not representable as a decimal: {error}"))
+/// A JSON figure, told apart by its JSON type.
+enum Figure {
+    Number(Decimal),
+    Text(SmolStr),
+}
+
+/// Read a JSON number or string, a number from the decimal text the provider wrote.
+///
+/// The text, not an `f64` parsed from it: a float parse rounds a figure with many digits, and
+/// `serde_json`'s default parser does not always round to the nearest `f64` either.
+fn read_figure<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Figure, D::Error> {
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    let text = raw.get();
+    if text.starts_with('"') {
+        return serde_json::from_str::<SmolStr>(text)
+            .map(Figure::Text)
+            .map_err(serde::de::Error::custom);
+    }
+    if !text.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+        return Err(serde::de::Error::custom(format!(
+            "a macro figure must be a number or text, not {text}"
+        )));
+    }
+    Decimal::from_str(text)
+        .or_else(|_| Decimal::from_scientific(text))
+        .map(Figure::Number)
+        .map_err(|error| {
+            serde::de::Error::custom(format!("{text} is not representable as a decimal: {error}"))
+        })
+}
+
+/// A [`Decimal`] as a JSON number, through the `f64` nearest its text.
+///
+/// Parsing the text rounds correctly, so a decimal that is some `f64`'s shortest text (as a
+/// provider's float figure is) gives back that `f64`, which serializes as the same text.
+fn serialize_json_number<S: serde::Serializer>(
+    value: &Decimal,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let float = f64::from_str(&value.to_string()).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_f64(float)
 }
 
 /// A decimal field: the provider's JSON number, or the decimal string [`Decimal`] serializes as,
 /// so a row this crate serialized reads back.
 fn deserialize_decimal<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Figure {
-        Number(serde_json::Number),
-        Text(SmolStr),
+    match read_figure(deserializer)? {
+        Figure::Number(number) => Ok(number),
+        Figure::Text(text) => Decimal::from_str(&text)
+            .map_err(|error| serde::de::Error::custom(format!("{text} is not a decimal: {error}"))),
     }
-
-    match Figure::deserialize(deserializer)? {
-        Figure::Number(number) => decimal_from_json(&number),
-        Figure::Text(text) => {
-            Decimal::from_str(&text).map_err(|error| format!("{text} is not a decimal: {error}"))
-        }
-    }
-    .map_err(serde::de::Error::custom)
 }
 
 /// An empty string as `None`.
@@ -311,8 +332,8 @@ impl LseReleaseValue {
     }
 
     /// Split the text into its leading number and the rest, or `None` when it does not start with
-    /// one, or when the rest goes on like a number (`"1.2.3"`, `"5-3"`), so the split would be a
-    /// guess.
+    /// one, or when the rest goes on like a number (`"1.2.3"`, `"5-3"`, an exponent as in
+    /// `"1e5"`), so the split would be a guess.
     ///
     /// The number is read as written and the rest is returned as written: `"5.3%"` is `5.3` and
     /// `"%"`, `"337.51Index"` is `337.51` and `"Index"`, `"250K"` is `250` and `"K"`. Nothing is
@@ -325,8 +346,15 @@ impl LseReleaseValue {
             .find(|character: char| !(character.is_ascii_digit() || character == '.'))
             .unwrap_or(unsigned.len());
         let (number, rest) = text.split_at(text.len() - unsigned.len() + digits);
-        // A sign after the number would continue it, and a second point fails the decimal parse.
-        if !number.bytes().any(|byte| byte.is_ascii_digit()) || rest.starts_with(['+', '-']) {
+        // A sign or an exponent after the number would continue it, and a second point fails the
+        // decimal parse. A unit starting with `e` (`"5EUR"`) is not an exponent.
+        let exponent = rest.strip_prefix(['e', 'E']).is_some_and(|after| {
+            after.starts_with(|c: char| c.is_ascii_digit() || c == '+' || c == '-')
+        });
+        if !number.bytes().any(|byte| byte.is_ascii_digit())
+            || rest.starts_with(['+', '-'])
+            || exponent
+        {
             return None;
         }
         Decimal::from_str(number)
@@ -623,9 +651,45 @@ mod tests {
         assert_eq!(value("5-3").parse(), None);
         assert_eq!(value("5+").parse(), None);
         assert_eq!(value(".%").parse(), None);
+        assert_eq!(value("1e5").parse(), None);
+        assert_eq!(value("1.5E-3").parse(), None);
+        assert_eq!(value("2e+2").parse(), None);
+        assert_eq!(value("5EUR").parse(), Some((decimal("5"), "EUR")));
         assert_eq!(value("n/a").parse(), None);
         assert_eq!(value("-").parse(), None);
         assert_eq!(value("").parse(), None);
+    }
+
+    #[test]
+    fn a_figure_is_read_from_its_text_exactly() {
+        let read = |json: &str| {
+            serde_json::from_str::<LseMacroObservation>(json)
+                .unwrap()
+                .value
+        };
+
+        // A float parse would round both: the first is past an `f64`'s digits, and the second is
+        // one `serde_json`'s default parser reads one digit off.
+        assert_eq!(
+            read(r#"{"day": "2026-11-01", "value": 0.1234567890123456789}"#),
+            decimal("0.1234567890123456789")
+        );
+        assert_eq!(
+            read(r#"{"day": "2026-11-01", "value": 957975.1552457525}"#),
+            decimal("957975.1552457525")
+        );
+        assert_eq!(
+            read(r#"{"day": "2026-11-01", "value": 25e3}"#),
+            decimal("25000")
+        );
+        assert_eq!(
+            read(r#"{"day": "2026-11-01", "value": -0.2}"#),
+            decimal("-0.2")
+        );
+        assert!(
+            serde_json::from_str::<LseMacroObservation>(r#"{"day": "2026-11-01", "value": null}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -642,8 +706,11 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&yields).unwrap()).unwrap();
         assert_eq!(again, yields);
 
+        // Up to an `f64`'s 17 significant digits, as a provider float's shortest text runs.
         for figure in [
             LseMacroValue::Number(decimal("2.6")),
+            LseMacroValue::Number(decimal("957975.1552457525")),
+            LseMacroValue::Number(decimal("350.8600934342509")),
             LseMacroValue::Text(SmolStr::new("5")),
         ] {
             let json = serde_json::to_string(&figure).unwrap();

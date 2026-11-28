@@ -31,8 +31,17 @@ databento = ["dep:databento"]
 # `sha2`/`hex` verify the SHA-256 the provider sends with every file answer; both are already in
 # the workspace tree via `rustrade-integration`, so this adds no new supply-chain surface.
 # `reqwest/stream` + `tokio/fs` + `tokio/io-util` stream an export to disk while hashing it rather
-# than buffering it in memory.
-lse = ["dep:sha2", "dep:hex", "dep:csv", "reqwest/stream", "tokio/fs", "tokio/io-util"]
+# than buffering it in memory. `serde_json/raw_value` reads each macroeconomic figure's decimal
+# text exactly.
+lse = [
+    "dep:sha2",
+    "dep:hex",
+    "dep:csv",
+    "reqwest/stream",
+    "tokio/fs",
+    "tokio/io-util",
+    "serde_json/raw_value",
+]
 # Decodes downloaded Parquet exports into market events. Separate from `lse` so a consumer who
 # only wants files on disk pays no Parquet dependency cost.
 #

@@ -97,7 +97,7 @@ const ADJUSTED_HEADER: &str = "x-lse3-adjusted";
 /// Built only after every byte has arrived and matched the declared length and SHA-256.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileHead {
-    /// The body's length in bytes, as received and declared.
+    /// The body's length in bytes, as received.
     pub(crate) bytes: u64,
     /// The body's SHA-256, lowercase hex, as received and declared.
     pub(crate) sha256: String,

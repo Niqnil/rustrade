@@ -236,7 +236,8 @@ impl LseExportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LseExportInfo {
-    /// The file's length in bytes, verified against `Content-Length`.
+    /// The file's length in bytes as received. The HTTP stack refuses a body shorter than its
+    /// `Content-Length`, and the SHA-256 covers every byte.
     pub bytes: u64,
     /// The file's SHA-256 as lowercase hex, verified against the provider's checksum header.
     pub sha256: String,
