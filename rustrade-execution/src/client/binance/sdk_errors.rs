@@ -25,6 +25,26 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
+/// A server that answers every request with a 302 to the second server, which expects none:
+/// dropping the second fails the test if the redirect was followed.
+pub(crate) async fn redirecting() -> (MockServer, MockServer) {
+    let elsewhere = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&elsewhere)
+        .await;
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/elsewhere", elsewhere.uri())),
+        )
+        .mount(&server)
+        .await;
+    (server, elsewhere)
+}
+
 /// The error the SDK returns for a REST answer of `status` with `body` and `headers`.
 ///
 /// # Panics

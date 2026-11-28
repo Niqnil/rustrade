@@ -84,8 +84,8 @@ use super::shared::{
     classify_rest_symbol_query_error, convert_ended_order, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_unknown_order, new_dedup_cache, optional_decimal, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    rest_read_with_retry, trailing_params, unreadable_answer,
+    recovered_order_cids, recovered_order_totals, refusing_redirects, response_decode_error,
+    rest_call_with_retry, rest_read_with_retry, trailing_params, unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
 use crate::rules::{InstrumentSpecError, OrderRules, PreSendRules};
@@ -1084,7 +1084,8 @@ impl BinanceMargin {
         let builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
             .api_secret(config.secret_key.clone())
-            .base_path(MARGIN_TRADING_REST_API_PROD_URL);
+            .base_path(MARGIN_TRADING_REST_API_PROD_URL)
+            .agent(refusing_redirects());
         match signing {
             Some(signing) => builder.timestamp_provider(signing.provider()),
             None => builder,
@@ -6096,12 +6097,13 @@ mod tests {
         );
     }
 
-    /// A REST config whose requests go to `server`.
+    /// A REST config whose requests go to `server`, refusing redirects as the client's own do.
     fn margin_rest_config_at(server: &wiremock::MockServer) -> ConfigurationRestApi {
         ConfigurationRestApi::builder()
             .api_key("key")
             .api_secret("secret")
             .base_path(server.uri())
+            .agent(refusing_redirects())
             .build()
             .unwrap()
     }
@@ -8008,6 +8010,56 @@ mod tests {
             );
             assert_eq!(placed.borrowed, None);
         }
+    }
+
+    /// An open answered with a redirect is refused, not followed: the API key goes to no other
+    /// host, the order is not sent again, and the refusal is `RequestRejected`.
+    #[tokio::test]
+    async fn an_open_answered_with_a_redirect_is_refused_unfollowed() {
+        let (server, elsewhere) = sdk_errors::redirecting().await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let placed = client
+            .open_margin_order(margin_open_request(&btcusdt, "x"))
+            .await;
+
+        let OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+            OrderError::Rejected(ApiError::RequestRejected(said)),
+        )) = &placed.order.state
+        else {
+            panic!("{placed:?}");
+        };
+        assert!(said.contains("HTTP 302"), "{said}");
+        assert!(said.contains(&elsewhere.uri()), "{said}");
+        let requests = margin_requests(&server).await;
+        let orders = requests
+            .iter()
+            .filter(|(path, _)| path == "/sapi/v1/margin/order");
+        assert_eq!(orders.count(), 1, "{requests:?}");
+    }
+
+    /// The account REST client does not follow a redirect either: the 3xx itself is the answer.
+    #[tokio::test]
+    async fn the_account_rest_client_refuses_redirects() {
+        let (server, _elsewhere) = sdk_errors::redirecting().await;
+        let config = BinanceMarginConfig::cross_margin("key".into(), "secret".into());
+        let built = BinanceMargin::rest_config_builder(&config, None)
+            .base_path(server.uri())
+            .build()
+            .unwrap();
+        let answer = binance_sdk::common::utils::send_request::<serde_json::Value>(
+            &built,
+            "/sapi/v1/margin/account",
+            reqwest::Method::GET,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.status, 302);
     }
 
     /// A cancel answered with a success that cannot be read was acted on, so whether the order
