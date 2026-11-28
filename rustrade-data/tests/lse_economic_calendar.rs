@@ -334,7 +334,10 @@ async fn a_count_that_disagrees_with_the_events_delivered_is_an_error() {
         .await
         .unwrap_err();
 
-    let LseError::Api { status, message } = &error else {
+    let LseError::Api {
+        status, message, ..
+    } = &error
+    else {
         panic!("expected Api, got {error:?}");
     };
     assert_eq!(*status, 200);
@@ -421,7 +424,10 @@ async fn a_provider_error_is_reported_with_its_status_and_detail() {
         .await
         .unwrap_err();
 
-    let LseError::Api { status, message } = &error else {
+    let LseError::Api {
+        status, message, ..
+    } = &error
+    else {
         panic!("expected Api, got {error:?}");
     };
     assert_eq!(*status, 500);
@@ -449,7 +455,7 @@ async fn a_rate_limit_is_typed_and_carries_its_retry_after() {
         .await
         .unwrap_err()
     {
-        LseError::RateLimited { retry_after } => {
+        LseError::RateLimited { retry_after, .. } => {
             assert_eq!(retry_after, Some(Duration::from_secs(30)));
         }
         other => panic!("expected RateLimited, got {other}"),

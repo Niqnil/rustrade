@@ -267,7 +267,7 @@ pub struct LseCalendarEvent {
     /// [`DateTime<Utc>`].
     ///
     /// Kept as the provider's string and parsed on demand, following the same rule as
-    /// [`LseCatalogEntry`](super::reference::LseCatalogEntry) and `LseBondYieldRow`: one malformed
+    /// the pre-3.0 catalog entry and `LseBondYieldRow`: one malformed
     /// event then fails at the event rather than taking the whole fetch down with it.
     pub event_date: String,
     /// Country code as this host spells it.
@@ -760,6 +760,7 @@ impl LseDataApiClient {
         if envelope.count != envelope.data.len() {
             return Err(LseError::Api {
                 status: 200,
+                code: None,
                 message: format!(
                     "economic-calendar response declared {} events but carried {}: the response \
                      appears to have been truncated",

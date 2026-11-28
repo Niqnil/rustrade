@@ -32,7 +32,7 @@ databento = ["dep:databento"]
 # the workspace tree via `rustrade-integration`, so this adds no new supply-chain surface.
 # `reqwest/stream` + `tokio/fs` stream a multi-gigabyte export to disk with `Range` resume rather
 # than buffering it in memory.
-lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
+lse = ["dep:sha2", "dep:hex", "dep:csv", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # Decodes downloaded export artifacts into market events. Separate from `lse` so a consumer who
 # only wants files on disk pays no Parquet dependency cost.
 #
@@ -226,7 +226,7 @@ name = "lse_bond_yield"
 required-features = ["lse"]
 
 [[test]]
-name = "lse_vault"
+name = "lse_client"
 required-features = ["lse"]
 
 [[test]]
@@ -242,7 +242,7 @@ name = "lse_economic_calendar_canary"
 required-features = ["lse"]
 
 [[test]]
-name = "lse_vault_canary"
+name = "lse_client_canary"
 required-features = ["lse"]
 
 [[test]]
