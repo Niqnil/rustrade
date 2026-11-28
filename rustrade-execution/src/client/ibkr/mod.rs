@@ -185,7 +185,8 @@
 //!    shut-down client fails, so replace the client, by reconnecting with
 //!    [`IbkrClient::connect_sync`] and choosing the client ID: the caller's decision. The old
 //!    client's connection is closed in each case, so TWS/Gateway frees its ID once it has
-//!    processed the close (see [`IbkrClient::disconnect`]). A new `IbkrClient` tracks the
+//!    processed the close (see [`IbkrClient::disconnect`]); until then a connect with the same
+//!    ID fails with [`IbkrConnectError::ClientIdInUse`]. A new `IbkrClient` tracks the
 //!    orders the old one placed once an account snapshot or `fetch_open_orders` lists them;
 //!    until then their events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
@@ -1595,8 +1596,10 @@ impl IbkrClient {
     ///
     /// # Errors
     ///
+    /// - [`IbkrConnectError::ClientIdInUse`] if TWS/Gateway refuses
+    ///   [`IbkrConfig::client_id`] because another connection holds it.
     /// - [`IbkrConnectError::Connect`] if TWS/Gateway cannot be reached or refuses the
-    ///   connection.
+    ///   connection for another reason.
     /// - [`IbkrConnectError::Contracts`] if any configured contract cannot be registered.
     pub fn connect_sync(config: IbkrConfig) -> Result<Self, IbkrConnectError> {
         let ConnectOutcome { client, skipped } = Self::connect_inner(config)?;
@@ -1625,21 +1628,23 @@ impl IbkrClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if TWS/Gateway cannot be reached or refuses the connection.
-    pub fn connect_sync_lenient(
-        config: IbkrConfig,
-    ) -> Result<ConnectOutcome, UnindexedClientError> {
+    /// - [`IbkrConnectError::ClientIdInUse`] if TWS/Gateway refuses
+    ///   [`IbkrConfig::client_id`] because another connection holds it.
+    /// - [`IbkrConnectError::Connect`] if TWS/Gateway cannot be reached or refuses the
+    ///   connection for another reason.
+    ///
+    /// Never [`IbkrConnectError::Contracts`]: a contract that cannot be registered is in
+    /// [`ConnectOutcome::skipped`] instead.
+    pub fn connect_sync_lenient(config: IbkrConfig) -> Result<ConnectOutcome, IbkrConnectError> {
         Self::connect_inner(config)
     }
 
     /// Connect, then register each configured contract, collecting the ones that fail.
-    fn connect_inner(config: IbkrConfig) -> Result<ConnectOutcome, UnindexedClientError> {
+    fn connect_inner(config: IbkrConfig) -> Result<ConnectOutcome, IbkrConnectError> {
         let url = format!("{}:{}", config.host, config.port);
         info!(url = %url, client_id = config.client_id, "Connecting to IB");
 
-        let client = Client::connect(&url, config.client_id).map_err(|e| {
-            UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
-        })?;
+        let client = Client::connect(&url, config.client_id).map_err(connect::connect_error)?;
 
         let next_id = client.next_order_id();
         let session_zone = execution::session_zone(&client);
@@ -1861,8 +1866,8 @@ impl IbkrClient {
     /// This closes the TCP connection, even while other clones of this client ([`IbkrClient`]
     /// implements [`Clone`] and shares one connection) or their subscriptions are still alive.
     /// TWS/Gateway frees the API client ID once it has processed the close, which can take a
-    /// moment: [`connect_sync`](Self::connect_sync) under the same ID right after this call may be
-    /// refused with IB error 326 ("client id is already in use"), and succeeds on a retry. The
+    /// moment: [`connect_sync`](Self::connect_sync) under the same ID right after this call may
+    /// fail with [`IbkrConnectError::ClientIdInUse`] (IB error 326), and succeeds on a retry. The
     /// clones need not be dropped first. A clone that outlives the call is shut down, not
     /// reconnected.
     ///
