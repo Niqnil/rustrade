@@ -1487,6 +1487,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Binance clients no longer follow HTTP redirects** (`rustrade-execution`, `binance`).
+  binance-sdk builds its own HTTP client, which followed up to ten redirects. It sends the API key
+  as the custom `X-MBX-APIKEY` header, which a redirect to another host carried along, and a 301
+  or 302 turned an order `POST` into a `GET`. `BinanceSpot` and `BinanceMargin` now have the SDK's
+  client refuse redirects, and report a REST answer with a 3xx as `ApiError::RequestRejected`,
+  naming the status and where it pointed: an order or cancel so answered was not acted on, and is
+  not sent again. Before, such an answer read as an unreadable one, with an unknown outcome.
 - **The Alpaca clients no longer follow HTTP redirects** (`rustrade-execution`, `alpaca`;
   `rustrade-data`). `AlpacaClient` and `AlpacaRestClient` send the API key and secret as custom
   headers, which reqwest's default policy carries across a redirect to another host, and a 301 or

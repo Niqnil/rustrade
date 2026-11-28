@@ -53,6 +53,7 @@ use crate::client::order_recovery::{
 use crate::client::reconnect_budget::ReconnectBudget;
 use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::common::{
+    config::HttpAgent,
     errors::{ConnectorError, WebsocketError},
     models::{
         Interval, ParamBuildError, RateLimitType, RestApiRateLimit, RestApiResponse,
@@ -1312,6 +1313,49 @@ fn pause_after(sent_ms: u128, now_ms: u128) -> Option<Duration> {
 pub(crate) struct CooldownActive {
     /// How long the cooldown has left.
     pub(crate) remaining: Duration,
+}
+
+/// A REST answer with a redirect (an HTTP 3xx), which is not followed: see [`refusing_redirects`].
+///
+/// [`rest_call_with_retry`] returns it inside its `anyhow::Error`, and
+/// [`classify_rest_query_error`] and [`classify_rest_order_error`] report it as
+/// [`ApiError::RequestRejected`]: whatever answered with a redirect did not act on the request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Binance REST answered HTTP {status}, a redirect{}, which is not followed; the request was \
+     not acted on (check the configured base URL)",
+    location.as_deref().map(|to| format!(" to {to}")).unwrap_or_default()
+)]
+pub(crate) struct RedirectRefused {
+    /// The answer's HTTP status.
+    pub(crate) status: u16,
+    /// Where the answer redirected to, from its `Location` header.
+    pub(crate) location: Option<String>,
+}
+
+impl RedirectRefused {
+    /// The refusal of an answer with HTTP `status` and `headers` (named in lowercase, as the SDK
+    /// keys them), when `status` is a redirect.
+    pub(crate) fn of(status: u16, headers: &HashMap<String, String>) -> Option<Self> {
+        (300..400).contains(&status).then(|| Self {
+            status,
+            location: headers.get("location").cloned(),
+        })
+    }
+}
+
+/// The SDK REST client setting that refuses every redirect, for each REST configuration the
+/// Binance clients build.
+///
+/// binance-sdk builds its own reqwest client, which by default follows up to ten redirects. On a
+/// redirect to another host reqwest drops only the standard credential headers, not the SDK's
+/// `X-MBX-APIKEY`, so the API key would go to whatever host the redirect named; and a 301 or 302
+/// turns a `POST` into a `GET`. With redirects refused, the SDK hands back the 3xx answer itself,
+/// which [`rest_call_with_retry`] reports as [`RedirectRefused`].
+pub(crate) fn refusing_redirects() -> HttpAgent {
+    HttpAgent(Arc::new(|builder| {
+        builder.redirect(reqwest012::redirect::Policy::none())
+    }))
 }
 
 /// The wait Binance sent with a REST rate-limit refusal (`Retry-After`, in seconds), as
@@ -3741,6 +3785,7 @@ fn refuses_symbol(msg: &str, symbol: &InstrumentNameExchange, text: CallerText) 
 ///
 /// - [`CooldownActive`] (held back unsent) → [`ApiError::RateLimit`], with the cooldown's time
 ///   left as the wait.
+/// - [`RedirectRefused`] → [`ApiError::RequestRejected`].
 /// - The SDK's [`ParamBuildError`] (a request builder missing a required field) is a bug in this
 ///   client → [`UnindexedClientError::Internal`].
 /// - A [`ConnectorError`] is classified by [`classify_connector_error`], and a venue rejection by
@@ -3776,6 +3821,9 @@ fn classify_rest_query_error_naming(
 ) -> UnindexedClientError {
     if let Some(cooldown) = e.downcast_ref::<CooldownActive>() {
         return UnindexedClientError::Api(ApiError::rate_limited(Some(cooldown.remaining)));
+    }
+    if let Some(redirect) = e.downcast_ref::<RedirectRefused>() {
+        return UnindexedClientError::Api(ApiError::RequestRejected(redirect.to_string()));
     }
     if let Some(build) = e.downcast_ref::<ParamBuildError>() {
         return UnindexedClientError::Internal(format!("building Binance request: {build}"));
@@ -3886,8 +3934,9 @@ pub(crate) fn optional_decimal(
 ///
 /// # Errors
 ///
-/// The SDK's error from the last attempt, or [`CooldownActive`] when a cooldown too long to sleep
-/// through held the request back unsent. Map either with [`classify_rest_query_error`] or
+/// The SDK's error from the last attempt; [`CooldownActive`] when a cooldown too long to sleep
+/// through held the request back unsent; or [`RedirectRefused`] for an answer with a redirect,
+/// which is neither followed nor sent again. Map any of them with [`classify_rest_query_error`] or
 /// [`classify_rest_order_error`].
 ///
 /// Generic over the SDK `RestApi` type (`R`) so it serves both the spot
@@ -3921,6 +3970,9 @@ pub(crate) trait RestAnswer {
     fn rate_limits(&self) -> &[RestApiRateLimit];
     /// The answer's headers, named in lowercase.
     fn headers(&self) -> &HashMap<String, String>;
+    /// The answer's HTTP status, or `None` when it was read from the SDK's error, which carries
+    /// none. The SDK returns every 4xx and 5xx as an error, so a status here is a 2xx or a 3xx.
+    fn status(&self) -> Option<u16>;
 }
 
 impl<D> RestAnswer for RestApiResponse<D> {
@@ -3930,6 +3982,10 @@ impl<D> RestAnswer for RestApiResponse<D> {
 
     fn headers(&self) -> &HashMap<String, String> {
         &self.headers
+    }
+
+    fn status(&self) -> Option<u16> {
+        Some(self.status)
     }
 }
 
@@ -3981,6 +4037,12 @@ where
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
+                if let Some(redirect) = response
+                    .status()
+                    .and_then(|status| RedirectRefused::of(status, response.headers()))
+                {
+                    return Err(redirect.into());
+                }
                 return Ok((response, sent));
             }
             Err(e) if is_rate_limit_error(&e) => {
@@ -4499,6 +4561,7 @@ fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
 ///
 /// - [`CooldownActive`] (held back unsent) → [`ApiError::RateLimit`], with the cooldown's time
 ///   left as the wait.
+/// - [`RedirectRefused`] → [`ApiError::RequestRejected`]: the order was not placed.
 /// - 401 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`], with Binance's
 ///   `Retry-After` as the wait; 403 → `Unauthenticated` when it is an auth failure, else
 ///   `RateLimit` (Binance's WAF limit), with no wait.
@@ -4513,6 +4576,9 @@ pub(crate) fn classify_rest_order_error(
 ) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
     if let Some(cooldown) = e.downcast_ref::<CooldownActive>() {
         return OrderError::Rejected(ApiError::rate_limited(Some(cooldown.remaining)));
+    }
+    if let Some(redirect) = e.downcast_ref::<RedirectRefused>() {
+        return OrderError::Rejected(ApiError::RequestRejected(redirect.to_string()));
     }
     let Some(ce) = e.downcast_ref::<ConnectorError>() else {
         // Not an SDK ConnectorError — treat as opaque transport failure.
@@ -4613,7 +4679,82 @@ fn order_error_from(
 mod tests {
     use super::*;
     use crate::client::{binance::sdk_errors, reconnect_budget::BackoffLimits};
+    use binance_sdk::common::{config::ConfigurationRestApi, utils::send_request};
     use futures::FutureExt as _;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_redirect_is_any_3xx_and_names_where_it_led() {
+        let to = HashMap::from([("location".to_owned(), "https://elsewhere/x".to_owned())]);
+        assert_eq!(RedirectRefused::of(299, &to), None);
+        assert_eq!(RedirectRefused::of(400, &to), None);
+        let unnamed = RedirectRefused::of(300, &HashMap::new()).unwrap();
+        assert_eq!(unnamed.location, None);
+        assert!(
+            unnamed
+                .to_string()
+                .contains("HTTP 300, a redirect, which is not followed"),
+            "{unnamed}"
+        );
+        let named = RedirectRefused::of(399, &to).unwrap();
+        assert_eq!(named.status, 399);
+        assert!(
+            named
+                .to_string()
+                .contains("HTTP 399, a redirect to https://elsewhere/x, which"),
+            "{named}"
+        );
+    }
+
+    /// A REST answer with a redirect is not followed, so the API key goes to no other host. It is
+    /// refused after one request: `RequestRejected` for a query and for an order alike.
+    #[tokio::test]
+    async fn a_redirect_answer_is_refused_unfollowed_and_unretried() {
+        let (server, elsewhere) = sdk_errors::redirecting().await;
+        let config = Arc::new(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .agent(refusing_redirects())
+                .build()
+                .unwrap(),
+        );
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+
+        let error = rest_call_with_retry(&config, &tracker, RequestKind::Order, |config| {
+            Box::pin(async move {
+                send_request::<serde_json::Value>(
+                    &config,
+                    "/api/v3/order",
+                    reqwest::Method::POST,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    None,
+                    false,
+                )
+                .await
+            })
+        })
+        .await
+        .err()
+        .expect("a redirect is refused");
+
+        let refused = error.downcast_ref::<RedirectRefused>().unwrap();
+        assert_eq!(refused.status, 302);
+        let to = format!("{}/elsewhere", elsewhere.uri());
+        assert_eq!(refused.location.as_deref(), Some(to.as_str()));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let said = refused.to_string();
+        assert_eq!(
+            classify_rest_query_error(&error, None),
+            UnindexedClientError::Api(ApiError::RequestRejected(said.clone()))
+        );
+        assert_eq!(
+            classify_rest_order_error(&error, &InstrumentNameExchange::new("BTCUSDT")),
+            OrderError::Rejected(ApiError::RequestRejected(said))
+        );
+    }
 
     /// Every time in force outside the set is refused whatever the kind, `post_only` on every kind
     /// but a limit order, and the kinds that send no `timeInForce` take the rest of the set: none

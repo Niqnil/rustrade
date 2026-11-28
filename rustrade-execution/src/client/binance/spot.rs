@@ -58,9 +58,9 @@ use super::shared::{
     convert_open_order_owned_symbol, convert_order_report, dedup_key_from_event, disconnect_error,
     disconnect_lookback, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
     log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, rest_read_with_retry, retry_or_end, trailing_params, unix_ms,
-    unreadable_answer,
+    placed_order_state, recovered_order_cids, recovered_order_totals, refusing_redirects,
+    response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
+    trailing_params, unix_ms, unreadable_answer,
 };
 use crate::client::listed_order::ListedOrder;
 use crate::client::log_excerpt::frame_excerpt;
@@ -590,7 +590,8 @@ impl BinanceSpot {
     ) -> ConfigurationRestApiBuilder {
         let builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
-            .api_secret(config.secret_key.clone());
+            .api_secret(config.secret_key.clone())
+            .agent(refusing_redirects());
         match signing {
             Some(signing) => builder.timestamp_provider(signing.provider()),
             None => builder,
@@ -8443,6 +8444,34 @@ mod tests {
             .unwrap();
         assert_eq!(order.timeout, ORDER_REST_TIMEOUT_MS);
         assert_eq!(order.retries, 0);
+    }
+
+    /// Neither REST client follows a redirect: the 3xx itself is the answer.
+    #[tokio::test]
+    async fn the_rest_clients_refuse_redirects() {
+        let config = BinanceSpotConfig::new("key".into(), "secret".into());
+        for (built, label) in [
+            (BinanceSpot::rest_config_builder(&config, None), "rest"),
+            (
+                BinanceSpot::order_rest_config_builder(&config, None),
+                "order",
+            ),
+        ] {
+            let (server, _elsewhere) = sdk_errors::redirecting().await;
+            let built = built.base_path(server.uri()).build().unwrap();
+            let answer = binance_sdk::common::utils::send_request::<serde_json::Value>(
+                &built,
+                "/api/v3/order",
+                reqwest::Method::POST,
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(answer.status, 302, "{label}");
+        }
     }
 
     #[test]
