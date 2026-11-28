@@ -1555,6 +1555,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`IbkrMarketStream` waits for a close it runs inline before reconnecting** (`rustrade-data`,
+  `ibkr`, #1081). A dropped connection closes on a thread of its own, and the next connection
+  waits for it before connecting with the same client ID. When the OS refused that thread, the
+  close ran on the dropping thread instead, but the next connection did not wait for it, so it
+  could connect while the old connection was still open. It now waits. Such a drop still blocks
+  the thread it runs on, an async worker included, until `ibapi`'s disconnect returns; the
+  rustdoc says so.
 - **The Binance clients no longer follow HTTP redirects** (`rustrade-execution`, `binance`).
   binance-sdk builds its own HTTP client, which followed up to ten redirects. It sends the API key
   as the custom `X-MBX-APIKEY` header, which a redirect to another host carried along, and a 301
