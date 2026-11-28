@@ -873,10 +873,33 @@ impl Drop for AbandonOnDrop {
 #[derive(Debug, Clone, Default)]
 struct PendingClose(Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>>);
 
+/// A close for [`PendingClose`] to run, with any close started before it.
+type CloseJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Start a thread for the close, as `std::thread::Builder::spawn` does: on an error, `job` is
+/// dropped without having run.
+fn spawn_close_thread(job: CloseJob) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("ibkr-close".to_owned())
+        .spawn(job)
+}
+
 impl PendingClose {
-    /// Run `close` on a new thread, after any close started before it. If no thread can be
-    /// started, the earlier closes and `close` run here instead, blocking the caller.
+    /// Run `close` on a new thread, after any close started before it.
+    ///
+    /// If no thread can be started (the OS refuses one), the earlier closes and `close` run here
+    /// instead, so the call blocks for as long as they take: on an async worker, that blocks the
+    /// worker. A [`wait`](Self::wait) meanwhile blocks until they have finished.
     fn start(&self, close: impl FnOnce() + Send + 'static) {
+        self.start_with(spawn_close_thread, close);
+    }
+
+    /// [`start`](Self::start), with the thread started by `spawn`.
+    fn start_with(
+        &self,
+        spawn: impl FnOnce(CloseJob) -> std::io::Result<std::thread::JoinHandle<()>>,
+        close: impl FnOnce() + Send + 'static,
+    ) {
         let mut pending = self.0.lock();
         let earlier = pending.take();
         let job = move || {
@@ -888,21 +911,22 @@ impl PendingClose {
         // Shared with the thread, so that the job is still here to run if the spawn fails.
         let job = Arc::new(parking_lot::Mutex::new(Some(job)));
         let on_thread = job.clone();
-        let spawned = std::thread::Builder::new()
-            .name("ibkr-close".to_owned())
-            .spawn(move || {
-                if let Some(job) = on_thread.lock().take() {
-                    job();
-                }
-            });
+        let spawned = spawn(Box::new(move || {
+            if let Some(job) = on_thread.lock().take() {
+                job();
+            }
+        }));
         match spawned {
             Ok(handle) => *pending = Some(handle),
             Err(error) => {
-                drop(pending);
                 warn!(%error, "Failed to spawn the IB close thread; closing on this one");
+                // Run with the slot still locked, so that the next connection's `wait` blocks
+                // until this close has finished, as it would for a close thread. The job takes no
+                // lock of this slot, so it cannot deadlock on it.
                 if let Some(job) = job.lock().take() {
                     job();
                 }
+                drop(pending);
             }
         }
     }
@@ -1467,7 +1491,9 @@ where
 impl<K> Connection<K> {
     /// Close the connection, which ends every worker's subscription and the notice watcher, with
     /// nothing reported for it. Returns at once: the close runs on a thread of its own
-    /// ([`PendingClose`]), which the stream's next connection waits for.
+    /// ([`PendingClose`]), which the stream's next connection waits for. If the OS refuses that
+    /// thread, the close runs here instead and blocks the caller, an async worker when the
+    /// connection is dropped on one, until `ibapi`'s disconnect returns.
     fn close(&self) {
         debug!("Closing IB market data connection");
         // Set here, not on the close thread, so that no worker reports the close as a failure.
@@ -2319,6 +2345,104 @@ mod tests {
 
         pending.wait();
         assert_eq!(*order.lock(), [1, 2]);
+    }
+
+    /// A spawner that fails as `std::thread::Builder::spawn` does when the OS refuses a thread:
+    /// the job is dropped without having run.
+    fn refuse_thread(job: CloseJob) -> std::io::Result<std::thread::JoinHandle<()>> {
+        drop(job);
+        Err(std::io::Error::other("no thread for you"))
+    }
+
+    #[test]
+    fn a_close_runs_on_the_callers_thread_when_no_thread_can_be_started() {
+        let pending = PendingClose::default();
+        let ran_on = Arc::new(parking_lot::Mutex::new(None));
+
+        let on_close = ran_on.clone();
+        pending.start_with(refuse_thread, move || {
+            *on_close.lock() = Some(std::thread::current().id());
+        });
+
+        assert_eq!(
+            *ran_on.lock(),
+            Some(std::thread::current().id()),
+            "the close ran, on the caller's thread, before start_with returned"
+        );
+    }
+
+    #[test]
+    fn a_close_run_on_the_callers_thread_waits_for_the_earlier_close_first() {
+        let pending = PendingClose::default();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let earlier = order.clone();
+        pending.start(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            earlier.lock().push(1);
+        });
+        let later = order.clone();
+        pending.start_with(refuse_thread, move || later.lock().push(2));
+
+        assert_eq!(*order.lock(), [1, 2]);
+    }
+
+    #[test]
+    fn closes_start_on_threads_again_after_a_refused_thread() {
+        let pending = PendingClose::default();
+        pending.start_with(refuse_thread, || {});
+
+        let caller = std::thread::current().id();
+        let off_caller = Arc::new(AtomicBool::new(false));
+        let on_close = off_caller.clone();
+        pending.start(move || {
+            on_close.store(std::thread::current().id() != caller, Ordering::Release);
+        });
+        pending.wait();
+
+        assert!(
+            off_caller.load(Ordering::Acquire),
+            "the next close ran, off the caller's thread"
+        );
+    }
+
+    #[test]
+    fn a_wait_blocks_until_a_close_on_the_callers_thread_has_finished() {
+        let pending = PendingClose::default();
+        let (started, close_started) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let (closer, on_close) = (pending.clone(), done.clone());
+        let closing = std::thread::spawn(move || {
+            closer.start_with(refuse_thread, move || {
+                let _ = started.send(());
+                let _ = released.recv();
+                on_close.store(true, Ordering::Release);
+            });
+        });
+        close_started.recv().expect("the close started");
+
+        let (returned, wait_returned) = std::sync::mpsc::channel::<bool>();
+        let (waiter, seen) = (pending.clone(), done.clone());
+        let waiting = std::thread::spawn(move || {
+            waiter.wait();
+            let _ = returned.send(seen.load(Ordering::Acquire));
+        });
+        assert_eq!(
+            wait_returned.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "wait returned while the close was still running"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(
+            wait_returned.recv(),
+            Ok(true),
+            "wait returned after the close"
+        );
+        closing.join().unwrap();
+        waiting.join().unwrap();
     }
 
     type Item = Result<u8, DataError>;
