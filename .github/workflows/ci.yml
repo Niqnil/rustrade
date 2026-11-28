@@ -536,13 +536,14 @@ jobs:
       #   do its neighbours on the same line), spread across the shards.
       # - `timeout` interrupts the run with time left in the job, so a large PR still gets a summary
       #   of the mutants tested so far. cargo-mutants records each outcome as it lands.
-      # - The runner caps the data segment of each test binary at 4 GiB. A mutant that stops a loop
-      #   from advancing can allocate without bound, and it exhausts the runner's memory well
-      #   before cargo-mutants' test timeout. GitHub then shuts the runner down, and the rest of
-      #   the shard goes untested. Under the cap the allocation fails, the test aborts, and the
-      #   mutant counts as caught. It limits only the test binaries cargo runs, never rustc, and
-      #   is set on this step alone because rust-cache hashes the job's `CARGO_*` variables into
-      #   its key.
+      # - The runner caps each test binary's heap and private mappings (`RLIMIT_DATA`) at 4 GiB.
+      #   A mutant that stops a loop from advancing can allocate without bound, and it exhausts
+      #   the runner's memory well before cargo-mutants' test timeout. GitHub then shuts the
+      #   runner down, and the rest of the shard goes untested. Under the cap the allocation
+      #   fails, the test aborts, and the mutant counts as caught. A test binary that legitimately
+      #   needs more would abort the same way, already in the baseline run. It limits only the
+      #   test binaries cargo runs, never rustc, and is set on this step alone because rust-cache
+      #   hashes the job's `CARGO_*` variables into its key.
       - name: Run cargo mutants
         id: mutants
         env:
