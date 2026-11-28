@@ -40,6 +40,7 @@ use crate::exchange::lse::transport::FileHead;
 use crate::subscription::candle::CandleInterval;
 use smol_str::SmolStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::BufWriter;
 use tracing::{debug, warn};
 
@@ -350,11 +351,61 @@ impl Drop for PartFile {
     }
 }
 
-/// `<dest>.part`, beside the destination so the final rename stays on one filesystem.
-fn part_path(destination: &Path) -> PathBuf {
+/// Numbers this process's `.part` files, so two downloads to one destination never share one.
+static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Names tried before [`create_part_file`] gives up. Each takes a fresh sequence number, so only
+/// files left by an earlier process that had this one's id can collide, and only a few of them.
+const PART_NAME_ATTEMPTS: u32 = 16;
+
+/// `<dest>.<process>-<sequence>.part`, beside the destination so the final rename stays on one
+/// filesystem.
+fn part_path(destination: &Path, process: u32, sequence: u64) -> PathBuf {
     let mut name = destination.as_os_str().to_owned();
-    name.push(".part");
+    name.push(format!(".{process}-{sequence}.part"));
     PathBuf::from(name)
+}
+
+/// Create a `.part` file for `destination` that no other download is using, with its guard.
+///
+/// Opened with `create_new`, so a name that exists already, another download's or one left by a
+/// process that died, is never truncated: the next number is tried instead.
+async fn create_part_file(
+    destination: &Path,
+    process: u32,
+    sequence: &AtomicU64,
+) -> Result<(PartFile, tokio::fs::File), LseError> {
+    let mut attempt = 1;
+    loop {
+        // Relaxed: the number only has to be unique, and a read-modify-write always is.
+        let path = part_path(
+            destination,
+            process,
+            sequence.fetch_add(1, Ordering::Relaxed),
+        );
+        // Armed before the open: a future dropped while the open runs on the blocking pool removes
+        // the file if the open has created it by then.
+        let mut guard = PartFile::new(path);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&guard.path)
+            .await
+        {
+            Ok(file) => return Ok((guard, file)),
+            Err(error) => {
+                // A failed open created nothing, and a name that already exists belongs to someone
+                // else: removing it would destroy their file.
+                guard.disarm();
+                if error.kind() != std::io::ErrorKind::AlreadyExists
+                    || attempt == PART_NAME_ATTEMPTS
+                {
+                    return Err(io_error("creating", &guard.path)(error));
+                }
+            }
+        }
+        attempt += 1;
+    }
 }
 
 /// The directory holding `destination`: its parent, or `.` for a bare file name.
@@ -406,6 +457,9 @@ impl LseClient {
     /// - A file that fails its checks is [`LseError::MissingChecksum`] or
     ///   [`LseError::IntegrityMismatch`]; calling again downloads it again whole. One whose headers
     ///   describe another selection is [`LseError::ExportMismatch`].
+    /// - A connection silent for 30 s is [`LseError::Http`], and that includes the wait for the
+    ///   file to be built: the provider sends nothing until it has built the whole file, and has
+    ///   charged the rows by then. Builds near the row cap have taken about a second.
     ///
     /// `Ok(None)` is the provider's `404 data-unavailable`, which it sends both for a window with
     /// nothing stored (a weekend, a holiday) and for a kind of data the market does not serve, so
@@ -430,14 +484,21 @@ impl LseClient {
     /// Download one export to `destination`, verified, or `None` when the provider stores nothing
     /// for it.
     ///
-    /// The body streams to `<destination>.part` and is hashed as it arrives, so memory stays flat
-    /// whatever the file's size. Only once every byte has matched the declared length and SHA-256
+    /// The body streams to a `.part` file beside `destination`, named
+    /// `<destination>.<process id>-<n>.part` so that no two downloads share one, and is hashed as it
+    /// arrives, so memory stays flat whatever the file's size. Only once every byte has matched the declared length and SHA-256
     /// is the file synced, renamed to `destination` and the rename synced: `destination` either
     /// holds a whole, verified file or is as it was before the call.
     ///
     /// # Cancellation
-    /// Dropping the returned future (a timeout, a `select!`) removes the `.part` file. One left by
-    /// a process that died mid-download is overwritten by the next download to that destination.
+    /// Dropping the returned future (a timeout, a `select!`) removes the `.part` file. A process
+    /// that dies mid-download leaves its `.part` file behind, as can, rarely, a future dropped
+    /// while the file is being created. No later download removes or reuses one: delete them by
+    /// that pattern.
+    ///
+    /// # Concurrency
+    /// Two downloads to one destination each write their own `.part` file, and each places a whole,
+    /// verified file; the last to finish is the one left at `destination`.
     ///
     /// # Arguments
     /// - `destination`: the file to place. Its directory must exist. See
@@ -472,17 +533,9 @@ impl LseClient {
             });
         }
 
-        let part = part_path(destination);
-        // Armed before the open: a future dropped while the open runs on the blocking pool would
-        // otherwise leave the file it creates behind. Removing one never created is a no-op.
-        let mut guard = PartFile::new(part.clone());
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&part)
-            .await
-            .map_err(io_error("creating", &part))?;
+        let (mut guard, file) =
+            create_part_file(destination, std::process::id(), &PART_SEQUENCE).await?;
+        let part = guard.path.clone();
         let mut writer = BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
 
         let Some(head) = self.get_export_into(&query, &mut writer).await? else {
@@ -708,11 +761,58 @@ mod tests {
     }
 
     #[test]
-    fn the_part_file_sits_beside_its_destination() {
+    fn the_part_file_sits_beside_its_destination_named_by_process_and_number() {
         assert_eq!(
-            part_path(Path::new("/data/AAPL.parquet")),
-            PathBuf::from("/data/AAPL.parquet.part")
+            part_path(Path::new("/data/AAPL.parquet"), 42, 7),
+            PathBuf::from("/data/AAPL.parquet.42-7.part")
         );
+    }
+
+    #[tokio::test]
+    async fn a_part_file_name_in_use_is_skipped_and_left_as_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("AAPL.parquet");
+        let taken = part_path(&destination, 42, 0);
+        std::fs::write(&taken, b"another download's bytes").unwrap();
+        let sequence = AtomicU64::new(0);
+
+        let (guard, _file) = create_part_file(&destination, 42, &sequence).await.unwrap();
+
+        assert_eq!(guard.path, part_path(&destination, 42, 1));
+        assert!(guard.path.exists());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"another download's bytes");
+    }
+
+    #[tokio::test]
+    async fn every_part_file_name_in_use_is_an_io_error_that_removes_none_of_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("AAPL.parquet");
+        let taken: Vec<PathBuf> = (0..u64::from(PART_NAME_ATTEMPTS))
+            .map(|sequence| part_path(&destination, 42, sequence))
+            .collect();
+        for path in &taken {
+            std::fs::write(path, b"another download's bytes").unwrap();
+        }
+        let sequence = AtomicU64::new(0);
+
+        let result = create_part_file(&destination, 42, &sequence).await;
+
+        assert!(matches!(result, Err(LseError::Io { .. })));
+        assert!(taken.iter().all(|path| path.exists()));
+        assert!(!part_path(&destination, 42, u64::from(PART_NAME_ATTEMPTS)).exists());
+    }
+
+    #[tokio::test]
+    async fn a_part_file_that_cannot_be_created_is_an_io_error() {
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("gone")
+            .join("AAPL.parquet");
+
+        let result = create_part_file(&missing, 42, &AtomicU64::new(0)).await;
+
+        assert!(matches!(result, Err(LseError::Io { .. })));
     }
 
     #[test]

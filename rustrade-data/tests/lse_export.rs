@@ -328,16 +328,14 @@ async fn replacing_keeps_the_old_file_until_the_new_one_is_verified() {
 }
 
 #[tokio::test]
-async fn a_stale_part_file_is_overwritten() {
+async fn a_part_file_left_by_another_process_is_left_alone() {
     let server = MockServer::start().await;
     mount(&server, file_answer(BODY)).await;
     let directory = tempfile::tempdir().unwrap();
     let destination = directory.path().join("export.parquet");
-    std::fs::write(
-        directory.path().join("export.parquet.part"),
-        b"left by a process that died mid-download, and longer than the new body",
-    )
-    .unwrap();
+    // A process id above Linux's ceiling of 2^22, so never this test's own.
+    let stale = directory.path().join("export.parquet.4294967295-0.part");
+    std::fs::write(&stale, b"left by a process that died mid-download").unwrap();
 
     client(&server)
         .download_export(&request(), &destination, LseExistingFile::Refuse)
@@ -345,6 +343,38 @@ async fn a_stale_part_file_is_overwritten() {
         .unwrap()
         .unwrap();
 
+    assert_eq!(std::fs::read(&destination).unwrap(), BODY);
+    assert_eq!(
+        std::fs::read(&stale).unwrap(),
+        b"left by a process that died mid-download"
+    );
+    assert_eq!(
+        files(directory.path()),
+        ["export.parquet", "export.parquet.4294967295-0.part"]
+    );
+}
+
+#[tokio::test]
+async fn two_downloads_to_one_destination_each_place_a_whole_file() {
+    let server = MockServer::start().await;
+    // The delay keeps the first download in flight while the second creates its `.part` file.
+    mount(
+        &server,
+        file_answer(BODY).set_delay(Duration::from_millis(100)),
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("export.parquet");
+    let client = client(&server);
+    let request = request();
+
+    let (first, second) = tokio::join!(
+        client.download_export(&request, &destination, LseExistingFile::Replace),
+        client.download_export(&request, &destination, LseExistingFile::Replace),
+    );
+
+    assert_eq!(first.unwrap().unwrap().path, destination);
+    assert_eq!(second.unwrap().unwrap().path, destination);
     assert_eq!(std::fs::read(&destination).unwrap(), BODY);
     assert_eq!(files(directory.path()), ["export.parquet"]);
 }

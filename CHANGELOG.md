@@ -25,9 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <https://londonstrategicedge.com/terms>.
   - `LseClient::fetch_export` returns one selection's file in memory, and `download_export` streams
     it to disk; both check it against the provider's size and SHA-256 headers before returning
-    anything. A download writes `<destination>.part`, then syncs, renames and syncs the directory,
-    so the destination holds a whole verified file or is untouched; the `.part` file is removed on
-    any error and when the future is dropped. `LseExistingFile` chooses between refusing an
+    anything. A download writes its own `<destination>.<process id>-<n>.part`, then syncs, renames
+    and syncs the directory, so the destination holds a whole verified file or is untouched, and two
+    downloads to one destination never share a `.part` file; it is removed on any error and when the
+    future is dropped. `LseExistingFile` chooses between refusing an
     existing destination (the default, checked before any request) and replacing it atomically.
     An `LseExportRequest` names the market, symbol, `LseExportData` (`Candles(interval)`,
     `TradeSlice`, `Greeks`), an `LseWindow` (timestamps with an exclusive end, to the nanosecond, or
