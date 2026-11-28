@@ -49,7 +49,11 @@ impl SnapshotFetcher<BinanceFuturesUsd, OrderBooksL2>
         Instrument: InstrumentData,
         Subscription<BinanceFuturesUsd, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
     {
+        // One client for every snapshot of this initialisation, so they share its connection pool
+        // and TLS setup; each future holds a clone, which shares them too.
+        let client = reqwest::Client::new();
         let l2_snapshot_futures = subscriptions.iter().map(|sub| {
+            let client = client.clone();
             // Construct initial OrderBook snapshot GET url
             let market = sub.id();
             let snapshot_url = format!(
@@ -61,7 +65,8 @@ impl SnapshotFetcher<BinanceFuturesUsd, OrderBooksL2>
             async move {
                 // Fetch initial OrderBook snapshot via HTTP
                 let snapshot =
-                    fetch_l2_snapshot(&snapshot_url, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT).await?;
+                    fetch_l2_snapshot(&client, &snapshot_url, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT)
+                        .await?;
 
                 Ok(MarketEvent::from((
                     ExchangeId::BinanceFuturesUsd,

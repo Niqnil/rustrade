@@ -1532,6 +1532,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   examples on `main` (the old link pointed to a branch that no longer exists), and the
   `rustrade-data` docs and README now list the `alpha-vantage` and `sec-edgar` features too. The
   `rustrade-data` and `rustrade` package descriptions are updated to match.
+- **Binance order book snapshots share one HTTP client per initialisation** (`rustrade-data`).
+  Initialising a Binance Spot or USD-M futures L2 order book stream fetches one snapshot per
+  instrument; those requests now share one client, and with it one connection pool and TLS
+  setup, instead of building both for every instrument.
 
 ### Fixed
 
