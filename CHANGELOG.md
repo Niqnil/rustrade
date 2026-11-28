@@ -84,10 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OptionExerciseClient` with `POST /v2/positions/{symbol}/do-not-exercise`, for a whole position
   only: a quantity of contracts is refused with `QuantityUnsupported` without sending anything,
   as is a name that is not an OCC option symbol, with `InstrumentInvalid`. Alpaca's paper API
-  takes the instruction only on the contract's expiration day, until 5:15 PM New York time, and
-  judges that before the position. Its refusals, all but one under the same generic code, are
-  read by their message: `NotExpiryDay` (dated from the symbol), `PastDeadline` (the stated time
-  on the expiration day in New York), `NoPosition`, and `ShortPosition` by its own code.
+  takes the instruction only on the contract's expiration day, until 5:15 PM New York time, or
+  2:30 PM when the market closes early at 1:00 PM, and judges that before the position. Its
+  refusals, all but one under the same generic code, are read by their message: `NotExpiryDay`
+  (dated from the symbol), `PastDeadline` (the stated time on the expiration day in New York),
+  `NoPosition`, and `ShortPosition` by its own code.
   `NoPosition` is also read from the 404 "long position not found" that the paper API sends for a
   contract the account does not hold, in place of the documented 403. Any other is `Other` with
   Alpaca's code and message. A request whose outcome is unknown, such as

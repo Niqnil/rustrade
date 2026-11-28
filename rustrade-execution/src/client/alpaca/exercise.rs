@@ -57,12 +57,12 @@ impl OptionExerciseClient for AlpacaClient {
     ///   closes early at 1:00 PM.** Alpaca's API reference states no window, and its FAQ asks for
     ///   the instruction before 3:00 PM ET. Its paper API, observed in November 2026, refuses one
     ///   sent on any other day, before or after, with [`ExerciseRefusal::NotExpiryDay`], and one
-    ///   sent on the day after the deadline with [`ExerciseRefusal::PastDeadline`], whose message
-    ///   names that day's deadline. The early-close deadline is not a fixed offset from the
-    ///   close, so it is a time of day per session, not the close plus a constant. Alpaca judges
-    ///   the day before it looks at the position, so [`ExerciseRefusal::NoPosition`] comes only
-    ///   on the expiration day. This client checks neither rule itself: it reports what Alpaca
-    ///   answers.
+    ///   sent on the expiration day after the deadline with [`ExerciseRefusal::PastDeadline`],
+    ///   whose message names that day's deadline. The early-close deadline is not a fixed offset
+    ///   from the close, so it is a time of day per session, not the close plus a constant.
+    ///   Alpaca judges the day before it looks at the position, so [`ExerciseRefusal::NoPosition`]
+    ///   comes only on the expiration day. This client checks neither rule itself: it reports
+    ///   what Alpaca answers.
     /// - **A repeat is accepted.** Alpaca's paper API answers a second instruction for the same
     ///   position with the same empty 200 as the first (observed in November 2026). The position
     ///   carries no marker of it, so an instruction cannot be read back from Alpaca's positions.
@@ -74,10 +74,11 @@ impl OptionExerciseClient for AlpacaClient {
     ///   [`ExerciseRefusal::ShortPosition`] only for the documented 403 with code `40310001`. If
     ///   Alpaca instead answers an account short the contract with the same 404 "long position not
     ///   found", that is reported as `NoPosition`.
-    /// - **An in-the-money long lapses.** On Alpaca's paper API, observed in November 2026, a long
-    ///   call in the money at the close, under an accepted instruction, was gone the morning after
-    ///   expiry with no shares delivered and no sale. By then the account's activities held no
-    ///   expiry record for it, so the position can vanish before an event reports why.
+    /// - **An in-the-money long lapsed, once.** On Alpaca's paper API, observed in November 2026,
+    ///   a long call in the money at the close, under an accepted instruction, was gone the
+    ///   morning after expiry with no shares delivered and no sale. Alpaca stated no cause: by then
+    ///   the account's activities held no expiry record for it, so the position can vanish before
+    ///   an event reports why.
     /// - **Not documented:** what a sale or a purchase of the contract after the instruction does
     ///   to it; and whether it keeps Alpaca from selling an expiring long that the account could
     ///   not afford to exercise, as Alpaca otherwise may on the expiration day. In the one
