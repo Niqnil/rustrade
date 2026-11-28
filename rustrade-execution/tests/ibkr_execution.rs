@@ -344,6 +344,34 @@ async fn test_connect_refuses_a_configured_contract_it_cannot_register() {
     assert_eq!(client.contract_registry().len(), 1);
 }
 
+/// TWS/Gateway refuses a client ID another connection holds, and both connects report it as its
+/// own error, naming the ID.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_connect_reports_a_client_id_in_use() {
+    init_logging();
+
+    let holder = connect_client(test_config(35))
+        .await
+        .expect("first connection failed");
+    let client_id = test_config(35).client_id;
+
+    let refused = tokio::task::spawn_blocking(|| IbkrClient::connect_sync(test_config(35)))
+        .await
+        .unwrap()
+        .map(|_| ());
+    assert_eq!(refused, Err(IbkrConnectError::ClientIdInUse { client_id }));
+
+    let refused = tokio::task::spawn_blocking(|| IbkrClient::connect_sync_lenient(test_config(35)))
+        .await
+        .unwrap()
+        .map(|_| ());
+    assert_eq!(refused, Err(IbkrConnectError::ClientIdInUse { client_id }));
+
+    drop(holder);
+}
+
 #[tokio::test]
 #[ignore]
 #[serial]
