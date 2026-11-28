@@ -525,6 +525,14 @@ impl SessionCalendar for Unavailable {
     fn session_close_on(&self, _: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, CalendarError> {
         Err(CalendarError::unavailable("down for maintenance"))
     }
+
+    fn closes_early_on(&self, _: DateTime<Utc>) -> Result<bool, CalendarError> {
+        Err(CalendarError::unavailable("down for maintenance"))
+    }
+
+    fn zone(&self) -> chrono_tz::Tz {
+        chrono_tz::UTC
+    }
 }
 
 #[test]
@@ -577,6 +585,14 @@ impl SessionCalendar for Stuck {
 
     fn session_close_on(&self, at: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, CalendarError> {
         Ok(Some(at))
+    }
+
+    fn closes_early_on(&self, _: DateTime<Utc>) -> Result<bool, CalendarError> {
+        Ok(false)
+    }
+
+    fn zone(&self) -> chrono_tz::Tz {
+        chrono_tz::UTC
     }
 }
 

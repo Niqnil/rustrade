@@ -68,8 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is kept in the venue's snapshot (an additive field; format version unchanged). The new
   `MockExecutionConfig::lapse_deadline` (`LapseDeadline`, anchored as the other expiry-day rules
   are) refuses instructions from a set time before each option's close or expiry; by default
-  they are taken until expiry. `ExpiryRule` gains `LapseDeadline` and `VenueRestoreError` gains
-  `LapseWithoutLong`.
+  they are taken until expiry. `LapseDeadline::expiry_day_only` also refuses an instruction sent
+  on any date but the option's expiry day, dated in its session calendar's zone, with
+  `NotExpiryDay`, judged before the position as a venue that takes instructions only on the
+  expiry day judges it; it needs a session calendar whatever the anchor. The new anchor
+  `ExpiryAnchor::AtLocalTime { time, early_close }` places a rule at a local time of day on the
+  expiry's date in the option's calendar zone, `early_close` on a date the calendar closes early:
+  Alpaca takes do-not-exercise instructions until 17:15 New York, and until 14:30 on a 13:00
+  early close, which no offset from the close matches. It needs a session calendar, may fall
+  after the close, and is refused with the new `ExpiryAnchorError::AfterExpiry` if it falls after
+  the expiry (stamp the expiry at or after the deadline). `ExpiryRule` gains `LapseDeadline` and
+  `VenueRestoreError` gains `LapseWithoutLong`.
 
 - **Alpaca do-not-exercise** (`rustrade-execution`, feature `alpaca`). `AlpacaClient` implements
   `OptionExerciseClient` with `POST /v2/positions/{symbol}/do-not-exercise`, for a whole position
@@ -507,8 +516,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Known limitations:** holidays and early closes only as listed (none are built in); no open
     time, so an order sent after the close can fill on after-hours data.
   - **New `rustrade_instrument::calendar`:** the `SessionCalendar` trait (`next_close_after`,
-    strictly after, and `session_close_on`, the close of the session on an instant's own local
-    date or `None` on a day without one; UTC in and out), `CalendarError`, `DailyClose`,
+    strictly after; `session_close_on`, the close of the session on an instant's own local date
+    or `None` on a day without one; UTC in and out; `closes_early_on`, whether that date's
+    session closes early; and `zone`, the time zone it dates sessions in, for a rule set by local
+    date), `CalendarError`, `DailyClose`,
     `instant_at_local` (local time to UTC, with the daylight-saving rule `DailyAccrual` already
     used), and a re-export of `chrono_tz::Tz`.
   - **Holidays and early closes:** `SessionDates` lists a market's holidays and early-close days

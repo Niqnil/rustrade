@@ -160,7 +160,7 @@ pub(super) fn check_order_rules(
 }
 
 /// The anchor of an expiry-day rule cannot place the rule for an option a
-/// [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored before the session close
+/// [`SimulatedVenue`](super::SimulatedVenue) lists, such as one anchored to the session calendar
 /// for an option whose expiry falls on a date with no session.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
