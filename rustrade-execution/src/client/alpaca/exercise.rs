@@ -74,9 +74,14 @@ impl OptionExerciseClient for AlpacaClient {
     ///   [`ExerciseRefusal::ShortPosition`] only for the documented 403 with code `40310001`. If
     ///   Alpaca instead answers an account short the contract with the same 404 "long position not
     ///   found", that is reported as `NoPosition`.
+    /// - **An in-the-money long lapses.** On Alpaca's paper API, observed in November 2026, a long
+    ///   call in the money at the close, under an accepted instruction, was gone the morning after
+    ///   expiry with no shares delivered and no sale. By then the account's activities held no
+    ///   expiry record for it, so the position can vanish before an event reports why.
     /// - **Not documented:** what a sale or a purchase of the contract after the instruction does
     ///   to it; and whether it keeps Alpaca from selling an expiring long that the account could
-    ///   not afford to exercise, as Alpaca otherwise may on the expiration day.
+    ///   not afford to exercise, as Alpaca otherwise may on the expiration day. In the one
+    ///   observation above Alpaca did not sell the call, which does not settle it.
     ///
     /// # Errors
     /// - [`ApiError::InstrumentInvalid`], without sending anything, for a name that is not an
