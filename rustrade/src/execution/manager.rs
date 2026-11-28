@@ -2418,7 +2418,7 @@ mod tests {
             Arc::new(client),
             AccountEventIndexer::new(Arc::new(map)),
             AccountStreamOptions::default()
-                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1))
+                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1, 0))
                 .with_clock(clock),
         )
         .await
@@ -3216,7 +3216,7 @@ mod tests {
             Arc::new(client),
             AccountEventIndexer::new(Arc::new(map)),
             AccountStreamOptions::default()
-                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1))
+                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1, 0))
                 .with_clock(Clock::new(sim_now)),
         )
         .await
@@ -3272,7 +3272,7 @@ mod tests {
 
     #[test]
     fn account_stream_options_setters_set_their_field() {
-        let reconnect = ReconnectionBackoffPolicy::new(7, 3, 9);
+        let reconnect = ReconnectionBackoffPolicy::new(7, 3, 9, 25);
         let fill_recovery = FillRecoveryConfig::default().with_max_pages(3);
         let options = AccountStreamOptions::default()
             .with_reconnect(reconnect.clone())

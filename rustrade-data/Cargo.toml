@@ -129,6 +129,9 @@ thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
+# Jitter in the reconnect backoff (`ReconnectionBackoffPolicy`). Already in the workspace tree.
+rand = { workspace = true }
+
 # Data Structures
 parking_lot = { workspace = true }
 # `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`

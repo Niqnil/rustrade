@@ -850,6 +850,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: reconnect waits are jittered, by 50 % by default** (`rustrade-data`).
+  `ReconnectionBackoffPolicy` gains `backoff_jitter_percent`: each wait is drawn at random from
+  the top that many percent of the backoff, so from half the backoff to all of it at the new
+  `DEFAULT_BACKOFF_JITTER_PERCENT` (50). Streams that drop together, such as every stream to a
+  venue that dropped them all at once, no longer reconnect at the same instants, in bursts against
+  the venue's connection limits. A wait is still never longer than `backoff_ms_max`, and `0` gives
+  exactly the old waits. `STREAM_RECONNECTION_POLICY` uses 50, so market streams and
+  `AccountStreamOptions` (`rustrade`) jitter by default, and a configuration deserialized without
+  the field gets 50. Building the policy with a struct literal or `::new` now needs the
+  fourth value. IBKR's wait after a connection that ends at once is jittered the same way. The
+  backoff no longer overflows a very large `backoff_ms_max`, and a `backoff_ms_initial` above the
+  cap now waits the cap.
 - **Breaking: a refused IB client ID has its own error when `IbkrClient` connects**
   (`rustrade-execution`, `ibkr` feature). When TWS/Gateway refuses the connection because another
   connection holds the client ID (IB code 326), `IbkrClient::connect_sync` and

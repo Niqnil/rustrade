@@ -728,23 +728,14 @@ impl QuickEnds {
         }
     }
 
-    /// The wait before the next attempt, which it takes: the backoff `policy` gives the attempt
-    /// after as many failures as there were quick ends in a row, once after each quick end, else
-    /// none.
+    /// The wait before the next attempt, which it takes: the wait `policy` gives after as many
+    /// failures in a row as there were quick ends in a row, jitter included, once after each quick
+    /// end, else none.
     fn take_delay(&mut self, policy: &ReconnectionBackoffPolicy) -> std::time::Duration {
         if !std::mem::take(&mut self.owed) {
             return std::time::Duration::ZERO;
         }
-        let steps = self.in_a_row.saturating_sub(1);
-        let multiplier = u64::from(policy.backoff_multiplier);
-        let mut millis = policy.backoff_ms_initial;
-        for _ in 0..steps {
-            if millis >= policy.backoff_ms_max {
-                break;
-            }
-            millis = millis.saturating_mul(multiplier);
-        }
-        std::time::Duration::from_millis(millis.min(policy.backoff_ms_max))
+        policy.wait(self.in_a_row)
     }
 }
 
@@ -2198,6 +2189,7 @@ mod tests {
         backoff_ms_initial: 100,
         backoff_multiplier: 2,
         backoff_ms_max: 1_000,
+        backoff_jitter_percent: 0,
     };
 
     #[test]
@@ -2385,6 +2377,7 @@ mod tests {
                 backoff_ms_initial: 1,
                 backoff_multiplier: 2,
                 backoff_ms_max: 10,
+                backoff_jitter_percent: 0,
             };
         let refused = DataError::Socket("IB connect: connection refused".to_owned());
         let attempts = stream::iter([

@@ -4526,6 +4526,7 @@ dependencies = [
  "parking_lot",
  "parquet",
  "quick-xml",
+ "rand 0.10.4",
  "reqwest 0.13.5",
  "rust_decimal",
  "rust_decimal_macros",

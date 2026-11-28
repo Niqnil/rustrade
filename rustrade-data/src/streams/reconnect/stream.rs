@@ -98,7 +98,6 @@ where
                                     "failed to re-initialise Stream"
                                 );
                                 let backoff = state.generate_sleep_future(hint);
-                                state.multiply_backoff();
                                 let failure = ReinitFailure {
                                     attempt: consecutive,
                                     error,
@@ -318,6 +317,25 @@ where
 }
 
 /// Reconnection backoff policy for a [`ReconnectingStream::with_reconnect_backoff`].
+///
+/// # The wait
+///
+/// After the `n`th failed attempt in a row (`n` from 1), the backoff is
+/// `backoff_ms_initial × backoff_multiplier^(n − 1)`, capped at `backoff_ms_max`. The wait before
+/// the next attempt is drawn at random from the top `backoff_jitter_percent` of that backoff: with
+/// `d` the backoff and `p` the percent, from `d × (1 − p/100)` to `d`, both included. So:
+///
+/// - a wait is never longer than `backoff_ms_max`;
+/// - `0` gives exactly the backoff, every time; `50` a wait between half the backoff and all of
+///   it; `100` anything from no wait to all of it;
+/// - streams that failed together, such as every stream to a venue that dropped them all at once,
+///   spread their next attempts over that range instead of all retrying at the same instant.
+///
+/// A percent above 100 counts as 100. A `backoff_multiplier` of 1 keeps the backoff at
+/// `backoff_ms_initial`, and 0 makes every wait after the first zero.
+///
+/// A configuration deserialized without `backoff_jitter_percent` gets
+/// [`DEFAULT_BACKOFF_JITTER_PERCENT`].
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
 )]
@@ -334,19 +352,61 @@ pub struct ReconnectionBackoffPolicy {
 
     /// Maximum possible backoff duration between reconnection attempts.
     pub backoff_ms_max: u64,
+
+    /// How much of the backoff each wait may be cut by at random, in percent: see
+    /// [The wait](ReconnectionBackoffPolicy#the-wait).
+    #[serde(default = "default_backoff_jitter_percent")]
+    pub backoff_jitter_percent: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+/// The [`ReconnectionBackoffPolicy::backoff_jitter_percent`] of
+/// [`STREAM_RECONNECTION_POLICY`](crate::streams::consumer::STREAM_RECONNECTION_POLICY), and of a
+/// configuration deserialized without one: each wait falls between half the backoff and all of it.
+pub const DEFAULT_BACKOFF_JITTER_PERCENT: u8 = 50;
+
+fn default_backoff_jitter_percent() -> u8 {
+    DEFAULT_BACKOFF_JITTER_PERCENT
+}
+
+impl ReconnectionBackoffPolicy {
+    /// The wait after the `failures`th failed attempt in a row, drawn as
+    /// [The wait](ReconnectionBackoffPolicy#the-wait) says. `failures` of 0 counts as 1.
+    pub(crate) fn wait(&self, failures: u32) -> Duration {
+        self.wait_cut_by(failures, |most| rand::random_range(0..=most))
+    }
+
+    /// The wait after the `failures`th failed attempt in a row: the backoff, less what `cut` picks
+    /// given the most the wait may be cut by, in milliseconds. A pick above that most counts as
+    /// that most.
+    fn wait_cut_by(&self, failures: u32, cut: impl FnOnce(u64) -> u64) -> Duration {
+        let backoff = self.backoff_ms(failures);
+        let percent = u128::from(self.backoff_jitter_percent.min(100));
+        // At most `backoff`, since `percent` is at most 100, so it fits back in a `u64`.
+        let most = u64::try_from(u128::from(backoff) * percent / 100).unwrap_or(backoff);
+        Duration::from_millis(backoff - cut(most).min(most))
+    }
+
+    /// The backoff, in milliseconds, after the `failures`th failed attempt in a row, before any
+    /// jitter: `backoff_ms_initial × backoff_multiplier^(failures − 1)`, capped at
+    /// `backoff_ms_max`.
+    fn backoff_ms(&self, failures: u32) -> u64 {
+        // Saturating, so a power or product past `u64::MAX` lands on the cap instead of wrapping.
+        let growth = u64::from(self.backoff_multiplier).saturating_pow(failures.saturating_sub(1));
+        self.backoff_ms_initial
+            .saturating_mul(growth)
+            .min(self.backoff_ms_max)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ReconnectionState {
     policy: ReconnectionBackoffPolicy,
-    backoff_ms_current: u64,
     consecutive_failures: u32,
 }
 
 impl From<ReconnectionBackoffPolicy> for ReconnectionState {
     fn from(policy: ReconnectionBackoffPolicy) -> Self {
         Self {
-            backoff_ms_current: policy.backoff_ms_initial,
             policy,
             consecutive_failures: 0,
         }
@@ -355,7 +415,6 @@ impl From<ReconnectionBackoffPolicy> for ReconnectionState {
 
 impl ReconnectionState {
     fn reset_backoff(&mut self) {
-        self.backoff_ms_current = self.policy.backoff_ms_initial;
         self.consecutive_failures = 0;
     }
 
@@ -365,15 +424,10 @@ impl ReconnectionState {
         self.consecutive_failures
     }
 
-    fn multiply_backoff(&mut self) {
-        let next = self.backoff_ms_current * self.policy.backoff_multiplier as u64;
-        let next_capped = std::cmp::min(next, self.policy.backoff_ms_max);
-        self.backoff_ms_current = next_capped;
-    }
-
-    /// The wait before the next attempt: the current backoff, or `at_least` when that is longer.
+    /// The wait before the next attempt: the policy's wait after the failures so far, or
+    /// `at_least` when that is longer.
     fn generate_sleep_future(&self, at_least: Option<Duration>) -> tokio::time::Sleep {
-        let backoff = Duration::from_millis(self.backoff_ms_current);
+        let backoff = self.policy.wait(self.consecutive_failures);
         tokio::time::sleep(at_least.map_or(backoff, |hint| hint.max(backoff)))
     }
 }
@@ -390,6 +444,7 @@ mod tests {
         backoff_ms_initial: 100,
         backoff_multiplier: 2,
         backoff_ms_max: 1_000,
+        backoff_jitter_percent: 0,
     };
 
     fn key() -> StreamKey {
@@ -510,5 +565,127 @@ mod tests {
                 Event::Reconnecting(origin),
             ]
         );
+    }
+    /// `POLICY` with `percent` of jitter.
+    fn jittered(percent: u8) -> ReconnectionBackoffPolicy {
+        ReconnectionBackoffPolicy {
+            backoff_jitter_percent: percent,
+            ..POLICY
+        }
+    }
+
+    #[test]
+    fn the_backoff_grows_by_the_multiplier_up_to_its_cap() {
+        let backoffs = (0..=6).map(|n| POLICY.backoff_ms(n)).collect::<Vec<_>>();
+
+        // No failure yet counts as the first.
+        assert_eq!(backoffs, [100, 100, 200, 400, 800, 1_000, 1_000]);
+        assert_eq!(POLICY.backoff_ms(u32::MAX), 1_000);
+    }
+
+    #[test]
+    fn the_backoff_never_passes_the_cap_nor_overflows() {
+        let above = ReconnectionBackoffPolicy {
+            backoff_ms_initial: 5_000,
+            ..POLICY
+        };
+        assert_eq!(above.backoff_ms(1), 1_000);
+
+        let huge = ReconnectionBackoffPolicy::new(u64::MAX / 2, u8::MAX, u64::MAX, 0);
+        assert_eq!(huge.backoff_ms(3), u64::MAX);
+    }
+
+    #[test]
+    fn a_multiplier_of_one_holds_the_backoff_and_zero_drops_it_after_the_first() {
+        let flat = ReconnectionBackoffPolicy::new(100, 1, 1_000, 0);
+        assert_eq!(flat.backoff_ms(u32::MAX), 100);
+
+        let zero = ReconnectionBackoffPolicy::new(100, 0, 1_000, 0);
+        assert_eq!([zero.backoff_ms(1), zero.backoff_ms(2)], [100, 0]);
+    }
+
+    #[test]
+    fn the_jitter_cuts_up_to_its_percent_off_the_backoff() {
+        // The third failure's backoff is 400 ms; 50 % may cut up to 200 ms of it.
+        let half = jittered(50);
+        let mut offered = None;
+        let uncut = half.wait_cut_by(3, |most| {
+            offered = Some(most);
+            0
+        });
+        assert_eq!(offered, Some(200));
+        assert_eq!(uncut, Duration::from_millis(400));
+        assert_eq!(half.wait_cut_by(3, |most| most), Duration::from_millis(200));
+        assert_eq!(half.wait_cut_by(3, |_| 150), Duration::from_millis(250));
+        // A cut past the most counts as the most.
+        assert_eq!(
+            half.wait_cut_by(3, |_| u64::MAX),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn no_jitter_waits_the_backoff_and_a_percent_past_100_counts_as_100() {
+        assert_eq!(
+            jittered(0).wait_cut_by(3, |most| most),
+            Duration::from_millis(400)
+        );
+        assert_eq!(jittered(0).wait(3), Duration::from_millis(400));
+        assert_eq!(jittered(100).wait_cut_by(3, |most| most), Duration::ZERO);
+        assert_eq!(jittered(255).wait_cut_by(3, |most| most), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_drawn_wait_falls_in_the_jitter_range_and_varies() {
+        let waits = (0..1_000)
+            .map(|_| jittered(50).wait(3).as_millis())
+            .collect::<Vec<_>>();
+
+        assert!(
+            waits.iter().all(|wait| (200..=400).contains(wait)),
+            "{waits:?}"
+        );
+        // Each of the 201 values is equally likely, so 1,000 draws all at one value never happen.
+        assert!(waits.iter().any(|wait| *wait != waits[0]), "{waits:?}");
+    }
+
+    #[test]
+    fn a_configuration_without_a_jitter_percent_gets_the_default() {
+        let policy: ReconnectionBackoffPolicy = serde_json::from_str(
+            r#"{"backoff_ms_initial": 125, "backoff_multiplier": 2, "backoff_ms_max": 60000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.backoff_jitter_percent,
+            DEFAULT_BACKOFF_JITTER_PERCENT
+        );
+
+        let stated: ReconnectionBackoffPolicy = serde_json::from_str(
+            r#"{"backoff_ms_initial": 125, "backoff_multiplier": 2, "backoff_ms_max": 60000,
+                "backoff_jitter_percent": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(stated.backoff_jitter_percent, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_jittered_backoff_holds_the_next_attempt_back_within_the_range() {
+        let mut waits = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let mut results = Box::pin(
+                stream::iter([Err("a"), ok(&[1])])
+                    .with_reconnect_backoff_reporting(jittered(50), key()),
+            );
+            assert!(results.next().await.unwrap().is_err());
+            assert!(results.next().await.unwrap().is_ok());
+            waits.push(started.elapsed());
+        }
+
+        // The first failure's backoff is 100 ms; 50 % jitter waits 50 to 100 ms.
+        let range = Duration::from_millis(50)..=Duration::from_millis(100);
+        assert!(waits.iter().all(|wait| range.contains(wait)), "{waits:?}");
+        // Each of the 51 whole milliseconds is equally likely, so 20 draws all at one never happen.
+        assert!(waits.iter().any(|wait| *wait != waits[0]), "{waits:?}");
     }
 }
