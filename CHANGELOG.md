@@ -1534,8 +1534,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-data` and `rustrade` package descriptions are updated to match.
 - **Binance order book snapshots share one HTTP client per initialisation** (`rustrade-data`).
   Initialising a Binance Spot or USD-M futures L2 order book stream fetches one snapshot per
-  instrument; those requests now share one client, and with it one connection pool and TLS
-  setup, instead of building both for every instrument.
+  instrument; those requests now share one client, and with it one TLS configuration and
+  connection pool, instead of building both for every instrument.
 
 ### Fixed
 
