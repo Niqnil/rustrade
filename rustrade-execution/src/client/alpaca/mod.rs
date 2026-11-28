@@ -9840,7 +9840,13 @@ mod tests {
 
     #[test]
     fn parse_order_error_404_maps_to_order_rejected_with_not_found_prefix() {
-        let err = parse_order_error(reqwest::StatusCode::NOT_FOUND, None, "order not found");
+        // Alpaca's not-found answer: the only 404 a cancel passes on here (any other is refused
+        // first, by `not_found_refusal`).
+        let err = parse_order_error(
+            reqwest::StatusCode::NOT_FOUND,
+            Some(NOT_FOUND),
+            "order not found",
+        );
         let UnindexedOrderError::Rejected(ApiError::OrderRejected(msg)) = err else {
             panic!("expected OrderRejected, got {err:?}");
         };
