@@ -17,7 +17,7 @@
 //! <https://londonstrategicedge.com/licence>.
 
 use crate::exchange::lse::error::LseError;
-use crate::exchange::lse::transport::LseHttpCore;
+use crate::exchange::lse::transport::{FileHead, LseHttpCore};
 use crate::exchange::lse::usage::LseUsage;
 use std::{num::NonZeroU32, time::Duration};
 
@@ -217,16 +217,34 @@ impl LseClient {
     pub(crate) async fn get_export(
         &self,
         query: &[(&str, String)],
-    ) -> Result<Option<Vec<u8>>, LseError> {
-        match self.core.get_file("export", query).await {
-            Ok(body) => Ok(Some(body)),
-            Err(LseError::Api {
-                status: 404,
-                code: Some(code),
-                ..
-            }) if code == DATA_UNAVAILABLE => Ok(None),
-            Err(error) => Err(error),
-        }
+    ) -> Result<Option<(Vec<u8>, FileHead)>, LseError> {
+        no_stored_data_is_none(self.core.get_file("export", query).await)
+    }
+
+    /// Stream one `/v3/export` selection into `sink`, verified as it arrives, or `None` when the
+    /// provider stores nothing for it (see [`get_export`](Self::get_export)).
+    pub(crate) async fn get_export_into<W>(
+        &self,
+        query: &[(&str, String)],
+        sink: &mut W,
+    ) -> Result<Option<FileHead>, LseError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        no_stored_data_is_none(self.core.get_file_into("export", query, sink).await)
+    }
+}
+
+/// Read the provider's `404 data-unavailable` as "nothing stored here", leaving every other answer.
+fn no_stored_data_is_none<T>(answer: Result<T, LseError>) -> Result<Option<T>, LseError> {
+    match answer {
+        Ok(value) => Ok(Some(value)),
+        Err(LseError::Api {
+            status: 404,
+            code: Some(code),
+            ..
+        }) if code == DATA_UNAVAILABLE => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

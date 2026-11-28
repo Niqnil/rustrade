@@ -1,6 +1,5 @@
-use crate::exchange::lse::quota::QuotaStatus;
 use crate::subscription::candle::CandleInterval;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use smol_str::SmolStr;
 use std::time::Duration;
 use thiserror::Error;
@@ -60,11 +59,7 @@ pub enum LseError {
     /// `code` is the provider's machine-readable refusal code where it sent one (`symbol-unknown`,
     /// `plan-required`, `history-limit`, `rows-exhausted`, `export-too-wide`, `date-missing`, ...):
     /// match on it rather than on `message`, whose wording the provider changes. `message` is the
-    /// provider's own sentence, truncated to a bounded length — or, where `status` is a success
-    /// code, this integration's own diagnostic for a response that violated the contract that
-    /// status implies (a download whose checksum disagrees with its header, say). The
-    /// status is the one the provider sent, so it stays reportable, but the fault is one only the
-    /// client can see; `code` is `None` then.
+    /// provider's own sentence, truncated to a bounded length.
     #[error("API error ({status}{}): {message}", match .code {
         Some(code) => format!(" {code}"),
         None => String::new(),
@@ -104,129 +99,6 @@ pub enum LseError {
     /// The request is malformed in a way the caller must fix, detected before it is sent.
     #[error("invalid input: {message}")]
     InvalidInput { message: String },
-
-    /// The requested country is not one the provider publishes bond yields for.
-    ///
-    /// Raised before the request is sent, because `/bond-yields` performs **no validation of its
-    /// own**: a country it does not know answers `200` with `count: 0`, which is byte-for-byte
-    /// indistinguishable from an unknown maturity and from a range that is simply empty. Measured:
-    /// `country=ZZ` and `country=GB` both return `200 count=0`, against `country=UK` returning rows.
-    ///
-    /// `normalised` is what `requested` became before the lookup — the provider keys the United
-    /// Kingdom `UK`, **not** the ISO-3166 `GB` its own `country_iso2` column name implies, and that
-    /// is the only divergence among its 34 codes. Both forms are reported so a caller can see which
-    /// one was actually looked up.
-    #[error(
-        "unknown bond-yield country {requested:?} (looked up as {normalised:?}): the provider does          not publish it - consult the stats handle for the countries it does"
-    )]
-    UnknownBondYieldCountry {
-        requested: String,
-        normalised: String,
-    },
-
-    /// The requested maturity is not one the provider publishes for that country.
-    ///
-    /// Raised before the request is sent, for the same reason as
-    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): measured, `maturity=99Y` answers
-    /// `200` with `count: 0` rather than an error.
-    ///
-    /// `available` is the country's published tenor list, carried in full because it is short
-    /// (fifteen at the widest measured) and because a tenor is a **provider label**, not a
-    /// duration — `5Y` and `5Y TIPS` are distinct series that report the same `maturity_days`, so
-    /// there is nothing a caller can compute the right spelling from.
-    #[error(
-        "unknown bond-yield maturity {requested:?} for country {country}: the provider publishes          {available:?}"
-    )]
-    UnknownBondYieldMaturity {
-        country: String,
-        requested: String,
-        available: Vec<String>,
-    },
-
-    /// The requested range lies entirely outside the published coverage of that series.
-    ///
-    /// The third cause of a `200 count=0`, and the one that membership alone cannot catch: a
-    /// `(country, maturity)` pair can exist and still hold nothing in the window asked for.
-    /// Measured on `US 10Y TIPS` and `TR 2Y`, both of which return zero rows for 2023-2024 and both
-    /// of which report a `first_date` of 2025-07-07 — correct behaviour from the provider, and
-    /// silent.
-    ///
-    /// Raised only when the requested range and the published one are **disjoint**. A partial
-    /// overlap is not an error: it returns the rows that exist, which is what was asked for.
-    #[error(
-        "bond-yield range {start}..={end} lies outside the published coverage of {country}{} \
-         ({first_date}..={last_date})",
-        match .maturity {
-            Some(maturity) => format!(" {maturity}"),
-            None => String::new(),
-        }
-    )]
-    BondYieldRangeOutsideCoverage {
-        country: String,
-        /// `None` when the query named no maturity, so the bound is the country's own coverage.
-        maturity: Option<String>,
-        start: NaiveDate,
-        end: NaiveDate,
-        first_date: NaiveDate,
-        last_date: NaiveDate,
-    },
-
-    /// The requested country is not one the economic calendar publishes.
-    ///
-    /// Raised before the request is sent, for the same reason as
-    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): the endpoint answers an unknown
-    /// country with `200` and `count: 0`, indistinguishable from a quiet window.
-    ///
-    /// `normalised` is what `requested` became before the lookup. The calendar keys the United
-    /// Kingdom `UK` rather than `GB`, exactly as `/bond-yields` does — but the two vocabularies are
-    /// **not** the same set: the calendar's 108 codes also include `EA` and `EU`, which are not
-    /// countries. Both forms are reported so a caller can see which one was actually looked up.
-    #[error(
-        "unknown economic-calendar country {requested:?} (looked up as {normalised:?}): the          provider does not publish it - consult the stats handle for the countries it does"
-    )]
-    UnknownCalendarCountry {
-        requested: String,
-        normalised: String,
-    },
-
-    /// The requested impact rating is not one the economic calendar publishes.
-    ///
-    /// Measured: `impact=Critical` answers `200` with `count: 0` rather than an error, so this is
-    /// raised before the request is sent.
-    ///
-    /// `available` is carried in full because the vocabulary is closed and short — exactly
-    /// `["High", "Low", "Medium", "None"]`. ⚠️ `"None"` in that list is a literal rating, not an
-    /// absent value.
-    #[error("unknown economic-calendar impact {requested:?}: the provider publishes {available:?}")]
-    UnknownCalendarImpact {
-        requested: String,
-        available: Vec<String>,
-    },
-
-    /// The requested range lies entirely outside the calendar's published coverage.
-    ///
-    /// ⚠️ **A global bound, not a per-country one**, which makes this weaker than
-    /// [`BondYieldRangeOutsideCoverage`](Self::BondYieldRangeOutsideCoverage).
-    /// `/economic-calendar/stats` publishes no per-country coverage at all, so a window *inside*
-    /// this range may still legitimately return nothing — 88 of the 108 countries hold fewer than
-    /// 100 events. That case is deliberately **not** an error: the library has no way to
-    /// distinguish it from a quiet period, and inventing an error for it would mean inventing
-    /// knowledge the provider does not publish.
-    ///
-    /// 🔴 `latest` has been 2026-03-24 across measurements two months apart — the feed is frozen,
-    /// so **every** forward-looking window lands here.
-    ///
-    /// Raised only when the requested range and the published one are **disjoint**. A partial
-    /// overlap is not an error: it returns the events that exist, which is what was asked for.
-    #[error(
-        "economic-calendar range {start}..={end} lies outside the published coverage          ({earliest}..={latest})"
-    )]
-    CalendarRangeOutsideCoverage {
-        start: NaiveDate,
-        end: NaiveDate,
-        earliest: NaiveDate,
-        latest: NaiveDate,
-    },
 
     /// The requested resolution is not one the provider serves.
     ///
@@ -300,10 +172,11 @@ pub enum LseError {
     /// nothing in a Parquet artifact records the resolution it was written at. The wrong resolution
     /// therefore reaches the same arithmetic from a different origin — the caller's declaration
     /// rather than the provider's answer — and produces the same overlapping bars, so the same
-    /// check guards it: a file of 1-minute bars decoded as `Day1` is rejected rather than yielding
-    /// 390 "daily" bars per trading day. Reported in terms of the artifact's `ts` column, which
-    /// carries the bar's open — the close is a value that decoder derived, and only the open is
-    /// something a caller can find in the file itself.
+    /// check guards it: a file of 1-minute bars decoded as `Hour1` is rejected rather than yielding
+    /// 60 overlapping "hourly" bars an hour. (Decoded as `Day1` it fails sooner: a daily file
+    /// carries a `date` column that an intraday one lacks.) Reported in terms of the file's `time`
+    /// column, which carries the bar's open — the close is a value the decoder derived, and only
+    /// the open is something a caller can find in the file itself.
     ///
     /// # Limits
     /// Only the **finer-than-asked-for** direction is detectable. Coarser is not: daily bars taken
@@ -335,95 +208,53 @@ pub enum LseError {
     #[error("option print of {ticker} does not match its request: {message}")]
     UnexpectedOptionFlowRow { ticker: SmolStr, message: String },
 
-    /// The shared allowance is exhausted.
+    /// A downloaded file's body does not hash to the SHA-256 the provider declared for it.
     ///
-    /// Carries the allowance state at the point of rejection so the caller can decide how to pace.
-    /// Terminal — never retried internally.
-    ///
-    /// # Raised by the export path only
-    /// The bulk-export endpoints report allowance exhaustion as a `429` carrying no `Retry-After`
-    /// and no rate-limit headers, which this integration distinguishes from a per-minute rate
-    /// limit and reports here, populating the position from
-    /// [`usage`](super::vault::LseVaultClient::usage). A *candle* fetch that runs into a limit
-    /// still surfaces as [`RateLimited`](Self::RateLimited) — the provider gives no way to tell
-    /// the two apart on that path.
-    /// `status` is `None` when the follow-up [`usage`](super::vault::LseVaultClient::usage) call
-    /// itself failed. The allowance is still known to be exhausted — that is what the `429` said —
-    /// but this integration will not fabricate a [`QuotaStatus`] to fill the field. One variant
-    /// meaning "allowance gone, position unknown" is what lets a caller pace itself by matching a
-    /// single variant; reporting the second case as a generic
-    /// [`Api`](Self::Api)`{ status: 429 }` instead would make it silently miss half the cases.
-    #[error("quota exceeded{}", match .status {
-        Some(status) => format!(": {status:?}"),
-        None => " (allowance position could not be retrieved)".to_owned(),
-    })]
-    QuotaExceeded { status: Option<QuotaStatus> },
+    /// Nothing from it is returned or left on disk: a download's `.part` file is removed and the
+    /// destination is untouched. The provider ignores range requests, so calling again downloads
+    /// the whole file again.
+    #[error("downloaded file failed its checksum: declared SHA-256 {expected}, received {actual}")]
+    IntegrityMismatch { expected: String, actual: String },
 
-    /// An export job reached a terminal state without producing an artifact.
+    /// A file answer carries no usable SHA-256 header, so its body cannot be verified.
     ///
-    /// `expired` means the artifact was built and has since been reaped — roughly 48 hours after
-    /// it was created. Both are terminal; re-exporting costs another export.
-    #[error("export job {job_id} {status}{}", match .message.as_str() {
-        "" => String::new(),
-        message => format!(": {message}"),
-    })]
-    ExportFailed {
-        job_id: String,
-        status: String,
-        message: String,
-    },
-
-    /// An export job did not become ready within the caller's timeout.
-    ///
-    /// **The job is not cancelled and the identifier stays valid** — it keeps building, so polling
-    /// [`export_status`](super::vault::LseVaultClient::export_status) later picks it up without
-    /// spending another export. This is a timeout on waiting, not on the job.
+    /// Refused rather than accepted unverified: a cut or damaged transfer would otherwise become
+    /// data that looks whole.
     #[error(
-        "export job {job_id} still {status} when the caller's timeout elapsed; it keeps building, so poll it again rather than re-exporting"
+        "the provider's file answer carries no usable SHA-256 header, so it cannot be verified"
     )]
-    ExportTimeout { job_id: String, status: String },
+    MissingChecksum,
 
-    /// A downloaded artifact does not match the integrity metadata the job reported.
+    /// A download was asked not to replace a file, and one is already at its destination.
     ///
-    /// The destination is left untouched rather than holding a corrupt artifact.
-    ///
-    /// `discarded` reports what happened to the partial file at `path`:
-    /// - `false` — it is **retained**, because it is *incomplete* rather than wrong: shorter than the
-    ///   artifact, so the bytes are a real prefix the next call resumes from with a `Range` request.
-    ///   For a multi-gigabyte artifact that is the difference between finishing and starting over.
-    /// - `true` — it was **removed**, because it is *corrupt*: longer than the artifact, or the right
-    ///   length at the wrong digest with nothing left to fetch. Retaining it would fail identically
-    ///   forever, so a re-call restarts instead.
-    #[error("integrity check failed for {}: expected {expected}, got {actual} ({})", .path.display(), match .discarded {
-        true => "unusable partial file discarded; re-call to restart",
-        false => "partial file kept for resume",
-    })]
-    IntegrityMismatch {
-        path: std::path::PathBuf,
-        expected: String,
-        actual: String,
-        discarded: bool,
-    },
+    /// Checked before the request is sent, so it spends none of the plan's allowance. See
+    /// [`LseExistingFile`](super::export::LseExistingFile).
+    #[error("{} already exists and the download was asked not to replace it", .path.display())]
+    DestinationExists { path: std::path::PathBuf },
 
-    /// A `ready` export job does not describe the request it is being downloaded for.
+    /// A file answer describes something other than what was asked for.
     ///
-    /// The provider **silently substitutes defaults for parameters it does not recognise**, so a
-    /// request it partly ignored still yields a `ready` job — covering something other than what was
-    /// asked for. The job record echoes `dataset`, `symbol`, `timeframe`, `start` and `end`, and that
-    /// echo is the only client-side evidence of what the artifact actually contains. Downloading it
-    /// anyway would attribute one instrument's or one range's data to another, silently.
-    ///
-    /// Not recoverable by re-downloading: the artifact is what it is. The request has to be corrected
-    /// and re-exported, which costs one of the five hourly exports.
-    #[error(
-        "export job {job_id} does not describe this request: {field} is {reported:?}, requested {requested:?}"
-    )]
-    ExportJobMismatch {
-        job_id: String,
-        field: String,
+    /// The provider echoes some of the selection in its answer's headers (whether prices are
+    /// adjusted for splits, say); one that disagrees with the request means the file holds other
+    /// data than the caller thinks, so it is refused rather than returned.
+    #[error("the file answer reports {field} = {reported:?}, but {requested:?} was asked for")]
+    ExportMismatch {
+        field: &'static str,
         requested: String,
         reported: String,
     },
+
+    /// The Parquet decoder does not decode this kind of export into market events.
+    #[error("exports of {data} are not decoded into market events")]
+    UnsupportedExportData { data: String },
+
+    /// A trade-slice row carries a `kind` other than `trade`.
+    ///
+    /// Every row of every trade slice measured is a trade. Another kind (a quote, a correction)
+    /// would not be a [`PublicTrade`](crate::subscription::trade::PublicTrade), so it is refused
+    /// rather than decoded as one or skipped.
+    #[error("trade-slice row has kind {kind:?}, but only \"trade\" rows are decoded")]
+    UnexpectedTradeKind { kind: String },
 
     /// A filesystem operation failed.
     ///
@@ -437,36 +268,37 @@ pub enum LseError {
         source: std::io::Error,
     },
 
-    /// An export artifact's columns match none of the layouts this integration decodes.
+    /// A file lacks a column the kind of export it was decoded as must carry.
     ///
-    /// The provider's tick schema **varies by dataset** — `fx` publishes `bid`/`ask`, `stocks`
-    /// publishes `price`/`volume`, and the synthetic classes publish `price`/`volume`/`ask` — so
-    /// the layout is resolved from the columns present. Reported rather than guessed at: a wrong
-    /// column guess yields plausible numbers in the wrong field.
+    /// The decoder is told what a file holds (candles or a trade slice) and reads that kind's
+    /// columns by name. A missing one means the file is another kind, or the provider changed its
+    /// layout; reported rather than guessed at, since a wrong guess yields plausible numbers in the
+    /// wrong field.
     ///
     /// Also raised for a schema that is not **flat**. Columns are read by leaf index, which equals a
     /// top-level field's position only when every field is a primitive: one nested group contributes
     /// several leaves and shifts every index after it. Every measured artifact is flat, so rather
     /// than support a nesting the provider has never emitted, it is rejected — the alternative is a
-    /// decoder whose column mapping is silently wrong on a file it accepted, which for a `bid`/`ask`
-    /// pair means reading one as the other.
+    /// decoder whose column mapping is silently wrong on a file it accepted, which for `open` and
+    /// `close` means reading one as the other.
     #[error("unsupported export schema; columns were: {columns}")]
     UnsupportedSchema { columns: String },
 
     /// A recognised export column does not have the type this integration decodes it as.
     ///
     /// Distinct from [`UnsupportedSchema`](Self::UnsupportedSchema), which reports columns whose
-    /// *names* match no known layout. Here the layout is recognised and one of its columns is the
-    /// wrong type, so naming the column and both types is the whole diagnostic — reported up front
-    /// rather than as an opaque decode failure on the first row.
+    /// a file lacks. Here the column is present and has the wrong type, so naming the column and
+    /// both types is the whole diagnostic — reported up front rather than as an opaque decode
+    /// failure on the first row.
     ///
-    /// # Why a `ts` column that is not UTC-adjusted lands here
-    /// `Timestamp { unit: MICROS, is_adjusted_to_utc: false }` is *physically identical* to the
-    /// UTC-adjusted form — same `INT64`, same legacy `TIMESTAMP_MICROS` converted type — and differs
-    /// only in the origin its values are measured against. Read as epoch microseconds, a local-time
-    /// column shifts every event by the venue's UTC offset with nothing downstream able to notice:
-    /// the timeline is still monotonic and the prices are still right, so a backtest simply trades
-    /// on data it could not have had. This check is the only place that difference is visible.
+    /// # Why a `time` column that is not UTC-adjusted lands here
+    /// `Timestamp { unit: MILLIS, is_adjusted_to_utc: false }` is *physically identical* to the
+    /// UTC-adjusted form — same `INT64`, same legacy `TIMESTAMP_MILLIS` converted type — and
+    /// differs only in the origin its values are measured against. Read as epoch milliseconds, a
+    /// local-time column shifts every event by the venue's UTC offset with nothing downstream able
+    /// to notice: the timeline is still monotonic and the prices are still right, so a backtest
+    /// simply trades on data it could not have had. This check is the only place that difference
+    /// is visible.
     #[error("export column {column:?} is {found}, but this integration requires {required}")]
     UnsupportedColumnType {
         column: String,
@@ -474,25 +306,16 @@ pub enum LseError {
         found: String,
     },
 
-    /// A column the resolved layout has no substitute for is null on some row.
+    /// A column that has no substitute is null on some row.
     ///
-    /// `ts`, `symbol` and the layout's price columns are `REQUIRED` on every measured artifact, but a
-    /// writer change would make them nullable without altering anything else the decoder keys on, so
-    /// the schema check accepts `OPTIONAL` and this reports a value that is actually missing. None of
-    /// them is substitutable: a null timestamp has no place on a timeline, a null symbol cannot be
-    /// checked against the descriptor — the check that catches a mis-described file — and a null
-    /// price would have to be invented.
+    /// A file's timestamp and price columns are `REQUIRED` in almost every measured file, but
+    /// option candles already declare their prices `OPTIONAL`, and a writer change could do the
+    /// same elsewhere without altering anything else the decoder keys on. The schema check
+    /// therefore accepts `OPTIONAL` and this reports a value that is actually missing. None of them
+    /// is substitutable: a null timestamp has no place on a timeline, and a null price would have
+    /// to be invented.
     #[error("export column {column:?} is null on a row that has no substitute for it")]
     NullValue { column: &'static str },
-
-    /// A row's `symbol` column does not match the symbol the export descriptor names.
-    ///
-    /// Every export is single-symbol, so this means the file and its descriptor disagree — the
-    /// artifact is not the one the caller thinks it is. Caught because attributing it to the
-    /// descriptor's instrument would be silent misattribution, and because `BP` and `BP.L` are
-    /// different instruments quoted in different currencies.
-    #[error("export symbol mismatch: descriptor says {expected:?} but a row carries {found:?}")]
-    SymbolMismatch { expected: String, found: String },
 
     /// An artifact's timestamps do not advance as its layout requires.
     ///
@@ -500,8 +323,8 @@ pub enum LseError {
     /// release, with no failure point, so this is rejected at decode.
     ///
     /// # What counts as a violation depends on the layout
-    /// - **Tick and quote** tapes are *non-decreasing*: several prints routinely share a
-    ///   microsecond, so ties are permitted and only a step backwards is rejected.
+    /// - **Trade slices** are *non-decreasing*: several prints routinely share a nanosecond, so
+    ///   ties are permitted and only a step backwards is rejected.
     /// - **Candle** artifacts at a fixed resolution are *strictly ascending*: two bars of one
     ///   series cannot share an open, so they cannot share the close derived from it. A tie there
     ///   means the file holds more than one series, or repeats a row. It does **not** mean the
@@ -518,8 +341,8 @@ pub enum LseError {
     },
 
     /// A row's timestamp is outside the representable [`DateTime<Utc>`] range.
-    #[error("export timestamp {micros}µs is not representable")]
-    TimestampNotRepresentable { micros: i64 },
+    #[error("export timestamp {value} ({unit} since the Unix epoch) is not representable")]
+    TimestampNotRepresentable { value: i64, unit: &'static str },
 
     /// A provider `f64` has no [`rust_decimal::Decimal`] representation.
     ///
@@ -623,18 +446,16 @@ pub enum LseErrorKind {
     /// API key missing, malformed, or rejected. Retrying changes nothing until it is fixed.
     Authentication,
     /// Throttled, or a metered allowance is spent. Resumable once it replenishes — see
-    /// [`LseError::RateLimited`]'s `retry_after` and [`LseError::QuotaExceeded`]'s status.
+    /// [`LseError::RateLimited`]'s `retry_after`.
     RateLimit,
-    /// Transport-level failure. Resumable; a retry may well succeed.
+    /// Transport-level failure, including a downloaded file cut short or damaged in transit (it
+    /// fails its length or checksum check). Resumable; a retry may well succeed.
     Network,
-    /// An export job did not reach a terminal state within the caller's timeout. Resumable: the
-    /// job keeps building and its identifier stays valid, so polling again spends no allowance.
-    Timeout,
-    /// The provider rejected the request or the job failed. Not resumable by retrying alone.
+    /// The provider rejected the request. Not resumable by retrying alone.
     Api,
     /// The bytes could not be read as what they claim to be — a malformed body, an unsupported or
-    /// mistyped Parquet schema, a value with no representation, an ordering violation, an
-    /// integrity mismatch. Terminal: the data is what it is.
+    /// mistyped Parquet schema, a value with no representation, an ordering violation. Terminal:
+    /// the data is what it is.
     Decode,
     /// The caller's request or instrument registry is wrong. Terminal until the caller changes it.
     InvalidInput,
@@ -645,11 +466,11 @@ pub enum LseErrorKind {
 impl LseErrorKind {
     /// Whether retrying the same operation could succeed without the caller changing anything.
     ///
-    /// [`RateLimit`](Self::RateLimit) and [`Timeout`](Self::Timeout) require *waiting* first; this
-    /// says the attempt is worth making again, not that it is worth making immediately.
+    /// [`RateLimit`](Self::RateLimit) requires *waiting* first; this says the attempt is worth
+    /// making again, not that it is worth making immediately.
     #[must_use]
     pub fn is_resumable(&self) -> bool {
-        matches!(self, Self::RateLimit | Self::Network | Self::Timeout)
+        matches!(self, Self::RateLimit | Self::Network)
     }
 }
 
@@ -659,7 +480,6 @@ impl std::fmt::Display for LseErrorKind {
             Self::Authentication => "authentication",
             Self::RateLimit => "rate limit",
             Self::Network => "network",
-            Self::Timeout => "timeout",
             Self::Api => "API",
             Self::Decode => "decode",
             Self::InvalidInput => "invalid input",
@@ -679,11 +499,12 @@ impl LseError {
     pub fn kind(&self) -> LseErrorKind {
         match self {
             Self::EnvVar(_) | Self::InvalidCredential(_) => LseErrorKind::Authentication,
-            Self::RateLimited { .. } | Self::QuotaExceeded { .. } => LseErrorKind::RateLimit,
-            Self::Http(_) => LseErrorKind::Network,
-            Self::ExportTimeout { .. } => LseErrorKind::Timeout,
+            Self::RateLimited { .. } => LseErrorKind::RateLimit,
+            // A file cut short or damaged in transit: nothing from it was kept, and calling again
+            // downloads it afresh.
+            Self::Http(_) | Self::IntegrityMismatch { .. } => LseErrorKind::Network,
             // The request was valid and the provider cannot serve it whole; retrying changes nothing.
-            Self::Api { .. } | Self::ExportFailed { .. } => LseErrorKind::Api,
+            Self::Api { .. } => LseErrorKind::Api,
             Self::Io { .. } => LseErrorKind::Io,
 
             // The caller's request or registry, not the provider's answer.
@@ -695,15 +516,11 @@ impl LseError {
             | Self::UnknownInstrument { .. }
             | Self::AmbiguousInstrument { .. }
             | Self::QuoteAssetMismatch { .. }
-            | Self::UnknownBondYieldCountry { .. }
-            | Self::UnknownBondYieldMaturity { .. }
-            | Self::BondYieldRangeOutsideCoverage { .. }
-            | Self::UnknownCalendarCountry { .. }
-            | Self::UnknownCalendarImpact { .. }
-            | Self::CalendarRangeOutsideCoverage { .. } => LseErrorKind::InvalidInput,
+            | Self::DestinationExists { .. }
+            | Self::UnsupportedExportData { .. } => LseErrorKind::InvalidInput,
 
-            // Everything the provider sent that could not be read as what it claims to be. An
-            // integrity or job mismatch belongs here rather than under `Api`: the request was
+            // Everything the provider sent that could not be read as what it claims to be. A file
+            // describing another selection belongs here rather than under `Api`: the request was
             // accepted and answered, and it is the payload that does not hold up.
             Self::Deserialize { .. }
             | Self::TimestampOverflow { .. }
@@ -711,12 +528,12 @@ impl LseError {
             | Self::NonMonotonicCandles { .. }
             | Self::UnexpectedCandleResolution { .. }
             | Self::UnexpectedOptionFlowRow { .. }
-            | Self::IntegrityMismatch { .. }
-            | Self::ExportJobMismatch { .. }
+            | Self::MissingChecksum
+            | Self::ExportMismatch { .. }
+            | Self::UnexpectedTradeKind { .. }
             | Self::UnsupportedSchema { .. }
             | Self::UnsupportedColumnType { .. }
             | Self::NullValue { .. }
-            | Self::SymbolMismatch { .. }
             | Self::NonMonotonicTimestamps { .. }
             | Self::TimestampNotRepresentable { .. }
             | Self::PriceNotRepresentable { .. } => LseErrorKind::Decode,
@@ -787,6 +604,12 @@ pub(crate) fn extract_refusal(body: &str) -> (Option<SmolStr>, String) {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_kind_displays_as_its_name() {
+        assert_eq!(LseErrorKind::Network.to_string(), "network");
+        assert_eq!(LseErrorKind::InvalidInput.to_string(), "invalid input");
+    }
 
     /// The sentence alone, for the shapes that carry no code.
     fn detail(body: &str) -> String {
@@ -931,7 +754,6 @@ mod tests {
         // tell "wait and try again" from "stop" without substring-matching a `Display`.
         assert!(LseErrorKind::RateLimit.is_resumable());
         assert!(LseErrorKind::Network.is_resumable());
-        assert!(LseErrorKind::Timeout.is_resumable());
 
         assert!(!LseErrorKind::Authentication.is_resumable());
         assert!(!LseErrorKind::Api.is_resumable());
@@ -961,22 +783,15 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_allowance_is_a_rate_limit_and_an_export_timeout_is_a_timeout() {
-        // Both are export-path variants that a naive reading would file under `Api` -- they arrive
-        // as a 429 and as a job that never finished. Classifying either as terminal would stop a
-        // consumer that only had to wait.
-        assert_eq!(
-            LseError::QuotaExceeded { status: None }.kind(),
-            LseErrorKind::RateLimit
-        );
-        assert_eq!(
-            LseError::ExportTimeout {
-                job_id: "job-1".to_owned(),
-                status: "running".to_owned(),
-            }
-            .kind(),
-            LseErrorKind::Timeout
-        );
+    fn a_file_damaged_in_transit_is_resumable() {
+        // Nothing from such a file was kept, and the provider builds it afresh on the next call,
+        // so filing these under `Decode` would stop a consumer that only had to call again.
+        let error = LseError::IntegrityMismatch {
+            expected: "abc".to_owned(),
+            actual: "def".to_owned(),
+        };
+        assert_eq!(error.kind(), LseErrorKind::Network, "{error}");
+        assert!(error.kind().is_resumable());
     }
 
     #[test]
@@ -985,25 +800,18 @@ mod tests {
         // answered, so `status` is a success code -- but the bytes are not what they claim to be.
         // Filing these under `Api` would tell a consumer to fix its request, which cannot help.
         let decode_variants = [
-            LseError::IntegrityMismatch {
-                path: std::path::PathBuf::from("/tmp/export.parquet.part"),
-                expected: "abc".to_owned(),
-                actual: "def".to_owned(),
-                discarded: true,
+            LseError::MissingChecksum,
+            LseError::ExportMismatch {
+                field: "adjusted",
+                requested: "true".to_owned(),
+                reported: "false".to_owned(),
             },
-            LseError::ExportJobMismatch {
-                job_id: "job-1".to_owned(),
-                field: "symbol".to_owned(),
-                requested: "BP.L".to_owned(),
-                reported: "BP".to_owned(),
+            LseError::UnexpectedTradeKind {
+                kind: "quote".to_owned(),
             },
             LseError::NonMonotonicTimestamps {
                 previous: DateTime::UNIX_EPOCH,
                 found: DateTime::UNIX_EPOCH,
-            },
-            LseError::SymbolMismatch {
-                expected: "BP.L".to_owned(),
-                found: "BP".to_owned(),
             },
         ];
 
@@ -1029,6 +837,12 @@ mod tests {
         // provider's fault would send the caller looking in the wrong place.
         let caller_variants = [
             LseError::UnknownDataset("nope".to_owned()),
+            LseError::DestinationExists {
+                path: std::path::PathBuf::from("/tmp/export.parquet"),
+            },
+            LseError::UnsupportedExportData {
+                data: "greeks".to_owned(),
+            },
             LseError::UnsupportedInterval {
                 interval: CandleInterval::Sec1,
             },

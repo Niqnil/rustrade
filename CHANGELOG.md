@@ -19,6 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   organisation needs the provider's licence: <https://londonstrategicedge.com/licence>,
   <https://londonstrategicedge.com/terms>.
 
+- **London Strategic Edge: verified exports and macroeconomic series on LSE Data 3.0**
+  (`rustrade-data`, `lse`). **The retrieved data is not redistributable**, and use by or for an
+  organisation needs the provider's licence: <https://londonstrategicedge.com/licence>,
+  <https://londonstrategicedge.com/terms>.
+  - `LseClient::fetch_export` returns one selection's file in memory, and `download_export` streams
+    it to disk; both check it against the provider's size and SHA-256 headers before returning
+    anything. A download writes its own `<destination>.<process id>-<n>.part`, then syncs, renames
+    and syncs the directory, so the destination holds a whole verified file or is untouched, and two
+    downloads to one destination never share a `.part` file; it is removed on any error and when the
+    future is dropped. `LseExistingFile` chooses between refusing an
+    existing destination (the default, checked before any request) and replacing it atomically.
+    An `LseExportRequest` names the market, symbol, `LseExportData` (`Candles(interval)`,
+    `TradeSlice`, `Greeks`), an `LseWindow` (timestamps with an exclusive end, to the nanosecond, or
+    trading days with both ends included), the format (Parquet or CSV) and split adjustment;
+    `file_name()` gives a name that records the selection. A selection with nothing stored is
+    `Ok(None)`.
+  - `macroeconomic`: `fetch_macro_summary`, `fetch_macro_catalogue` (one page of a kind's series,
+    filtered by country, code or search) and one typed read per kind: `fetch_macro_observations`
+    (`day, value`), `fetch_macro_yields` (`day, close`) and `fetch_macro_releases` (`released_at`
+    and the actual, previous, consensus and forecast figures as the provider's text, with a
+    non-scaling `LseReleaseValue::parse` into a number and its unit).
+
 - **Market stream initialisation is bounded** (`rustrade-data`, `rustrade-integration`). An attempt
   to initialise a market stream (connect, subscribe, wait for acknowledgements, fetch any initial
   snapshots) that stalled left the stream waiting with nothing yielded and nothing retried, and a
@@ -882,8 +904,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-data`, `lse`). The data is not redistributable and an organisation needs the
   provider's licence (<https://londonstrategicedge.com/licence>).
   - `fetch_candles`, `collect_candles`, `fetch_option_flow`, `collect_option_flow` and the
-    catalogue are on `LseClient`, not `LseVaultClient`, which keeps only what the export module
-    still needs. `reference` (`fetch_catalog`, `LseCatalogEntry`) is replaced by `catalogue`.
+    catalogue are on `LseClient`; `LseVaultClient` is removed (see the entry on exports below).
+    `reference` (`fetch_catalog`, `LseCatalogEntry`) is replaced by `catalogue`.
   - A candle fetch takes an `LseCandleRequest` (market, symbol as the market's REST listing spells
     it, interval, range, and `as_published()` for unadjusted prices). It downloads aligned chunks
     of `with_chunk_bars` bars (default 50,000), each checked against its SHA-256 and size before
@@ -905,6 +927,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each client admits one request at a time by default (was two): the provider allows one
     download per key. Requests start a second apart by default (was 300 ms), the free plan's 60
     calls per minute; `with_pace` lowers it for a larger allowance.
+- **Breaking: London Strategic Edge exports, bond yields and the economic calendar move to LSE
+  Data 3.0** (`rustrade-data`, `lse`). The data is not redistributable and an organisation needs
+  the provider's licence (<https://londonstrategicedge.com/licence>).
+  - The export job flow is removed with the hosts it ran on: `LseVaultClient` (`submit_export`,
+    `export_status`, `await_export`, the old `download_export`), `LseExport`, `LseExportJob`,
+    `LseExportJobStatus`, `LseExportStatus`, `LseExportTimeframe` and `LseExportRange` (whose end
+    was exclusive; an `LseWindow` of dates includes both ends). Exports are single requests on
+    `LseClient` (see Added); a cut transfer is requested again, since the provider no longer
+    resumes one.
+  - `bond_yield`, `calendar`, `data_api` (`LseDataApiClient`) and `quota` (`QuotaStatus`) are
+    removed; bond yields, economic observations and releases are read from `macroeconomic` by the
+    catalogue's codes (`US10Y`, `US.inflation_rate`). The provider's new series carry no release
+    impact level and no country or maturity vocabulary of their own.
+  - The Parquet decoder (`lse-parquet`) reads LSE Data 3.0 files: `read_export(path, data,
+    exchange, instrument)` takes the `LseExportData` the file was exported as, and
+    `read_export_rows` yields `(time, DataKind)` without an instrument key. Candles are checked and
+    stamped as on the CSV path (shared rules, `close_time` = open + interval) and prices convert
+    through their shortest decimal text, so a bar is the same from either format; the trade slice
+    decodes to `PublicTrade`s. Greeks are not decoded (`fetch_option_greeks` reads them).
+    `symbols_in_export` is removed: the files carry no symbol, so nothing checks that a file
+    belongs to its instrument.
+  - `LseError`: `IntegrityMismatch` becomes `{ expected, actual }`, and `MissingChecksum`,
+    `DestinationExists`, `ExportMismatch`, `UnsupportedExportData` and `UnexpectedTradeKind` are
+    new; a damaged download is classified `Network` (resumable).
+    `QuotaExceeded`, `ExportFailed`, `ExportTimeout`, `ExportJobMismatch`, `SymbolMismatch` and the
+    bond-yield and calendar variants are removed, as is `LseErrorKind::Timeout`.
+    `TimestampNotRepresentable` reports the value and its unit.
 - **Breaking: `SocketError` is `#[non_exhaustive]`** (`rustrade-integration`). It gains
   `ConnectTimeout { timeout }`, and future failure kinds are added the same way, so a `match` on it
   needs a wildcard arm.
@@ -1570,9 +1619,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client refuse redirects, and report a REST answer with a 3xx as `ApiError::RequestRejected`,
   naming the status and where it pointed: an order or cancel so answered was not acted on, and is
   not sent again. Before, such an answer read as an unreadable one, with an unknown outcome.
-- **London Strategic Edge candles and option prints work again** (`rustrade-data`, `lse`; part of
-  #914). The provider retired the hosts they were read from; `LseClient` reads LSE Data 3.0
-  instead (see Changed).
+- **London Strategic Edge candles, option prints, exports, bond yields and economic releases work
+  again** (`rustrade-data`, `lse`; part of #914). The provider retired the hosts they were read
+  from; `LseClient` reads LSE Data 3.0 instead (see Added and Changed).
 - **The Alpaca clients no longer follow HTTP redirects** (`rustrade-execution`, `alpaca`;
   `rustrade-data`). `AlpacaClient` and `AlpacaRestClient` send the API key and secret as custom
   headers, which reqwest's default policy carries across a redirect to another host, and a 301 or

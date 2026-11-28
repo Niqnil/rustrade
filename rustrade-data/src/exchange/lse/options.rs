@@ -627,7 +627,7 @@ impl LseClient {
                     ("to", to),
                     ("format", "csv".to_owned()),
                 ];
-                let Some(body) = self.get_export(&query).await? else {
+                let Some((body, _)) = self.get_export(&query).await? else {
                     debug!(%symbol, ?window, "lse option greeks chunk: no stored data");
                     continue;
                 };

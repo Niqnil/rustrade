@@ -28,12 +28,21 @@ databento = ["dep:databento"]
 # ⚠️ The data this integration retrieves is NOT redistributable, whatever this crate's own licence
 # says. See `exchange::lse` and https://londonstrategicedge.com/terms
 #
-# `sha2`/`hex` verify the SHA-256 the vault reports for a bulk export artifact; both are already in
+# `sha2`/`hex` verify the SHA-256 the provider sends with every file answer; both are already in
 # the workspace tree via `rustrade-integration`, so this adds no new supply-chain surface.
-# `reqwest/stream` + `tokio/fs` stream a multi-gigabyte export to disk with `Range` resume rather
-# than buffering it in memory.
-lse = ["dep:sha2", "dep:hex", "dep:csv", "reqwest/stream", "tokio/fs", "tokio/io-util"]
-# Decodes downloaded export artifacts into market events. Separate from `lse` so a consumer who
+# `reqwest/stream` + `tokio/fs` + `tokio/io-util` stream an export to disk while hashing it rather
+# than buffering it in memory. `serde_json/raw_value` reads each macroeconomic figure's decimal
+# text exactly.
+lse = [
+    "dep:sha2",
+    "dep:hex",
+    "dep:csv",
+    "reqwest/stream",
+    "tokio/fs",
+    "tokio/io-util",
+    "serde_json/raw_value",
+]
+# Decodes downloaded Parquet exports into market events. Separate from `lse` so a consumer who
 # only wants files on disk pays no Parquet dependency cost.
 #
 # ⚠️ `parquet` MUST stay `default-features = false`: its defaults pull the whole `arrow` stack.
@@ -69,7 +78,8 @@ serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection 
 wiremock = { workspace = true }  # For Massive/Alpaca REST pagination tests (mock next_url/page_token chains) and http.rs unit tests
 http = { workspace = true }  # Builds synthetic `reqwest::Response`s (via reqwest's `From<http::Response<_>>`) for socket-free transport tests; already in the tree via reqwest
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util"] }  # `test-util` = paused-clock poll-timing tests; `io-util` = the IBKR live reconnect test's proxy
-tempfile = { workspace = true }  # Scratch directories for LSE export download/resume tests; already in the tree
+# Scratch directories for LSE export download and decoder tests; already in the tree.
+tempfile = { workspace = true }
 sha2 = { workspace = true }  # Computes the digest in synthetic LSE export job fixtures
 hex = { workspace = true }  # Encodes that digest as the provider does
 # Speaks the server half of the LSE WebSocket handshake in-process, so the guards that must run
@@ -96,18 +106,18 @@ futures-util = { workspace = true }
 # Massive client). Plain dep — not feature-gated. Note for tier-2 review.
 async-stream = { workspace = true }
 
-# Integrity verification of London Strategic Edge bulk-export artifacts (the job record carries a
-# SHA-256). Optional, enabled by `lse`; already present in the workspace tree.
+# Integrity verification of London Strategic Edge file answers (each carries its SHA-256 in a
+# header). Optional, enabled by `lse`; already present in the workspace tree.
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 
-# Decodes London Strategic Edge bulk-export artifacts. `default-features = false` is load-bearing:
+# Decodes London Strategic Edge Parquet exports. `default-features = false` is load-bearing:
 # it keeps the entire `arrow` stack out of the tree, leaving only zstd (already present) and three
 # net-new crates.
 #
-# Measured artifact profile (the provider writes with ClickHouse 26.6.1): one row group, a flat
-# schema of primitives, PLAIN and RLE_DICTIONARY encodings, ZSTD compression, row-group statistics.
-# `zstd` is therefore the only codec feature enabled.
+# Measured file profile (the provider writes with ClickHouse 26.9.7, 2026-11-28): row groups of up
+# to ~100k rows, a flat schema of primitives, ZSTD compression. `zstd` is therefore the only codec
+# feature enabled.
 #
 # ⚠️ If the provider ever switches its writer's codec, decoding fails with `LseError::Parquet`
 # carrying parquet's own "Disabled feature at compile time: <codec>" — observable and self-naming,
@@ -225,24 +235,18 @@ name = "lse_export"
 required-features = ["lse"]
 
 [[test]]
-name = "lse_bond_yield"
+name = "lse_macro"
 required-features = ["lse"]
 
 [[test]]
 name = "lse_client"
 required-features = ["lse"]
 
-[[test]]
-name = "lse_economic_calendar"
-required-features = ["lse"]
 
 [[test]]
-name = "lse_bond_yield_canary"
+name = "lse_macro_canary"
 required-features = ["lse"]
 
-[[test]]
-name = "lse_economic_calendar_canary"
-required-features = ["lse"]
 
 [[test]]
 name = "lse_client_canary"
