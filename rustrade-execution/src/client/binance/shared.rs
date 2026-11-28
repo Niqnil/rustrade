@@ -3988,7 +3988,8 @@ pub(crate) trait RestAnswer {
     /// The answer's headers, named in lowercase.
     fn headers(&self) -> &HashMap<String, String>;
     /// The refusal of this answer when it is a redirect (an HTTP 3xx). `None` by default, for an
-    /// answer that carries no status of its own or has already been checked.
+    /// answer that carries no status of its own: an implementor keeping the default must refuse a
+    /// redirect itself before it builds the answer, as `LegsAnswer::read` does.
     fn redirect(&self) -> Option<RedirectRefused> {
         None
     }
