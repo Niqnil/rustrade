@@ -59,11 +59,7 @@ pub enum LseError {
     /// `code` is the provider's machine-readable refusal code where it sent one (`symbol-unknown`,
     /// `plan-required`, `history-limit`, `rows-exhausted`, `export-too-wide`, `date-missing`, ...):
     /// match on it rather than on `message`, whose wording the provider changes. `message` is the
-    /// provider's own sentence, truncated to a bounded length — or, where `status` is a success
-    /// code, this integration's own diagnostic for a response that violated the contract that
-    /// status implies (a download whose checksum disagrees with its header, say). The
-    /// status is the one the provider sent, so it stays reportable, but the fault is one only the
-    /// client can see; `code` is `None` then.
+    /// provider's own sentence, truncated to a bounded length.
     #[error("API error ({status}{}): {message}", match .code {
         Some(code) => format!(" {code}"),
         None => String::new(),
@@ -219,13 +215,6 @@ pub enum LseError {
     /// the whole file again.
     #[error("downloaded file failed its checksum: declared SHA-256 {expected}, received {actual}")]
     IntegrityMismatch { expected: String, actual: String },
-
-    /// A downloaded file's body is not as long as the provider's `Content-Length` declared.
-    ///
-    /// Handled as [`IntegrityMismatch`](Self::IntegrityMismatch) is: nothing from it is kept, and
-    /// calling again downloads the whole file again.
-    #[error("downloaded file is {received} bytes but {declared} were declared")]
-    LengthMismatch { declared: u64, received: u64 },
 
     /// A file answer carries no usable SHA-256 header, so its body cannot be verified.
     ///
@@ -513,9 +502,7 @@ impl LseError {
             Self::RateLimited { .. } => LseErrorKind::RateLimit,
             // A file cut short or damaged in transit: nothing from it was kept, and calling again
             // downloads it afresh.
-            Self::Http(_) | Self::IntegrityMismatch { .. } | Self::LengthMismatch { .. } => {
-                LseErrorKind::Network
-            }
+            Self::Http(_) | Self::IntegrityMismatch { .. } => LseErrorKind::Network,
             // The request was valid and the provider cannot serve it whole; retrying changes nothing.
             Self::Api { .. } => LseErrorKind::Api,
             Self::Io { .. } => LseErrorKind::Io,
@@ -799,19 +786,12 @@ mod tests {
     fn a_file_damaged_in_transit_is_resumable() {
         // Nothing from such a file was kept, and the provider builds it afresh on the next call,
         // so filing these under `Decode` would stop a consumer that only had to call again.
-        for error in [
-            LseError::IntegrityMismatch {
-                expected: "abc".to_owned(),
-                actual: "def".to_owned(),
-            },
-            LseError::LengthMismatch {
-                declared: 10,
-                received: 7,
-            },
-        ] {
-            assert_eq!(error.kind(), LseErrorKind::Network, "{error}");
-            assert!(error.kind().is_resumable());
-        }
+        let error = LseError::IntegrityMismatch {
+            expected: "abc".to_owned(),
+            actual: "def".to_owned(),
+        };
+        assert_eq!(error.kind(), LseErrorKind::Network, "{error}");
+        assert!(error.kind().is_resumable());
     }
 
     #[test]

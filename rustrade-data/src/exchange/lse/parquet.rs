@@ -1170,7 +1170,7 @@ mod tests {
 
     fn candle(row: &Result<(DateTime<Utc>, DataKind), LseError>) -> (DateTime<Utc>, Candle) {
         match row {
-            Ok((time, DataKind::Candle(candle))) => (*time, candle.clone()),
+            Ok((time, DataKind::Candle(candle))) => (*time, *candle),
             other => panic!("candle expected, got {other:?}"),
         }
     }

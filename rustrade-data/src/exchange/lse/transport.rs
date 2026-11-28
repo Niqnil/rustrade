@@ -390,9 +390,9 @@ impl LseHttpCore {
     ///
     /// # Errors
     /// See [`checked`](Self::checked) for a refusal. A success answer without a usable checksum is
-    /// [`LseError::MissingChecksum`]; a body of another length than declared is
-    /// [`LseError::LengthMismatch`], and one that hashes otherwise is
-    /// [`LseError::IntegrityMismatch`]. A failed write to `sink` is [`LseError::Io`].
+    /// [`LseError::MissingChecksum`], and a body that hashes otherwise is
+    /// [`LseError::IntegrityMismatch`]. A body cut short of its `Content-Length` is refused by the
+    /// HTTP stack as [`LseError::Http`]. A failed write to `sink` is [`LseError::Io`].
     pub(crate) async fn get_file_into<W>(
         &self,
         path: &str,
@@ -413,7 +413,6 @@ impl LseHttpCore {
             .map(str::to_ascii_lowercase)
             .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or(LseError::MissingChecksum)?;
-        let declared_bytes = response.content_length();
         let rows_charged = header_str(headers, ROWS_HEADER).and_then(|rows| rows.parse().ok());
         let export_id = header_str(headers, EXPORT_ID_HEADER).map(str::to_owned);
         let file_name = header_str(headers, reqwest::header::CONTENT_DISPOSITION.as_str())
@@ -441,13 +440,8 @@ impl LseHttpCore {
             source,
         })?;
 
-        // The HTTP stack already refuses a body cut short of its `Content-Length`; this also
-        // covers an answer that declared none, or a stack that let a short body through.
-        if let Some(declared) = declared_bytes
-            && declared != received
-        {
-            return Err(LseError::LengthMismatch { declared, received });
-        }
+        // A body cut short of its `Content-Length` never gets here: the HTTP stack refuses it. The
+        // checksum covers every byte of what did arrive.
         let actual = hex::encode(hasher.finalize());
         if actual != declared_sha256 {
             return Err(LseError::IntegrityMismatch {

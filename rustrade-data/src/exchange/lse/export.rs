@@ -294,6 +294,7 @@ pub struct LseExportFile {
 
 /// What a download does when a file is already at its destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum LseExistingFile {
     /// Refuse with [`LseError::DestinationExists`] before sending the request, so nothing is
     /// spent. The default.
@@ -399,12 +400,15 @@ impl LseClient {
     /// - Before anything is sent: [`LseError::InvalidInput`] for an inverted window,
     ///   [`LseError::UnsupportedInterval`] for a resolution the provider does not serve.
     /// - A refusal is [`LseError::Api`] with the provider's code (`export-too-wide`,
-    ///   `symbol-unknown`, `plan-required`, `history-limit`, `data-unavailable` for a kind of data
-    ///   the market does not serve, ...); a limit reached is [`LseError::RateLimited`].
-    /// - A file that fails its checks is [`LseError::MissingChecksum`],
-    ///   [`LseError::LengthMismatch`] or [`LseError::IntegrityMismatch`]; calling again downloads
-    ///   it again whole. One whose headers describe another selection is
-    ///   [`LseError::ExportMismatch`].
+    ///   `symbol-unknown`, `plan-required`, `history-limit`, ...); a limit reached is
+    ///   [`LseError::RateLimited`].
+    /// - A file that fails its checks is [`LseError::MissingChecksum`] or
+    ///   [`LseError::IntegrityMismatch`]; calling again downloads it again whole. One whose headers
+    ///   describe another selection is [`LseError::ExportMismatch`].
+    ///
+    /// `Ok(None)` is the provider's `404 data-unavailable`, which it sends both for a window with
+    /// nothing stored (a weekend, a holiday) and for a kind of data the market does not serve, so
+    /// `None` alone does not prove the window empty.
     pub async fn fetch_export(
         &self,
         request: &LseExportRequest,
@@ -441,8 +445,13 @@ impl LseClient {
     ///
     /// # Errors
     /// As [`fetch_export`](Self::fetch_export), plus [`LseError::DestinationExists`] (checked
-    /// before anything is sent) and [`LseError::Io`] for a filesystem failure. On every error the
-    /// `.part` file is removed and `destination` is untouched.
+    /// before anything is sent) and [`LseError::Io`] for a filesystem failure. On every error
+    /// before the rename the `.part` file is removed and `destination` is untouched.
+    ///
+    /// The one step after the rename is syncing the directory. If that fails, the `Io` error
+    /// names the directory, and `destination` already holds the whole, verified file; only its
+    /// placement surviving a crash is in doubt. A future dropped at that step likewise leaves the
+    /// file placed.
     pub async fn download_export(
         &self,
         request: &LseExportRequest,
@@ -463,6 +472,9 @@ impl LseClient {
         }
 
         let part = part_path(destination);
+        // Armed before the open: a future dropped while the open runs on the blocking pool would
+        // otherwise leave the file it creates behind. Removing one never created is a no-op.
+        let mut guard = PartFile::new(part.clone());
         let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -470,7 +482,6 @@ impl LseClient {
             .open(&part)
             .await
             .map_err(io_error("creating", &part))?;
-        let mut guard = PartFile::new(part.clone());
         let mut writer = BufWriter::with_capacity(DOWNLOAD_BUFFER_BYTES, file);
 
         let Some(head) = self.get_export_into(&query, &mut writer).await? else {

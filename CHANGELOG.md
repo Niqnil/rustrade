@@ -947,9 +947,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     decodes to `PublicTrade`s. Greeks are not decoded (`fetch_option_greeks` reads them).
     `symbols_in_export` is removed: the files carry no symbol, so nothing checks that a file
     belongs to its instrument.
-  - `LseError`: `IntegrityMismatch` becomes `{ expected, actual }`, and `LengthMismatch`,
-    `MissingChecksum`, `DestinationExists`, `ExportMismatch`, `UnsupportedExportData` and
-    `UnexpectedTradeKind` are new; a damaged download is classified `Network` (resumable).
+  - `LseError`: `IntegrityMismatch` becomes `{ expected, actual }`, and `MissingChecksum`,
+    `DestinationExists`, `ExportMismatch`, `UnsupportedExportData` and `UnexpectedTradeKind` are
+    new; a damaged download is classified `Network` (resumable).
     `QuotaExceeded`, `ExportFailed`, `ExportTimeout`, `ExportJobMismatch`, `SymbolMismatch` and the
     bond-yield and calendar variants are removed, as is `LseErrorKind::Timeout`.
     `TimestampNotRepresentable` reports the value and its unit.

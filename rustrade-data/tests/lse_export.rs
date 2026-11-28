@@ -172,27 +172,45 @@ async fn download_places_the_verified_file_and_leaves_no_part_file() {
     assert_eq!(files(directory.path()), [request().file_name()]);
 }
 
+/// An answer, and a test of the error it must produce.
+type Failure = (ResponseTemplate, fn(&LseError) -> bool);
+
 #[tokio::test]
 async fn a_failed_download_leaves_neither_a_file_nor_a_part_file() {
     let directory = tempfile::tempdir().unwrap();
     let destination = directory.path().join("export.parquet");
-    let failures = [
-        file_answer(BODY).insert_header("x-checksum-sha256", hex::encode(Sha256::digest(b"x"))),
-        ResponseTemplate::new(200).set_body_raw(BODY.to_vec(), "application/octet-stream"),
-        file_answer(BODY).insert_header("x-lse3-adjusted", "0"),
-        ResponseTemplate::new(429)
-            .insert_header("retry-after", "5")
-            .set_body_raw(
-                r#"{"code": "connections-exhausted", "message": "One download at a time."}"#,
+    let failures: [Failure; 5] = [
+        (
+            file_answer(BODY).insert_header("x-checksum-sha256", hex::encode(Sha256::digest(b"x"))),
+            |error| matches!(error, LseError::IntegrityMismatch { .. }),
+        ),
+        (
+            ResponseTemplate::new(200).set_body_raw(BODY.to_vec(), "application/octet-stream"),
+            |error| matches!(error, LseError::MissingChecksum),
+        ),
+        (
+            file_answer(BODY).insert_header("x-lse3-adjusted", "0"),
+            |error| matches!(error, LseError::ExportMismatch { .. }),
+        ),
+        (
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "5")
+                .set_body_raw(
+                    r#"{"code": "connections-exhausted", "message": "One download at a time."}"#,
+                    "application/json",
+                ),
+            |error| matches!(error, LseError::RateLimited { .. }),
+        ),
+        (
+            ResponseTemplate::new(413).set_body_raw(
+                r#"{"code": "export-too-wide", "message": "Choose shorter dates."}"#,
                 "application/json",
             ),
-        ResponseTemplate::new(413).set_body_raw(
-            r#"{"code": "export-too-wide", "message": "Choose shorter dates."}"#,
-            "application/json",
+            |error| matches!(error, LseError::Api { status: 413, .. }),
         ),
     ];
 
-    for failure in failures {
+    for (failure, expected) in failures {
         let server = MockServer::start().await;
         mount(&server, failure).await;
 
@@ -201,8 +219,32 @@ async fn a_failed_download_leaves_neither_a_file_nor_a_part_file() {
             .await
             .unwrap_err();
 
+        assert!(expected(&error), "unexpected error: {error:?}");
         assert!(files(directory.path()).is_empty(), "{error}: left files");
     }
+}
+
+#[tokio::test]
+async fn a_404_with_another_code_is_a_refusal_not_nothing_stored() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(404).set_body_raw(
+            r#"{"code": "symbol-unknown", "message": "symbol is not available"}"#,
+            "application/json",
+        ),
+    )
+    .await;
+
+    let error = client(&server).fetch_export(&request()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            LseError::Api { status: 404, code: Some(code), .. } if code == "symbol-unknown"
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

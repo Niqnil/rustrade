@@ -104,10 +104,16 @@ pub struct LseMacroSummary {
 
 /// A figure in the catalogue: a number for observations and yields, the provider's text for a
 /// release.
+///
+/// Serialized as the provider writes it, a JSON number or a string, so it reads back as the same
+/// variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
 pub enum LseMacroValue {
     /// A number.
-    Number(Decimal),
+    // As a JSON number: a figure read from one is its float's shortest text, which the float
+    // gives back exactly.
+    Number(#[serde(serialize_with = "rust_decimal::serde::float::serialize")] Decimal),
     /// Text, as a release's figures are (`"5.3%"`, `"337.51Index"`); see [`LseReleaseValue`].
     Text(SmolStr),
 }
@@ -136,10 +142,23 @@ fn decimal_from_json(number: &serde_json::Number) -> Result<Decimal, String> {
         .map_err(|error| format!("{text} is not representable as a decimal: {error}"))
 }
 
-/// A JSON number field as a [`Decimal`].
+/// A decimal field: the provider's JSON number, or the decimal string [`Decimal`] serializes as,
+/// so a row this crate serialized reads back.
 fn deserialize_decimal<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
-    let number = serde_json::Number::deserialize(deserializer)?;
-    decimal_from_json(&number).map_err(serde::de::Error::custom)
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Figure {
+        Number(serde_json::Number),
+        Text(SmolStr),
+    }
+
+    match Figure::deserialize(deserializer)? {
+        Figure::Number(number) => decimal_from_json(&number),
+        Figure::Text(text) => {
+            Decimal::from_str(&text).map_err(|error| format!("{text} is not a decimal: {error}"))
+        }
+    }
+    .map_err(serde::de::Error::custom)
 }
 
 /// An empty string as `None`.
@@ -292,7 +311,8 @@ impl LseReleaseValue {
     }
 
     /// Split the text into its leading number and the rest, or `None` when it does not start with
-    /// one.
+    /// one, or when the rest goes on like a number (`"1.2.3"`, `"5-3"`), so the split would be a
+    /// guess.
     ///
     /// The number is read as written and the rest is returned as written: `"5.3%"` is `5.3` and
     /// `"%"`, `"337.51Index"` is `337.51` and `"Index"`, `"250K"` is `250` and `"K"`. Nothing is
@@ -300,22 +320,15 @@ impl LseReleaseValue {
     /// business, and differs between series.
     pub fn parse(&self) -> Option<(Decimal, &str)> {
         let text = self.0.trim();
-        let mut end = 0;
-        let mut seen_digit = false;
-        let mut seen_point = false;
-        for (index, character) in text.char_indices() {
-            match character {
-                '+' | '-' if index == 0 => {}
-                '0'..='9' => seen_digit = true,
-                '.' if !seen_point => seen_point = true,
-                _ => break,
-            }
-            end = index + character.len_utf8();
-        }
-        if !seen_digit {
+        let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+        let digits = unsigned
+            .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+            .unwrap_or(unsigned.len());
+        let (number, rest) = text.split_at(text.len() - unsigned.len() + digits);
+        // A sign after the number would continue it, and a second point fails the decimal parse.
+        if !number.bytes().any(|byte| byte.is_ascii_digit()) || rest.starts_with(['+', '-']) {
             return None;
         }
-        let (number, rest) = text.split_at(end);
         Decimal::from_str(number)
             .ok()
             .map(|number| (number, rest.trim()))
@@ -603,12 +616,43 @@ mod tests {
         assert_eq!(value("250K").parse(), Some((decimal("250"), "K")));
         assert_eq!(value("-0.2%").parse(), Some((decimal("-0.2"), "%")));
         assert_eq!(value(" 12 ").parse(), Some((decimal("12"), "")));
-        assert_eq!(value("1.2.3").parse(), Some((decimal("1.2"), ".3")));
-        // A sign counts only in front: one after the number starts the unit.
-        assert_eq!(value("5-3").parse(), Some((decimal("5"), "-3")));
+        assert_eq!(value("+1.5").parse(), Some((decimal("1.5"), "")));
+        assert_eq!(value(".5%").parse(), Some((decimal("0.5"), "%")));
+        // Text that goes on like a number is not split into a number and a unit.
+        assert_eq!(value("1.2.3").parse(), None);
+        assert_eq!(value("5-3").parse(), None);
+        assert_eq!(value("5+").parse(), None);
+        assert_eq!(value(".%").parse(), None);
         assert_eq!(value("n/a").parse(), None);
         assert_eq!(value("-").parse(), None);
         assert_eq!(value("").parse(), None);
+    }
+
+    #[test]
+    fn rows_and_figures_read_back_what_they_serialize() {
+        let observation: LseMacroObservation =
+            serde_json::from_str(r#"{"day": "2026-11-01", "value": 2.6}"#).unwrap();
+        let yields: LseMacroYield =
+            serde_json::from_str(r#"{"day": "2026-11-24", "close": 4.5}"#).unwrap();
+
+        let again: LseMacroObservation =
+            serde_json::from_str(&serde_json::to_string(&observation).unwrap()).unwrap();
+        assert_eq!(again, observation);
+        let again: LseMacroYield =
+            serde_json::from_str(&serde_json::to_string(&yields).unwrap()).unwrap();
+        assert_eq!(again, yields);
+
+        for figure in [
+            LseMacroValue::Number(decimal("2.6")),
+            LseMacroValue::Text(SmolStr::new("5")),
+        ] {
+            let json = serde_json::to_string(&figure).unwrap();
+            assert_eq!(
+                serde_json::from_str::<LseMacroValue>(&json).unwrap(),
+                figure,
+                "{json}"
+            );
+        }
     }
 
     #[test]
