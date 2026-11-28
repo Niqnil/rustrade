@@ -42,7 +42,7 @@ const INVALID_SYMBOL: i64 = 42_210_000;
 const EXPIRY_DAY_ONLY: &str = "only accepted on the expiration day";
 
 /// What precedes the time in Alpaca's refusal after the expiry day's deadline, lower-cased: "dne
-/// requests are not accepted after 5:15PM".
+/// requests are not accepted after 5:15PM", or "2:30PM" on a day the market closes early.
 const NOT_ACCEPTED_AFTER: &str = "not accepted after";
 
 impl OptionExerciseClient for AlpacaClient {
@@ -53,13 +53,19 @@ impl OptionExerciseClient for AlpacaClient {
     /// # When Alpaca takes it
     /// - **Whole positions only.** The endpoint takes no quantity, so
     ///   [`ExerciseQuantity::Contracts`] is refused without sending anything.
-    /// - **Only on the expiration day, until 5:15 PM New York time.** Alpaca's API reference
-    ///   states no window, and its FAQ asks for the instruction before 3:00 PM ET. Its paper API,
-    ///   observed in November 2026, refuses one sent on any other day, before or after, with
-    ///   [`ExerciseRefusal::NotExpiryDay`], and one sent on the day after 5:15 PM with
-    ///   [`ExerciseRefusal::PastDeadline`]. It judges the day before it looks at the position, so
-    ///   [`ExerciseRefusal::NoPosition`] comes only on the expiration day. This client checks
-    ///   neither rule itself: it reports what Alpaca answers.
+    /// - **Only on the expiration day, until 5:15 PM New York time, or 2:30 PM when the market
+    ///   closes early at 1:00 PM.** Alpaca's API reference states no window, and its FAQ asks for
+    ///   the instruction before 3:00 PM ET. Its paper API, observed in November 2026, refuses one
+    ///   sent on any other day, before or after, with [`ExerciseRefusal::NotExpiryDay`], and one
+    ///   sent on the expiration day after the deadline with [`ExerciseRefusal::PastDeadline`],
+    ///   whose message names that day's deadline. The early-close deadline is not a fixed offset
+    ///   from the close, so it is a time of day per session, not the close plus a constant.
+    ///   Alpaca judges the day before it looks at the position, so [`ExerciseRefusal::NoPosition`]
+    ///   comes only on the expiration day. This client checks neither rule itself: it reports
+    ///   what Alpaca answers.
+    /// - **A repeat is accepted.** Alpaca's paper API answers a second instruction for the same
+    ///   position with the same empty 200 as the first (observed in November 2026). The position
+    ///   carries no marker of it, so an instruction cannot be read back from Alpaca's positions.
     /// - **Without a long position.** Alpaca documents a 403 with code `40310000`, "no available
     ///   position for the specified contract". Its paper API, observed in November 2026, answers a
     ///   contract the account does not hold with a 404 with code `40410000`, "long position not
@@ -68,10 +74,15 @@ impl OptionExerciseClient for AlpacaClient {
     ///   [`ExerciseRefusal::ShortPosition`] only for the documented 403 with code `40310001`. If
     ///   Alpaca instead answers an account short the contract with the same 404 "long position not
     ///   found", that is reported as `NoPosition`.
+    /// - **An in-the-money long lapsed, once.** On Alpaca's paper API, observed in November 2026,
+    ///   a long call in the money at the close, under an accepted instruction, was gone the
+    ///   morning after expiry with no shares delivered and no sale. Alpaca stated no cause: by then
+    ///   the account's activities held no expiry record for it, so the position can vanish before
+    ///   an event reports why.
     /// - **Not documented:** what a sale or a purchase of the contract after the instruction does
-    ///   to it; whether it keeps Alpaca from selling an expiring long that the account could not
-    ///   afford to exercise, as Alpaca otherwise may on the expiration day; and what Alpaca
-    ///   answers a repeat of an accepted instruction with.
+    ///   to it; and whether it keeps Alpaca from selling an expiring long that the account could
+    ///   not afford to exercise, as Alpaca otherwise may on the expiration day. In the one
+    ///   observation above Alpaca did not sell the call, which does not settle it.
     ///
     /// # Errors
     /// - [`ApiError::InstrumentInvalid`], without sending anything, for a name that is not an
@@ -469,6 +480,11 @@ mod tests {
             stated_deadline("dne requests are not accepted after 5:15pm", day(6, 19)),
             utc("2026-06-19T21:15:00Z"),
             "summer time, UTC-4"
+        );
+        assert_eq!(
+            stated_deadline("dne requests are not accepted after 2:30pm", day(11, 27)),
+            utc("2026-11-27T19:30:00Z"),
+            "an early-close day's deadline, as Alpaca words it"
         );
         assert_eq!(
             stated_deadline("not accepted after 1:30 pm.", day(11, 27)),
