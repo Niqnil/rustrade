@@ -53,7 +53,7 @@
 //! [module documentation](super) and <https://londonstrategicedge.com/terms>.
 
 use crate::exchange::http::{MAX_ERROR_BODY_DOWNLOAD_BYTES, read_body_capped};
-use crate::exchange::lse::error::{LseError, extract_detail};
+use crate::exchange::lse::error::{LseError, extract_refusal};
 use crate::exchange::lse::market::{LseDataset, candle_interval_str};
 use crate::exchange::lse::vault::LseVaultClient;
 use crate::subscription::candle::CandleInterval;
@@ -1079,9 +1079,11 @@ impl LseVaultClient {
 
         if !status.is_success() {
             let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+            let (code, message) = extract_refusal(&body);
             return Err(LseError::Api {
                 status: status.as_u16(),
-                message: extract_detail(&body),
+                code,
+                message,
             });
         }
 
@@ -1204,9 +1206,11 @@ impl LseVaultClient {
 
         if !status.is_success() {
             let body = read_body_capped(response, MAX_ERROR_BODY_DOWNLOAD_BYTES).await?;
+            let (code, message) = extract_refusal(&body);
             return Err(LseError::Api {
                 status: status.as_u16(),
-                message: extract_detail(&body),
+                code,
+                message,
             });
         }
 
@@ -1422,6 +1426,7 @@ fn verify_resume_offset(response: &reqwest::Response, expected_start: u64) -> Re
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| LseError::Api {
             status,
+            code: None,
             message: "partial-content response carries no usable Content-Range header".to_owned(),
         })?;
 
@@ -1433,12 +1438,14 @@ fn verify_resume_offset(response: &reqwest::Response, expected_start: u64) -> Re
         .and_then(|first| first.trim().parse::<u64>().ok())
         .ok_or_else(|| LseError::Api {
             status,
+            code: None,
             message: format!("unparseable Content-Range on a partial-content response: {header}"),
         })?;
 
     if first != expected_start {
         return Err(LseError::Api {
             status,
+            code: None,
             message: format!(
                 "partial-content response resumes at byte {first}, not the requested \
                  {expected_start}"

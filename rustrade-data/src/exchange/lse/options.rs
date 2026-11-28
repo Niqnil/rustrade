@@ -1,14 +1,13 @@
-//! US equity and ETF option prints and one-minute option candles from the London Strategic Edge
-//! vault.
+//! US equity and ETF option prints, chains, candles and Greeks from LSE Data 3.0.
 //!
 //! ```no_run
 //! # use chrono::{Duration, TimeZone, Utc};
 //! # use futures::StreamExt;
+//! # use rustrade_data::exchange::lse::client::LseClient;
 //! # use rustrade_data::exchange::lse::error::LseError;
-//! # use rustrade_data::exchange::lse::vault::LseVaultClient;
 //! # async fn example() -> Result<(), LseError> {
-//! let client = LseVaultClient::from_env()?;
-//! let start = Utc.with_ymd_and_hms(2026, 9, 22, 15, 0, 0).unwrap();
+//! let client = LseClient::from_env()?;
+//! let start = Utc.with_ymd_and_hms(2026, 11, 25, 15, 0, 0).unwrap();
 //! let end = start + Duration::minutes(5);
 //!
 //! let prints = client.fetch_option_flow(Some("SPY"), start, end);
@@ -16,50 +15,49 @@
 //!
 //! while let Some(print) = prints.next().await {
 //!     let print = print?;
-//!     println!("{} {} x{} delta={:?}", print.contract.ticker, print.price, print.volume, print.greeks.delta);
+//!     let (contract, greeks) = (&print.contract, &print.greeks);
+//!     println!("{} {} x{} delta={:?}", contract.ticker, print.price, print.size, greeks.delta);
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # ⚠️ Licensing
-//! Data retrieved here is **not redistributable**. See the [module documentation](super) and
-//! <https://londonstrategicedge.com/terms>.
+//! Data retrieved here is **not redistributable**. See the [module documentation](super#licensing).
 //!
-//! # What this feed is — and is not
-//! - **Prints, not quotes.** Every row is an executed option trade. There is no bid, ask or book
-//!   anywhere on these paths, so nothing here can build an [`OrderBookL1`](crate::subscription::book::OrderBookL1).
-//! - **⚠️ Greeks are PRINT-TRIGGERED, not continuous.** Each print carries the greeks the provider
-//!   computed at that print, and nothing publishes them in between. A contract's greeks are
-//!   therefore only as fresh as its last trade, which on an illiquid strike can be weeks old — and
-//!   an unheld contract that never trades is never marked at all. This is a property of the source:
-//!   the provider's chain snapshot endpoint, which would be the continuous alternative, serves
-//!   stale stored fields (expired contracts, a `dte` that disagrees with the expiry) and is
-//!   deliberately not wrapped. Do not treat the latest print's greeks as a current risk figure
-//!   without checking its age.
-//! - **Timestamps are batch stamps at whole-second granularity.** Every print inside one second
-//!   carries a stamp within a few milliseconds of every other, so the sub-second part is not a
-//!   print time. Never order, de-duplicate or join on the timestamp alone; the provider's print
-//!   [`id`](LseOptionPrint::id) is the unique key.
+//! # What these feeds are — and are not
+//! - **Prints, not quotes.** A flow row is an executed option trade, and the chain carries each
+//!   contract's last trade. There is no bid, ask or book on these paths, so nothing here can build
+//!   an [`OrderBookL1`](crate::subscription::book::OrderBookL1).
+//! - **⚠️ A print's Greeks are those of its minute.** Each flow row carries the Greeks the provider
+//!   computed for the minute it traded in, and the chain carries each contract's Greeks as of its
+//!   [`greeks_at`](LseOptionChainEntry::greeks_at). A contract that does not trade is not marked:
+//!   check the age before treating a figure as a current risk number.
+//! - **No print identifier.** The provider sends none, so two prints of one contract at one size
+//!   and price in one nanosecond cannot be told apart. The walk preserves the provider's order.
 //! - **Strikes are not always round.** Contracts adjusted for a corporate action carry fractional
-//!   strikes (`2.67`, `9.85`), so the strike is a [`Decimal`] and the contract's identity is its
-//!   [`ticker`](LseOptionContract::ticker), not a strike rebuilt from integers.
+//!   strikes (`2.67`), so the strike is a [`Decimal`] and the contract's identity is its
+//!   [`ticker`](LseOptionContract::ticker).
 //! - **⚠️ A contract is read from its ticker, not from the row's separate fields.** The served
 //!   `strike` is a float and has carried noise (`504.99999999999994` for a 505 strike), so
 //!   [`kind`](LseOptionContract::kind), [`strike`](LseOptionContract::strike) and
 //!   [`expiry`](LseOptionContract::expiry) are all read exactly from the OSI ticker. A row whose
 //!   ticker is not an OSI symbol is a decode error.
-//! - **An unknown underlying or ticker is an empty result, not an error.** The provider answers
-//!   `200` with no rows for a symbol it has never heard of, indistinguishable here from a quiet
-//!   period.
+//! - **Two spellings of a contract.** The OSI ticker (`SPY261127C00650000`) is the identity used
+//!   here and on the websocket; the REST market data selection spells the same contract with its
+//!   root padded to six characters (`SPY   261127C00650000`), which
+//!   [`rest_symbol`](LseOptionContract::rest_symbol) produces. The unpadded spelling is refused
+//!   there with `404 symbol-unknown`.
 //! - **Exercise style is not reported**, so none is claimed: most listed US equity options are
-//!   American, but index options are European, and guessing would be this library inventing a fact.
+//!   American, but index options are European.
 
 use crate::event::{DataKind, MarketEvent};
-use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
+use crate::exchange::lse::client::LseClient;
 use crate::exchange::lse::error::LseError;
-use crate::exchange::lse::historical::{VaultCandleRow, parse_candle_open};
-use crate::exchange::lse::vault::LseVaultClient;
+use crate::exchange::lse::historical::{
+    CsvColumns, LseCandleRequest, cell, csv_records, parse_decimal, parse_provider_time, windows,
+};
+use crate::exchange::lse::market::LseMarketCode;
 use crate::exchange::osi;
 use crate::subscription::{
     candle::{Candle, CandleInterval},
@@ -67,48 +65,42 @@ use crate::subscription::{
     trade::PublicTrade,
 };
 use async_stream::try_stream;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, instrument::kind::option::OptionKind};
 use serde::{Deserialize, Serialize};
-use smol_str::{SmolStr, ToSmolStr};
+use smol_str::{SmolStr, format_smolstr};
 use tracing::debug;
 
-/// How long after a moment the provider's print tape can be relied on to be complete up to it.
+/// How long after a moment the provider's print tape is taken to be complete up to it.
 ///
-/// Ingestion lag on `/options/flow` is variable and **episodic**: a window is usually complete
-/// about fifteen seconds after it closes, but during a bad minute one was measured returning **no
-/// rows at all** thirty seconds after closing, and another sat at roughly a fifth of its final count
-/// across two consecutive reads. Both answered `200`. A partial window holds steady, so completeness
-/// cannot be detected by polling until the count stops changing.
-///
-/// [`fetch_option_flow`](LseVaultClient::fetch_option_flow) therefore refuses a range ending
-/// inside this margin rather than returning rows that look final and are not. Sixty seconds is
-/// twice the longest outlier measured, which makes it a floor informed by observation rather than a
-/// guarantee — a fetch near it during provider degradation can still come back short.
+/// Ingestion lag on the print tape was measured as variable and **episodic** on the provider's
+/// pre-3.0 API: a window was usually complete about fifteen seconds after it closed, but one
+/// returned no rows at all thirty seconds after closing, and another sat at a fifth of its final
+/// count across two reads. Both answered `200`. It has not been re-measured on LSE Data 3.0, so
+/// [`fetch_option_flow`](LseClient::fetch_option_flow) refuses a range ending inside this margin
+/// rather than return rows that look final and are not. The refusal is
+/// [`LseError::InvalidInput`]: the caller asked for a range that ends too recently, and an
+/// earlier `end` fixes it. A floor informed by observation, not a
+/// guarantee.
 pub const OPTION_FLOW_SETTLE_MARGIN: TimeDelta = TimeDelta::seconds(60);
 
-/// Format accepted by the flow endpoint's `start` / `end` parameters: whole seconds only. A
-/// fractional second, and the ISO `T…Z` form, are rejected with a `400`.
-const WINDOW_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+/// Format of a print-tape bound: UTC, with the fraction the provider accepts (to the nanosecond).
+const FLOW_BOUND_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
-/// The first adaptive window [`fetch_option_flow`](LseVaultClient::fetch_option_flow) tries.
-///
-/// One minute of the busiest underlying measured is roughly two and a half thousand prints —
-/// inside the provider's 5,000-row cap — so a busy underlying rarely needs a retry on its first
-/// window, and a quiet one grows out of it in a few doublings.
-const INITIAL_FLOW_WINDOW: TimeDelta = TimeDelta::seconds(60);
-
-/// The widest window the adaptive walk grows to.
-///
-/// Bounds how far a sparse stretch — a weekend, a quiet underlying — is covered by one request.
-/// Growth is only ever a request-count optimisation: correctness comes from the cap check, not from
-/// the window size.
+/// The widest window one walk step pages through. The provider refuses a sweep of the whole tape
+/// (no underlying) over more than seven days; a day keeps every window well inside that.
 const MAX_FLOW_WINDOW: TimeDelta = TimeDelta::days(1);
 
-/// The narrowest window the walk can shrink to, set by the bounds' whole-second precision.
-const MIN_FLOW_WINDOW: TimeDelta = TimeDelta::seconds(1);
+/// Rows asked for per page of the print tape: the provider's maximum.
+const FLOW_PAGE_ROWS: u32 = 5000;
+
+/// Length of an OSI symbol's suffix: `YYMMDD`, `C`/`P` and an eight-digit strike.
+const OSI_SUFFIX_LEN: usize = 15;
+
+/// Width the REST selection pads an option root to.
+const REST_ROOT_WIDTH: usize = 6;
 
 /// One option contract, as the provider identifies it.
 #[non_exhaustive]
@@ -130,13 +122,8 @@ pub struct LseOptionContract {
 impl LseOptionContract {
     /// Build a contract from a served row, reading its kind, strike and expiry from the ticker.
     ///
-    /// ⚠️ The row's own `strike`, `contract_type` and `expiry` fields are deliberately not decoded.
-    /// The strike is a JSON float, and the provider has served `504.99999999999994` on
-    /// `SPY261130P00505000`: carried through, that strike spells no OSI symbol, so a subscription
-    /// built from the contract is rejected. The ticker is the contract's identity and carries all
-    /// three exactly, so reading them from it is what guarantees the contract spells the ticker
-    /// back.
-    ///
+    /// ⚠️ The row's own `strike`, `contract_type` and `expiry` fields are deliberately not decoded:
+    /// the strike is a JSON float that has carried noise, and the ticker carries all three exactly.
     /// `underlying` stays the row's: an adjusted contract's OSI root (`SPY1`) is not its
     /// underlying's symbol.
     fn from_row(ticker: SmolStr, underlying: SmolStr) -> Result<Self, LseError> {
@@ -156,52 +143,74 @@ impl LseOptionContract {
             expiry,
         })
     }
+
+    /// The contract as the REST market data selection spells it: root padded to six characters.
+    #[must_use]
+    pub fn rest_symbol(&self) -> SmolStr {
+        rest_symbol(&self.ticker).unwrap_or_else(|| self.ticker.clone())
+    }
 }
 
-/// One executed option trade, with the greeks the provider computed at that print.
+/// An OSI ticker as the REST selection spells it, or `None` if `ticker` is not an OSI symbol or
+/// its root is longer than the padded width.
+pub fn rest_symbol(ticker: &str) -> Option<SmolStr> {
+    let root = osi::root(ticker)?;
+    if root.len() > REST_ROOT_WIDTH {
+        return None;
+    }
+    let suffix = &ticker[ticker.len() - OSI_SUFFIX_LEN..];
+    Some(format_smolstr!("{root:<REST_ROOT_WIDTH$}{suffix}"))
+}
+
+/// One executed option trade, with the Greeks of the minute it traded in.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LseOptionPrint {
-    /// The provider's print identifier — unique, and the only reliable key; see the
-    /// [module documentation](self).
-    pub id: u64,
-    /// When the print was recorded, UTC — a whole-second batch stamp, not an execution time.
+    /// When the print was recorded, UTC, to the nanosecond.
     pub time: DateTime<Utc>,
     pub contract: LseOptionContract,
+    /// The provider's number for the contract.
+    pub pair_id: u64,
     /// Premium per share.
     pub price: Decimal,
     /// Size in contracts.
-    pub volume: u64,
-    /// Notional premium in the quote currency, as the provider reports it: `price × volume ×` the
-    /// contract multiplier.
+    pub size: u64,
+    /// Notional premium, as the provider reports it: `price × size × 100`. Carries float noise
+    /// (`249219.99999999997`).
     pub premium: Decimal,
-    /// Greeks at this print, with the underlying's price at the time in
-    /// [`underlying_price`](OptionGreeks::underlying_price). Any greek may be `None`, and on a
-    /// small share of prints all of them are. See the
-    /// [module documentation](self) on staleness.
+    /// The exchange the print was reported from, as the OPRA participant letter (`A` is NYSE
+    /// American).
+    pub venue: SmolStr,
+    /// The Greeks of the print's minute, with the underlying's price in
+    /// [`underlying_price`](OptionGreeks::underlying_price). Any figure may be `None`, and the
+    /// provider publishes no `rho`.
     pub greeks: OptionGreeks,
 }
 
 impl LseOptionPrint {
     /// This print as a library [`PublicTrade`], sized in contracts.
     ///
-    /// `side` is `None`: the provider does not report an aggressor.
+    /// `id` is empty, because the provider sends no print identifier, and `side` is `None`: the
+    /// provider reports no aggressor.
     #[must_use]
     pub fn public_trade(&self) -> PublicTrade {
         PublicTrade {
-            id: self.id.to_smolstr(),
+            id: SmolStr::default(),
             price: self.price,
-            amount: Decimal::from(self.volume),
+            amount: Decimal::from(self.size),
             side: None,
         }
     }
 
-    /// This print as the market events an engine consumes: its trade, then its greeks.
+    /// This print as the market events an engine consumes: its trade, then its Greeks.
     ///
     /// Both are stamped with the print's [`time`](Self::time) as `time_exchange` **and**
     /// `time_received` — a historical fetch has no receipt instant of its own — on
-    /// [`ExchangeId::LseOptions`]. The greeks event is emitted even when every greek is `None`; a
-    /// consumer such as the engine's option state decides whether an empty update means anything.
+    /// [`ExchangeId::LseOptions`]. The Greeks event is emitted even when every figure is `None`.
+    ///
+    /// # ⚠️ The Greeks are the print's minute's
+    /// They may have been computed after the print, so a backtest replaying them at the print's
+    /// time can see a figure a little early.
     #[must_use]
     pub fn into_market_events<InstrumentKey: Clone>(
         self,
@@ -215,132 +224,79 @@ impl LseOptionPrint {
     }
 }
 
-/// One minute of trading in one option contract.
+/// One contract of an option chain, as `/v3/options/chain` serves it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LseOptionCandle {
+pub struct LseOptionChainEntry {
     pub contract: LseOptionContract,
-    /// Premium OHLC for the minute, with [`volume`](Candle::volume) in contracts and
-    /// [`trade_count`](Candle::trade_count) the number of prints.
-    pub candle: Candle,
-    /// Total notional premium traded in the minute.
-    pub premium: Decimal,
-    /// Greeks **averaged over the minute's prints**, not sampled at its close, with the averaged
-    /// underlying price in [`underlying_price`](OptionGreeks::underlying_price).
+    /// The provider's number for the contract.
+    pub pair_id: u64,
+    /// The contract's last trade price, if it has traded.
+    pub last_price: Option<Decimal>,
+    /// When it last traded.
+    pub last_trade_at: Option<DateTime<Utc>>,
+    /// Contracts traded today.
+    pub volume_today: Option<u64>,
+    /// Notional premium traded today.
+    pub premium_today: Option<Decimal>,
+    /// The contract's Greeks as of [`greeks_at`](Self::greeks_at), with the underlying's price
+    /// then.
     pub greeks: OptionGreeks,
+    /// When the Greeks were computed.
+    pub greeks_at: Option<DateTime<Utc>>,
 }
 
-/// One `/options/flow` row as served. Unknown fields — `dte`, derivable from `expiry` — are ignored
-/// rather than rejected, so an added field does not break decoding.
-#[derive(Debug, Deserialize)]
-struct FlowRow {
-    id: u64,
-    ts: String,
-    underlying: SmolStr,
-    ticker: SmolStr,
-    last_price: Decimal,
-    volume: u64,
-    premium: Decimal,
-    #[serde(default)]
-    underlying_price: Option<f64>,
-    #[serde(default)]
-    iv: Option<f64>,
-    #[serde(default)]
-    delta: Option<f64>,
-    #[serde(default)]
-    gamma: Option<f64>,
-    #[serde(default)]
-    theta: Option<f64>,
-    #[serde(default)]
-    vega: Option<f64>,
-    #[serde(default)]
-    rho: Option<f64>,
+/// One page of an option chain.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LseOptionChain {
+    /// The underlying, as the provider echoes it.
+    pub underlying: SmolStr,
+    /// The underlying's price, and when it was taken.
+    pub underlying_price: Option<Decimal>,
+    pub underlying_at: Option<DateTime<Utc>>,
+    /// How many contracts matched the filters, across every page.
+    pub contracts: u64,
+    /// This page's contracts.
+    pub entries: Vec<LseOptionChainEntry>,
 }
 
-impl FlowRow {
-    fn time(&self) -> Result<DateTime<Utc>, LseError> {
-        NaiveDateTime::parse_from_str(&self.ts, PROVIDER_TIMESTAMP_FORMAT)
-            .map(|naive| naive.and_utc())
-            .map_err(|error| LseError::Deserialize {
-                message: format!("invalid option print timestamp {:?}: {error}", self.ts),
-            })
-    }
-
-    fn into_print(self, time: DateTime<Utc>) -> Result<LseOptionPrint, LseError> {
-        Ok(LseOptionPrint {
-            id: self.id,
-            time,
-            contract: LseOptionContract::from_row(self.ticker, self.underlying)?,
-            price: self.last_price,
-            volume: self.volume,
-            premium: self.premium,
-            greeks: OptionGreeks {
-                delta: self.delta,
-                gamma: self.gamma,
-                theta: self.theta,
-                vega: self.vega,
-                rho: self.rho,
-                implied_volatility: self.iv,
-                theoretical_price: None,
-                underlying_price: self.underlying_price,
-            },
-        })
-    }
+/// One minute's Greeks for one option contract, from the `greeks` selection.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LseOptionMinuteGreeks {
+    /// The minute's close: its open plus one minute. The instant the figures are stamped with.
+    pub close_time: DateTime<Utc>,
+    /// The instant of the option price the figures were computed from.
+    pub price_at: Option<DateTime<Utc>>,
+    /// The option price the figures were computed from.
+    pub option_price: Option<Decimal>,
+    /// Where that price came from, as the provider names it.
+    pub price_source: Option<SmolStr>,
+    /// The figures, with the underlying's price in
+    /// [`underlying_price`](OptionGreeks::underlying_price). A figure the provider's model could
+    /// not compute is `None`; no `rho` is published.
+    pub greeks: OptionGreeks,
+    /// The model inputs the provider used: years to expiry, the rate, and the present value of
+    /// dividends.
+    pub years_to_expiry: Option<f64>,
+    pub rate: Option<f64>,
+    pub dividends_pv: Option<f64>,
 }
 
-/// One `/options/candles` row as served.
-#[derive(Debug, Deserialize)]
-struct OptionCandleRow {
-    ticker: SmolStr,
-    underlying: SmolStr,
-    /// The bar's **open**, UTC, with no zone suffix.
-    minute: String,
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
-    volume: u64,
-    premium: Decimal,
-    print_count: u64,
-    #[serde(default)]
-    underlying_price: Option<f64>,
-    #[serde(default)]
-    iv_avg: Option<f64>,
-    #[serde(default)]
-    delta_avg: Option<f64>,
-    #[serde(default)]
-    gamma_avg: Option<f64>,
-    #[serde(default)]
-    theta_avg: Option<f64>,
-    #[serde(default)]
-    vega_avg: Option<f64>,
-    #[serde(default)]
-    rho_avg: Option<f64>,
-}
-
-impl VaultCandleRow for OptionCandleRow {
-    fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
-        parse_candle_open(&self.minute)
-    }
-}
-
-impl LseOptionCandle {
-    /// This candle as the market events an engine consumes: the bar, then its averaged greeks.
-    ///
-    /// Both are stamped with the bar's [`close_time`](Candle::close_time) — the instant its
-    /// contents, the averages included, became knowable — as `time_exchange` and `time_received`,
-    /// on [`ExchangeId::LseOptions`]. Stamping any earlier would hand an engine the minute's outcome
-    /// before the minute has ended.
+impl LseOptionMinuteGreeks {
+    /// These Greeks as the market event an engine consumes, stamped at the minute's close on
+    /// [`ExchangeId::LseOptions`], so the minute's figures are never seen before it ends.
     #[must_use]
-    pub fn into_market_events<InstrumentKey: Clone>(
+    pub fn into_market_event<InstrumentKey>(
         self,
         instrument: InstrumentKey,
-    ) -> [MarketEvent<InstrumentKey, DataKind>; 2] {
-        let time = self.candle.close_time;
-        [
-            option_event(time, instrument.clone(), DataKind::Candle(self.candle)),
-            option_event(time, instrument, DataKind::OptionGreeks(self.greeks)),
-        ]
+    ) -> MarketEvent<InstrumentKey, DataKind> {
+        option_event(
+            self.close_time,
+            instrument,
+            DataKind::OptionGreeks(self.greeks),
+        )
     }
 }
 
@@ -358,27 +314,50 @@ fn option_event<InstrumentKey>(
     }
 }
 
-impl OptionCandleRow {
-    fn into_option_candle(self, close_time: DateTime<Utc>) -> Result<LseOptionCandle, LseError> {
-        Ok(LseOptionCandle {
+/// One `/v3/options/flow` row as served. Unknown fields (`symbol`, `strike`, `expiry`, `dte`,
+/// `contract_type`) are ignored rather than rejected; the contract is read from `ticker`.
+#[derive(Debug, Deserialize)]
+struct FlowRow {
+    ts: String,
+    underlying: SmolStr,
+    ticker: SmolStr,
+    pair_id: u64,
+    price: Decimal,
+    size: u64,
+    premium: Decimal,
+    #[serde(default)]
+    venue: SmolStr,
+    #[serde(default)]
+    underlying_price: Option<f64>,
+    #[serde(default)]
+    iv: Option<f64>,
+    #[serde(default)]
+    delta: Option<f64>,
+    #[serde(default)]
+    gamma: Option<f64>,
+    #[serde(default)]
+    theta: Option<f64>,
+    #[serde(default)]
+    vega: Option<f64>,
+}
+
+impl FlowRow {
+    fn into_print(self, time: DateTime<Utc>) -> Result<LseOptionPrint, LseError> {
+        Ok(LseOptionPrint {
+            time,
             contract: LseOptionContract::from_row(self.ticker, self.underlying)?,
-            candle: Candle {
-                close_time,
-                open: self.open,
-                high: self.high,
-                low: self.low,
-                close: self.close,
-                volume: Some(Decimal::from(self.volume)),
-                trade_count: Some(self.print_count),
-            },
+            pair_id: self.pair_id,
+            price: self.price,
+            size: self.size,
             premium: self.premium,
+            venue: self.venue,
             greeks: OptionGreeks {
-                delta: self.delta_avg,
-                gamma: self.gamma_avg,
-                theta: self.theta_avg,
-                vega: self.vega_avg,
-                rho: self.rho_avg,
-                implied_volatility: self.iv_avg,
+                delta: self.delta,
+                gamma: self.gamma,
+                theta: self.theta,
+                vega: self.vega,
+                rho: None,
+                implied_volatility: self.iv,
                 theoretical_price: None,
                 underlying_price: self.underlying_price,
             },
@@ -386,112 +365,378 @@ impl OptionCandleRow {
     }
 }
 
-impl LseVaultClient {
-    /// Fetch one-minute candles for one option contract, paginating automatically.
-    ///
-    /// Same range contract as [`fetch_candles`](Self::fetch_candles): yields exactly the bars whose
-    /// [`close_time`](Candle::close_time) falls in `[start, end]` (**both inclusive**), ascending,
-    /// with the same ordering, resolution and range checks and the same errors. Minutes with no
-    /// print are absent rather than zero-filled.
-    ///
-    /// # Arguments
-    /// * `ticker` - The OSI contract symbol, e.g. `"SPY260922P00773000"`. Case-insensitive.
-    /// * `start` / `end` - Inclusive `close_time` bounds.
+/// One `/v3/options/flow` page.
+#[derive(Debug, Deserialize)]
+struct FlowPage {
+    rows: Vec<FlowRow>,
+}
+
+/// One `/v3/options/chain` row as served.
+#[derive(Debug, Deserialize)]
+struct ChainRow {
+    ticker: SmolStr,
+    underlying: SmolStr,
+    pair_id: u64,
+    #[serde(default)]
+    last_price: Option<Decimal>,
+    #[serde(default)]
+    last_trade_at: Option<String>,
+    #[serde(default)]
+    volume_today: Option<u64>,
+    #[serde(default)]
+    premium_today: Option<Decimal>,
+    #[serde(default)]
+    greeks_at: Option<String>,
+    #[serde(default)]
+    greeks_underlying_price: Option<f64>,
+    #[serde(default)]
+    iv: Option<f64>,
+    #[serde(default)]
+    delta: Option<f64>,
+    #[serde(default)]
+    gamma: Option<f64>,
+    #[serde(default)]
+    theta: Option<f64>,
+    #[serde(default)]
+    vega: Option<f64>,
+}
+
+/// One `/v3/options/chain` page.
+#[derive(Debug, Deserialize)]
+struct ChainPage {
+    underlying: SmolStr,
+    #[serde(default)]
+    underlying_price: Option<Decimal>,
+    #[serde(default)]
+    underlying_at: Option<String>,
+    contracts: u64,
+    rows: Vec<ChainRow>,
+}
+
+/// Parse an optional provider timestamp.
+fn optional_time(label: Option<&str>) -> Result<Option<DateTime<Utc>>, LseError> {
+    label
+        .filter(|label| !label.is_empty())
+        .map(parse_provider_time)
+        .transpose()
+}
+
+impl TryFrom<ChainPage> for LseOptionChain {
+    type Error = LseError;
+
+    fn try_from(page: ChainPage) -> Result<Self, LseError> {
+        let entries = page
+            .rows
+            .into_iter()
+            .map(|row| {
+                Ok(LseOptionChainEntry {
+                    contract: LseOptionContract::from_row(row.ticker, row.underlying)?,
+                    pair_id: row.pair_id,
+                    last_price: row.last_price,
+                    last_trade_at: optional_time(row.last_trade_at.as_deref())?,
+                    volume_today: row.volume_today,
+                    premium_today: row.premium_today,
+                    greeks_at: optional_time(row.greeks_at.as_deref())?,
+                    greeks: OptionGreeks {
+                        delta: row.delta,
+                        gamma: row.gamma,
+                        theta: row.theta,
+                        vega: row.vega,
+                        rho: None,
+                        implied_volatility: row.iv,
+                        theoretical_price: None,
+                        underlying_price: row.greeks_underlying_price,
+                    },
+                })
+            })
+            .collect::<Result<_, LseError>>()?;
+
+        Ok(Self {
+            underlying: page.underlying,
+            underlying_price: page.underlying_price,
+            underlying_at: optional_time(page.underlying_at.as_deref())?,
+            contracts: page.contracts,
+            entries,
+        })
+    }
+}
+
+/// The `greeks` selection's column positions, resolved once per chunk.
+struct GreeksColumns {
+    time: usize,
+    price_at: Option<usize>,
+    option_price: Option<usize>,
+    price_source: Option<usize>,
+    delta: Option<usize>,
+    gamma: Option<usize>,
+    theta: Option<usize>,
+    vega: Option<usize>,
+    iv: Option<usize>,
+    underlying_price: Option<usize>,
+    years_to_expiry: Option<usize>,
+    rate: Option<usize>,
+    dividends_pv: Option<usize>,
+}
+
+impl GreeksColumns {
+    /// Resolve the positions from the header.
     ///
     /// # Errors
-    /// See [`fetch_candles`](Self::fetch_candles). A ticker the provider does not know yields an
-    /// empty stream, not an error. A row whose ticker is not an OSI symbol is an
-    /// [`LseError::Deserialize`].
+    /// [`LseError::UnsupportedSchema`] when the header has no `time` column.
+    fn new(columns: &CsvColumns) -> Result<Self, LseError> {
+        Ok(Self {
+            time: columns.required("time")?,
+            price_at: columns.optional("price_at"),
+            option_price: columns.optional("option_price"),
+            price_source: columns.optional("price_source"),
+            delta: columns.optional("delta"),
+            gamma: columns.optional("gamma"),
+            theta: columns.optional("theta"),
+            vega: columns.optional("vega"),
+            iv: columns.optional("iv"),
+            underlying_price: columns.optional("underlying_price"),
+            years_to_expiry: columns.optional("years_to_expiry"),
+            rate: columns.optional("rate"),
+            dividends_pv: columns.optional("dividends_pv"),
+        })
+    }
+
+    /// Parse one row.
+    fn parse(&self, record: &csv::StringRecord) -> Result<LseOptionMinuteGreeks, LseError> {
+        let cell_at = |index: Option<usize>| index.and_then(|index| cell(record, index));
+        let float = |index: Option<usize>, name: &str| -> Result<Option<f64>, LseError> {
+            cell_at(index)
+                .map(|cell| {
+                    cell.parse::<f64>().map_err(|error| LseError::Deserialize {
+                        message: format!("column {name}: invalid number {cell:?}: {error}"),
+                    })
+                })
+                .transpose()
+        };
+        let open = parse_provider_time(
+            cell(record, self.time).ok_or(LseError::NullValue { column: "time" })?,
+        )?;
+        let close_time =
+            open.checked_add_signed(TimeDelta::minutes(1))
+                .ok_or(LseError::TimestampOverflow {
+                    open,
+                    interval: CandleInterval::Min1,
+                })?;
+
+        Ok(LseOptionMinuteGreeks {
+            close_time,
+            price_at: optional_time(cell_at(self.price_at))?,
+            option_price: cell_at(self.option_price)
+                .map(|cell| parse_decimal("option_price", cell))
+                .transpose()?,
+            price_source: cell_at(self.price_source).map(SmolStr::new),
+            greeks: OptionGreeks {
+                delta: float(self.delta, "delta")?,
+                gamma: float(self.gamma, "gamma")?,
+                theta: float(self.theta, "theta")?,
+                vega: float(self.vega, "vega")?,
+                rho: None,
+                implied_volatility: float(self.iv, "iv")?,
+                theoretical_price: None,
+                underlying_price: float(self.underlying_price, "underlying_price")?,
+            },
+            years_to_expiry: float(self.years_to_expiry, "years_to_expiry")?,
+            rate: float(self.rate, "rate")?,
+            dividends_pv: float(self.dividends_pv, "dividends_pv")?,
+        })
+    }
+}
+
+impl LseClient {
+    /// Fetch candles for one option contract.
+    ///
+    /// [`fetch_candles`](Self::fetch_candles) on the US options market, with the contract spelt as
+    /// the selection requires (its root padded to six characters): the same range contract, checks
+    /// and errors. [`volume`](Candle::volume) is in contracts and
+    /// [`trade_count`](Candle::trade_count) the number of prints. Minutes with no print are absent.
+    ///
+    /// ⚠️ Bars have been observed before the US regular session opens (from `12:30` UTC); check
+    /// them against your session calendar.
+    ///
+    /// # Errors
+    /// [`LseError::InvalidInput`] for a `ticker` that is not an OSI symbol, else see
+    /// [`fetch_candles`](Self::fetch_candles).
     #[must_use = "fetch_option_candles returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_option_candles<'a>(
         &'a self,
         ticker: &'a str,
+        interval: CandleInterval,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> impl Stream<Item = Result<LseOptionCandle, LseError>> + 'a {
-        self.candle_rows::<OptionCandleRow>(
-            "options/candles",
-            ticker,
-            vec![("ticker", ticker.to_owned())],
-            CandleInterval::Min1,
-            start,
-            end,
-        )
-        .map(|row| row.and_then(|(row, close_time)| row.into_option_candle(close_time)))
+    ) -> impl Stream<Item = Result<Candle, LseError>> + 'a {
+        try_stream! {
+            let symbol = rest_symbol(ticker).ok_or_else(|| LseError::InvalidInput {
+                message: format!("{ticker:?} is not an OSI option symbol with a root of six characters or fewer"),
+            })?;
+            let candles = self.fetch_candles(LseCandleRequest::new(
+                LseMarketCode::UsOptions,
+                symbol,
+                interval,
+                start,
+                end,
+            ));
+            futures::pin_mut!(candles);
+            while let Some(candle) = candles.next().await {
+                yield candle?;
+            }
+        }
     }
 
-    /// Fetch option candles into a `Vec`. **Buffers the whole range.**
+    /// Fetch one option contract's Greeks, one row per traded minute.
+    ///
+    /// Yields the minutes whose [`close_time`](LseOptionMinuteGreeks::close_time) falls in
+    /// `[start, end]` (**both inclusive**), ascending, in verified chunks like
+    /// [`fetch_candles`](Self::fetch_candles). A minute with no trade has no row, and a chunk the
+    /// provider stores nothing for yields none, as there.
     ///
     /// # Errors
-    /// Fails on the first error, discarding any candles already received. See
-    /// [`fetch_option_candles`](Self::fetch_option_candles).
-    pub async fn collect_option_candles(
-        &self,
-        ticker: &str,
+    /// [`LseError::InvalidInput`] for a `ticker` that is not an OSI symbol or an inverted range; a
+    /// row out of order is [`LseError::NonMonotonicCandles`]; else as
+    /// [`fetch_candles`](Self::fetch_candles).
+    #[must_use = "fetch_option_greeks returns a lazy Stream that does nothing unless polled"]
+    pub fn fetch_option_greeks<'a>(
+        &'a self,
+        ticker: &'a str,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> Result<Vec<LseOptionCandle>, LseError> {
-        let stream = self.fetch_option_candles(ticker, start, end);
-        futures::pin_mut!(stream);
+    ) -> impl Stream<Item = Result<LseOptionMinuteGreeks, LseError>> + 'a {
+        try_stream! {
+            let symbol = rest_symbol(ticker).ok_or_else(|| LseError::InvalidInput {
+                message: format!("{ticker:?} is not an OSI option symbol with a root of six characters or fewer"),
+            })?;
+            if start > end {
+                Err(LseError::InvalidInput {
+                    message: format!("start ({start}) must not be after end ({end})"),
+                })?;
+            }
 
-        let mut candles = Vec::new();
-        while let Some(candle) = stream.next().await {
-            candles.push(candle?);
+            let mut previous: Option<DateTime<Utc>> = None;
+            for window in windows(CandleInterval::Min1, start, end, self.chunk_bars().get()) {
+                let (from, to) = window.bounds();
+                let query = [
+                    ("market", LseMarketCode::UsOptions.as_str().to_owned()),
+                    ("symbol", symbol.to_string()),
+                    ("data", "greeks".to_owned()),
+                    ("timeframe", "1m".to_owned()),
+                    ("from", from),
+                    ("to", to),
+                    ("format", "csv".to_owned()),
+                ];
+                let Some(body) = self.get_export(&query).await? else {
+                    debug!(%symbol, ?window, "lse option greeks chunk: no stored data");
+                    continue;
+                };
+                let (columns, records) = csv_records(&body)?;
+                debug!(%symbol, ?window, rows = records.len(), "lse option greeks chunk received");
+
+                let columns = GreeksColumns::new(&columns)?;
+                let (window_start, window_end) = window.instants();
+                let mut minutes = Vec::with_capacity(records.len());
+                for record in &records {
+                    let minute = columns.parse(record)?;
+                    let open = minute.close_time - TimeDelta::minutes(1);
+                    if open < window_start || open >= window_end {
+                        Err(LseError::UnexpectedCandleRange {
+                            symbol: symbol.to_string(),
+                            open,
+                            window_start,
+                            window_end,
+                        })?;
+                    }
+                    if let Some(previous) = previous
+                        && open <= previous
+                    {
+                        Err(LseError::NonMonotonicCandles {
+                            symbol: symbol.to_string(),
+                            previous_open: previous,
+                            open,
+                        })?;
+                    }
+                    previous = Some(open);
+                    if minute.close_time >= start && minute.close_time <= end {
+                        minutes.push(minute);
+                    }
+                }
+                for minute in minutes {
+                    yield minute;
+                }
+            }
         }
-
-        Ok(candles)
     }
 
-    /// Fetch every option print in `[start, end)`, oldest first, walking the range automatically.
+    /// Fetch one page of an underlying's option chain, nearest expiry first.
+    ///
+    /// `limit` caps the page (the provider allows up to 5,000) and `offset` skips that many matched
+    /// contracts; [`contracts`](LseOptionChain::contracts) says how many matched in all.
+    ///
+    /// # Errors
+    /// See [`LseError`]. A row whose ticker is not an OSI symbol is [`LseError::Deserialize`].
+    pub async fn fetch_option_chain(
+        &self,
+        underlying: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<LseOptionChain, LseError> {
+        let page: ChainPage = self
+            .get_json(
+                "options/chain",
+                &[
+                    ("underlying", underlying.to_owned()),
+                    ("limit", limit.to_string()),
+                    ("offset", offset.to_string()),
+                ],
+            )
+            .await?;
+        LseOptionChain::try_from(page)
+    }
+
+    /// Fetch every option print in `[start, end)`, oldest first, paging automatically.
     ///
     /// # Range and order
-    /// Yields exactly the prints whose [`time`](LseOptionPrint::time) falls in `[start, end)` —
-    /// half-open, so adjacent ranges tile without overlap — ordered by time and then by
-    /// [`id`](LseOptionPrint::id). Sub-second bounds are honoured by trimming: the provider accepts
-    /// only whole seconds, so the requested range is widened to them and cut back here.
+    /// The range is half-open and exact to the nanosecond. It is walked in windows of at most a
+    /// day, each paged oldest first until the provider answers an empty page: a short page is not
+    /// taken as the end, so a page cap lowered by the provider below the 5,000 asked for costs
+    /// more requests instead of dropping prints. The one case this cannot cover is a single
+    /// instant holding at least that lowered cap's prints: its page looks complete, and the rest
+    /// of that instant would be skipped. At the 5,000 cap such a page is an error (below).
     ///
-    /// # How the range is walked
-    /// The provider answers newest-first and silently truncates at a 5,000-row cap, with no offset
-    /// or cursor, so a range can only be read in windows small enough to come back whole. This
-    /// method walks forward in adaptive windows: a window that returns a full page is halved and
-    /// read again, and one that comes back sparse lets the next window grow. Each complete window is
-    /// emitted oldest-first, so memory holds at most one page. The extra requests fall only on
-    /// windows that hit the cap.
+    /// # Request count
+    /// One request per page, plus up to two per window: the re-read of the last page's held-back
+    /// instant and the empty page that ends the window. Requests are spaced by the client's
+    /// [pace](Self::with_pace).
     ///
-    /// A full page is the only sign of truncation, so the fetch first reads the provider's own
-    /// [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request) from
-    /// [`usage`](Self::usage) — one extra request per fetch — and treats the smaller of that and
-    /// [`with_page_limit`](Self::with_page_limit) as a full page. A page limit set above the
-    /// provider's cap therefore cannot hide a truncated window.
-    ///
-    /// # Known limitation
-    /// The walk trusts the reported cap to be the one `/options/flow` enforces. They agreed when
-    /// measured, and the live options canary asserts they still do; were the provider to enforce a
-    /// lower cap than it reports, a truncated window would read as complete.
+    /// # Paged by time, not by offset
+    /// The provider orders prints by time alone and returns prints sharing an instant in a
+    /// different order from one request to the next (measured 2026-11-27). Paging by offset would
+    /// then repeat one print and drop another wherever a page boundary splits such a group. Each
+    /// page instead starts at an instant: the prints at a page's last instant are held back and
+    /// the next page starts at that instant, so the group is read whole by one request. Prints
+    /// that are identical in every field are kept, as the provider sends them.
     ///
     /// # Arguments
     /// * `underlying` - Restrict to one underlying (case-insensitive), or `None` for every
-    ///   underlying the provider carries. The endpoint cannot filter by contract — it silently
-    ///   ignores a `ticker` parameter — so select contracts from the result.
+    ///   underlying the provider carries.
     /// * `start` / `end` - The half-open time range.
     ///
     /// # Errors
     /// Each yielded item is a `Result`, and the stream ends after the first error.
     /// - [`LseError::InvalidInput`] for an inverted range, or one ending within
-    ///   [`OPTION_FLOW_SETTLE_MARGIN`] of now: the provider can serve a recent window
-    ///   incomplete with a `200`, and returning it would hand back a short tape that looks final.
-    /// - [`LseError::OptionFlowWindowSaturated`] when a single second holds more prints than one
-    ///   page can carry, so the window cannot be narrowed further without losing some.
+    ///   [`OPTION_FLOW_SETTLE_MARGIN`] of now.
     /// - [`LseError::UnexpectedOptionFlowRow`] when a row falls outside the window or underlying it
-    ///   was requested for — the provider ignoring a parameter, which it is known to do silently.
-    ///   Checked before any row of that window is yielded.
-    /// - On `429`, [`LseError::RateLimited`]; resume by re-calling with `start` set to the last
-    ///   print's time. Prints sharing that time are then yielded again; de-duplicate on
-    ///   [`id`](LseOptionPrint::id).
+    ///   was requested for, or steps back in time: the provider ignoring a parameter. Checked
+    ///   before any row of that page is yielded. Also when a whole page of prints shares one
+    ///   instant, which paging by time cannot get past.
+    /// - A limit reached is [`LseError::RateLimited`]; resume by re-calling with `start` one
+    ///   nanosecond after the last print's time. An instant's prints are yielded only once all of
+    ///   them have been read, so the resumed walk neither repeats nor misses one.
     /// - Otherwise [`LseError::Api`] / [`Http`](LseError::Http) /
-    ///   [`Deserialize`](LseError::Deserialize) — the last also when the reported row cap is zero,
-    ///   or when a row's ticker is not an OSI symbol. Like the row checks above, that fails the
-    ///   whole window before any of it is yielded.
+    ///   [`Deserialize`](LseError::Deserialize), the last also when a row's ticker is not an OSI
+    ///   symbol.
     #[must_use = "fetch_option_flow returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_option_flow<'a>(
         &'a self,
@@ -505,7 +750,6 @@ impl LseVaultClient {
                     message: format!("start ({start}) must not be after end ({end})"),
                 })?;
             }
-
             let settled_until = Utc::now() - OPTION_FLOW_SETTLE_MARGIN;
             if end > settled_until {
                 Err(LseError::InvalidInput {
@@ -518,111 +762,110 @@ impl LseVaultClient {
                 })?;
             }
 
-            // A full page is the only truncation signal, so the walk must know the size a full page
-            // has. The provider caps silently, and `page_limit` is only what this client ASKS for: a
-            // caller may raise it past the cap, and the provider may lower the cap under the
-            // default. Either way a truncated window would come back shorter than `page_limit`,
-            // read as complete, and silently lose its oldest prints. The provider's own figure is
-            // read once per fetch -- it is a static request-shaping limit, not a running total --
-            // and the smaller of the two is what a full page means here.
-            let reported = self.usage().await?.max_rows_per_request;
-            if reported == 0 {
-                Err(LseError::Deserialize {
-                    message: "usage reports max_rows_per_request = 0, which leaves no page size a \
-                              truncated option-flow window could be recognised by"
-                        .to_owned(),
-                })?;
-            }
-            let limit = self.page_limit().get().min(reported);
-            let cap = usize::try_from(limit).unwrap_or(usize::MAX);
-            let range_end = ceil_to_second(end);
-            let mut cursor = floor_to_second(start);
-            let mut window = INITIAL_FLOW_WINDOW;
+            let mut previous: Option<DateTime<Utc>> = None;
+            let mut window_start = start;
+            while window_start < end {
+                let window_end = window_start
+                    .checked_add_signed(MAX_FLOW_WINDOW)
+                    .map_or(end, |candidate| candidate.min(end));
+                let mut cursor = window_start;
 
-            while cursor < range_end {
-                let window_end = cursor
-                    .checked_add_signed(window)
-                    .map_or(range_end, |candidate| candidate.min(range_end));
-
-                let mut query = vec![
-                    ("start", cursor.format(WINDOW_FORMAT).to_string()),
-                    ("end", window_end.format(WINDOW_FORMAT).to_string()),
-                    ("limit", limit.to_string()),
-                ];
-                if let Some(underlying) = underlying {
-                    query.push(("underlying", underlying.to_owned()));
-                }
-
-                let rows: Vec<FlowRow> = self.get_json("options/flow", &query).await?;
-                debug!(
-                    ?underlying, %cursor, %window_end, rows = rows.len(),
-                    "vault option flow window received"
-                );
-
-                // A full page may be a truncated one: the cap is applied silently, and the rows it
-                // drops are the OLDEST in the window. Narrow and read the same window start again.
-                if rows.len() >= cap {
-                    let span = window_end - cursor;
-                    if span <= MIN_FLOW_WINDOW {
-                        Err(LseError::OptionFlowWindowSaturated {
-                            window_start: cursor,
-                            rows: rows.len(),
-                        })?;
+                while cursor < window_end {
+                    let mut query = vec![
+                        ("from", cursor.format(FLOW_BOUND_FORMAT).to_string()),
+                        ("to", window_end.format(FLOW_BOUND_FORMAT).to_string()),
+                        ("order", "asc".to_owned()),
+                        ("limit", FLOW_PAGE_ROWS.to_string()),
+                    ];
+                    if let Some(underlying) = underlying {
+                        query.push(("underlying", underlying.to_owned()));
                     }
-                    // Halved in WHOLE seconds: every bound sent must be one the endpoint can express,
-                    // and an odd span halved exactly would put the next window's start mid-second.
-                    window = TimeDelta::seconds(span.num_seconds() / 2).max(MIN_FLOW_WINDOW);
-                    continue;
-                }
+                    let page: FlowPage = self.get_json("options/flow", &query).await?;
+                    debug!(
+                        ?underlying, %cursor, %window_end, rows = page.rows.len(),
+                        "lse option flow page received"
+                    );
+                    if page.rows.is_empty() {
+                        break;
+                    }
+                    let full = page.rows.len() >= FLOW_PAGE_ROWS as usize;
 
-                // Validate the whole window before yielding any of it, so an ignored parameter
-                // never leaks a partial window into the caller's tape.
-                let mut prints = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let time = row.time()?;
-
-                    if time < cursor || time >= window_end {
-                        Err(LseError::UnexpectedOptionFlowRow {
-                            id: row.id,
-                            message: format!(
+                    // Validate the whole page before yielding any of it, so an ignored parameter
+                    // never leaks a partial page into the caller's tape.
+                    let mut prints = Vec::with_capacity(page.rows.len());
+                    let mut last = previous;
+                    for row in page.rows {
+                        let time = parse_provider_time(&row.ts)?;
+                        let refuse = |message: String| LseError::UnexpectedOptionFlowRow {
+                            ticker: row.ticker.clone(),
+                            message,
+                        };
+                        if time < cursor || time >= window_end {
+                            Err(refuse(format!(
                                 "stamped {time}, outside the requested window [{cursor}, \
                                  {window_end}): the range parameters appear to have been ignored"
-                            ),
-                        })?;
-                    }
-                    if let Some(underlying) = underlying
-                        && !row.underlying.eq_ignore_ascii_case(underlying)
-                    {
-                        Err(LseError::UnexpectedOptionFlowRow {
-                            id: row.id,
-                            message: format!(
+                            )))?;
+                        }
+                        if let Some(underlying) = underlying
+                            && !row.underlying.eq_ignore_ascii_case(underlying)
+                        {
+                            Err(refuse(format!(
                                 "underlying {:?} where {underlying:?} was requested: the \
                                  underlying filter appears to have been ignored",
                                 row.underlying
-                            ),
-                        })?;
+                            )))?;
+                        }
+                        if let Some(last) = last
+                            && time < last
+                        {
+                            Err(refuse(format!(
+                                "stamped {time}, before the previous print at {last}: the order \
+                                 parameter appears to have been ignored"
+                            )))?;
+                        }
+                        last = Some(time);
+                        prints.push(row.into_print(time)?);
                     }
 
-                    prints.push(row.into_print(time)?);
-                }
-
-                // The provider serves newest-first; sort rather than reverse, so the order promised
-                // does not rest on how the response happens to be sorted today.
-                prints.sort_unstable_by_key(|print| (print.time, print.id));
-                let received = prints.len();
-
-                for print in prints {
-                    if print.time >= start && print.time < end {
+                    // Ascending and non-empty, so the last print holds the page's latest instant.
+                    let Some((latest, ticker)) = prints
+                        .last()
+                        .map(|print| (print.time, print.contract.ticker.clone()))
+                    else {
+                        break;
+                    };
+                    if latest == cursor {
+                        // Every print sits at the cursor: the group held back last page, now whole
+                        // unless it alone filled the page.
+                        if full {
+                            Err(LseError::UnexpectedOptionFlowRow {
+                                ticker,
+                                message: format!(
+                                    "a full page of {} prints is stamped {latest}: prints sharing \
+                                     one instant cannot be paged past",
+                                    prints.len()
+                                ),
+                            })?;
+                        }
+                        // `latest` is before `window_end`, so one nanosecond on is representable.
+                        cursor = latest
+                            .checked_add_signed(TimeDelta::nanoseconds(1))
+                            .unwrap_or(window_end);
+                    } else {
+                        // Hold back the latest instant's group, which the page may have split; the
+                        // next page starts at it and reads it whole.
+                        prints.retain(|print| print.time < latest);
+                        cursor = latest;
+                    }
+                    if let Some(print) = prints.last() {
+                        previous = Some(print.time);
+                    }
+                    for print in prints {
                         yield print;
                     }
                 }
 
-                cursor = window_end;
-                // Grow only out of a clearly sparse window, so the next one is unlikely to hit the
-                // cap and cost a retry.
-                if received < cap / 4 {
-                    window = (window * 2).min(MAX_FLOW_WINDOW);
-                }
+                window_start = window_end;
             }
         }
     }
@@ -652,23 +895,6 @@ impl LseVaultClient {
     }
 }
 
-/// Truncate to the whole second at or before `time`.
-fn floor_to_second(time: DateTime<Utc>) -> DateTime<Utc> {
-    time.with_nanosecond(0).unwrap_or(time)
-}
-
-/// Round up to the whole second at or after `time`, saturating at the representable maximum.
-fn ceil_to_second(time: DateTime<Utc>) -> DateTime<Utc> {
-    let floor = floor_to_second(time);
-    if floor == time {
-        time
-    } else {
-        floor
-            .checked_add_signed(TimeDelta::seconds(1))
-            .unwrap_or(time)
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -676,130 +902,83 @@ mod tests {
     use rust_decimal_macros::dec;
 
     // Every value in these rows is invented. No row in this repository may be mistaken for provider
-    // data, which is not licensed for redistribution (<https://londonstrategicedge.com/terms>).
+    // data, which is not licensed for redistribution (<https://londonstrategicedge.com/licence>).
     // Decoding is value-independent, so a synthetic row proves what a captured one would.
 
-    const FLOW_ROW: &str = r#"{"id":7,"ts":"2024-01-02 15:00:00.075000","underlying":"TEST",
-        "ticker":"TEST240105C00010500","strike":10.5,"expiry":"2024-01-05","contract_type":"call",
-        "last_price":1,"volume":3,"premium":300,"underlying_price":11.0,"dte":3,"iv":0.2,
-        "delta":0.5,"gamma":0.1,"theta":-0.01,"vega":0.02,"rho":0.003}"#;
+    const FLOW_ROW: &str = r#"{"ts":"2024-01-02 15:00:00.075000123","underlying":"TEST",
+        "symbol":"TEST  240105C00010500","ticker":"TEST240105C00010500","strike":10.5,
+        "expiry":"2024-01-05","contract_type":"call","dte":3,"pair_id":42,"price":1,"size":3,
+        "premium":300,"venue":"A","underlying_price":11.0,"iv":0.2,"delta":0.5,"gamma":0.1,
+        "theta":-0.01,"vega":0.02}"#;
+
+    fn print() -> LseOptionPrint {
+        let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
+        let time = parse_provider_time(&row.ts).unwrap();
+        row.into_print(time).unwrap()
+    }
 
     #[test]
-    fn a_flow_row_decodes_integer_or_float_numbers_and_maps_every_greek() {
-        let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
-        let time = row.time().unwrap();
-        let print = row.into_print(time).unwrap();
+    fn a_flow_row_decodes_and_maps_every_greek() {
+        let print = print();
 
+        assert_eq!(print.contract.ticker, "TEST240105C00010500");
+        assert_eq!((print.pair_id, print.size), (42, 3));
+        assert_eq!((print.price, print.premium), (dec!(1), dec!(300)));
+        assert_eq!(print.venue, "A");
+        assert_eq!(print.time.timestamp_subsec_nanos(), 75_000_123);
         assert_eq!(
-            time,
-            "2024-01-02T15:00:00.075Z".parse::<DateTime<Utc>>().unwrap()
+            print.greeks,
+            OptionGreeks {
+                delta: Some(0.5),
+                gamma: Some(0.1),
+                theta: Some(-0.01),
+                vega: Some(0.02),
+                rho: None,
+                implied_volatility: Some(0.2),
+                theoretical_price: None,
+                underlying_price: Some(11.0),
+            }
         );
-        assert_eq!(print.contract.kind, OptionKind::Call);
-        assert_eq!(print.contract.strike, dec!(10.5));
-        assert_eq!(
-            print.contract.expiry,
-            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()
-        );
-        // `last_price` arrived as a JSON integer.
-        assert_eq!(print.price, dec!(1));
-        assert_eq!(print.premium, dec!(300));
-        assert_eq!(print.greeks.implied_volatility, Some(0.2));
-        assert_eq!(print.greeks.rho, Some(0.003));
-        assert_eq!(print.greeks.underlying_price, Some(11.0));
-        assert_eq!(print.greeks.theoretical_price, None);
     }
 
     #[test]
     fn a_flow_row_with_null_greeks_decodes_them_as_none() {
         let json = FLOW_ROW
             .replace(r#""iv":0.2"#, r#""iv":null"#)
-            .replace(r#""delta":0.5"#, r#""delta":null"#)
-            .replace(r#""rho":0.003"#, r#""rho":null"#);
+            .replace(r#""delta":0.5"#, r#""delta":null"#);
         let row: FlowRow = serde_json::from_str(&json).unwrap();
-        let print = row.into_print(Utc::now()).unwrap();
 
-        assert_eq!(print.greeks.implied_volatility, None);
-        assert_eq!(print.greeks.delta, None);
-        assert_eq!(print.greeks.rho, None);
+        assert_eq!((row.iv, row.delta), (None, None));
     }
 
     #[test]
-    fn a_print_is_a_public_trade_sized_in_contracts_with_no_side() {
-        let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
-        let trade = row.into_print(Utc::now()).unwrap().public_trade();
+    fn a_print_is_a_public_trade_sized_in_contracts_with_no_side_or_id() {
+        let trade = print().public_trade();
 
-        assert_eq!(trade.id, "7");
-        assert_eq!(trade.price, dec!(1));
         assert_eq!(trade.amount, dec!(3));
         assert_eq!(trade.side, None);
-    }
-
-    #[test]
-    fn an_option_candle_row_keeps_prints_as_trade_count_and_averages_as_greeks() {
-        let json = r#"{"ticker":"TEST240105P00010000","underlying":"TEST","strike":10,
-            "expiry":"2024-01-05","contract_type":"put","minute":"2024-01-02 15:00:00","dte":3,
-            "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9,
-            "iv_avg":0.3,"delta_avg":-0.4,"gamma_avg":0.1,"theta_avg":-0.02,"vega_avg":0.05,
-            "rho_avg":-0.001,"underlying_price":10.25}"#;
-        let row: OptionCandleRow = serde_json::from_str(json).unwrap();
-        let open = row.open_time().unwrap();
-        let candle = row
-            .into_option_candle(open + TimeDelta::minutes(1))
-            .unwrap();
-
-        assert_eq!(candle.contract.kind, OptionKind::Put);
-        assert_eq!(candle.candle.trade_count, Some(9));
-        assert_eq!(candle.candle.volume, Some(dec!(40)));
-        assert_eq!(
-            candle.candle.close_time,
-            "2024-01-02T15:01:00Z".parse::<DateTime<Utc>>().unwrap()
-        );
-        assert_eq!(candle.greeks.delta, Some(-0.4));
-        assert_eq!(candle.greeks.rho, Some(-0.001));
-        assert_eq!(candle.greeks.underlying_price, Some(10.25));
+        assert!(trade.id.is_empty());
     }
 
     #[test]
     fn a_print_becomes_a_trade_then_its_greeks_stamped_at_the_print() {
-        let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
-        let time = row.time().unwrap();
-        let [trade, greeks] = row.into_print(time).unwrap().into_market_events(0usize);
+        let print = print();
+        let time = print.time;
+        let [trade, greeks] = print.into_market_events(7u8);
 
-        for event in [&trade, &greeks] {
-            assert_eq!(event.exchange, ExchangeId::LseOptions);
-            assert_eq!(event.time_exchange, time);
-            assert_eq!(event.time_received, time);
-        }
         assert!(matches!(trade.kind, DataKind::Trade(_)));
-        assert!(matches!(greeks.kind, DataKind::OptionGreeks(ref g) if g.rho == Some(0.003)));
+        assert!(matches!(greeks.kind, DataKind::OptionGreeks(_)));
+        for event in [&trade, &greeks] {
+            assert_eq!((event.time_exchange, event.time_received), (time, time));
+            assert_eq!(event.exchange, ExchangeId::LseOptions);
+        }
     }
 
-    #[test]
-    fn an_option_candle_is_stamped_at_its_close_so_the_minute_is_never_seen_early() {
-        let json = r#"{"ticker":"TEST240105P00010000","underlying":"TEST","strike":10,
-            "expiry":"2024-01-05","contract_type":"put","minute":"2024-01-02 15:00:00",
-            "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9}"#;
-        let row: OptionCandleRow = serde_json::from_str(json).unwrap();
-        let close = row.open_time().unwrap() + TimeDelta::minutes(1);
-        let [bar, greeks] = row
-            .into_option_candle(close)
-            .unwrap()
-            .into_market_events(0usize);
-
-        assert_eq!(bar.time_exchange, close);
-        assert_eq!(greeks.time_exchange, close);
-        assert!(matches!(bar.kind, DataKind::Candle(c) if c.close_time == close));
-    }
-
-    /// The served `strike` is a float, and the provider has put float noise on it. The contract is
-    /// read from the ticker, so neither that noise nor a row field disagreeing with the ticker can
-    /// reach it.
     #[test]
     fn the_contract_is_read_from_the_ticker_not_the_row_fields() {
         let json = FLOW_ROW
             .replace(r#""strike":10.5"#, r#""strike":10.499999999999998"#)
-            .replace(r#""contract_type":"call""#, r#""contract_type":"put""#)
-            .replace(r#""expiry":"2024-01-05""#, r#""expiry":"2024-01-06""#);
+            .replace(r#""contract_type":"call""#, r#""contract_type":"put""#);
         let row: FlowRow = serde_json::from_str(&json).unwrap();
         let contract = row.into_print(Utc::now()).unwrap().contract;
 
@@ -813,7 +992,7 @@ mod tests {
 
     #[test]
     fn a_ticker_that_is_not_osi_is_a_typed_error() {
-        let json = FLOW_ROW.replace("TEST240105C00010500", "TEST");
+        let json = FLOW_ROW.replace("\"ticker\":\"TEST240105C00010500\"", "\"ticker\":\"TEST\"");
         let row: FlowRow = serde_json::from_str(&json).unwrap();
         let error = row.into_print(Utc::now()).unwrap_err();
 
@@ -822,33 +1001,81 @@ mod tests {
     }
 
     #[test]
-    fn a_candle_row_whose_ticker_is_not_osi_is_a_typed_error() {
-        let json = r#"{"ticker":"TEST","underlying":"TEST","minute":"2024-01-02 15:00:00",
-            "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9}"#;
-        let row: OptionCandleRow = serde_json::from_str(json).unwrap();
-        let close = row.open_time().unwrap() + TimeDelta::minutes(1);
-
-        assert!(matches!(
-            row.into_option_candle(close),
-            Err(LseError::Deserialize { .. })
-        ));
+    fn the_rest_symbol_pads_the_root_to_six_characters() {
+        assert_eq!(
+            rest_symbol("SPY261127C00650000").unwrap(),
+            "SPY   261127C00650000"
+        );
+        assert_eq!(
+            rest_symbol("GOOGL261127P00100500").unwrap(),
+            "GOOGL 261127P00100500"
+        );
+        assert_eq!(
+            rest_symbol("ABCDEF261127C00650000").unwrap(),
+            "ABCDEF261127C00650000"
+        );
+        assert_eq!(print().contract.rest_symbol(), "TEST  240105C00010500");
     }
 
     #[test]
-    fn a_malformed_print_timestamp_is_a_typed_error() {
-        let json = FLOW_ROW.replace("2024-01-02 15:00:00.075000", "not-a-time");
-        let row: FlowRow = serde_json::from_str(&json).unwrap();
-
-        assert!(matches!(row.time(), Err(LseError::Deserialize { .. })));
+    fn a_root_too_long_or_a_non_osi_ticker_has_no_rest_symbol() {
+        assert_eq!(rest_symbol("ABCDEFG261127C00650000"), None);
+        assert_eq!(rest_symbol("SPY"), None);
     }
 
     #[test]
-    fn whole_second_rounding() {
-        let exact = "2024-01-02T15:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let fractional = "2024-01-02T15:00:00.25Z".parse::<DateTime<Utc>>().unwrap();
+    fn a_chain_page_decodes_times_and_reads_missing_or_empty_ones_as_none() {
+        let json = r#"{"underlying":"TEST","underlying_price":11.0,
+            "underlying_at":"2024-01-02 15:00:00","contracts":2,"limit":2,"offset":0,"returned":2,
+            "greeks_as_of":"2024-01-02 15:00:00","rows":[
+            {"ticker":"TEST240105C00010500","symbol":"TEST  240105C00010500","underlying":"TEST",
+             "pair_id":1,"last_price":1.5,"last_trade_at":"2024-01-02 14:59:00.5","volume_today":9,
+             "premium_today":1350,"greeks_at":"2024-01-02 14:59:00","greeks_underlying_price":11.0,
+             "iv":0.2,"delta":0.5,"gamma":0.1,"theta":-0.01,"vega":0.02},
+            {"ticker":"TEST240105P00010500","underlying":"TEST","pair_id":2,"last_price":null,
+             "last_trade_at":null,"volume_today":0,"premium_today":0,"greeks_at":"",
+             "iv":null,"delta":null,"gamma":null,"theta":null,"vega":null}]}"#;
+        let page: ChainPage = serde_json::from_str(json).unwrap();
+        let chain = LseOptionChain::try_from(page).unwrap();
 
-        assert_eq!(floor_to_second(fractional), exact);
-        assert_eq!(ceil_to_second(fractional), exact + TimeDelta::seconds(1));
-        assert_eq!(ceil_to_second(exact), exact);
+        assert_eq!(chain.contracts, 2);
+        assert_eq!(chain.entries.len(), 2);
+        assert_eq!(chain.entries[0].last_price, Some(dec!(1.5)));
+        assert_eq!(chain.entries[0].greeks.underlying_price, Some(11.0));
+        assert_eq!(
+            chain.underlying_at,
+            Some(parse_provider_time("2024-01-02 15:00:00").unwrap())
+        );
+        assert_eq!(
+            chain.entries[0].last_trade_at,
+            Some(parse_provider_time("2024-01-02 14:59:00.5").unwrap())
+        );
+        assert_eq!(chain.entries[1].last_trade_at, None);
+        assert_eq!(chain.entries[1].greeks_at, None);
+        assert_eq!(chain.entries[1].contract.kind, OptionKind::Put);
+    }
+
+    #[test]
+    fn a_greeks_row_is_stamped_at_the_minute_close_with_null_figures_as_none() {
+        let body = b"time,price_at,iv,delta,gamma,theta,vega,option_price,price_source,\
+underlying_price,years_to_expiry,rate,dividends_pv\n\
+2024-01-02 15:00:00,2024-01-02 15:00:30.5,0.2,\\N,0.1,-0.01,0.02,1.5,trade,11.0,0.01,0.04,0\n";
+        let (columns, records) = csv_records(body).unwrap();
+        let minute = GreeksColumns::new(&columns)
+            .unwrap()
+            .parse(&records[0])
+            .unwrap();
+
+        assert_eq!(
+            minute.close_time,
+            parse_provider_time("2024-01-02 15:01:00").unwrap()
+        );
+        assert_eq!(minute.greeks.delta, None);
+        assert_eq!(minute.greeks.implied_volatility, Some(0.2));
+        assert_eq!(minute.option_price, Some(dec!(1.5)));
+        assert_eq!(minute.price_source.as_deref(), Some("trade"));
+
+        let event = minute.clone().into_market_event(1u8);
+        assert_eq!(event.time_exchange, minute.close_time);
     }
 }

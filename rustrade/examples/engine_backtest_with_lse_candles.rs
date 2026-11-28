@@ -5,17 +5,18 @@
 //! # ⚠️ Licensing — the data is NOT redistributable
 //!
 //! This example's **code** is MIT-licensed like the rest of this repository. **The data it
-//! retrieves is not.** London Strategic Edge permits use for your own research, trading and model
-//! training — including commercially — but **prohibits redistributing, reselling, or otherwise
-//! making the data available to third parties**, in bulk or through any competing feed, download
-//! service or interface. Terms: <https://londonstrategicedge.com/terms>
+//! retrieves is not.** The provider's licence allows an account's data for its holder's own
+//! personal use: their own research, trading and models. Supplying it to anyone else, in any form,
+//! or running a product or service on it needs the provider's licence, and so does any use by or
+//! for an organisation. Licence: <https://londonstrategicedge.com/licence>; terms:
+//! <https://londonstrategicedge.com/terms>.
 //!
 //! In practice: do not commit what this fetches to a public repository, do not publish it as
 //! fixtures or an example dataset, and do not re-serve it.
 //!
 //! # Running
 //!
-//! Requires a free API key (no account, no card) from <https://londonstrategicedge.com/data>, in
+//! Requires an API key (a free plan exists) from <https://londonstrategicedge.com/data>, in
 //! `LSE_API_KEY`:
 //!
 //! ```bash
@@ -26,7 +27,7 @@
 //! # What this demonstrates
 //!
 //! 1. **[`MarketDataStreamed`] over a provider factory.** The dataset is never resident: candles
-//!    are fetched, merged and consumed on demand. Read-ahead is bounded here because each page is
+//!    are fetched, merged and consumed on demand. Read-ahead is bounded here because each chunk is
 //!    awaited — a *blocking* source needs
 //!    [`stream_blocking_iter`](rustrade_data::streams::blocking::stream_blocking_iter) to get the
 //!    same property. Compare `engine_backtest_with_candle_market_data.rs`, which holds everything in
@@ -42,8 +43,8 @@
 //! # ⚠️ Cost — this is the wrong shape for a parameter sweep
 //!
 //! [`MarketDataStreamed`] calls its factory once per backtest, so `run_backtests` with N strategy
-//! configurations would re-fetch the entire range N times, against a provider whose streaming and
-//! export allowances come out of one shared pool. This example therefore runs a **single**
+//! configurations would re-fetch the entire range N times, and every download spends the key's
+//! daily row allowance. This example therefore runs a **single**
 //! `backtest`. For repeated runs over one range, fetch once to local storage and stream from that —
 //! or, for a slice small enough to hold, use `collect_candles` with `MarketDataInMemory`.
 //!
@@ -53,53 +54,22 @@
 //! against `MockExchange`. That is sound for research; before risking capital, note that deciding
 //! on one venue's prices while filling on another's is a basis mismatch you are opting into.
 //!
-//! # ⚠️ This backtest fills at the BID on FX, which flatters every buy
+//! # ⚠️ Known traps in the data
 //!
-//! The provider's FX candles are **bid** candles: reconciled against the tick tape for the same
-//! day, open/high/low/close matched the bid series on 1421 of 1421 minutes and matched the mid or
-//! the ask on none. Filling at the candle close — which is what this example does — therefore buys
-//! at the bid, systematically favourable by a full spread (roughly 0.8 pip on `EUR/USD`) on every
-//! buy. Nothing in the library can correct that without inventing a spread, so a strategy whose
-//! edge is near spread-sized will look profitable here and lose live. Model the spread yourself
-//! before believing a result. Equity candles track the trade tape instead, so the bias is
-//! FX-specific.
+//! The module documentation (`rustrade_data::exchange::lse`) lists them. Two were measured on the
+//! provider's previous API and have not been re-measured on LSE Data 3.0: FX candles were **bid**
+//! candles, so filling at their close buys a spread too cheaply, and candle **volume** was wrong
+//! by orders of magnitude in both directions. This example trades equities and never reads volume;
+//! check both before building on either.
 //!
-//! A related property of the same data: non-trading days arrive as **flat** `o == h == l == c`
-//! bars rather than being omitted, so a daily backtest sees a tradeable price on a closed market.
+//! # How far back you may read depends on the plan
 //!
-//! # ⚠️ Candle `volume` is unreliable in both directions — do not size on it
-//!
-//! This example never reads `volume`, and that is deliberate. Where the vault publishes the field
-//! at all it is wrong by margins that invert results rather than blur them: a majority of sampled
-//! one-minute equity bars report zero in minutes that demonstrably had trades, and since
-//! 2026-04-27 ETF bars have been reported over-stating volume by three to four orders of magnitude
-//! — one `QQQ` minute published at roughly 5,700× that session's entire consolidated volume,
-//! repeated across `SPY`, `IWM`, `SMH`, `XLE`, `XLF` and `TLT` on every trading day sampled over
-//! two months. Equities went the other way over the same period, with `AAPL`, `MSFT` and `NVDA`
-//! daily totals at 24–45% of the consolidated tape against 65–80% before.
-//!
-//! Every one of those bars is structurally valid, so no check the library can perform tells them
-//! from correct ones. A strategy gated on volume — a liquidity filter, a VWAP benchmark, a
-//! participation-rate cap — would therefore backtest against a quantity that is not the market's.
-//! Reconcile against a second source before adding one.
-//!
-//! # ⚠️ Do not assume a long history exists — check depth per symbol first
-//!
-//! The range below is two months of `AAPL` and `MSFT`, which is comfortably inside what those
-//! symbols carry. That is not a general guarantee. Coverage is a per-symbol, per-dataset property
-//! and the spread is wide: equities are stated to reach back to 2004 and options on some tickers
-//! to 2014, while an ETF has been reported carrying a first tick of 2026-04-27 — about three
-//! months of spot. The provider publishes a first tick and a coverage span for every catalog
-//! entry, but the catalog lives on its discovery host and this integration does not wrap it.
-//!
-//! So a range starting before a symbol's coverage is **not** rejected and does not error. The
-//! fetch returns the bars that exist, the backtest runs on them, and the summary statistics are
-//! computed over a period shorter than the one requested — with nothing anywhere to say so. A
-//! backtest quietly evaluated over three months instead of ten years is the failure mode here, and
-//! it looks exactly like a successful run. Establish each symbol's depth from the catalog before
-//! widening the range below.
+//! The window is per market and per plan, and [`LseClient::usage`] reports it in `history`. The
+//! range below is the last 60 days, inside the free plan's window. A symbol can also start later
+//! than the plan allows: a backtest over a shorter period than requested looks exactly like a
+//! successful run, so check the first bar's time against the range you asked for.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, Utc};
 use futures::StreamExt;
 use rust_decimal::Decimal;
 use rustrade::{
@@ -123,7 +93,8 @@ use rustrade_data::{
     event::DataKind,
     exchange::lse::{
         backtest::{LseCandleSource, replay_candles},
-        vault::LseVaultClient,
+        client::LseClient,
+        market::LseMarketCode,
     },
     subscription::candle::CandleInterval,
 };
@@ -158,26 +129,35 @@ async fn main() {
     let instruments = IndexedInstruments::new(instruments);
 
     let client = Arc::new(
-        LseVaultClient::from_env()
-            .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data"),
+        LseClient::from_env()
+            .expect("set LSE_API_KEY - get a key at https://londonstrategicedge.com/data"),
     );
 
-    // Each source pairs a vault display symbol with the index and exchange its instrument was
-    // registered under. `resolve` derives the index from the registry above rather than taking a
-    // literal, which is what you want: a wrong index would silently attribute one symbol's prices
-    // to a different instrument, and an unregistered exchange panics the engine. It also checks the
-    // quote asset, so a `.L` listing registered in `gbp` rather than `gbx` -- pence booked as
-    // pounds, every notional 100x wrong -- is rejected here instead of running to completion.
+    // Each source pairs a symbol, spelt as the websocket and the config spell it, with its market
+    // and the index and exchange its instrument was registered under. `resolve` derives the index
+    // from the registry above rather than taking a literal, which is what you want: a wrong index
+    // would silently attribute one symbol's prices to a different instrument, and an unregistered
+    // exchange panics the engine. It also checks the quote asset, so a `.L` listing registered in
+    // `gbp` rather than `gbx` -- pence booked as pounds, every notional 100x wrong -- is rejected
+    // here instead of running to completion, and that the symbol has a REST spelling.
     let sources = ["AAPL", "MSFT"]
         .into_iter()
         .map(|symbol| {
-            LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, symbol)
-                .expect("each symbol to be registered in the config above, priced in its own unit")
+            LseCandleSource::resolve(
+                &instruments,
+                ExchangeId::LseEquities,
+                LseMarketCode::UsStocks,
+                symbol,
+            )
+            .expect("each symbol to be registered in the config above, priced in its own unit")
         })
         .collect::<Vec<_>>();
 
-    let start: DateTime<Utc> = "2024-01-02T00:00:00Z".parse().unwrap();
-    let end: DateTime<Utc> = "2024-03-01T00:00:00Z".parse().unwrap();
+    // Whole days, ending at the start of yesterday (UTC), so the range is settled history.
+    let end: DateTime<Utc> = (Utc::now().date_naive() - Duration::days(1))
+        .and_time(NaiveTime::MIN)
+        .and_utc();
+    let start = end - Duration::days(60);
 
     // The factory: called once at construction to resolve the first event's time, then once per
     // backtest. Everything provider-specific — fetching, pagination, the k-way merge, the

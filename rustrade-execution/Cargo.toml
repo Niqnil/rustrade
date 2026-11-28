@@ -38,6 +38,10 @@ binance = [
     # the SDK's `common::utils::send_request` (and its own reqwest client). No new crate enters
     # the graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
     "dep:reqwest",
+    # To refuse redirects in binance-sdk's own HTTP client, through the `HttpAgent` its REST
+    # configuration takes, which hands over a reqwest 0.12 `ClientBuilder`. No new crate enters the
+    # graph: it is the SDK's own reqwest.
+    "dep:reqwest012",
 ]
 ibkr = [
     "dep:ibapi",
@@ -106,6 +110,9 @@ reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST AP
 # fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
 binance-sdk = { version = "=78.1.0", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
+# The reqwest major binance-sdk builds its client with, to name `redirect::Policy` for it. Keep it
+# on the SDK's major on each SDK bump: on a mismatch the `HttpAgent` closure no longer compiles.
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, optional = true }
 
 # Shared between "alpaca" and "binance" features
 serde_json = { workspace = true, optional = true }

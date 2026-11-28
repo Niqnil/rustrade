@@ -11,6 +11,7 @@
 //! is suspended, which would leave the stamps behind by the time it was; a request that finds the
 //! wall clock gone further than the monotonic one since the last read waits for a new read first.
 
+use crate::client::binance::shared::RedirectRefused;
 use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::{common::config::TimestampProvider, spot::rest_api::RestApi};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -63,7 +64,11 @@ pub(crate) fn read_server_time(rest: Arc<RestApi>) -> ReadServerTime {
     Arc::new(move || {
         let rest = Arc::clone(&rest);
         Box::pin(async move {
-            let time = rest.time().await?.data().await?;
+            let response = rest.time().await?;
+            if let Some(redirect) = RedirectRefused::of(response.status, &response.headers) {
+                return Err(redirect.into());
+            }
+            let time = response.data().await?;
             time.server_time
                 .ok_or_else(|| anyhow::anyhow!("Binance's server time answer has no serverTime"))
         })
@@ -643,6 +648,24 @@ mod tests {
 
         let lead = server_time.host_lead().unwrap();
         assert!(lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3));
+    }
+
+    /// A server time answer with a redirect is refused, not read as an unreadable time.
+    #[tokio::test]
+    async fn a_server_time_answer_with_a_redirect_is_refused() {
+        let (server, _elsewhere) = sdk_errors::redirecting().await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .base_path(server.uri())
+                .agent(crate::client::binance::shared::refusing_redirects())
+                .build()
+                .unwrap(),
+        ));
+
+        let error = read_server_time(rest)().await.unwrap_err();
+
+        let refused = error.downcast_ref::<RedirectRefused>().map(|r| r.status);
+        assert_eq!(refused, Some(302), "{error:#}");
     }
 
     /// A spot REST client on `server` that stamps its signed requests with `clock`, and a tracker

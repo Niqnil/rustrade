@@ -7,8 +7,8 @@
 
 use super::{
     shared::{
-        BinanceOrderType, BinanceTimeInForce, PlacementResponse, RestAnswer, answer_time,
-        binance_filled_qty, order_rejection, placed_order_state, unreadable_answer,
+        BinanceOrderType, BinanceTimeInForce, PlacementResponse, RedirectRefused, RestAnswer,
+        answer_time, binance_filled_qty, order_rejection, placed_order_state, unreadable_answer,
     },
     spot::SpotOrderFields,
 };
@@ -51,6 +51,8 @@ pub(super) struct LegsAnswer {
     results: Option<LegResults>,
 }
 
+// `redirect` keeps its default `None`: `read` refuses an answer with a redirect before decoding
+// its legs.
 impl RestAnswer for LegsAnswer {
     fn rate_limits(&self) -> &[RestApiRateLimit] {
         &self.rate_limits
@@ -66,12 +68,16 @@ impl LegsAnswer {
     /// refused the whole request.
     ///
     /// # Errors
-    /// The SDK's error, unchanged, when it is not one [`failed`](Self::failed) reads legs from.
+    /// - [`RedirectRefused`] for an answer with a redirect, whose body holds no legs.
+    /// - The SDK's error, unchanged, when it is not one [`failed`](Self::failed) reads legs from.
     pub(super) async fn read(
         answer: anyhow::Result<RestApiResponse<OrderCancelReplaceResponse>>,
     ) -> anyhow::Result<Self> {
         match answer {
             Ok(mut response) => {
+                if let Some(redirect) = RedirectRefused::of(response.status, &response.headers) {
+                    return Err(redirect.into());
+                }
                 let rate_limits = response.rate_limits.take().unwrap_or_default();
                 let headers = std::mem::take(&mut response.headers);
                 let decoded = response
@@ -436,6 +442,34 @@ mod tests {
 
     fn btcusdt() -> InstrumentNameExchange {
         InstrumentNameExchange::new("BTCUSDT")
+    }
+
+    /// An answer with a redirect holds no legs: it is refused before they are read.
+    #[tokio::test]
+    async fn an_answer_with_a_redirect_is_refused_before_its_legs_are_read() {
+        let (server, _elsewhere) = crate::client::binance::sdk_errors::redirecting().await;
+        let config = binance_sdk::common::config::ConfigurationRestApi::builder()
+            .api_key("key")
+            .api_secret("secret")
+            .base_path(server.uri())
+            .agent(super::super::shared::refusing_redirects())
+            .build()
+            .unwrap();
+        let answer = binance_sdk::common::utils::send_request::<OrderCancelReplaceResponse>(
+            &config,
+            "/api/v3/order/cancelReplace",
+            reqwest::Method::POST,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            None,
+            false,
+        )
+        .await;
+
+        let error = LegsAnswer::read(answer).await.unwrap_err();
+
+        let refused = error.downcast_ref::<RedirectRefused>().map(|r| r.status);
+        assert_eq!(refused, Some(302), "{error:#}");
     }
 
     /// A success whose body is `body`, decoded as the SDK decodes it.

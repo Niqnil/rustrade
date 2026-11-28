@@ -1,19 +1,27 @@
-//! Paged historical candles from the London Strategic Edge vault.
+//! Historical candles from LSE Data 3.0, read as verified CSV chunks.
 //!
 //! ```no_run
 //! # use chrono::{Duration, Utc};
 //! # use futures::StreamExt;
+//! # use rustrade_data::exchange::lse::client::LseClient;
 //! # use rustrade_data::exchange::lse::error::LseError;
-//! # use rustrade_data::exchange::lse::vault::LseVaultClient;
+//! # use rustrade_data::exchange::lse::historical::LseCandleRequest;
+//! # use rustrade_data::exchange::lse::market::LseMarketCode;
 //! # use rustrade_data::subscription::candle::CandleInterval;
 //! # async fn example() -> Result<(), LseError> {
-//! let client = LseVaultClient::from_env()?;
+//! let client = LseClient::from_env()?;
 //! let end = Utc::now();
-//! let start = end - Duration::days(7);
+//! let request = LseCandleRequest::new(
+//!     LseMarketCode::Forex,
+//!     "EUR_USD",
+//!     CandleInterval::Hour1,
+//!     end - Duration::days(7),
+//!     end,
+//! );
 //!
-//! let stream = client.fetch_candles("EUR/USD", CandleInterval::Day1, start, end);
-//! // The returned stream is a generator holding borrows across await points, so it is `!Unpin`
-//! // and has to be pinned before `StreamExt::next` will accept it.
+//! let stream = client.fetch_candles(request);
+//! // The returned stream holds borrows across await points, so it is `!Unpin` and has to be
+//! // pinned before `StreamExt::next` will accept it.
 //! futures::pin_mut!(stream);
 //!
 //! while let Some(candle) = stream.next().await {
@@ -24,447 +32,598 @@
 //! ```
 //!
 //! # ⚠️ Licensing
-//! Candles retrieved here are **not redistributable**. See the [module documentation](super) and
-//! <https://londonstrategicedge.com/terms>.
+//! Candles retrieved here are **not redistributable**. See the
+//! [module documentation](super#licensing).
 
 use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
+use crate::exchange::lse::client::LseClient;
 use crate::exchange::lse::error::LseError;
-use crate::exchange::lse::market::candle_interval_str;
-use crate::exchange::lse::vault::LseVaultClient;
+use crate::exchange::lse::market::{LseMarketCode, candle_interval_str};
 use crate::subscription::candle::{
     Candle, CandleInterval, IntervalStep, close_time_from_open, open_time_from_close,
 };
 use async_stream::try_stream;
-use chrono::{DateTime, Duration as TimeDelta, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, TimeDelta, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use serde::{Deserialize, de::DeserializeOwned};
+use smol_str::SmolStr;
+use std::str::FromStr;
 use tracing::debug;
 
-/// Format accepted by the `start` / `end` query parameters.
-///
-/// **Second precision, and no finer.** The provider rejects both a sub-second value and the ISO
-/// `2024-01-02T09:09:00Z` form with a `400` whose message (`use YYYY-MM-DD`) understates what is
-/// actually accepted — the time-of-day *is* honoured.
-const CURSOR_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+/// Format of a timestamp bound sent as `from` / `to`: whole seconds, UTC, no zone suffix.
+const BOUND_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
-/// Amount the page cursor advances past the last bar received.
-///
-/// The cursor is inclusive, so resuming exactly at the last open time would re-yield that bar.
-/// One second is the smallest step the parameter accepts.
-///
-/// # ⚠️ This is lossless only while the finest resolution is one second
-/// Bars are at least one second apart, so stepping a full second past the last open can never skip
-/// one. Were the provider to publish a sub-second resolution, this step would silently drop bars —
-/// revisit it alongside any new [`CandleInterval`] variant below [`Sec1`](CandleInterval::Sec1).
-const CURSOR_STEP_SECS: i64 = 1;
+/// Format of a date bound sent as `from` / `to`.
+const BOUND_DATE_FORMAT: &str = "%Y-%m-%d";
 
-/// One candle as the vault serves it.
+/// What one candle fetch asks for.
 ///
-/// The `symbol` field is echoed by the provider and deliberately not captured: the caller already
-/// knows what it asked for, and unknown fields are ignored rather than rejected so an added field
-/// does not break decoding.
-#[derive(Debug, Deserialize)]
-struct LseCandleRow {
-    /// Bar **open** time, UTC. See [`PROVIDER_TIMESTAMP_FORMAT`].
-    ts: String,
+/// Built with [`new`](Self::new); `#[non_exhaustive]` so a selection the provider adds can join it
+/// without breaking callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LseCandleRequest {
+    /// The market the symbol is listed in.
+    pub market: LseMarketCode,
+    /// The symbol, spelt as the market's catalogue spells it: `AAPL`, `EUR_USD`, `BTCUSDT`,
+    /// `SP500`, `VOD` (no `.L`), or an option contract with its root padded to six characters
+    /// (`AAPL  261120C00100000`).
+    pub symbol: SmolStr,
+    /// The resolution. The provider serves 14 of [`CandleInterval`]'s variants.
+    pub interval: CandleInterval,
+    /// Inclusive lower bound on [`close_time`](Candle::close_time).
+    pub start: DateTime<Utc>,
+    /// Inclusive upper bound on [`close_time`](Candle::close_time).
+    pub end: DateTime<Utc>,
+    /// Whether prices and volumes are adjusted for splits (`true`, the provider's default) or
+    /// served as published.
+    pub adjusted: bool,
+}
+
+impl LseCandleRequest {
+    /// Candles of `symbol` in `market` at `interval` whose close falls in `[start, end]`, adjusted
+    /// for splits.
+    pub fn new(
+        market: LseMarketCode,
+        symbol: impl Into<SmolStr>,
+        interval: CandleInterval,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            market,
+            symbol: symbol.into(),
+            interval,
+            start,
+            end,
+            adjusted: true,
+        }
+    }
+
+    /// Ask for prices and volumes as published, not adjusted for splits.
+    #[must_use]
+    pub fn as_published(mut self) -> Self {
+        self.adjusted = false;
+        self
+    }
+}
+
+/// One window a chunk asks for, aligned so the provider aggregates whole periods only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Window {
+    /// An intraday window on the interval's grid, `to` exclusive.
+    Times {
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    },
+    /// Whole sessions by date, both ends inclusive, each end on a period boundary.
+    Dates { from: NaiveDate, to: NaiveDate },
+}
+
+impl Window {
+    pub(super) fn bounds(&self) -> (String, String) {
+        match self {
+            Self::Times { from, to } => (
+                from.format(BOUND_TIME_FORMAT).to_string(),
+                to.format(BOUND_TIME_FORMAT).to_string(),
+            ),
+            Self::Dates { from, to } => (
+                from.format(BOUND_DATE_FORMAT).to_string(),
+                to.format(BOUND_DATE_FORMAT).to_string(),
+            ),
+        }
+    }
+
+    /// The window as instants: `[from, to)`.
+    pub(super) fn instants(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        match self {
+            Self::Times { from, to } => (*from, *to),
+            Self::Dates { from, to } => (
+                from.and_time(chrono::NaiveTime::MIN).and_utc(),
+                to.succ_opt()
+                    .unwrap_or(*to)
+                    .and_time(chrono::NaiveTime::MIN)
+                    .and_utc(),
+            ),
+        }
+    }
+}
+
+/// How an interval's periods are labelled, which decides how its windows are aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Period {
+    /// A fixed width below a day, on a grid every width of which divides a UTC day.
+    Intraday(TimeDelta),
+    /// One session, labelled by its date.
+    Day,
+    /// Monday to Sunday, labelled by its Monday.
+    Week,
+    /// A calendar month, labelled by its first day.
+    Month,
+}
+
+impl Period {
+    fn of(interval: CandleInterval) -> Self {
+        match interval.to_step() {
+            IntervalStep::Fixed(width) if width < TimeDelta::days(1) => Self::Intraday(width),
+            IntervalStep::Fixed(width) if width < TimeDelta::days(7) => Self::Day,
+            IntervalStep::Fixed(_) => Self::Week,
+            IntervalStep::Months(_) => Self::Month,
+        }
+    }
+}
+
+/// Floor `time` to the grid of `width`, measured from the Unix epoch.
+///
+/// Every intraday width the provider serves divides a day, so the epoch grid is the UTC-day grid
+/// the provider buckets on (measured: hours at `:00`, four hours at `00/04/08/...` UTC).
+fn floor_to_grid(time: DateTime<Utc>, width: TimeDelta) -> Option<DateTime<Utc>> {
+    let width = width.num_seconds();
+    if width <= 0 {
+        return None;
+    }
+    let seconds = time.timestamp();
+    DateTime::from_timestamp(seconds - seconds.rem_euclid(width), 0)
+}
+
+/// The aligned windows covering every candle that can close in `[start, end]`, in order.
+///
+/// # Why aligned
+/// The provider **aggregates the window it is asked for** from its ticks: a window starting at
+/// 14:30 returns a 14:00 hourly bar built from 14:30 onwards, and one starting on a Wednesday
+/// returns that week's bar built from Wednesday on (measured 2026-11-27). Both are fragments that
+/// look whole. So every window boundary sits on a period boundary: the interval's grid for an
+/// intraday interval, a whole date for a daily one, a Monday for a weekly one and a first of the
+/// month for a monthly one. Each window holds at most `chunk_bars` periods.
+///
+/// # Bounds
+/// A candle's close is its open plus the interval, so the opens that can close in `[start, end]`
+/// lie in `[start - interval, end - interval]`. A daily or longer bar opens at its session's first
+/// trade, which can fall on the evening before its session date (forex: `22:04` UTC), so the date
+/// range is widened by a day at the top. The caller trims on close.
+pub(super) fn windows(
+    interval: CandleInterval,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    chunk_bars: u32,
+) -> Vec<Window> {
+    let step = interval.to_step();
+    // `None` (underflow near `DateTime::MIN_UTC`) leaves the bound un-widened: a bar whose open is
+    // unrepresentable cannot exist, so the un-widened bound is already correct.
+    let lowest_open = open_time_from_close(start, step).unwrap_or(start);
+    let highest_open = open_time_from_close(end, step).unwrap_or(end);
+    let chunk_bars = chunk_bars.max(1);
+    let mut windows = Vec::new();
+
+    match Period::of(interval) {
+        Period::Intraday(width) => {
+            let (Some(from), Some(last)) = (
+                floor_to_grid(lowest_open, width),
+                floor_to_grid(highest_open, width),
+            ) else {
+                return windows;
+            };
+            let to = last.checked_add_signed(width).unwrap_or(last);
+            // `None` when `chunk_bars` periods overflow a `TimeDelta`: one window then spans the
+            // whole range, which is what so many bars per chunk asks for.
+            let span = i32::try_from(chunk_bars)
+                .ok()
+                .and_then(|bars| width.checked_mul(bars));
+            let mut cursor = from;
+            while cursor < to {
+                let next = span
+                    .and_then(|span| cursor.checked_add_signed(span))
+                    .map_or(to, |next| next.min(to));
+                windows.push(Window::Times {
+                    from: cursor,
+                    to: next,
+                });
+                cursor = next;
+            }
+        }
+        period => {
+            let mut from = lowest_open.date_naive();
+            let mut to = highest_open
+                .date_naive()
+                .checked_add_days(Days::new(1))
+                .unwrap_or(highest_open.date_naive());
+            match period {
+                Period::Week => {
+                    from = from
+                        .checked_sub_days(Days::new(u64::from(
+                            from.weekday().num_days_from_monday(),
+                        )))
+                        .unwrap_or(from);
+                    to = to
+                        .checked_add_days(Days::new(u64::from(
+                            6 - to.weekday().num_days_from_monday(),
+                        )))
+                        .unwrap_or(to);
+                }
+                Period::Month => {
+                    from = from.with_day(1).unwrap_or(from);
+                    to = to
+                        .with_day(1)
+                        .and_then(|first| first.checked_add_months(Months::new(1)))
+                        .and_then(|next| next.pred_opt())
+                        .unwrap_or(to);
+                }
+                Period::Day | Period::Intraday(_) => {}
+            }
+            let mut cursor = from;
+            while cursor <= to {
+                // The last date of a chunk of `chunk_bars` periods starting at `cursor`.
+                let next = match period {
+                    Period::Week => cursor.checked_add_days(Days::new(7 * u64::from(chunk_bars))),
+                    Period::Month => cursor.checked_add_months(Months::new(chunk_bars)),
+                    Period::Day | Period::Intraday(_) => {
+                        cursor.checked_add_days(Days::new(u64::from(chunk_bars)))
+                    }
+                };
+                let last = next
+                    .and_then(|next| next.pred_opt())
+                    .map_or(to, |last| last.min(to));
+                windows.push(Window::Dates {
+                    from: cursor,
+                    to: last,
+                });
+                match last.succ_opt() {
+                    Some(following) => cursor = following,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    windows
+}
+
+/// One candle row as the provider writes it in CSV.
+#[derive(Debug, Clone, PartialEq)]
+struct CandleRow {
+    open_time: DateTime<Utc>,
+    /// The session date of a daily or longer bar (the `date` column), else `None`.
+    session: Option<NaiveDate>,
     open: Decimal,
     high: Decimal,
     low: Decimal,
     close: Decimal,
-    /// Absent entirely for FX; an integer for equities.
-    #[serde(default)]
     volume: Option<Decimal>,
+    trades: Option<u64>,
 }
 
-/// A vault row describing one candle, identified by the instant its bar opens.
-///
-/// Implemented by every row type [`candle_rows`](LseVaultClient::candle_rows) pages over, so the
-/// cursor arithmetic and the structural page checks are written once for every vault candle
-/// endpoint rather than once per row shape.
-pub(super) trait VaultCandleRow: DeserializeOwned {
-    /// Parse the row's timestamp as the bar's open instant.
-    fn open_time(&self) -> Result<DateTime<Utc>, LseError>;
-}
-
-/// Parse a vault candle label, which carries the bar's **open** in UTC with no zone suffix.
-pub(super) fn parse_candle_open(label: &str) -> Result<DateTime<Utc>, LseError> {
+/// Parse a provider timestamp (`YYYY-MM-DD hh:mm:ss[.fraction]`, UTC, no zone suffix).
+pub(super) fn parse_provider_time(label: &str) -> Result<DateTime<Utc>, LseError> {
     NaiveDateTime::parse_from_str(label, PROVIDER_TIMESTAMP_FORMAT)
         .map(|naive| naive.and_utc())
         .map_err(|error| LseError::Deserialize {
-            message: format!("invalid candle timestamp {label:?}: {error}"),
+            message: format!("invalid timestamp {label:?}: {error}"),
         })
 }
 
-impl VaultCandleRow for LseCandleRow {
-    fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
-        parse_candle_open(&self.ts)
+/// Parse a decimal cell. The provider writes plain decimals; scientific notation is accepted too.
+pub(super) fn parse_decimal(column: &str, cell: &str) -> Result<Decimal, LseError> {
+    Decimal::from_str(cell)
+        .or_else(|_| Decimal::from_scientific(cell))
+        .map_err(|error| LseError::Deserialize {
+            message: format!("column {column}: invalid number {cell:?}: {error}"),
+        })
+}
+
+/// A CSV answer's header, resolved to column positions once.
+pub(super) struct CsvColumns {
+    names: csv::StringRecord,
+}
+
+impl CsvColumns {
+    pub(super) fn new(names: csv::StringRecord) -> Self {
+        Self { names }
+    }
+
+    /// The position of `name`, which the answer must carry.
+    pub(super) fn required(&self, name: &str) -> Result<usize, LseError> {
+        self.optional(name)
+            .ok_or_else(|| LseError::UnsupportedSchema {
+                columns: self.names.iter().collect::<Vec<_>>().join(", "),
+            })
+    }
+
+    /// The position of `name`, if the answer carries it.
+    pub(super) fn optional(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|column| column == name)
     }
 }
 
-impl LseCandleRow {
-    /// Convert into the library [`Candle`] model, given the period-end boundary.
-    ///
-    /// `trade_count` is unconditionally `None`: the vault reports no trade count for any dataset.
-    /// `volume` carries the provider's absence through as `None` rather than as a zero — for FX
-    /// the field is omitted entirely, and a synthetic zero would aggregate into a
-    /// legitimate-looking total at every derived resolution.
-    fn into_candle(self, close_time: DateTime<Utc>) -> Candle {
-        Candle {
-            close_time,
-            open: self.open,
-            high: self.high,
-            low: self.low,
-            close: self.close,
-            volume: self.volume,
-            trade_count: None,
-        }
+/// A cell the row must carry, or [`LseError::NullValue`] when it is empty or null.
+fn required<'r>(
+    record: &'r csv::StringRecord,
+    index: usize,
+    name: &'static str,
+) -> Result<&'r str, LseError> {
+    cell(record, index).ok_or(LseError::NullValue { column: name })
+}
+
+/// A cell, or `None` when it is empty or the provider's null (`\N`).
+pub(super) fn cell(record: &csv::StringRecord, index: usize) -> Option<&str> {
+    record
+        .get(index)
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty() && *cell != "\\N")
+}
+
+/// Parse a verified CSV answer into its header and records.
+pub(super) fn csv_records(body: &[u8]) -> Result<(CsvColumns, Vec<csv::StringRecord>), LseError> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(body);
+    let columns = CsvColumns::new(
+        reader
+            .headers()
+            .map_err(|error| LseError::Deserialize {
+                message: format!("unreadable CSV header: {error}"),
+            })?
+            .clone(),
+    );
+    let records = reader
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LseError::Deserialize {
+            message: format!("unreadable CSV row: {error}"),
+        })?;
+
+    Ok((columns, records))
+}
+
+fn candle_rows(body: &[u8]) -> Result<Vec<CandleRow>, LseError> {
+    let (columns, records) = csv_records(body)?;
+    let time = columns.required("time")?;
+    let open = columns.required("open")?;
+    let high = columns.required("high")?;
+    let low = columns.required("low")?;
+    let close = columns.required("close")?;
+    let volume = columns.optional("volume");
+    let trades = columns.optional("trades");
+    let date = columns.optional("date");
+
+    records
+        .iter()
+        .map(|record| {
+            Ok(CandleRow {
+                open_time: parse_provider_time(required(record, time, "time")?)?,
+                session: date
+                    .and_then(|index| cell(record, index))
+                    .map(|label| {
+                        NaiveDate::parse_from_str(label, BOUND_DATE_FORMAT).map_err(|error| {
+                            LseError::Deserialize {
+                                message: format!("invalid session date {label:?}: {error}"),
+                            }
+                        })
+                    })
+                    .transpose()?,
+                open: parse_decimal("open", required(record, open, "open")?)?,
+                high: parse_decimal("high", required(record, high, "high")?)?,
+                low: parse_decimal("low", required(record, low, "low")?)?,
+                close: parse_decimal("close", required(record, close, "close")?)?,
+                volume: volume
+                    .and_then(|index| cell(record, index))
+                    .map(|cell| parse_decimal("volume", cell))
+                    .transpose()?,
+                trades: trades
+                    .and_then(|index| cell(record, index))
+                    .map(|cell| {
+                        cell.parse::<u64>().map_err(|error| LseError::Deserialize {
+                            message: format!("column trades: invalid count {cell:?}: {error}"),
+                        })
+                    })
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// The bar's position in its series: its open for an intraday interval, its session date (at
+/// midnight UTC) for a daily or longer one, whose opens float with its first trade.
+fn ordinal(row: &CandleRow, period: Period) -> Result<DateTime<Utc>, LseError> {
+    match period {
+        Period::Intraday(_) => Ok(row.open_time),
+        Period::Day | Period::Week | Period::Month => row
+            .session
+            .map(|date| date.and_time(chrono::NaiveTime::MIN).and_utc())
+            .ok_or(LseError::NullValue { column: "date" }),
     }
 }
 
-impl LseVaultClient {
-    /// Fetch historical candles for `symbol` at `interval`, paginating automatically.
+impl LseClient {
+    /// Fetch historical candles, one verified chunk at a time.
     ///
-    /// Returns a [`Stream`] that processes each page as it arrives rather than buffering the whole
-    /// range. For a convenience `Vec`, see [`collect_candles`](Self::collect_candles).
-    ///
-    /// # Symbol
-    /// The vault keys candles on the **display symbol** — `EUR/USD`, `AAPL`, `BP.L`, `ES.F` — not
-    /// on a dataset slug. Nothing here needs [`slug`](super::market::slug).
+    /// Returns a [`Stream`] that downloads, verifies and yields one chunk of at most
+    /// [`chunk_bars`](LseClient::with_chunk_bars) bars before asking for the next. For a `Vec`, see
+    /// [`collect_candles`](Self::collect_candles).
     ///
     /// # Range contract
-    /// Yields exactly the candles whose [`close_time`](Candle::close_time) falls in `[start, end]`
-    /// (**both inclusive**), matched on `close_time` — the field consumers receive — consistent
-    /// with the library's other historical fetches.
+    /// Yields exactly the candles whose [`close_time`](Candle::close_time) falls in
+    /// `[request.start, request.end]` (**both inclusive**), in ascending order.
     ///
-    /// The vault's own range is expressed on the bar's **open** time with an **exclusive** upper
-    /// bound, so this method maps both bounds (lower widens to capture the bar whose
-    /// `close_time == start`; upper is extended past the final bar's open) and then trims exactly
-    /// on `close_time`. The trim also absorbs the cursor's second-precision truncation of
-    /// sub-second `start`/`end` values.
+    /// `close_time` is computed here as the bar's open plus the interval, via the shared boundary
+    /// helper. For a daily, weekly or monthly bar the provider's open is the **first trade** of the
+    /// session, week or month (US stocks: `09:00` UTC, the start of pre-market; forex: `22:04` UTC
+    /// on the evening before the session date; crypto: midnight), so `close_time` lands a period
+    /// after that first trade. Sessions are shorter than a day, so this is never before the session
+    /// ends: a backtest sees a daily bar no earlier than its session's close, and sometimes later.
     ///
-    /// `close_time` is computed library-side as the exclusive period-end boundary
-    /// (`open_time + interval`) via the shared boundary helper; the provider reports only the open
-    /// instant.
+    /// # Windows are aligned to whole periods
+    /// The provider aggregates whatever window it is asked for, so a window cut mid-period would
+    /// return a fragment that looks like a whole bar. Each chunk's window is aligned to whole
+    /// periods instead, which is why the first and last chunks may reach past the range: the extra
+    /// bars are trimmed on close.
     ///
-    /// # Sparseness differs by resolution — and a closed market is not the same as no bar
-    /// **Intraday**: periods with no activity are omitted entirely, so consecutive candles are
-    /// **not** guaranteed to be one interval apart. This is the opposite of Binance's REST klines,
-    /// which server-side gap-fill. Consumers needing a dense grid must fill it themselves.
+    /// # Intraday bars include extended hours
+    /// US stock bars run from pre-market to after-hours (the first hourly bar of a day opens at
+    /// `09:00` UTC). Periods with no trade are omitted, so consecutive bars are not guaranteed to
+    /// be one interval apart; fill a dense grid yourself if you need one.
     ///
-    /// **Daily**: the series is **not** sparse. Non-trading days are emitted as *flat* bars —
-    /// `open == high == low == close` — for every sampled Saturday and for the US Independence Day
-    /// observance; only Sundays are absent. So a backtest sees a tradeable price on a closed market,
-    /// and the flat OHLC is the only signal. Do not infer "no bar means the market was closed": see
-    /// the [module's data characteristics](super#data-characteristics).
-    ///
-    /// # Volume — ⚠️ not a figure to size on without reconciling it
-    /// FX candles carry **no volume**: the vault omits the field, which surfaces as
-    /// [`volume: None`](Candle::volume) rather than a zero. `trade_count` is `None` for every
-    /// dataset — the vault reports none.
-    ///
-    /// Where volume *is* published it is unreliable in both directions, and by margins large
-    /// enough to invert a result rather than blur it: a majority of sampled one-minute equity bars
-    /// report `0` in minutes the tick tape shows real trades, and ETF bars have been reported
-    /// carrying three to four orders of magnitude too much — one `QQQ` minute published at some
-    /// 5,700× that session's entire consolidated volume. Equity totals over the same period ran
-    /// well under the consolidated tape. Every one of those bars is structurally valid, so neither
-    /// this method nor any shape check on its output can tell them from correct ones. See the
-    /// [module's data characteristics](super#data-characteristics) for the measurements and their
-    /// provenance. Reconcile against a second source before trusting a volume-derived quantity.
-    ///
-    /// # Coverage — a range the symbol does not cover is not an error
-    /// The provider publishes a first tick and a coverage span per symbol per dataset, and the two
-    /// vary widely: an ETF has been reported carrying three months of spot history where equities
-    /// reach back two decades. Those fields live in the catalog on the discovery host, which this
-    /// integration does not wrap, so this method cannot check `start` against them. A range
-    /// beginning before a symbol's coverage yields the bars that exist and nothing to say the
-    /// remainder was never published — indistinguishable here from a genuinely quiet period.
-    /// Establish a symbol's depth from the catalog before choosing a range to backfill.
+    /// # A chunk with nothing stored yields nothing
+    /// The provider answers a window holding no stored bars `404 data-unavailable`, and gives that
+    /// answer both for dates with no trading and for dates it has not loaded. Such a chunk yields
+    /// no bars rather than an error, so the result does not depend on how the range is chunked; an
+    /// empty stretch therefore does not prove there was no trading.
     ///
     /// # Arguments
-    /// * `symbol` - Display symbol, e.g. `"EUR/USD"` or `"AAPL"`.
-    /// * `interval` - Resolution. The provider serves 14 of [`CandleInterval`]'s variants;
-    ///   an unserved one is rejected up front with [`LseError::UnsupportedInterval`] rather than
-    ///   relayed as a `400`.
-    /// * `start` / `end` - Inclusive `close_time` bounds.
+    /// See [`LseCandleRequest`]. An interval the provider does not serve is rejected up front with
+    /// [`LseError::UnsupportedInterval`].
     ///
     /// # Errors
-    /// Each yielded item is a `Result`. On `429` the stream yields [`LseError::RateLimited`] and
-    /// **ends** — resume by re-calling with `start` set past the last `close_time` received. An
-    /// inverted range is [`LseError::InvalidInput`]. Other failures surface as
-    /// [`LseError::Api`] / [`Http`](LseError::Http) / [`Deserialize`](LseError::Deserialize).
-    ///
-    /// A page carrying a bar that closes past `end` ends the stream with
-    /// [`LseError::UnexpectedCandleRange`] rather than trimming it away: the upper bound is exact
-    /// by construction, so such a bar means the range parameters were not honoured. Every in-range
-    /// bar on that page is yielded first. Note the lower bound is **not** symmetric — it is widened
-    /// deliberately, so bars closing before `start` are trimmed without comment.
-    ///
-    /// A page whose opens step backwards ends the stream with
-    /// [`LseError::NonMonotonicCandlePage`], and one whose bars are spaced closer than `interval`
-    /// with [`LseError::UnexpectedCandleResolution`]. Both are checked before *any* bar of that
-    /// page is yielded — unlike the range violation above, nothing from such a page is emitted.
+    /// Each yielded item is a `Result`, and the first error ends the stream. Resume after one by
+    /// re-calling with `start` set past the last `close_time` received.
+    /// - An inverted range is [`LseError::InvalidInput`].
+    /// - A refusal is [`LseError::Api`] with the provider's code (`symbol-unknown`,
+    ///   `plan-required`, `history-limit`, `export-too-wide`, ...), and a limit reached is
+    ///   [`LseError::RateLimited`].
+    /// - A chunk whose body disagrees with its checksum or size is [`LseError::Api`] with the
+    ///   success status and no code; nothing from it is yielded.
+    /// - A chunk carrying a bar outside its window is [`LseError::UnexpectedCandleRange`], bars out
+    ///   of order are [`LseError::NonMonotonicCandles`], and intraday bars spaced closer than the
+    ///   interval are [`LseError::UnexpectedCandleResolution`]. All are checked before any bar of
+    ///   that chunk is yielded.
     ///
     /// # Request count
-    /// Because the row cap is applied silently, a short page cannot be distinguished from the end
-    /// of the data. Pagination therefore continues until a page comes back **empty** or the cursor
-    /// passes the requested range, which costs at most one extra request per fetch. Treating a
-    /// short page as terminal would be faster and would silently truncate the result if the
-    /// provider ever lowered its cap below the rows requested per page — the figure the provider
-    /// itself reports as [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request),
-    /// measured at 5,000 and overridable with
-    /// [`with_page_limit`](LseVaultClient::with_page_limit).
+    /// One download per chunk, every chunk of the range requested even where it holds no bars (a
+    /// weekend, a quiet symbol): a missing chunk cannot be told from a skipped one. Each download
+    /// spends the plan's rows; see [`usage`](Self::usage).
     #[must_use = "fetch_candles returns a lazy Stream that does nothing unless polled"]
-    pub fn fetch_candles<'a>(
-        &'a self,
-        symbol: &'a str,
-        interval: CandleInterval,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> impl Stream<Item = Result<Candle, LseError>> + 'a {
+    pub fn fetch_candles(
+        &self,
+        request: LseCandleRequest,
+    ) -> impl Stream<Item = Result<Candle, LseError>> + '_ {
         try_stream! {
-            // Rejected up front so the caller gets a typed answer instead of a relayed 400.
-            let timeframe = candle_interval_str(interval)
-                .ok_or(LseError::UnsupportedInterval { interval })?;
+            let timeframe = candle_interval_str(request.interval)
+                .ok_or(LseError::UnsupportedInterval { interval: request.interval })?;
 
-            let rows = self.candle_rows::<LseCandleRow>(
-                "candles",
-                symbol,
-                vec![
-                    ("symbol", symbol.to_owned()),
-                    // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently
-                    // and the vault defaults to 1-minute bars, returning a byte-identical shape.
-                    ("timeframe", timeframe.to_owned()),
-                ],
-                interval,
-                start,
-                end,
-            );
-            futures::pin_mut!(rows);
-
-            while let Some(row) = rows.next().await {
-                let (row, close_time) = row?;
-                yield row.into_candle(close_time);
-            }
-        }
-    }
-
-    /// The paging core shared by every vault candle endpoint.
-    ///
-    /// Yields each row whose close falls in `[start, end]`, paired with that close, under exactly
-    /// the range, ordering, resolution and request-count contract documented on
-    /// [`fetch_candles`](Self::fetch_candles) — every error described there originates here.
-    ///
-    /// `path` is the vault endpoint and `selector` the query parameters naming what to fetch; the
-    /// range and page-size parameters are appended per page. `symbol` labels the typed errors only.
-    ///
-    /// Relies on the endpoint sharing the vault's measured range semantics: `start` inclusive and
-    /// `end` exclusive, both on the bar's **open**, at second precision.
-    pub(super) fn candle_rows<'a, R>(
-        &'a self,
-        path: &'static str,
-        symbol: &'a str,
-        selector: Vec<(&'static str, String)>,
-        interval: CandleInterval,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> impl Stream<Item = Result<(R, DateTime<Utc>), LseError>> + 'a
-    where
-        R: VaultCandleRow + 'a,
-    {
-        try_stream! {
-            // An inverted range is a caller error, not an empty result: the vault would answer 200
-            // with a confusing selection rather than complaining.
-            if start > end {
+            // An inverted range is a caller error, not an empty result.
+            if request.start > request.end {
                 Err(LseError::InvalidInput {
-                    message: format!("start ({start}) must not be after end ({end})"),
+                    message: format!(
+                        "start ({}) must not be after end ({})",
+                        request.start, request.end
+                    ),
                 })?;
             }
 
-            let step = interval.to_step();
+            let step = request.interval.to_step();
+            let period = Period::of(request.interval);
+            let symbol = request.symbol.to_string();
+            // Carried across chunks, not reset per chunk: chunks served out of order, or one
+            // repeating another's bars, would pass a per-chunk check and still corrupt the series.
+            let mut previous: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
 
-            // Map the close-time contract onto the vault's open-time filter. `None` (underflow near
-            // `DateTime::MIN_UTC`) is not an error: the boundary bar would have an unrepresentable
-            // open and so cannot exist, making the un-widened bound already correct.
-            let request_start = open_time_from_close(start, step).unwrap_or(start);
-            let request_end_open = open_time_from_close(end, step).unwrap_or(end);
+            for window in windows(
+                request.interval,
+                request.start,
+                request.end,
+                self.chunk_bars().get(),
+            ) {
+                let (from, to) = window.bounds();
+                let query = [
+                    ("market", request.market.as_str().to_owned()),
+                    ("symbol", symbol.clone()),
+                    ("data", "candles".to_owned()),
+                    ("timeframe", timeframe.to_owned()),
+                    ("from", from),
+                    ("to", to),
+                    // `/v3/candles` answers Parquet by default; CSV is asked for explicitly.
+                    ("format", "csv".to_owned()),
+                    ("adjusted", if request.adjusted { "1" } else { "0" }.to_owned()),
+                ];
+                let Some(body) = self.get_export(&query).await? else {
+                    debug!(%symbol, ?window, "lse candle chunk: no stored data");
+                    continue;
+                };
+                let rows = candle_rows(&body)?;
+                debug!(%symbol, ?window, rows = rows.len(), "lse candle chunk received");
 
-            // The vault's `end` is EXCLUSIVE on open time, so extend past the final bar's open to
-            // readmit it. Saturating near `DateTime::MAX_UTC` is safe -- the close-time trim below
-            // is exact regardless, so an un-extended bound only risks omitting a bar that cannot
-            // exist at that boundary.
-            let range_end = request_end_open
-                .checked_add_signed(TimeDelta::seconds(CURSOR_STEP_SECS))
-                .unwrap_or(request_end_open);
+                // Every structural check runs over the whole chunk before any bar is yielded.
+                let (window_start, window_end) = window.instants();
+                let mut candles = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let position = ordinal(&row, period)?;
+                    let inside = match window {
+                        Window::Times { from, to } => row.open_time >= from && row.open_time < to,
+                        Window::Dates { .. } => position >= window_start && position < window_end,
+                    };
+                    if !inside {
+                        Err(LseError::UnexpectedCandleRange {
+                            symbol: symbol.clone(),
+                            open: row.open_time,
+                            window_start,
+                            window_end,
+                        })?;
+                    }
 
-            let mut cursor = request_start;
-            let mut page = 0usize;
-            // Carried ACROSS pages, not reset per page: a vault that served each page ascending but
-            // the pages themselves out of order, or that repeated a page's worth of bars after the
-            // cursor advanced, would satisfy a per-page check and still corrupt the series.
-            let mut previous_open: Option<DateTime<Utc>> = None;
-
-            loop {
-                // No sleep here: pacing is applied inside `get_json`, against a gate shared by
-                // every clone of this client. Spacing pages from inside this loop would only ever
-                // pace *this* fetch, so N concurrent fetches would issue N requests per interval —
-                // see `LseVaultClient::with_pace`.
-                let mut query = selector.clone();
-                query.extend([
-                    ("start", cursor.format(CURSOR_FORMAT).to_string()),
-                    ("end", range_end.format(CURSOR_FORMAT).to_string()),
-                    ("limit", self.page_limit().to_string()),
-                ]);
-
-                let rows: Vec<R> = self.get_json(path, &query).await?;
-                page += 1;
-                debug!(path, symbol, %cursor, rows = rows.len(), page, "vault candle page received");
-
-                // The only reliable end-of-data signal; see the request-count note above.
-                if rows.is_empty() {
-                    break;
-                }
-
-                let mut max_open: Option<DateTime<Utc>> = None;
-                let mut reached_end = false;
-
-                // Two STRUCTURAL properties of the page, checked in full before a single bar of it
-                // is yielded. Both are properties of the response as a whole rather than of any one
-                // row, and a page violating either is not partially usable: the first invalidates
-                // the cursor arithmetic, the second means every `close_time` this module computes
-                // for the page is wrong. That is the difference from the range trim below, which is
-                // a per-row property of a well-formed page and is therefore applied per row.
-                //
-                // The cost is one extra pass over a `Vec` already in memory. The instants this pass
-                // parses are kept and reused by the conversion loop below rather than reparsed:
-                // `open_time` is a format-string parse, not a comparison, so reparsing them would
-                // double the timestamp work on every page of every backfill.
-                let mut opens = Vec::with_capacity(rows.len());
-                for row in &rows {
-                    let open = row.open_time()?;
-
-                    if let Some(previous) = previous_open {
-                        // ORDER. Ascending is how the vault answers today, not something it
-                        // guarantees, and the cursor advances past the newest open a page carried
-                        // -- so a page served newest-first AND truncated at the row cap would jump
-                        // the cursor to the end of the range, make the next page empty (the
-                        // documented end-of-data signal), and return `Ok` holding the tail of the
-                        // series with nothing to say the rest was skipped.
-                        if open < previous {
-                            Err(LseError::NonMonotonicCandlePage {
-                                symbol: symbol.to_owned(),
-                                page,
-                                previous_open: previous,
-                                open,
+                    if let Some((previous_position, previous_open)) = previous {
+                        if position <= previous_position {
+                            Err(LseError::NonMonotonicCandles {
+                                symbol: symbol.clone(),
+                                previous_open,
+                                open: row.open_time,
                             })?;
                         }
-
-                        // RESOLUTION. Consecutive bars of a compliant fixed-interval series are
-                        // exactly one interval apart, and a gap (a weekend, a holiday, a quiet
-                        // symbol) only ever makes that spacing WIDER -- so spacing narrower than
-                        // the interval means the response is finer-grained than the request. This
-                        // is the runtime detector for the vault's documented habit of answering
-                        // `200` to a misspelled resolution parameter with 1-minute bars in a
-                        // byte-identical shape (see the `vault` module docs). Nothing else here can
-                        // see that: the bars ascend, and they fall inside the requested range.
-                        //
-                        // Skipped for a calendar step -- `month` has no single width, and February
-                        // would false-positive against a 31-day one.
-                        if let IntervalStep::Fixed(width) = step {
-                            let actual = open - previous;
+                        if let Period::Intraday(width) = period {
+                            let actual = row.open_time - previous_open;
                             if actual < width {
                                 Err(LseError::UnexpectedCandleResolution {
-                                    symbol: symbol.to_owned(),
-                                    interval,
-                                    previous_open: previous,
-                                    open,
+                                    symbol: symbol.clone(),
+                                    interval: request.interval,
+                                    previous_open,
+                                    open: row.open_time,
                                     actual,
                                 })?;
                             }
                         }
                     }
-                    previous_open = Some(open);
-                    opens.push(open);
-                }
+                    previous = Some((position, row.open_time));
 
-                for (row, open) in rows.into_iter().zip(opens) {
-                    let close_time = close_time_from_open(open, step)
-                        .ok_or(LseError::TimestampOverflow { open, interval })?;
-
-                    // Track every row, including trimmed ones, so the cursor advances past bars
-                    // that fell outside the contract rather than re-requesting them forever.
-                    max_open = Some(max_open.map_or(open, |seen| seen.max(open)));
-
-                    // A bar past the upper bound ends the fetch — but only after the rest of this
-                    // page has been examined, so the error never arrives having thrown away data
-                    // the response actually carried. On a page that reaches here that is now belt
-                    // and braces: the order check above rejects any page on which an out-of-range
-                    // bar could precede an in-range one, since on an ascending page everything
-                    // after the first out-of-range bar is also out of range. Kept because it costs
-                    // one pass over a page already in memory, `max_open` below scans every row
-                    // regardless, and "yield everything valid before failing" is the property worth
-                    // holding structurally rather than as a consequence of another check.
-                    if close_time > end {
-                        reached_end = true;
+                    let close_time = close_time_from_open(row.open_time, step).ok_or(
+                        LseError::TimestampOverflow {
+                            open: row.open_time,
+                            interval: request.interval,
+                        },
+                    )?;
+                    if close_time < request.start || close_time > request.end {
                         continue;
                     }
-
-                    // Below the lower bound only for the widened first page.
-                    if close_time < start {
-                        continue;
-                    }
-
-                    yield (row, close_time);
+                    candles.push(Candle {
+                        close_time,
+                        open: row.open,
+                        high: row.high,
+                        low: row.low,
+                        close: row.close,
+                        volume: row.volume,
+                        trade_count: row.trades,
+                    });
                 }
 
-                if reached_end {
-                    // Terminal, not trimmed-and-logged. `range_end` is derived as `end - step + 1s`
-                    // against an exclusive upper bound, so the newest bar a compliant page can carry
-                    // is the one closing exactly on `end`. A later one means the vault answered
-                    // outside the range it was asked for -- the same silently-ignored-parameter
-                    // failure as the cursor non-advance below, and so the same kind of typed error.
-                    // Trimming and continuing would hand back a series that looks complete; a caller
-                    // cannot assert on a log line, so a warning here would be observable to an
-                    // operator reading stderr and to nobody else. Every in-range bar on this page
-                    // was already yielded above, so nothing this response did contain is lost.
-                    Err(LseError::UnexpectedCandleRange {
-                        symbol: symbol.to_owned(),
-                        cursor,
-                        page,
-                        end,
-                    })?;
-                }
-
-                let Some(last_open) = max_open else {
-                    break;
-                };
-
-                let next_cursor = last_open
-                    .checked_add_signed(TimeDelta::seconds(CURSOR_STEP_SECS))
-                    .ok_or(LseError::CursorOverflow { last_open })?;
-
-                // A page consisting solely of bars at or before the cursor would leave the cursor
-                // unmoved and loop forever. That requires the provider to ignore `start`, which is
-                // exactly the silent-parameter failure this integration guards against elsewhere,
-                // so it is surfaced rather than trusted.
-                if next_cursor <= cursor {
-                    Err(LseError::Api {
-                        status: 200,
-                        message: format!(
-                            "page {page} did not advance past {cursor}: the range parameters \
-                             appear to have been ignored"
-                        ),
-                    })?;
-                }
-
-                cursor = next_cursor;
-
-                // `>=` rather than `>`: the vault's upper bound is exclusive, so a cursor sitting
-                // on it selects an empty window. Stopping here saves a guaranteed-empty request
-                // whenever the last bar received was the final one in range.
-                if cursor >= range_end {
-                    break;
+                for candle in candles {
+                    yield candle;
                 }
             }
         }
@@ -473,20 +632,16 @@ impl LseVaultClient {
     /// Fetch historical candles into a `Vec`.
     ///
     /// Convenience over [`fetch_candles`](Self::fetch_candles) with the same range contract, for
-    /// slices small enough to hold in memory. **Buffers the whole range** — prefer the stream for
-    /// long backfills at fine resolutions.
+    /// slices small enough to hold in memory.
     ///
     /// # Errors
     /// Fails on the first error, discarding any candles already received. See
     /// [`fetch_candles`](Self::fetch_candles).
     pub async fn collect_candles(
         &self,
-        symbol: &str,
-        interval: CandleInterval,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        request: LseCandleRequest,
     ) -> Result<Vec<Candle>, LseError> {
-        let stream = self.fetch_candles(symbol, interval, start, end);
+        let stream = self.fetch_candles(request);
         futures::pin_mut!(stream);
 
         let mut candles = Vec::new();
@@ -498,117 +653,316 @@ impl LseVaultClient {
     }
 }
 
+/// Mock answers in the provider's file shape, for this crate's unit tests.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+pub(crate) mod test_support {
+    use sha2::{Digest, Sha256};
+
+    /// A verified CSV answer: the body with its SHA-256, and its data row count in the
+    /// `x-export-rows` header the provider sends (which the client does not check).
+    pub(crate) fn csv_answer(body: &str) -> wiremock::ResponseTemplate {
+        let rows = body.lines().count().saturating_sub(1);
+        wiremock::ResponseTemplate::new(200)
+            .insert_header(
+                "x-checksum-sha256",
+                hex::encode(Sha256::digest(body.as_bytes())),
+            )
+            .insert_header("x-export-rows", rows.to_string())
+            .set_body_raw(body.to_owned(), "text/csv; charset=utf-8")
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use chrono::TimeZone;
 
-    fn row(ts: &str, volume: Option<Decimal>) -> LseCandleRow {
-        LseCandleRow {
-            ts: ts.to_owned(),
-            open: dec!(1),
-            high: dec!(2),
-            low: dec!(0.5),
-            close: dec!(1.5),
-            volume,
+    fn t(text: &str) -> DateTime<Utc> {
+        parse_provider_time(text).unwrap()
+    }
+
+    fn d(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, BOUND_DATE_FORMAT).unwrap()
+    }
+
+    #[test]
+    fn intraday_windows_sit_on_the_grid_even_when_the_range_does_not() {
+        // Closes in [14:30, 16:30] → opens in [13:30, 15:30] → grid [13:00, 16:00).
+        let windows = windows(
+            CandleInterval::Hour1,
+            t("2026-11-20 14:30:00"),
+            t("2026-11-20 16:30:00"),
+            50_000,
+        );
+
+        assert_eq!(
+            windows,
+            [Window::Times {
+                from: t("2026-11-20 13:00:00"),
+                to: t("2026-11-20 16:00:00"),
+            }]
+        );
+    }
+
+    #[test]
+    fn intraday_windows_split_into_chunks_of_whole_bars() {
+        let windows = windows(
+            CandleInterval::Min1,
+            t("2026-11-20 00:01:00"),
+            t("2026-11-20 00:05:00"),
+            2,
+        );
+
+        assert_eq!(
+            windows,
+            [
+                Window::Times {
+                    from: t("2026-11-20 00:00:00"),
+                    to: t("2026-11-20 00:02:00")
+                },
+                Window::Times {
+                    from: t("2026-11-20 00:02:00"),
+                    to: t("2026-11-20 00:04:00")
+                },
+                Window::Times {
+                    from: t("2026-11-20 00:04:00"),
+                    to: t("2026-11-20 00:05:00")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn four_hour_windows_sit_on_the_utc_day_grid() {
+        let [Window::Times { from, to }] = windows(
+            CandleInterval::Hour4,
+            t("2026-11-20 05:00:00"),
+            t("2026-11-20 13:00:00"),
+            50_000,
+        )[..] else {
+            panic!("one window expected");
+        };
+
+        assert_eq!(
+            (from, to),
+            (t("2026-11-20 00:00:00"), t("2026-11-20 12:00:00"))
+        );
+    }
+
+    #[test]
+    fn chunk_bars_too_many_for_a_time_delta_give_one_window() {
+        // Four hours times `i32::MAX` overflows a `TimeDelta`.
+        let [Window::Times { from, to }] = windows(
+            CandleInterval::Hour4,
+            t("2026-11-20 05:00:00"),
+            t("2026-11-22 13:00:00"),
+            u32::MAX,
+        )[..] else {
+            panic!("one window expected");
+        };
+
+        assert_eq!(
+            (from, to),
+            (t("2026-11-20 00:00:00"), t("2026-11-22 12:00:00"))
+        );
+    }
+
+    #[test]
+    fn daily_windows_are_whole_dates_widened_a_day_at_the_top() {
+        // Closes in [11-19, 11-21] → opens in [11-18, 11-20] → dates [11-18, 11-21].
+        let windows = windows(
+            CandleInterval::Day1,
+            t("2026-11-19 00:00:00"),
+            t("2026-11-21 00:00:00"),
+            50_000,
+        );
+
+        assert_eq!(
+            windows,
+            [Window::Dates {
+                from: d("2026-11-18"),
+                to: d("2026-11-21")
+            }]
+        );
+    }
+
+    #[test]
+    fn daily_windows_split_into_chunks_of_whole_dates() {
+        let windows = windows(
+            CandleInterval::Day1,
+            t("2026-11-02 00:00:00"),
+            t("2026-11-06 00:00:00"),
+            2,
+        );
+
+        assert_eq!(
+            windows,
+            [
+                Window::Dates {
+                    from: d("2026-11-01"),
+                    to: d("2026-11-02")
+                },
+                Window::Dates {
+                    from: d("2026-11-03"),
+                    to: d("2026-11-04")
+                },
+                Window::Dates {
+                    from: d("2026-11-05"),
+                    to: d("2026-11-06")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn weekly_windows_run_monday_to_sunday() {
+        // 2026-11-18 is a Wednesday.
+        let windows = windows(
+            CandleInterval::Week1,
+            t("2026-11-18 00:00:00"),
+            t("2026-11-25 00:00:00"),
+            50_000,
+        );
+
+        assert_eq!(
+            windows,
+            [Window::Dates {
+                from: d("2026-11-09"),
+                to: d("2026-11-22")
+            }]
+        );
+    }
+
+    #[test]
+    fn weekly_chunks_stay_on_mondays() {
+        let windows = windows(
+            CandleInterval::Week1,
+            t("2026-11-16 00:00:00"),
+            t("2026-12-07 00:00:00"),
+            1,
+        );
+
+        for window in &windows {
+            let Window::Dates { from, to } = window else {
+                panic!("dates expected");
+            };
+            assert_eq!(from.weekday(), chrono::Weekday::Mon, "{window:?}");
+            assert_eq!(to.weekday(), chrono::Weekday::Sun, "{window:?}");
         }
+        assert_eq!(windows.len(), 4);
     }
 
     #[test]
-    fn an_equity_row_deserializes_float_prices_and_an_integer_volume() {
-        // The measured equity *shape*: prices are JSON floats, volume a JSON integer. Both must
-        // land in `Decimal` without a custom helper.
-        //
-        // Every number here is invented — deliberately round, or obviously not a price — so no row
-        // in this repo can be mistaken for provider data, which we are not licensed to redistribute
-        // (<https://londonstrategicedge.com/terms>). Decoding is value-independent, so a synthetic
-        // row proves exactly the property a captured one would.
-        //
-        // `high` carries **15 significant digits** deliberately: that is the part under test, since
-        // a price this long must survive the `f64` the JSON number is parsed as. 15 is also the
-        // ceiling — the deserializer goes JSON float -> `f64` -> `Decimal`, so a 17-digit literal
-        // like `10.123456789012345` lands as `10.123456789012344` and would make this test assert
-        // the loss rather than the fidelity.
-        let json = r#"{"ts":"2024-01-02 00:00:00.000000","symbol":"TEST","open":10.0,
-                       "high":10.1234567890123,"low":10.0,"close":10.0,"volume":1000000}"#;
-
-        let row: LseCandleRow = serde_json::from_str(json).unwrap();
-
-        assert_eq!(row.open, dec!(10.0));
-        assert_eq!(row.high, dec!(10.1234567890123));
-        assert_eq!(row.volume, Some(dec!(1000000)));
-    }
-
-    #[test]
-    fn an_fx_row_omitting_volume_deserializes_as_none() {
-        // The measured FX shape: no `volume` key at all. This must be `None`, never `Some(0)`.
-        // Values are invented, for the reason given above.
-        let json = r#"{"ts":"2024-01-02 00:00:00.000000","symbol":"AAA/BBB","open":2.0,
-                       "high":2.0,"low":2.0,"close":2.0}"#;
-
-        let row: LseCandleRow = serde_json::from_str(json).unwrap();
-
-        assert_eq!(row.volume, None);
-    }
-
-    #[test]
-    fn timestamps_parse_as_utc() {
-        // The value carries no zone. Treating it as UTC is what makes the pre-market open land at
-        // 09:00 in winter and 08:00 in summer, i.e. 04:00 ET across the DST boundary.
-        let open = row("2024-01-02 09:09:00.000000", None).open_time().unwrap();
+    fn monthly_windows_run_from_the_first_to_the_last_day() {
+        let windows = windows(
+            CandleInterval::Month1,
+            t("2026-10-15 00:00:00"),
+            t("2026-11-15 00:00:00"),
+            50_000,
+        );
 
         assert_eq!(
-            open,
-            "2024-01-02T09:09:00Z".parse::<DateTime<Utc>>().unwrap()
+            windows,
+            [Window::Dates {
+                from: d("2026-09-01"),
+                to: d("2026-10-31")
+            }]
         );
     }
 
     #[test]
-    fn a_timestamp_without_a_fractional_part_still_parses() {
-        assert!(row("2024-01-02 09:09:00", None).open_time().is_ok());
-    }
-
-    #[test]
-    fn a_malformed_timestamp_is_a_typed_error() {
-        let error = row("not-a-timestamp", None).open_time().unwrap_err();
-
-        assert!(matches!(error, LseError::Deserialize { .. }));
-        assert!(error.to_string().contains("not-a-timestamp"));
-    }
-
-    #[test]
-    fn trade_count_is_always_none() {
-        // The vault reports no trade count for any dataset, so it must be the explicit unknown.
-        let candle = row("2024-01-02 09:09:00.000000", Some(dec!(5))).into_candle(Utc::now());
-
-        assert_eq!(candle.trade_count, None);
-    }
-
-    #[test]
-    fn a_daily_bars_close_is_the_next_midnight_not_its_own_label() {
-        // `ts` is the bar's OPEN. Passing it through as `close_time` would shift every candle in
-        // the integration by one bar.
-        let open = row("2024-01-02 00:00:00.000000", None).open_time().unwrap();
-
-        let close = close_time_from_open(open, CandleInterval::Day1.to_step()).unwrap();
+    fn a_degenerate_range_still_covers_the_bar_closing_on_it() {
+        let instant = t("2026-11-20 15:00:00");
+        let windows = windows(CandleInterval::Min1, instant, instant, 50_000);
 
         assert_eq!(
-            close,
-            "2024-01-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            windows,
+            [Window::Times {
+                from: t("2026-11-20 14:59:00"),
+                to: t("2026-11-20 15:00:00")
+            }]
         );
     }
 
     #[test]
-    fn a_monthly_bars_close_uses_calendar_arithmetic() {
-        // Measured: monthly bars are labelled on the 1st. February's length rules out a fixed step.
-        let open = row("2024-02-01 00:00:00.000000", None).open_time().unwrap();
-
-        let close = close_time_from_open(open, CandleInterval::Month1.to_step()).unwrap();
+    fn floor_to_grid_handles_instants_before_the_epoch() {
+        let before = Utc.with_ymd_and_hms(1969, 12, 31, 23, 30, 0).unwrap();
 
         assert_eq!(
-            close,
-            "2024-03-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            floor_to_grid(before, TimeDelta::hours(1)).unwrap(),
+            Utc.with_ymd_and_hms(1969, 12, 31, 23, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_candle_csv_decodes_with_volume_and_trades() {
+        let body = b"time,open,high,low,close,volume,trades\n\
+            2026-11-20 15:00:00,348.34,349.1,347.9,348.5,873,42\n";
+
+        let rows = candle_rows(body).unwrap();
+
+        assert_eq!(
+            rows,
+            [CandleRow {
+                open_time: t("2026-11-20 15:00:00"),
+                session: None,
+                open: Decimal::from_str("348.34").unwrap(),
+                high: Decimal::from_str("349.1").unwrap(),
+                low: Decimal::from_str("347.9").unwrap(),
+                close: Decimal::from_str("348.5").unwrap(),
+                volume: Some(Decimal::from(873)),
+                trades: Some(42),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_daily_candle_carries_its_session_date_and_a_fractional_adjusted_volume() {
+        let body = b"time,open,high,low,close,volume,trades,date\n\
+            2026-11-17 22:04:00,1.1,1.2,1.0,1.15,12.5,3,2026-11-18\n";
+
+        let rows = candle_rows(body).unwrap();
+
+        assert_eq!(rows[0].session, Some(d("2026-11-18")));
+        assert_eq!(rows[0].volume, Some(Decimal::from_str("12.5").unwrap()));
+    }
+
+    #[test]
+    fn an_empty_or_null_volume_is_none() {
+        let body = b"time,open,high,low,close,volume,trades\n\
+            2026-11-20 15:00:00,1,1,1,1,,\\N\n";
+
+        let rows = candle_rows(body).unwrap();
+
+        assert_eq!((rows[0].volume, rows[0].trades), (None, None));
+    }
+
+    #[test]
+    fn a_missing_price_column_is_an_unsupported_schema() {
+        let body = b"time,open,high,low\n2026-11-20 15:00:00,1,1,1\n";
+
+        assert!(matches!(
+            candle_rows(body),
+            Err(LseError::UnsupportedSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn a_null_price_is_a_typed_error() {
+        let body = b"time,open,high,low,close\n2026-11-20 15:00:00,1,1,1,\\N\n";
+
+        assert!(matches!(
+            candle_rows(body),
+            Err(LseError::NullValue { column: "close" })
+        ));
+    }
+
+    #[test]
+    fn scientific_notation_is_read() {
+        assert_eq!(
+            parse_decimal("price", "1e-05").unwrap(),
+            Decimal::from_str("0.00001").unwrap()
         );
     }
 }

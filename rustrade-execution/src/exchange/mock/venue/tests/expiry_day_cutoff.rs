@@ -310,7 +310,10 @@ fn a_cutoff_before_the_close_with_no_calendar_panics_when_the_clock_first_moves(
 }
 
 #[test]
-#[should_panic(expected = "option SPY_C100 has no session calendar")]
+#[should_panic(
+    expected = "expiry-day cutoff is anchored to the session calendar, but the option SPY_C100 \
+                has no session calendar"
+)]
 fn an_option_order_whose_cutoff_has_no_calendar_panics() {
     let _ = uncalendared_venue(&before_close_config(None)).open_order(option_request(
         Side::Buy,

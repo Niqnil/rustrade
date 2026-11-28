@@ -5,10 +5,11 @@
 //! # ⚠️ Licensing — the data is NOT redistributable
 //!
 //! This example's **code** is MIT-licensed like the rest of this repository. **The data it
-//! retrieves is not.** London Strategic Edge permits use for your own research, trading and model
-//! training — including commercially — but **prohibits redistributing, reselling, or otherwise
-//! making the data available to third parties**, in bulk or through any competing feed, download
-//! service or interface. Terms: <https://londonstrategicedge.com/terms>
+//! retrieves is not.** The provider's licence allows an account's data for its holder's own
+//! personal use: their own research, trading and models. Supplying it to anyone else, in any form,
+//! or running a product or service on it needs the provider's licence, and so does any use by or
+//! for an organisation. Licence: <https://londonstrategicedge.com/licence>; terms:
+//! <https://londonstrategicedge.com/terms>.
 //!
 //! In practice: do not commit what this prints to a public repository, do not publish it as
 //! fixtures or an example dataset, and do not re-serve it.
@@ -53,7 +54,7 @@ use chrono::{Datelike, Duration, NaiveTime, Utc, Weekday};
 use futures::StreamExt;
 use rustrade_data::{
     exchange::lse::{
-        LseOptions, live::LseSubscriber, options::LseOptionContract, vault::LseVaultClient,
+        LseOptions, client::LseClient, live::LseSubscriber, options::LseOptionContract,
     },
     streams::{Streams, reconnect::stream::ReconnectingStream},
     subscription::{Subscription, trade::PublicTrades},
@@ -75,10 +76,10 @@ const RUN_FOR: std::time::Duration = std::time::Duration::from_secs(75);
 async fn main() {
     init_logging();
 
-    let vault = LseVaultClient::from_env()
-        .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data");
+    let client = LseClient::from_env()
+        .expect("set LSE_API_KEY - get a key at https://londonstrategicedge.com/data");
 
-    let contracts = busiest_spy_contracts(&vault, 10).await;
+    let contracts = busiest_spy_contracts(&client, 10).await;
     for contract in &contracts {
         info!(ticker = %contract.ticker, "registering");
     }
@@ -131,10 +132,10 @@ fn instrument(contract: &LseOptionContract) -> MarketDataInstrument {
 
 /// The `count` SPY contracts that printed most in the last settled minute, or — with the market
 /// shut — in a minute of the previous weekday's session.
-async fn busiest_spy_contracts(vault: &LseVaultClient, count: usize) -> Vec<LseOptionContract> {
+async fn busiest_spy_contracts(client: &LseClient, count: usize) -> Vec<LseOptionContract> {
     // A range ending within a minute of now is refused: the provider can serve it incomplete.
     let end = Utc::now() - Duration::seconds(90);
-    let mut prints = vault
+    let mut prints = client
         .collect_option_flow(Some("SPY"), end - Duration::minutes(1), end)
         .await
         .expect("option flow");
@@ -150,7 +151,7 @@ async fn busiest_spy_contracts(vault: &LseVaultClient, count: usize) -> Vec<LseO
             .and_time(NaiveTime::from_hms_opt(15, 0, 0).unwrap())
             .and_utc();
 
-        prints = vault
+        prints = client
             .collect_option_flow(Some("SPY"), start, start + Duration::minutes(1))
             .await
             .expect("option flow");

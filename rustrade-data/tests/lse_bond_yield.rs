@@ -218,6 +218,7 @@ async fn a_count_that_disagrees_with_the_rows_delivered_is_an_error() {
         LseError::Api {
             status,
             ref message,
+            ..
         } => {
             assert_eq!(status, 200);
             assert!(message.contains("5000"), "{message}");
@@ -303,7 +304,9 @@ async fn a_provider_error_is_reported_with_its_status_and_detail() {
         .await
         .unwrap_err()
     {
-        LseError::Api { status, message } => {
+        LseError::Api {
+            status, message, ..
+        } => {
             assert_eq!(status, 503);
             assert!(message.contains("upstream unavailable"), "{message}");
         }
@@ -335,7 +338,7 @@ async fn a_rate_limit_is_typed_and_carries_its_retry_after() {
         .await
         .unwrap_err()
     {
-        LseError::RateLimited { retry_after } => {
+        LseError::RateLimited { retry_after, .. } => {
             assert_eq!(retry_after, Some(Duration::from_secs(42)));
         }
         other => panic!("expected RateLimited, got {other}"),
