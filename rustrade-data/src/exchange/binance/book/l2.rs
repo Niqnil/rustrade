@@ -71,12 +71,13 @@ pub struct BinanceOrderBookL2Snapshot {
 /// [`SocketError::HttpTimeout`].
 pub const HTTP_BOOK_L2_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Fetch one [`BinanceOrderBookL2Snapshot`] from `url`, giving up after `timeout`.
+/// Fetch one [`BinanceOrderBookL2Snapshot`] from `url` with `client`, giving up after `timeout`.
 pub(crate) async fn fetch_l2_snapshot(
+    client: &reqwest::Client,
     url: &str,
     timeout: Duration,
 ) -> Result<BinanceOrderBookL2Snapshot, SocketError> {
-    reqwest::Client::new()
+    client
         .get(url)
         .timeout(timeout)
         .send()
@@ -299,7 +300,7 @@ mod tests {
         use super::*;
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
+            matchers::{header, method, path},
         };
 
         const BODY: &str = r#"{"lastUpdateId":7,"bids":[["4.0","43.0"]],"asks":[["4.1","12.0"]]}"#;
@@ -323,6 +324,7 @@ mod tests {
             let server = server(Duration::from_secs(5)).await;
 
             let result = fetch_l2_snapshot(
+                &reqwest::Client::new(),
                 &format!("{}/depth", server.uri()),
                 Duration::from_millis(200),
             )
@@ -338,10 +340,43 @@ mod tests {
         async fn a_snapshot_within_the_timeout_is_returned() {
             let server = server(Duration::ZERO).await;
 
-            let snapshot =
-                fetch_l2_snapshot(&format!("{}/depth", server.uri()), Duration::from_secs(10))
-                    .await
-                    .unwrap();
+            let snapshot = fetch_l2_snapshot(
+                &reqwest::Client::new(),
+                &format!("{}/depth", server.uri()),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(snapshot.last_update_id, 7);
+        }
+
+        #[tokio::test]
+        async fn the_snapshot_is_fetched_with_the_given_client() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/depth"))
+                .and(header("x-client", "given"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(BODY, "application/json"))
+                .mount(&server)
+                .await;
+            // Only this client sends the header the mock answers; any other client gets a 404.
+            let headers = reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::HeaderName::from_static("x-client"),
+                reqwest::header::HeaderValue::from_static("given"),
+            )]);
+            let client = reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap();
+
+            let snapshot = fetch_l2_snapshot(
+                &client,
+                &format!("{}/depth", server.uri()),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(snapshot.last_update_id, 7);
         }

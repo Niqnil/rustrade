@@ -46,7 +46,11 @@ impl SnapshotFetcher<BinanceSpot, OrderBooksL2> for BinanceSpotOrderBooksL2Snaps
         Instrument: InstrumentData,
         Subscription<BinanceSpot, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
     {
+        // One client for every snapshot of this initialisation, so they share its connection pool
+        // and TLS setup; each future holds a clone, which shares them too.
+        let client = reqwest::Client::new();
         let l2_snapshot_futures = subscriptions.iter().map(|subscription| {
+            let client = client.clone();
             // Construct initial OrderBook snapshot GET url
             let market = subscription.id();
             let snapshot_url = format!(
@@ -57,7 +61,8 @@ impl SnapshotFetcher<BinanceSpot, OrderBooksL2> for BinanceSpotOrderBooksL2Snaps
             async move {
                 // Fetch initial OrderBook snapshot via HTTP
                 let snapshot =
-                    fetch_l2_snapshot(&snapshot_url, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT).await?;
+                    fetch_l2_snapshot(&client, &snapshot_url, HTTP_BOOK_L2_SNAPSHOT_TIMEOUT)
+                        .await?;
 
                 Ok(MarketEvent::from((
                     ExchangeId::BinanceSpot,
