@@ -1197,6 +1197,10 @@ struct AlpacaOrderWs<'a> {
 /// Either most likely means a wrong base URL or something between the client and Alpaca, so it is
 /// not read as an order or listing that does not exist.
 ///
+/// A cancel follows the same rule: Alpaca's not-found answer fails it with
+/// [`ApiError::OrderRejected`] saying the order was not found, and any other 404 with
+/// [`ApiError::RequestRejected`] as above.
+///
 /// # Instrument lookups
 /// Names match Alpaca's symbols ignoring case, and what a read finds is reported under Alpaca's
 /// symbol. Before [`account_snapshot`](ExecutionClient::account_snapshot),
@@ -1754,7 +1758,9 @@ where
 
 /// Execute a DELETE request, returning an order error on rejection.
 ///
-/// Handles 204 No Content (success) and other 4xx (API rejection, see [`parse_api_error`]). It
+/// Handles 204 No Content (success) and other 4xx (API rejection, see [`parse_api_error`]). A 404
+/// is read as the order not found only when it is Alpaca's not-found answer (see
+/// [`AlpacaApiError::is_not_found`]); any other is refused as [`not_found_refusal`] says. It
 /// waits and retries, and refuses a redirect, as [`send_rate_limited`] says.
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
@@ -1784,6 +1790,12 @@ async fn rest_delete_with_retry(
         )
         .unwrap_or_default();
     let api_err = AlpacaApiError::from_body(&bytes);
+
+    // As in `rest_request`: only Alpaca's own not-found answer says it knows no such order. Any
+    // other 404 more likely means a wrong base URL, and must not read as an order already gone.
+    if status == reqwest::StatusCode::NOT_FOUND && !api_err.is_not_found() {
+        return Err(UnindexedOrderError::Rejected(not_found_refusal(&api_err)));
+    }
 
     Err(parse_order_error(status, api_err.code, &api_err.message))
 }
@@ -11015,6 +11027,59 @@ mod tests {
                 let message =
                     rejected(fetch(ResponseTemplate::new(404).set_body_string("Not Found")).await);
                 assert!(message.contains("check the base URL"), "{message}");
+            }
+
+            /// A cancel reads only Alpaca's not-found answer as the order not found, and refuses
+            /// any other 404, so a wrong base URL never reads as an order already gone.
+            #[tokio::test]
+            async fn a_cancel_tells_the_two_404s_apart() {
+                async fn cancel(answer: ResponseTemplate) -> UnindexedOrderError {
+                    let server = MockServer::start().await;
+                    Mock::given(method("DELETE"))
+                        .and(path("/v2/orders/abc"))
+                        .respond_with(answer)
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let http = reqwest::Client::new();
+                    let url = format!("{}/v2/orders/abc", server.uri());
+                    rest_delete_with_retry(&RateLimitTracker::new(), || http.delete(&url))
+                        .await
+                        .unwrap_err()
+                }
+
+                let error = cancel(answer(Some(40410000), "order not found")).await;
+                assert!(
+                    matches!(
+                        &error,
+                        OrderError::Rejected(ApiError::OrderRejected(message))
+                            if message.contains("order not found")
+                    ),
+                    "{error:?}"
+                );
+
+                for (response, shown) in [
+                    (
+                        ResponseTemplate::new(404).set_body_string("Not Found"),
+                        "(Not Found)",
+                    ),
+                    (answer(None, "order not found"), "(order not found)"),
+                    (
+                        answer(Some(40410000), "endpoint not found"),
+                        "(40410000 endpoint not found)",
+                    ),
+                ] {
+                    let error = cancel(response).await;
+                    assert!(
+                        matches!(
+                            &error,
+                            OrderError::Rejected(ApiError::RequestRejected(message))
+                                if message.contains(shown)
+                                    && message.contains("check the base URL")
+                        ),
+                        "{shown}: {error:?}"
+                    );
+                }
             }
         }
 
