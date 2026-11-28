@@ -1866,8 +1866,8 @@ impl IbkrClient {
     /// This closes the TCP connection, even while other clones of this client ([`IbkrClient`]
     /// implements [`Clone`] and shares one connection) or their subscriptions are still alive.
     /// TWS/Gateway frees the API client ID once it has processed the close, which can take a
-    /// moment: [`connect_sync`](Self::connect_sync) under the same ID right after this call may be
-    /// refused with IB error 326 ("client id is already in use"), and succeeds on a retry. The
+    /// moment: [`connect_sync`](Self::connect_sync) under the same ID right after this call may fail
+    /// with [`IbkrConnectError::ClientIdInUse`] (IB error 326), and succeeds on a retry. The
     /// clones need not be dropped first. A clone that outlives the call is shut down, not
     /// reconnected.
     ///
