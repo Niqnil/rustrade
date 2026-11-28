@@ -51,6 +51,8 @@ pub(super) struct LegsAnswer {
     results: Option<LegResults>,
 }
 
+// `redirect` keeps its default `None`: `read` refuses an answer with a redirect before decoding
+// its legs.
 impl RestAnswer for LegsAnswer {
     fn rate_limits(&self) -> &[RestApiRateLimit] {
         &self.rate_limits
@@ -58,11 +60,6 @@ impl RestAnswer for LegsAnswer {
 
     fn headers(&self) -> &HashMap<String, String> {
         &self.headers
-    }
-
-    /// `None`: [`read`](Self::read) refuses an answer with a redirect before decoding its legs.
-    fn status(&self) -> Option<u16> {
-        None
     }
 }
 

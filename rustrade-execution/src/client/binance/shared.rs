@@ -1329,17 +1329,24 @@ pub(crate) struct CooldownActive {
 pub(crate) struct RedirectRefused {
     /// The answer's HTTP status.
     pub(crate) status: u16,
-    /// Where the answer redirected to, from its `Location` header.
+    /// Where the answer redirected to, from its `Location` header, cut to its first
+    /// [`MAX_LOCATION_CHARS`](Self::MAX_LOCATION_CHARS) characters.
     pub(crate) location: Option<String>,
 }
 
 impl RedirectRefused {
+    /// The most characters of the `Location` header kept, so whatever answered cannot put text of
+    /// any length into the error and the logs.
+    pub(crate) const MAX_LOCATION_CHARS: usize = 256;
+
     /// The refusal of an answer with HTTP `status` and `headers` (named in lowercase, as the SDK
     /// keys them), when `status` is a redirect.
     pub(crate) fn of(status: u16, headers: &HashMap<String, String>) -> Option<Self> {
         (300..400).contains(&status).then(|| Self {
             status,
-            location: headers.get("location").cloned(),
+            location: headers
+                .get("location")
+                .map(|to| to.chars().take(Self::MAX_LOCATION_CHARS).collect()),
         })
     }
 }
@@ -1352,6 +1359,10 @@ impl RedirectRefused {
 /// `X-MBX-APIKEY`, so the API key would go to whatever host the redirect named; and a 301 or 302
 /// turns a `POST` into a `GET`. With redirects refused, the SDK hands back the 3xx answer itself,
 /// which [`rest_call_with_retry`] reports as [`RedirectRefused`].
+///
+/// The SDK returns that answer as an ordinary response, so every REST read must check it before
+/// decoding the body: through [`rest_call_with_retry`] (by [`RestAnswer::redirect`]), or with
+/// [`RedirectRefused::of`] where a read decodes the SDK's response itself.
 pub(crate) fn refusing_redirects() -> HttpAgent {
     HttpAgent(Arc::new(|builder| {
         builder.redirect(reqwest012::redirect::Policy::none())
@@ -1388,6 +1399,12 @@ fn wait_until_epoch_ms(until_ms: i64, now_ms: u128) -> Duration {
 /// -1015 (IP rate-limit ban), and a WAF 403 (`ConnectorError::ForbiddenError` without an auth
 /// code or wording). All warrant the same backoff response.
 pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
+    // A refused redirect is never a rate limit, whatever its `Location` says: reading the texts
+    // below in it would resend a request the venue did not act on. (anyhow's downcast also sees
+    // through added context.)
+    if e.is::<RedirectRefused>() {
+        return false;
+    }
     // A WAF 403 carries none of the texts below; recognise it by type so it is backed off too.
     if let Some(ConnectorError::ForbiddenError { msg, code, .. }) =
         e.downcast_ref::<ConnectorError>()
@@ -3970,9 +3987,11 @@ pub(crate) trait RestAnswer {
     fn rate_limits(&self) -> &[RestApiRateLimit];
     /// The answer's headers, named in lowercase.
     fn headers(&self) -> &HashMap<String, String>;
-    /// The answer's HTTP status, or `None` when it was read from the SDK's error, which carries
-    /// none. The SDK returns every 4xx and 5xx as an error, so a status here is a 2xx or a 3xx.
-    fn status(&self) -> Option<u16>;
+    /// The refusal of this answer when it is a redirect (an HTTP 3xx). `None` by default, for an
+    /// answer that carries no status of its own or has already been checked.
+    fn redirect(&self) -> Option<RedirectRefused> {
+        None
+    }
 }
 
 impl<D> RestAnswer for RestApiResponse<D> {
@@ -3984,8 +4003,9 @@ impl<D> RestAnswer for RestApiResponse<D> {
         &self.headers
     }
 
-    fn status(&self) -> Option<u16> {
-        Some(self.status)
+    /// The SDK returns every 4xx and 5xx as an error, so a status here is a 2xx or a 3xx.
+    fn redirect(&self) -> Option<RedirectRefused> {
+        RedirectRefused::of(self.status, &self.headers)
     }
 }
 
@@ -4037,10 +4057,7 @@ where
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
-                if let Some(redirect) = response
-                    .status()
-                    .and_then(|status| RedirectRefused::of(status, response.headers()))
-                {
+                if let Some(redirect) = response.redirect() {
                     return Err(redirect.into());
                 }
                 return Ok((response, sent));
@@ -4704,6 +4721,47 @@ mod tests {
                 .contains("HTTP 399, a redirect to https://elsewhere/x, which"),
             "{named}"
         );
+    }
+
+    /// Whatever answered with a redirect cannot put text of any length into the error: the
+    /// `Location` is cut by characters, so a multi-byte one is not split mid-character.
+    #[test]
+    fn a_redirect_keeps_a_bounded_location() {
+        let max = RedirectRefused::MAX_LOCATION_CHARS;
+        let at_max = "é".repeat(max);
+        let to = HashMap::from([("location".to_owned(), format!("{at_max}x"))]);
+        assert_eq!(
+            RedirectRefused::of(302, &to).unwrap().location,
+            Some(at_max.clone())
+        );
+        let to = HashMap::from([("location".to_owned(), at_max.clone())]);
+        assert_eq!(
+            RedirectRefused::of(302, &to).unwrap().location,
+            Some(at_max)
+        );
+    }
+
+    /// A refused redirect is not read as a rate limit, even when its `Location` holds Binance's
+    /// throttle texts or codes, and even under added context: it would be retried otherwise.
+    #[test]
+    fn a_redirect_is_never_a_rate_limit() {
+        for to in [
+            "https://x/Too many requests",
+            "https://x/?code=-1003",
+            "https://x/-1015",
+        ] {
+            let to = HashMap::from([("location".to_owned(), to.to_owned())]);
+            let refused = RedirectRefused::of(307, &to).unwrap();
+            assert!(!is_rate_limit_error(&refused.clone().into()), "{refused}");
+            let wrapped = anyhow::Error::from(refused.clone()).context("cancel-replace");
+            assert!(!is_rate_limit_error(&wrapped), "{refused}");
+            // The same text outside a refused redirect is a rate limit, so the check above is what
+            // keeps the refusal out.
+            assert!(
+                is_rate_limit_error(&anyhow::anyhow!("{refused}")),
+                "{refused}"
+            );
+        }
     }
 
     /// A REST answer with a redirect is not followed, so the API key goes to no other host. It is
