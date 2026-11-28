@@ -7,8 +7,8 @@ use crate::{
     streams::{
         reconnect,
         reconnect::stream::{
-            ReconnectingStream, ReconnectionBackoffPolicy, ReinitFailure, end_on_silence,
-            init_reconnecting_stream, terminate_on_error,
+            DEFAULT_BACKOFF_JITTER_PERCENT, ReconnectingStream, ReconnectionBackoffPolicy,
+            ReinitFailure, end_on_silence, init_reconnecting_stream, terminate_on_error,
         },
     },
     subscription::{Subscription, SubscriptionKind, display_subscriptions_without_exchange},
@@ -26,6 +26,7 @@ pub const STREAM_RECONNECTION_POLICY: ReconnectionBackoffPolicy = ReconnectionBa
     backoff_ms_initial: 125,
     backoff_multiplier: 2,
     backoff_ms_max: 60000,
+    backoff_jitter_percent: DEFAULT_BACKOFF_JITTER_PERCENT,
 };
 
 /// Default [`MarketStreamOptions::init_timeout`]: how long one attempt to initialise a market
@@ -384,6 +385,7 @@ mod tests {
         backoff_ms_initial: 1,
         backoff_multiplier: 2,
         backoff_ms_max: 10,
+        backoff_jitter_percent: 0,
     };
 
     type Item = Result<u8, DataError>;
