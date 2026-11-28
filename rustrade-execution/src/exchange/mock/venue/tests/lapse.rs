@@ -488,9 +488,7 @@ fn a_deadline_at_a_local_time_moves_to_its_early_close_time_on_an_early_close_da
         early_close: Some(at(14, 30)),
     };
     let regular = new_york_close();
-    let SessionCalendarConfig::Daily(close) = new_york_close() else {
-        unreachable!("a daily close")
-    };
+    let SessionCalendarConfig::Daily(close) = new_york_close();
     let early = SessionCalendarConfig::Daily(
         close
             .with_dates(
