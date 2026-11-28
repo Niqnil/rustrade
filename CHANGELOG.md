@@ -850,6 +850,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: a refused IB client ID has its own error when `IbkrClient` connects**
+  (`rustrade-execution`, `ibkr` feature). When TWS/Gateway refuses the connection because another
+  connection holds the client ID (IB code 326), `IbkrClient::connect_sync` and
+  `connect_sync_lenient` now return the new `IbkrConnectError::ClientIdInUse { client_id }` instead
+  of a `ConnectivityError::Socket` string, so a caller can tell it from an unreachable host without
+  matching text. `connect_sync_lenient` now returns `IbkrConnectError` instead of
+  `UnindexedClientError` (never its `Contracts` variant). Any other connect failure stays
+  `IbkrConnectError::Connect`, its socket message now prefixed `IB connect:`. TWS/Gateway can hold
+  an ID briefly after its connection closes, so connecting again after a backoff can succeed; a
+  refusal that persists means the ID is shared with another connection. The library does not
+  retry.
 - **Breaking: London Strategic Edge history moves to `LseClient` on LSE Data 3.0**
   (`rustrade-data`, `lse`). The data is not redistributable and an organisation needs the
   provider's licence (<https://londonstrategicedge.com/licence>).
@@ -1550,9 +1561,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saying the URL was wrong. Now only Alpaca's not-found answer (code `40410000`) counts. Any
   other 404 fails the request with `ApiError::RequestRejected`, naming the answer: one without
   that code, and one worded "endpoint not found", which Alpaca sends for a path it serves nothing
-  under. Other requests that met such a 404 reported `ApiError::OrderRejected("order not found:
-  …")`, and a do-not-exercise `ExerciseRefusal::Other`; both now report the same
-  `RequestRejected`.
+  under. Other requests that met such a 404, cancels among them, reported
+  `ApiError::OrderRejected("order not found: …")`, and a do-not-exercise
+  `ExerciseRefusal::Other`; both now report the same `RequestRejected`. A cancel Alpaca answers
+  with its not-found answer still reports `OrderRejected("order not found: …")`.
 
 - **A failed market stream initialisation no longer leaves tasks running** (`rustrade-data`). On
   an exchange with application-level pings, an initialisation that failed after subscribing left
