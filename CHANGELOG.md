@@ -850,6 +850,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: a refused IB client ID has its own error when `IbkrClient` connects**
+  (`rustrade-execution`, `ibkr` feature). When TWS/Gateway refuses the connection because another
+  connection holds the client ID (IB code 326), `IbkrClient::connect_sync` and
+  `connect_sync_lenient` now return the new `IbkrConnectError::ClientIdInUse { client_id }` instead
+  of a `ConnectivityError::Socket` string, so a caller can tell it from an unreachable host without
+  matching text. `connect_sync_lenient` now returns `IbkrConnectError` instead of
+  `UnindexedClientError` (never its `Contracts` variant). Any other connect failure stays
+  `IbkrConnectError::Connect`, its socket message now prefixed `IB connect:`. TWS/Gateway can hold
+  an ID briefly after its connection closes, so connecting again after a backoff can succeed; a
+  refusal that persists means the ID is shared with another connection. The library does not
+  retry.
 - **Breaking: London Strategic Edge history moves to `LseClient` on LSE Data 3.0**
   (`rustrade-data`, `lse`). The data is not redistributable and an organisation needs the
   provider's licence (<https://londonstrategicedge.com/licence>).

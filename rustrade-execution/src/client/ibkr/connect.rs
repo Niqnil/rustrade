@@ -1,12 +1,13 @@
 //! What [`IbkrClient::connect_sync`](super::IbkrClient::connect_sync) and
 //! [`IbkrClient::connect_sync_lenient`](super::IbkrClient::connect_sync_lenient) report about
-//! the contracts listed in [`IbkrConfig::contracts`](super::IbkrConfig::contracts).
+//! the connection, and about the contracts listed in
+//! [`IbkrConfig::contracts`](super::IbkrConfig::contracts).
 
 use super::{
     ContractConfig, IbkrClient,
     contract::{ContractConfigError, ResolveContractError},
 };
-use crate::error::UnindexedClientError;
+use crate::error::{ConnectivityError, UnindexedClientError};
 use itertools::Itertools;
 use rustrade_instrument::{
     ibkr::{ContractRegistry, ContractRegistryError},
@@ -15,14 +16,28 @@ use rustrade_instrument::{
 use thiserror::Error;
 use tracing::{debug, warn};
 
-/// Why [`IbkrClient::connect_sync`](super::IbkrClient::connect_sync) failed.
+/// Why [`IbkrClient::connect_sync`](super::IbkrClient::connect_sync) or
+/// [`IbkrClient::connect_sync_lenient`](super::IbkrClient::connect_sync_lenient) failed.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum IbkrConnectError {
-    /// TWS/Gateway could not be reached, or refused the connection, such as for a client ID
-    /// already in use.
+    /// TWS/Gateway could not be reached, or refused the connection for a reason other than
+    /// [`ClientIdInUse`](Self::ClientIdInUse).
     #[error(transparent)]
     Connect(#[from] UnindexedClientError),
+
+    /// TWS/Gateway refused the connection because another connection holds `client_id` (IB
+    /// code 326).
+    ///
+    /// TWS/Gateway can go on holding a client ID for a moment after the connection that held it
+    /// has closed, so connecting again after a backoff can succeed once it lets the ID go. A
+    /// refusal that persists means another connection, in this process or another, is using the
+    /// same client ID: give each IB connection its own. The library does not retry.
+    #[error("IB refused the connection: client ID {client_id} is already in use")]
+    ClientIdInUse {
+        /// The refused client ID, [`IbkrConfig::client_id`](super::IbkrConfig::client_id).
+        client_id: i32,
+    },
 
     /// The connection succeeded, but at least one contract in
     /// [`IbkrConfig::contracts`](super::IbkrConfig::contracts) could not be registered. Every
@@ -34,6 +49,19 @@ pub enum IbkrConnectError {
         .0.iter().format("; ")
     )]
     Contracts(Vec<SkippedContract>),
+}
+
+/// The connect error for an `ibapi` error that failed the connection:
+/// [`IbkrConnectError::ClientIdInUse`] for TWS/Gateway's client ID refusal, else
+/// [`IbkrConnectError::Connect`] with [`ConnectivityError::Socket`], `"IB connect: {error}"`.
+pub(super) fn connect_error(error: ibapi::Error) -> IbkrConnectError {
+    match error {
+        ibapi::Error::ClientIdInUse { client_id } => IbkrConnectError::ClientIdInUse { client_id },
+        other => UnindexedClientError::Connectivity(ConnectivityError::Socket(format!(
+            "IB connect: {other}"
+        )))
+        .into(),
+    }
 }
 
 /// The result of [`IbkrClient::connect_sync_lenient`](super::IbkrClient::connect_sync_lenient):
@@ -158,8 +186,35 @@ pub(super) fn register_configured(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics are the correct failure mode
 mod tests {
     use super::*;
-    use crate::error::ConnectivityError;
     use ibapi::contracts::Contract;
+
+    /// TWS/Gateway's client ID refusal is its own error, so a caller can tell it from an
+    /// unreachable host without reading the text.
+    #[test]
+    fn a_client_id_refusal_is_its_own_error() {
+        let refused = connect_error(ibapi::Error::ClientIdInUse { client_id: 7 });
+        assert_eq!(refused, IbkrConnectError::ClientIdInUse { client_id: 7 });
+        assert_eq!(
+            refused.to_string(),
+            "IB refused the connection: client ID 7 is already in use"
+        );
+    }
+
+    /// Any other connect failure stays a socket error, naming the connect and `ibapi`'s error.
+    #[test]
+    fn another_connect_failure_is_a_socket_error() {
+        let failed = connect_error(ibapi::Error::ConnectionFailed);
+        let IbkrConnectError::Connect(UnindexedClientError::Connectivity(
+            ConnectivityError::Socket(message),
+        )) = &failed
+        else {
+            panic!("expected a socket error, got {failed:?}");
+        };
+        assert_eq!(
+            message,
+            &format!("IB connect: {}", ibapi::Error::ConnectionFailed)
+        );
+    }
 
     fn config(name: &str, security_type: &str) -> ContractConfig {
         ContractConfig {
