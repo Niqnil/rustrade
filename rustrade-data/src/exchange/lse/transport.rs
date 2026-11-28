@@ -1,14 +1,10 @@
-//! Authenticated, rationed REST transport shared by the London Strategic Edge REST clients.
-//! Internal: the clients are the public surface.
+//! Authenticated, rationed REST transport behind [`LseClient`](super::client::LseClient).
+//! Internal: the client is the public surface.
 //!
-//! [`LseHttpCore`] holds what every client shares: the `x-api-key` header, the `LSE_API_KEY`
-//! variable behind it, the `User-Agent` the provider's CDN demands, the redirect policy that keeps
-//! the key off a server-supplied host, the request rationing, the mapping from a non-success status
-//! to an [`LseError`], and the verified download of a file answer.
-//!
-//! [`LseClient`](super::client::LseClient) wraps one for LSE Data 3.0
-//! (`https://download.londonstrategicedge.com/v3`). The pre-3.0 clients still wrap one each until
-//! they are removed.
+//! [`LseHttpCore`] holds the `x-api-key` header, the `LSE_API_KEY` variable behind it, the
+//! `User-Agent` the provider's CDN demands, the redirect policy that keeps the key off a
+//! server-supplied host, the request rationing, the mapping from a non-success status to an
+//! [`LseError`], and the verified download of a file answer.
 //!
 //! # ⚠️ One core is one ration pool
 //!
@@ -22,26 +18,26 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 use std::{env, sync::Arc, time::Duration};
 use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
     sync::{Mutex, Semaphore, SemaphorePermit},
     time::{Instant, sleep_until},
 };
 use tracing::debug;
 
-/// Header carrying the API key. Identical on every host.
+/// Header carrying the API key.
 const API_KEY_HEADER: &str = "x-api-key";
 
 /// Environment variable read by [`LseHttpCore::from_env`].
 ///
-/// One key authenticates every host, so every client reads this same variable.
+/// One key authenticates every surface, the websocket included, so all of them read this variable.
 pub(crate) const API_KEY_ENV: &str = "LSE_API_KEY";
 
 /// Total deadline for a JSON request: connect, send, and read the whole body.
 ///
 /// Sound for the JSON endpoints, whose bodies are a page of rows at most. It is **not** sound for
-/// a file answer, which is why [`get_file`](LseHttpCore::get_file) and
-/// [`download_export`](super::export) override it per request —
-/// `reqwest` applies this as a total deadline "from when the request starts connecting until the
-/// response body has finished", so a multi-gigabyte transfer would abort mid-body however healthy
+/// a file answer, which is why [`get_file_into`](LseHttpCore::get_file_into) overrides it per
+/// request — `reqwest` applies this as a total deadline "from when the request starts connecting
+/// until the response body has finished", so a large transfer would abort mid-body however healthy
 /// the connection.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -51,13 +47,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// transfer time — the correct tool for a body whose length is not known up front.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `User-Agent` sent on every request to either host.
+/// `User-Agent` sent on every request.
 ///
-/// Set explicitly because both hosts sit behind a CDN that rejects some agents outright —
-/// measured: a request carrying `Python-urllib`'s default agent receives `403` with
-/// `error code: 1010` from **both** `api.londonstrategicedge.com` and
-/// `data-api.londonstrategicedge.com`, never reaching the API. `reqwest` sends no `User-Agent` by
-/// default, which leaves that outcome to the CDN's discretion rather than to anything this crate
+/// Set explicitly because the provider's hosts have sat behind a CDN that rejects some agents
+/// outright — measured on its earlier hosts: a request carrying `Python-urllib`'s default agent
+/// received `403` with `error code: 1010`, never reaching the API. `reqwest` sends no `User-Agent`
+/// by default, which leaves that outcome to the CDN's discretion rather than to anything this crate
 /// controls. An edge rejection is also invisible to the provider's allowance accounting, so it
 /// fails in a way that looks nothing like an API error.
 const USER_AGENT: &str = concat!("rustrade-data/", env!("CARGO_PKG_VERSION"));
@@ -79,13 +74,42 @@ pub(crate) const DEFAULT_CONCURRENCY: usize = 1;
 
 /// Total deadline for a file download: connect, send, and read the whole body.
 ///
-/// Far above any chunk this integration requests by default (a few megabytes), and bounded so a
-/// trickling transfer cannot hold the key's single download slot indefinitely. A *stalled* transfer
-/// is caught much sooner by [`READ_TIMEOUT`].
+/// The provider caps one export at 2,500,000 rows, a few tens of megabytes as Parquet and a few
+/// hundred as CSV, so ten minutes leaves room for a slow link while bounding how long a trickling
+/// transfer can hold the key's single download slot. A *stalled* transfer is caught much sooner by
+/// [`READ_TIMEOUT`].
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Header carrying the SHA-256 of a file answer, as lowercase hex.
+/// Header carrying the SHA-256 of a file answer, as hex.
 const CHECKSUM_HEADER: &str = "x-checksum-sha256";
+
+/// Header carrying the rows the provider charged an export against the plan.
+const ROWS_HEADER: &str = "x-export-rows";
+
+/// Header carrying the provider's own identifier for an export, for a support request.
+const EXPORT_ID_HEADER: &str = "x-export-id";
+
+/// Header saying whether an export's prices are adjusted for splits (`1`) or as published (`0`).
+const ADJUSTED_HEADER: &str = "x-lse3-adjusted";
+
+/// What the provider's headers said about a verified file answer.
+///
+/// Built only after every byte has arrived and matched the declared length and SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileHead {
+    /// The body's length in bytes, as received and declared.
+    pub(crate) bytes: u64,
+    /// The body's SHA-256, lowercase hex, as received and declared.
+    pub(crate) sha256: String,
+    /// `x-export-rows`: the rows charged, which for aggregated candles is not the file's row count.
+    pub(crate) rows_charged: Option<u64>,
+    /// `x-export-id`.
+    pub(crate) export_id: Option<String>,
+    /// The `filename` of `Content-Disposition`.
+    pub(crate) file_name: Option<String>,
+    /// `x-lse3-adjusted`, read as a boolean.
+    pub(crate) adjusted: Option<bool>,
+}
 
 /// Shared gate every request passes through: bounds concurrency, then spaces request starts.
 ///
@@ -158,11 +182,11 @@ impl RequestGate {
     }
 }
 
-/// Authenticated, rationed transport against one London Strategic Edge host.
+/// Authenticated, rationed transport against the London Strategic Edge REST host.
 ///
 /// Holds one configured [`reqwest::Client`] (auth header, agent, timeouts, redirect policy), the
-/// host's base URL, and the [gate](RequestGate) that rations requests. Host clients wrap one of
-/// these; see the [module documentation](self) for what is shared and what is not.
+/// base URL, and the [gate](RequestGate) that rations requests. See the
+/// [module documentation](self) for what clones share and what separately built cores do not.
 #[derive(Clone)]
 pub(crate) struct LseHttpCore {
     http: reqwest::Client,
@@ -192,8 +216,8 @@ impl LseHttpCore {
     /// `Proxy-Authorization` and `WWW-Authenticate` — **not** a custom header. Under reqwest's
     /// default [`Policy::limited(10)`](reqwest::redirect::Policy::limited) a single server-issued
     /// 302 would therefore re-issue the request, live key attached, against whatever host the
-    /// provider named. The vault's download endpoint is exactly the shape that hands off to object
-    /// storage, and in a CI workflow that key is a repository secret.
+    /// provider named. A download endpoint is exactly the shape that hands off to object storage,
+    /// and in a CI workflow that key is a repository secret.
     ///
     /// [`Policy::none`](reqwest::redirect::Policy::none) makes the "this client only ever requests
     /// URLs it builds itself" invariant structural rather than a property of the provider's
@@ -221,10 +245,10 @@ impl LseHttpCore {
             .read_timeout(READ_TIMEOUT)
             // The key above is a client-wide default header, and reqwest strips only
             // `Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
-            // when a redirect crosses hosts -- a custom `x-api-key` survives the hop. `set_sensitive`
-            // redacts `Debug` output and does nothing here. Without this line the default
-            // `Policy::limited(10)` would forward the live key to any host the provider names, which
-            // is precisely the invariant a caller-supplied base URL and `download_export` claim to hold.
+            // when a redirect crosses hosts -- a custom `x-api-key` survives the hop.
+            // `set_sensitive` redacts `Debug` output and does nothing here. Without this line the
+            // default `Policy::limited(10)` would forward the live key to any host the provider
+            // names, which is precisely the invariant a caller-supplied base URL claims to hold.
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
@@ -285,11 +309,6 @@ impl LseHttpCore {
         &self.base_url
     }
 
-    /// The configured, authenticated HTTP client.
-    pub(crate) fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     /// The configured minimum delay between request starts.
     pub(crate) fn pace(&self) -> Duration {
         self.pace
@@ -300,7 +319,7 @@ impl LseHttpCore {
         self.gate.concurrency
     }
 
-    /// Issue an authenticated `GET` against a path under the base URL and deserialise the JSON body.
+    /// Issue an authenticated `GET` against a path under the base URL and deserialise its JSON.
     ///
     /// Rationed by this core's shared gate, so a caller driving several of these concurrently does
     /// not have to pace them itself.
@@ -332,58 +351,120 @@ impl LseHttpCore {
         })
     }
 
-    /// Issue an authenticated `GET` for a file answer and verify it before handing it back.
+    /// Issue an authenticated `GET` for a file answer and hand back its verified body.
     ///
-    /// The provider sends a file whole, with its SHA-256 in `x-checksum-sha256`. The body is held
-    /// in memory, so callers must bound what they ask for;
+    /// The whole body is held in memory, so callers must bound what they ask for;
     /// [`fetch_candles`](super::client::LseClient::fetch_candles) asks for chunks of a bounded
-    /// number of bars.
+    /// number of bars. See [`get_file_into`](Self::get_file_into) for what is verified.
+    ///
+    /// # Errors
+    /// See [`get_file_into`](Self::get_file_into).
+    pub(crate) async fn get_file(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(Vec<u8>, FileHead), LseError> {
+        let mut body = Vec::new();
+        let head = self.get_file_into(path, query, &mut body).await?;
+        Ok((body, head))
+    }
+
+    /// Issue an authenticated `GET` for a file answer and stream its body into `sink`, verifying
+    /// it as it goes.
+    ///
+    /// The provider builds a file whole before sending it, then sends its exact length in
+    /// `Content-Length` and its SHA-256 in `x-checksum-sha256`. Each chunk is hashed as it arrives
+    /// and written to `sink`; after the last byte, the count and the digest must both match.
+    ///
+    /// A failure leaves whatever was written in `sink`: the caller discards it. The provider
+    /// ignores range requests and keeps nothing once it has sent a file, so a cut or damaged
+    /// transfer can only be requested again whole.
     ///
     /// `x-export-rows` is not checked: it is not the file's row count. A six-hour hourly read
     /// declared 6 rows and carried 6, but a three-day one declared 4,178 and carried 73 (measured
     /// 2026-11-27), so it appears to count the stored rows the bars were built from. The checksum
     /// already covers every byte of the body.
     ///
+    /// Rationed by this core's gate, and the permit is held until the last byte: the provider holds
+    /// one download open per key.
+    ///
     /// # Errors
-    /// See [`checked`](Self::checked). A success answer without a checksum, or whose body disagrees
-    /// with its checksum, is [`LseError::Api`] with the success status and no
-    /// code: nothing from it is returned, so a cut or damaged transfer never becomes partial data.
-    pub(crate) async fn get_file(
+    /// See [`checked`](Self::checked) for a refusal. A success answer without a usable checksum is
+    /// [`LseError::MissingChecksum`]; a body of another length than declared is
+    /// [`LseError::LengthMismatch`], and one that hashes otherwise is
+    /// [`LseError::IntegrityMismatch`]. A failed write to `sink` is [`LseError::Io`].
+    pub(crate) async fn get_file_into<W>(
         &self,
         path: &str,
         query: &[(&str, String)],
-    ) -> Result<Vec<u8>, LseError> {
+        sink: &mut W,
+    ) -> Result<FileHead, LseError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let _permit = self.enter_gate().await;
 
         let url = format!("{}/{path}", self.base_url);
         let request = self.http.get(&url).query(query).timeout(DOWNLOAD_TIMEOUT);
-        let response = Self::checked(request.send().await?).await?;
-        let status = response.status().as_u16();
-        let refuse = |message: String| LseError::Api {
-            status,
-            code: None,
-            message: format!("{path}: {message}"),
-        };
+        let mut response = Self::checked(request.send().await?).await?;
 
         let headers = response.headers();
-        let checksum = headers
-            .get(CHECKSUM_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .ok_or_else(|| refuse(format!("the answer carries no {CHECKSUM_HEADER} header")))?;
+        let declared_sha256 = header_str(headers, CHECKSUM_HEADER)
+            .map(str::to_ascii_lowercase)
+            .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or(LseError::MissingChecksum)?;
+        let declared_bytes = response.content_length();
+        let rows_charged = header_str(headers, ROWS_HEADER).and_then(|rows| rows.parse().ok());
+        let export_id = header_str(headers, EXPORT_ID_HEADER).map(str::to_owned);
+        let file_name = header_str(headers, reqwest::header::CONTENT_DISPOSITION.as_str())
+            .and_then(disposition_file_name);
+        let adjusted = header_str(headers, ADJUSTED_HEADER).and_then(|flag| match flag {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        });
 
-        // A body cut short of its `Content-Length` is already an error from `bytes()`: the HTTP
-        // stack refuses it. The checksum covers every byte that does arrive.
-        let body: Vec<u8> = response.bytes().await?.into();
-        let actual = hex::encode(Sha256::digest(&body));
-        if actual != checksum {
-            return Err(refuse(format!(
-                "SHA-256 {actual} does not match the declared {checksum}"
-            )));
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        while let Some(chunk) = response.chunk().await? {
+            hasher.update(&chunk);
+            received += chunk.len() as u64;
+            sink.write_all(&chunk)
+                .await
+                .map_err(|source| LseError::Io {
+                    message: format!("writing the body of {path}"),
+                    source,
+                })?;
         }
-        debug!(len = body.len(), path, "lse file received and verified");
+        sink.flush().await.map_err(|source| LseError::Io {
+            message: format!("flushing the body of {path}"),
+            source,
+        })?;
 
-        Ok(body)
+        // The HTTP stack already refuses a body cut short of its `Content-Length`; this also
+        // covers an answer that declared none, or a stack that let a short body through.
+        if let Some(declared) = declared_bytes
+            && declared != received
+        {
+            return Err(LseError::LengthMismatch { declared, received });
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != declared_sha256 {
+            return Err(LseError::IntegrityMismatch {
+                expected: declared_sha256,
+                actual,
+            });
+        }
+        debug!(len = received, path, "lse file received and verified");
+
+        Ok(FileHead {
+            bytes: received,
+            sha256: actual,
+            rows_charged,
+            export_id,
+            file_name,
+            adjusted,
+        })
     }
 
     /// Pass a success response through, or turn a refusal into its typed error.
@@ -441,6 +522,33 @@ pub(crate) fn api_key_from_env() -> Result<String, String> {
     env::var(API_KEY_ENV).map_err(|error| match error {
         env::VarError::NotPresent => format!("{API_KEY_ENV} is not set"),
         env::VarError::NotUnicode(_) => format!("{API_KEY_ENV} is set but is not valid UTF-8"),
+    })
+}
+
+/// A header's value as trimmed text, if present and visible ASCII.
+fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+}
+
+/// The `filename` parameter of a `Content-Disposition` value, quoted or not.
+///
+/// The provider sends `attachment; filename="AAPL_us_stocks_1m_....parquet"`. Only the plain
+/// `filename` parameter is read; the provider sends no extended `filename*` form.
+fn disposition_file_name(value: &str) -> Option<String> {
+    value.split(';').find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("filename") {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .unwrap_or(value);
+        (!value.is_empty()).then(|| value.to_owned())
     })
 }
 
@@ -552,8 +660,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn two_cores_built_separately_do_not_share_a_gate() {
-        // The claim the module documentation makes: rationing is per core, so a consumer driving
-        // both hosts gets the sum of the two rates, not one shared budget.
+        // The claim the module documentation makes: rationing is per core, so two clients built
+        // separately get the sum of the two rates, not one shared budget.
         let one = LseHttpCore::new("k", TEST_BASE).unwrap();
         let two = LseHttpCore::new("k", TEST_BASE).unwrap();
 
@@ -645,7 +753,7 @@ mod tests {
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
     }
 
-    /// The bound that makes the `vault_concurrency` claim true: however many callers want in, only
+    /// The bound that makes the `with_concurrency` claim true: however many callers want in, only
     /// `concurrency` of them are ever inside at once.
     #[tokio::test]
     async fn the_gate_never_admits_more_callers_than_its_concurrency() {

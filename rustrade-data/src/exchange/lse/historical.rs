@@ -50,8 +50,9 @@ use smol_str::SmolStr;
 use std::str::FromStr;
 use tracing::debug;
 
-/// Format of a timestamp bound sent as `from` / `to`: whole seconds, UTC, no zone suffix.
-const BOUND_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+/// Format of a timestamp bound sent as `from` / `to`: UTC, no zone suffix, with a fraction only
+/// when the instant has one (`%.f` prints 0, 3, 6 or 9 digits as needed).
+const BOUND_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 /// Format of a date bound sent as `from` / `to`.
 const BOUND_DATE_FORMAT: &str = "%Y-%m-%d";
@@ -108,19 +109,37 @@ impl LseCandleRequest {
     }
 }
 
-/// One window a chunk asks for, aligned so the provider aggregates whole periods only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Window {
-    /// An intraday window on the interval's grid, `to` exclusive.
+/// The span of one `/v3/export` selection, in either of the two forms the provider accepts.
+///
+/// The provider takes `from` and `to` as two timestamps or as two dates, never one of each, and the
+/// two forms bound differently, so each is its own variant.
+///
+/// # ⚠️ The provider builds bars from the span it is asked for
+/// A candle selection whose span starts or ends mid-period returns a partial bar at that edge that
+/// looks whole: hourly bars asked for from 14:30 start with a 14:00 bar built from 14:30 on, and a
+/// timestamp span over daily bars returns fragments of sessions. For candles, prefer
+/// [`LseClient::fetch_candles`], which aligns every span to whole periods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LseWindow {
+    /// Instants in `[from, to)`: `from` inclusive, `to` exclusive, to the nanosecond.
     Times {
+        /// Inclusive lower bound.
         from: DateTime<Utc>,
+        /// Exclusive upper bound.
         to: DateTime<Utc>,
     },
-    /// Whole sessions by date, both ends inclusive, each end on a period boundary.
-    Dates { from: NaiveDate, to: NaiveDate },
+    /// Trading days in `[from, to]`, both inclusive. A daily or longer bar is selected by its
+    /// session date.
+    Dates {
+        /// First trading day.
+        from: NaiveDate,
+        /// Last trading day, included.
+        to: NaiveDate,
+    },
 }
 
-impl Window {
+impl LseWindow {
+    /// The `from` and `to` query values, as the provider spells them.
     pub(super) fn bounds(&self) -> (String, String) {
         match self {
             Self::Times { from, to } => (
@@ -131,6 +150,21 @@ impl Window {
                 from.format(BOUND_DATE_FORMAT).to_string(),
                 to.format(BOUND_DATE_FORMAT).to_string(),
             ),
+        }
+    }
+
+    /// Refuse a window whose end comes before its start, which the provider would refuse too.
+    pub(super) fn check_order(&self) -> Result<(), LseError> {
+        let ordered = match self {
+            Self::Times { from, to } => from <= to,
+            Self::Dates { from, to } => from <= to,
+        };
+        if ordered {
+            Ok(())
+        } else {
+            Err(LseError::InvalidInput {
+                message: format!("the window's end comes before its start: {self:?}"),
+            })
         }
     }
 
@@ -206,7 +240,7 @@ pub(super) fn windows(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     chunk_bars: u32,
-) -> Vec<Window> {
+) -> Vec<LseWindow> {
     let step = interval.to_step();
     // `None` (underflow near `DateTime::MIN_UTC`) leaves the bound un-widened: a bar whose open is
     // unrepresentable cannot exist, so the un-widened bound is already correct.
@@ -234,7 +268,7 @@ pub(super) fn windows(
                 let next = span
                     .and_then(|span| cursor.checked_add_signed(span))
                     .map_or(to, |next| next.min(to));
-                windows.push(Window::Times {
+                windows.push(LseWindow::Times {
                     from: cursor,
                     to: next,
                 });
@@ -283,7 +317,7 @@ pub(super) fn windows(
                 let last = next
                     .and_then(|next| next.pred_opt())
                     .map_or(to, |last| last.min(to));
-                windows.push(Window::Dates {
+                windows.push(LseWindow::Dates {
                     from: cursor,
                     to: last,
                 });
@@ -298,18 +332,18 @@ pub(super) fn windows(
     windows
 }
 
-/// One candle row as the provider writes it in CSV.
+/// One candle row as the provider writes it, in CSV or in Parquet.
 #[derive(Debug, Clone, PartialEq)]
-struct CandleRow {
-    open_time: DateTime<Utc>,
+pub(super) struct CandleRow {
+    pub(super) open_time: DateTime<Utc>,
     /// The session date of a daily or longer bar (the `date` column), else `None`.
-    session: Option<NaiveDate>,
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
-    volume: Option<Decimal>,
-    trades: Option<u64>,
+    pub(super) session: Option<NaiveDate>,
+    pub(super) open: Decimal,
+    pub(super) high: Decimal,
+    pub(super) low: Decimal,
+    pub(super) close: Decimal,
+    pub(super) volume: Option<Decimal>,
+    pub(super) trades: Option<u64>,
 }
 
 /// Parse a provider timestamp (`YYYY-MM-DD hh:mm:ss[.fraction]`, UTC, no zone suffix).
@@ -453,6 +487,115 @@ fn ordinal(row: &CandleRow, period: Period) -> Result<DateTime<Utc>, LseError> {
     }
 }
 
+/// The checks every candle row of one series passes, in arrival order, and the conversion of a row
+/// into a [`Candle`].
+///
+/// Shared by the CSV reader ([`LseClient::fetch_candles`]) and the Parquet decoder, so a bar is
+/// held to the same rules and given the same `close_time` whichever format it arrived in. State
+/// carries across chunks: chunks served out of order, or one repeating another's bars, would pass a
+/// per-chunk check and still corrupt the series.
+#[derive(Debug, Clone)]
+pub(super) struct CandleSeries {
+    /// Names the series in errors: the symbol, or the file being decoded.
+    label: String,
+    interval: CandleInterval,
+    step: IntervalStep,
+    period: Period,
+    /// The previous bar's position and open.
+    previous: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+impl CandleSeries {
+    pub(super) fn new(label: impl Into<String>, interval: CandleInterval) -> Self {
+        Self {
+            label: label.into(),
+            interval,
+            step: interval.to_step(),
+            period: Period::of(interval),
+            previous: None,
+        }
+    }
+
+    /// Whether a bar of this series carries a session date (`1d` and longer).
+    #[cfg(feature = "lse-parquet")]
+    pub(super) fn has_sessions(&self) -> bool {
+        !matches!(self.period, Period::Intraday(_))
+    }
+
+    /// Check the next row and convert it into a [`Candle`] whose `close_time` is its open plus the
+    /// interval.
+    ///
+    /// `window`, when given, is the span the row was asked for: a row opening outside it is
+    /// [`LseError::UnexpectedCandleRange`].
+    ///
+    /// # Errors
+    /// A bar not after the previous one is [`LseError::NonMonotonicCandles`]; intraday bars spaced
+    /// closer than the interval are [`LseError::UnexpectedCandleResolution`]; a daily or longer bar
+    /// without its session date is [`LseError::NullValue`]; a close past the representable range is
+    /// [`LseError::TimestampOverflow`].
+    pub(super) fn accept(
+        &mut self,
+        row: &CandleRow,
+        window: Option<&LseWindow>,
+    ) -> Result<Candle, LseError> {
+        let position = ordinal(row, self.period)?;
+        if let Some(window) = window {
+            let (window_start, window_end) = window.instants();
+            let inside = match window {
+                LseWindow::Times { from, to } => row.open_time >= *from && row.open_time < *to,
+                LseWindow::Dates { .. } => position >= window_start && position < window_end,
+            };
+            if !inside {
+                return Err(LseError::UnexpectedCandleRange {
+                    symbol: self.label.clone(),
+                    open: row.open_time,
+                    window_start,
+                    window_end,
+                });
+            }
+        }
+
+        if let Some((previous_position, previous_open)) = self.previous {
+            if position <= previous_position {
+                return Err(LseError::NonMonotonicCandles {
+                    symbol: self.label.clone(),
+                    previous_open,
+                    open: row.open_time,
+                });
+            }
+            if let Period::Intraday(width) = self.period {
+                let actual = row.open_time - previous_open;
+                if actual < width {
+                    return Err(LseError::UnexpectedCandleResolution {
+                        symbol: self.label.clone(),
+                        interval: self.interval,
+                        previous_open,
+                        open: row.open_time,
+                        actual,
+                    });
+                }
+            }
+        }
+        self.previous = Some((position, row.open_time));
+
+        let close_time =
+            close_time_from_open(row.open_time, self.step).ok_or(LseError::TimestampOverflow {
+                open: row.open_time,
+                interval: self.interval,
+            })?;
+
+        Ok(Candle {
+            close_time,
+            open: row.open,
+            high: row.high,
+            low: row.low,
+            close: row.close,
+            volume: row.volume,
+            trade_count: row.trades,
+        })
+    }
+}
+
 impl LseClient {
     /// Fetch historical candles, one verified chunk at a time.
     ///
@@ -529,12 +672,8 @@ impl LseClient {
                 })?;
             }
 
-            let step = request.interval.to_step();
-            let period = Period::of(request.interval);
             let symbol = request.symbol.to_string();
-            // Carried across chunks, not reset per chunk: chunks served out of order, or one
-            // repeating another's bars, would pass a per-chunk check and still corrupt the series.
-            let mut previous: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+            let mut series = CandleSeries::new(symbol.clone(), request.interval);
 
             for window in windows(
                 request.interval,
@@ -554,7 +693,7 @@ impl LseClient {
                     ("format", "csv".to_owned()),
                     ("adjusted", if request.adjusted { "1" } else { "0" }.to_owned()),
                 ];
-                let Some(body) = self.get_export(&query).await? else {
+                let Some((body, _)) = self.get_export(&query).await? else {
                     debug!(%symbol, ?window, "lse candle chunk: no stored data");
                     continue;
                 };
@@ -562,64 +701,12 @@ impl LseClient {
                 debug!(%symbol, ?window, rows = rows.len(), "lse candle chunk received");
 
                 // Every structural check runs over the whole chunk before any bar is yielded.
-                let (window_start, window_end) = window.instants();
                 let mut candles = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let position = ordinal(&row, period)?;
-                    let inside = match window {
-                        Window::Times { from, to } => row.open_time >= from && row.open_time < to,
-                        Window::Dates { .. } => position >= window_start && position < window_end,
-                    };
-                    if !inside {
-                        Err(LseError::UnexpectedCandleRange {
-                            symbol: symbol.clone(),
-                            open: row.open_time,
-                            window_start,
-                            window_end,
-                        })?;
+                for row in &rows {
+                    let candle = series.accept(row, Some(&window))?;
+                    if candle.close_time >= request.start && candle.close_time <= request.end {
+                        candles.push(candle);
                     }
-
-                    if let Some((previous_position, previous_open)) = previous {
-                        if position <= previous_position {
-                            Err(LseError::NonMonotonicCandles {
-                                symbol: symbol.clone(),
-                                previous_open,
-                                open: row.open_time,
-                            })?;
-                        }
-                        if let Period::Intraday(width) = period {
-                            let actual = row.open_time - previous_open;
-                            if actual < width {
-                                Err(LseError::UnexpectedCandleResolution {
-                                    symbol: symbol.clone(),
-                                    interval: request.interval,
-                                    previous_open,
-                                    open: row.open_time,
-                                    actual,
-                                })?;
-                            }
-                        }
-                    }
-                    previous = Some((position, row.open_time));
-
-                    let close_time = close_time_from_open(row.open_time, step).ok_or(
-                        LseError::TimestampOverflow {
-                            open: row.open_time,
-                            interval: request.interval,
-                        },
-                    )?;
-                    if close_time < request.start || close_time > request.end {
-                        continue;
-                    }
-                    candles.push(Candle {
-                        close_time,
-                        open: row.open,
-                        high: row.high,
-                        low: row.low,
-                        close: row.close,
-                        volume: row.volume,
-                        trade_count: row.trades,
-                    });
                 }
 
                 for candle in candles {
@@ -698,7 +785,7 @@ mod tests {
 
         assert_eq!(
             windows,
-            [Window::Times {
+            [LseWindow::Times {
                 from: t("2026-11-20 13:00:00"),
                 to: t("2026-11-20 16:00:00"),
             }]
@@ -717,15 +804,15 @@ mod tests {
         assert_eq!(
             windows,
             [
-                Window::Times {
+                LseWindow::Times {
                     from: t("2026-11-20 00:00:00"),
                     to: t("2026-11-20 00:02:00")
                 },
-                Window::Times {
+                LseWindow::Times {
                     from: t("2026-11-20 00:02:00"),
                     to: t("2026-11-20 00:04:00")
                 },
-                Window::Times {
+                LseWindow::Times {
                     from: t("2026-11-20 00:04:00"),
                     to: t("2026-11-20 00:05:00")
                 },
@@ -735,7 +822,7 @@ mod tests {
 
     #[test]
     fn four_hour_windows_sit_on_the_utc_day_grid() {
-        let [Window::Times { from, to }] = windows(
+        let [LseWindow::Times { from, to }] = windows(
             CandleInterval::Hour4,
             t("2026-11-20 05:00:00"),
             t("2026-11-20 13:00:00"),
@@ -753,7 +840,7 @@ mod tests {
     #[test]
     fn chunk_bars_too_many_for_a_time_delta_give_one_window() {
         // Four hours times `i32::MAX` overflows a `TimeDelta`.
-        let [Window::Times { from, to }] = windows(
+        let [LseWindow::Times { from, to }] = windows(
             CandleInterval::Hour4,
             t("2026-11-20 05:00:00"),
             t("2026-11-22 13:00:00"),
@@ -780,7 +867,7 @@ mod tests {
 
         assert_eq!(
             windows,
-            [Window::Dates {
+            [LseWindow::Dates {
                 from: d("2026-11-18"),
                 to: d("2026-11-21")
             }]
@@ -799,15 +886,15 @@ mod tests {
         assert_eq!(
             windows,
             [
-                Window::Dates {
+                LseWindow::Dates {
                     from: d("2026-11-01"),
                     to: d("2026-11-02")
                 },
-                Window::Dates {
+                LseWindow::Dates {
                     from: d("2026-11-03"),
                     to: d("2026-11-04")
                 },
-                Window::Dates {
+                LseWindow::Dates {
                     from: d("2026-11-05"),
                     to: d("2026-11-06")
                 },
@@ -827,7 +914,7 @@ mod tests {
 
         assert_eq!(
             windows,
-            [Window::Dates {
+            [LseWindow::Dates {
                 from: d("2026-11-09"),
                 to: d("2026-11-22")
             }]
@@ -844,7 +931,7 @@ mod tests {
         );
 
         for window in &windows {
-            let Window::Dates { from, to } = window else {
+            let LseWindow::Dates { from, to } = window else {
                 panic!("dates expected");
             };
             assert_eq!(from.weekday(), chrono::Weekday::Mon, "{window:?}");
@@ -864,7 +951,7 @@ mod tests {
 
         assert_eq!(
             windows,
-            [Window::Dates {
+            [LseWindow::Dates {
                 from: d("2026-09-01"),
                 to: d("2026-10-31")
             }]
@@ -878,7 +965,7 @@ mod tests {
 
         assert_eq!(
             windows,
-            [Window::Times {
+            [LseWindow::Times {
                 from: t("2026-11-20 14:59:00"),
                 to: t("2026-11-20 15:00:00")
             }]
@@ -955,6 +1042,89 @@ mod tests {
         assert!(matches!(
             candle_rows(body),
             Err(LseError::NullValue { column: "close" })
+        ));
+    }
+
+    fn bar(open_time: DateTime<Utc>, session: Option<NaiveDate>) -> CandleRow {
+        CandleRow {
+            open_time,
+            session,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: None,
+            trades: None,
+        }
+    }
+
+    /// Whether a fresh series accepts `row` in `window`, so each check sees no earlier bar.
+    fn inside(interval: CandleInterval, row: &CandleRow, window: &LseWindow) -> bool {
+        match CandleSeries::new("TEST", interval).accept(row, Some(window)) {
+            Ok(_) => true,
+            Err(LseError::UnexpectedCandleRange { .. }) => false,
+            Err(other) => panic!("a range verdict expected, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_time_window_holds_its_start_and_refuses_its_end() {
+        let window = LseWindow::Times {
+            from: t("2026-11-20 15:00:00"),
+            to: t("2026-11-20 15:02:00"),
+        };
+        let minute = |text| bar(t(text), None);
+
+        assert!(!inside(
+            CandleInterval::Min1,
+            &minute("2026-11-20 14:59:00"),
+            &window
+        ));
+        assert!(inside(
+            CandleInterval::Min1,
+            &minute("2026-11-20 15:00:00"),
+            &window
+        ));
+        assert!(inside(
+            CandleInterval::Min1,
+            &minute("2026-11-20 15:01:00"),
+            &window
+        ));
+        assert!(!inside(
+            CandleInterval::Min1,
+            &minute("2026-11-20 15:02:00"),
+            &window
+        ));
+    }
+
+    #[test]
+    fn a_date_window_holds_both_its_days_by_session() {
+        let window = LseWindow::Dates {
+            from: d("2026-11-17"),
+            to: d("2026-11-18"),
+        };
+        // The open is the previous evening's, as the provider stamps a session; the date decides.
+        let session = |day| bar(t("2026-11-16 22:00:00"), Some(d(day)));
+
+        assert!(!inside(
+            CandleInterval::Day1,
+            &session("2026-11-16"),
+            &window
+        ));
+        assert!(inside(
+            CandleInterval::Day1,
+            &session("2026-11-17"),
+            &window
+        ));
+        assert!(inside(
+            CandleInterval::Day1,
+            &session("2026-11-18"),
+            &window
+        ));
+        assert!(!inside(
+            CandleInterval::Day1,
+            &session("2026-11-19"),
+            &window
         ));
     }
 

@@ -394,16 +394,42 @@ async fn a_checksum_mismatch_yields_nothing() {
         .await
         .unwrap_err();
 
-    let LseError::Api {
-        status,
-        code,
-        message,
-    } = &error
-    else {
-        panic!("expected Api, got {error:?}");
-    };
-    assert_eq!((*status, code), (200, &None));
-    assert!(message.contains("SHA-256"), "{message}");
+    assert!(
+        matches!(&error, LseError::IntegrityMismatch { .. }),
+        "{error:?}"
+    );
+}
+
+/// A header that is not a SHA-256 digest (short, or not hex) is no checksum at all, rather than one
+/// the body then fails to match.
+#[tokio::test]
+async fn a_checksum_header_that_is_not_a_digest_is_refused_as_missing() {
+    for header in ["00".repeat(31), "zz".repeat(32)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/export"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-checksum-sha256", header.as_str())
+                    .set_body_raw(minutes(&["15:00"]), "text/csv"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = client(&server)
+            .collect_candles(request(
+                CandleInterval::Min1,
+                "2026-11-20T15:01:00Z",
+                "2026-11-20T15:01:00Z",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, LseError::MissingChecksum),
+            "{header}: {error:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -424,10 +450,7 @@ async fn an_answer_without_a_checksum_is_refused() {
         .await
         .unwrap_err();
 
-    assert!(
-        matches!(&error, LseError::Api { status: 200, message, .. } if message.contains("x-checksum-sha256")),
-        "{error:?}"
-    );
+    assert!(matches!(&error, LseError::MissingChecksum), "{error:?}");
 }
 
 /// `x-export-rows` is not the file's row count for an aggregated selection (a three-day hourly

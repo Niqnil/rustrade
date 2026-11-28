@@ -8,11 +8,11 @@
 //! # Surfaces
 //! - **History** comes from LSE Data 3.0 (`https://download.londonstrategicedge.com/v3`) through
 //!   [`client::LseClient`]: the key's plan in [`usage`], the catalogue in [`catalogue`], candles in
-//!   [`historical`], option prints, chains, candles and Greeks in [`options`], and a candle replay
-//!   for backtests in [`backtest`].
+//!   [`historical`], option prints, chains, candles and Greeks in [`options`], whole verified
+//!   files in [`export`] (decoded by `parquet` behind the `lse-parquet` feature), economic
+//!   observations, bond yields and releases in [`macroeconomic`], and a candle replay for
+//!   backtests in [`backtest`].
 //! - **Live** ticks stream over the provider's websocket through the `Lse*` connectors below.
-//! - The pre-3.0 modules still here ([`vault`], [`data_api`], [`export`], [`bond_yield`],
-//!   [`calendar`], [`quota`]) talk to hosts the provider has retired and are being replaced.
 //!
 //! # Licensing
 //! This integration's **code** is MIT-licensed like the rest of this repository. **The data it
@@ -84,10 +84,6 @@
 /// Replay historical candles for N instruments as one time-ordered market stream.
 pub mod backtest;
 
-pub mod bond_yield;
-
-pub mod calendar;
-
 pub mod catalogue;
 
 /// The WebSocket channel a subscription maps to.
@@ -96,8 +92,6 @@ pub mod channel;
 pub mod client;
 
 pub mod connection;
-
-pub mod data_api;
 
 /// Errors produced by the London Strategic Edge integration.
 pub mod error;
@@ -108,6 +102,8 @@ pub mod historical;
 
 pub mod live;
 
+pub mod macroeconomic;
+
 pub mod mapper;
 
 pub mod options;
@@ -117,9 +113,6 @@ pub mod market;
 
 #[cfg(feature = "lse-parquet")]
 pub mod parquet;
-
-/// The shared streaming + export allowance, as the provider reports it.
-pub mod quota;
 
 pub mod quote;
 
@@ -139,8 +132,6 @@ pub mod usage;
 
 // HTTP plumbing shared by the REST clients; documented in its own file.
 pub(crate) mod transport;
-
-pub mod vault;
 
 use self::{
     channel::LseChannel,
