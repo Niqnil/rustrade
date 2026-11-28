@@ -855,8 +855,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the top that many percent of the backoff, so from half the backoff to all of it at the new
   `DEFAULT_BACKOFF_JITTER_PERCENT` (50). Streams that drop together, such as every stream to a
   venue that dropped them all at once, no longer reconnect at the same instants, in bursts against
-  the venue's connection limits. A wait is still never longer than `backoff_ms_max`, and `0` gives
-  exactly the old waits. `STREAM_RECONNECTION_POLICY` uses 50, so market streams and
+  the venue's connection limits. A wait the policy draws is still never longer than
+  `backoff_ms_max`, and `0` gives exactly the old waits. A retry-after hint given to
+  `with_reconnect_backoff_reporting_hinted` that is longer than the drawn wait is still waited
+  exactly, with no jitter. `STREAM_RECONNECTION_POLICY` uses 50, so market streams and
   `AccountStreamOptions` (`rustrade`) jitter by default, and a configuration deserialized without
   the field gets 50. Building the policy with a struct literal or `::new` now needs the
   fourth value. IBKR's wait after a connection that ends at once is jittered the same way. The

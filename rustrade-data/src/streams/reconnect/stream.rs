@@ -56,13 +56,17 @@ where
 
     /// As [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting), but the
     /// next attempt after a failure is held back for at least the wait `retry_after` reads from
-    /// it: the longer of that wait and the backoff. A failure whose wait is `None` waits the
-    /// backoff alone.
+    /// it: the longer of that wait and the policy's wait, jitter included. A failure whose wait
+    /// is `None` waits the policy's wait alone.
     ///
     /// The hint does not change the backoff, which grows with each consecutive failure as usual.
     /// It is a floor for one wait, so an attempt is never made before the source said it could
     /// succeed, nor sooner than the policy allows. It is not capped: a caller that wants a limit
     /// clamps the wait in `retry_after`.
+    ///
+    /// A hint longer than the policy's wait is waited exactly, with no jitter, so streams given
+    /// the same hint retry together. A caller that wants them spread adds its own jitter to the
+    /// wait in `retry_after`.
     fn with_reconnect_backoff_reporting_hinted<St, InitError, FnRetryAfter>(
         self,
         policy: ReconnectionBackoffPolicy,
@@ -380,9 +384,10 @@ impl ReconnectionBackoffPolicy {
     /// that most.
     fn wait_cut_by(&self, failures: u32, cut: impl FnOnce(u64) -> u64) -> Duration {
         let backoff = self.backoff_ms(failures);
-        let percent = u128::from(self.backoff_jitter_percent.min(100));
-        // At most `backoff`, since `percent` is at most 100, so it fits back in a `u64`.
-        let most = u64::try_from(u128::from(backoff) * percent / 100).unwrap_or(backoff);
+        let percent = u64::from(self.backoff_jitter_percent.min(100));
+        // `backoff × percent / 100`, rounded down, split at the hundreds so no product overflows:
+        // the first term is at most `backoff`, the second at most 99 × 100.
+        let most = backoff / 100 * percent + backoff % 100 * percent / 100;
         Duration::from_millis(backoff - cut(most).min(most))
     }
 
@@ -566,6 +571,7 @@ mod tests {
             ]
         );
     }
+
     /// `POLICY` with `percent` of jitter.
     fn jittered(percent: u8) -> ReconnectionBackoffPolicy {
         ReconnectionBackoffPolicy {
@@ -633,6 +639,39 @@ mod tests {
         assert_eq!(jittered(0).wait(3), Duration::from_millis(400));
         assert_eq!(jittered(100).wait_cut_by(3, |most| most), Duration::ZERO);
         assert_eq!(jittered(255).wait_cut_by(3, |most| most), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_jitter_cut_rounds_down_and_never_overflows() {
+        // `u64::MAX` is 18,446,744,073,709,551,615; half of it, rounded down, is `i64::MAX`.
+        let mut offered = None;
+        ReconnectionBackoffPolicy::new(u64::MAX, 2, u64::MAX, 50).wait_cut_by(1, |most| {
+            offered = Some(most);
+            0
+        });
+        assert_eq!(offered, Some(i64::MAX.unsigned_abs()));
+
+        // 50 % of a 99 ms backoff is 49.5 ms, so the most the cut may take is 49 ms.
+        let odd = ReconnectionBackoffPolicy::new(99, 2, 1_000, 50);
+        assert_eq!(odd.wait_cut_by(1, |most| most), Duration::from_millis(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_longer_than_the_jittered_wait_is_waited_exactly() {
+        let hint = |_: &&str| Some(Duration::from_millis(500));
+        let started = Instant::now();
+        let mut results = Box::pin(
+            stream::iter([Err("a"), ok(&[1])]).with_reconnect_backoff_reporting_hinted(
+                jittered(50),
+                key(),
+                hint,
+            ),
+        );
+
+        assert!(results.next().await.unwrap().is_err());
+        assert!(results.next().await.unwrap().is_ok());
+        // The jittered wait is 50 to 100 ms, so the 500 ms hint sets it, unjittered.
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
     }
 
     #[test]
