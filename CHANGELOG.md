@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **London Strategic Edge: one client for LSE Data 3.0** (`rustrade-data`, `lse`). The provider
+  retired its previous hosts; `LseClient` reads its single `/v3` host. Besides candles and the
+  option print tape (see Changed), it adds `fetch_option_chain` (one page of an underlying's
+  contracts with their latest Greeks), `fetch_option_greeks` (one contract's Greeks per traded
+  minute), `fetch_markets` and `fetch_pairs` (the catalogue, with what the key may download), and
+  `usage` (`LseUsage`: the plan's rows per day and per download, weekly bytes, and how far back
+  each market goes). **The retrieved data is not redistributable**, and use by or for an
+  organisation needs the provider's licence: <https://londonstrategicedge.com/licence>,
+  <https://londonstrategicedge.com/terms>.
+
 - **Market stream initialisation is bounded** (`rustrade-data`, `rustrade-integration`). An attempt
   to initialise a market stream (connect, subscribe, wait for acknowledgements, fetch any initial
   snapshots) that stalled left the stream waiting with nothing yielded and nothing retried, and a
@@ -840,6 +850,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument with no spec is logged at `debug`, as is normal when running without specs.
 
 ### Changed
+- **Breaking: London Strategic Edge history moves to `LseClient` on LSE Data 3.0**
+  (`rustrade-data`, `lse`). The data is not redistributable and an organisation needs the
+  provider's licence (<https://londonstrategicedge.com/licence>).
+  - `fetch_candles`, `collect_candles`, `fetch_option_flow`, `collect_option_flow` and the
+    catalogue are on `LseClient`, not `LseVaultClient`, which keeps only what the export module
+    still needs. `reference` (`fetch_catalog`, `LseCatalogEntry`) is replaced by `catalogue`.
+  - A candle fetch takes an `LseCandleRequest` (market, symbol as the market's REST listing spells
+    it, interval, range, and `as_published()` for unadjusted prices). It downloads aligned chunks
+    of `with_chunk_bars` bars (default 50,000), each checked against its SHA-256 and size before
+    any bar is yielded, and fills `trade_count`. A chunk the provider stores nothing for yields no
+    bars.
+  - Option candles are plain `Candle`s from `fetch_option_candles(ticker, interval, ..)`;
+    `LseOptionCandle` and `collect_option_candles` are removed.
+  - `LseOptionPrint` loses `id` (the provider no longer sends one) and renames `volume` to `size`,
+    and gains `pair_id` and `venue`. The print tape is paged by time rather than by offset, because
+    the provider orders prints sharing an instant differently from one request to the next;
+    `with_page_limit` is removed.
+  - `LseCandleSource::new` and `resolve` take the `LseMarketCode` the symbol is listed in, and
+    `replay_candles` takes an `Arc<LseClient>`. Symbols stay in the websocket spelling (`EUR/USD`,
+    `VOD.L`) and are translated for REST by `market::rest_symbol_for`.
+  - `LseError::Api` and `RateLimited` carry the provider's error `code`. `UnknownMarket` and
+    `NonMonotonicCandles` are new, and `UnexpectedCandleRange` reports the bar's open and the
+    window. `CursorOverflow`, `NonMonotonicCandlePage` and `OptionFlowWindowSaturated` are removed,
+    and `UnexpectedOptionFlowRow` names the contract's `ticker` instead of a print id.
+  - Each client admits one request at a time by default (was two): the provider allows one
+    download per key. Requests start a second apart by default (was 300 ms), the free plan's 60
+    calls per minute; `with_pace` lowers it for a larger allowance.
 - **Breaking: `SocketError` is `#[non_exhaustive]`** (`rustrade-integration`). It gains
   `ConnectTimeout { timeout }`, and future failure kinds are added the same way, so a `match` on it
   needs a wildcard arm.
@@ -1494,6 +1531,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client refuse redirects, and report a REST answer with a 3xx as `ApiError::RequestRejected`,
   naming the status and where it pointed: an order or cancel so answered was not acted on, and is
   not sent again. Before, such an answer read as an unreadable one, with an unknown outcome.
+- **London Strategic Edge candles and option prints work again** (`rustrade-data`, `lse`; part of
+  #914). The provider retired the hosts they were read from; `LseClient` reads LSE Data 3.0
+  instead (see Changed).
 - **The Alpaca clients no longer follow HTTP redirects** (`rustrade-execution`, `alpaca`;
   `rustrade-data`). `AlpacaClient` and `AlpacaRestClient` send the API key and secret as custom
   headers, which reqwest's default policy carries across a redirect to another host, and a 301 or

@@ -1,52 +1,23 @@
-//! Authenticated REST transport for the London Strategic Edge vault.
+//! The pre-3.0 vault client, kept only for the bulk [`export`](super::export) jobs until they move
+//! to LSE Data 3.0. History, the catalogue, usage and options are on
+//! [`LseClient`](super::client::LseClient).
 //!
-//! The vault (`api.londonstrategicedge.com/vault`) is the provider's data plane. It is a distinct
-//! host from their catalog/discovery API, with a different symbol key: **the vault keys candles on
-//! the display symbol** (`EUR/USD`, `AAPL`, `ES.F`), not on a dataset slug.
-//!
-//! The HTTP plumbing both of the provider's hosts share — auth header, agent, timeouts, redirect
-//! policy, request rationing and error mapping — lives in an internal transport that this client
-//! wraps; the module here holds what is specific to the vault.
-//!
-//! # Authentication
-//! Every vault endpoint requires an API key, sent as the `x-api-key` header. Supply it explicitly
-//! via [`LseVaultClient::new`] or from `LSE_API_KEY` via [`LseVaultClient::from_env`]. Keys are
-//! free and require no account.
-//!
-//! # ⚠️ Unknown query parameters are ignored, not rejected
-//! The vault answers `200` to a request carrying a misspelled parameter, having silently applied
-//! its default instead. Measured: `resolution=1d` returns **1-minute** bars, byte-identical in
-//! shape to a correct response, and `from`/`since`/`after`/`begin`/`start_date`/`start_time`/`to`/
-//! `until`/`end_date` are all ignored in favour of full history from page one. Only `symbol`,
-//! `timeframe`, `start`, `end` and `limit` are honoured. **Any parameter added here must be
-//! verified against a known-answer query** — a wrong name is never an error.
+//! The vault (`api.londonstrategicedge.com/vault`) is the provider's previous data plane. Its
+//! export routes answer `410` since the provider moved to LSE Data 3.0.
 
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::quota::QuotaStatus;
 use crate::exchange::lse::transport::LseHttpCore;
-use std::{num::NonZeroU32, time::Duration};
+use std::time::Duration;
 use tokio::sync::SemaphorePermit;
 
 /// Base URL of the vault data plane.
 const VAULT_BASE_URL: &str = "https://api.londonstrategicedge.com/vault";
 
-/// Default rows requested per page of a paged fetch.
-///
-/// Matches the provider's measured
-/// [`max_rows_per_request`](QuotaStatus::max_rows_per_request). The cap is enforced **silently** —
-/// an over-large range returns exactly this many rows with a `200` and no truncation marker — which
-/// is why pagination never treats a short page as the end of the data. A key on a different plan may
-/// be allowed more: read [`usage`](LseVaultClient::usage) and raise this with
-/// [`with_page_limit`](LseVaultClient::with_page_limit) rather than assuming the default is your
-/// key's limit.
-const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(5000).unwrap();
-
 /// Authenticated client for the London Strategic Edge vault.
 ///
-/// Wraps the internal transport shared with the provider's other host, pointed at the vault, and
-/// adds the vault's own configuration and endpoints: [`usage`](Self::usage) here, paged candles in
-/// [`historical`](super::historical), the catalog in [`reference`](super::reference), bulk export
-/// in [`export`](super::export).
+/// Wraps the internal transport, pointed at the vault, for the pre-3.0 bulk
+/// [`export`](super::export) and its [`usage`](Self::usage).
 ///
 /// # Request rationing is per client, not per call
 /// Every request this client issues — candle page, export submit, status poll, artifact download —
@@ -63,7 +34,6 @@ const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(5000).unwrap();
 #[derive(Clone)]
 pub struct LseVaultClient {
     core: LseHttpCore,
-    page_limit: NonZeroU32,
 }
 
 impl std::fmt::Debug for LseVaultClient {
@@ -74,7 +44,6 @@ impl std::fmt::Debug for LseVaultClient {
         f.debug_struct("LseVaultClient")
             .field("base_url", &self.core.base_url())
             .field("pace", &self.core.pace())
-            .field("page_limit", &self.page_limit)
             .field("concurrency", &self.core.concurrency())
             .finish_non_exhaustive()
     }
@@ -105,7 +74,6 @@ impl LseVaultClient {
     pub fn new(api_key: &str) -> Result<Self, LseError> {
         Ok(Self {
             core: LseHttpCore::new(api_key, VAULT_BASE_URL)?,
-            page_limit: DEFAULT_PAGE_LIMIT,
         })
     }
 
@@ -117,7 +85,6 @@ impl LseVaultClient {
     pub fn from_env() -> Result<Self, LseError> {
         Ok(Self {
             core: LseHttpCore::from_env(VAULT_BASE_URL)?,
-            page_limit: DEFAULT_PAGE_LIMIT,
         })
     }
 
@@ -143,8 +110,8 @@ impl LseVaultClient {
     /// [`new`](Self::new) configures a 30s total timeout and a 30s read timeout; `reqwest`'s
     /// default is **neither**. Replacing the client drops both, and a timeout-less client
     /// interacts badly with the [request gate](Self#request-rationing-is-per-client-not-per-call):
-    /// a permit is held for the whole request, so with the default concurrency of 2, two stalled
-    /// connections exhaust the gate *permanently* — for this client and every clone of it, with no
+    /// a permit is held for the whole request, so with the default concurrency of 1, one stalled
+    /// connection exhausts the gate *permanently* — for this client and every clone of it, with no
     /// error, no log, and nothing to observe but a run that stops making progress. Set
     /// [`timeout`](reqwest::ClientBuilder::timeout) and
     /// [`read_timeout`](reqwest::ClientBuilder::read_timeout) on any client passed here.
@@ -178,31 +145,10 @@ impl LseVaultClient {
         self
     }
 
-    /// Override how many rows a paged fetch requests per page.
-    ///
-    /// The default is the provider's measured
-    /// [`max_rows_per_request`](QuotaStatus::max_rows_per_request); raise it only against a key whose
-    /// [`usage`](Self::usage) reports a higher one. Requesting **more** than your key allows is not
-    /// an error — the vault caps the page silently, and pagination handles a short page — so an
-    /// over-large value costs nothing but degrades into more, smaller pages. The option print walk,
-    /// which cannot page past a short page, bounds this by the cap [`usage`](Self::usage) reports. Requesting fewer than
-    /// the cap is a legitimate way to bound per-page memory or response latency.
-    ///
-    /// # Why `NonZeroU32`, where [`with_concurrency`](Self::with_concurrency) clamps
-    /// A concurrency of `0` parks every request — visibly broken, so clamping to `1` is a safe
-    /// reading of a caller slip. A page limit of `0` is worse than broken: the vault answers `200`
-    /// with an empty page, which pagination reads as the end of the data, so the fetch **completes
-    /// successfully having returned nothing**. That is a silent wrong answer, and the type system
-    /// rules it out rather than a clamp papering over it.
-    #[must_use]
-    pub fn with_page_limit(mut self, limit: NonZeroU32) -> Self {
-        self.page_limit = limit;
-        self
-    }
-
     /// Override how many requests this client may have in flight at once.
     ///
-    /// The default is the provider's measured [`vault_concurrency`](QuotaStatus::vault_concurrency);
+    /// The default is one; the pre-3.0 provider reported its ceiling as
+    /// [`vault_concurrency`](QuotaStatus::vault_concurrency);
     /// raise it only against a key whose [`usage`](Self::usage) reports a higher one. `0` is
     /// clamped to `1`, since a client that can never issue a request is never what was meant.
     ///
@@ -232,15 +178,6 @@ impl LseVaultClient {
     /// never follows a server-supplied URL.
     pub(crate) fn base_url(&self) -> &str {
         self.core.base_url()
-    }
-
-    /// The configured rows-per-page for a paged fetch.
-    ///
-    /// Endpoint families send this as the `limit` query parameter. The non-zero guarantee
-    /// [`with_page_limit`](Self::with_page_limit) argues for is carried in the type rather than
-    /// asserted here, so a caller cannot reintroduce the empty-page-reads-as-end-of-data case.
-    pub(crate) fn page_limit(&self) -> NonZeroU32 {
-        self.page_limit
     }
 
     /// The configured, authenticated HTTP client.
@@ -307,8 +244,7 @@ mod tests {
         let rendered = format!("{client:?}");
 
         assert!(rendered.contains(VAULT_BASE_URL), "{rendered}");
-        assert!(rendered.contains("page_limit: 5000"), "{rendered}");
-        assert!(rendered.contains("concurrency: 2"), "{rendered}");
+        assert!(rendered.contains("concurrency: 1"), "{rendered}");
     }
 
     #[test]
@@ -378,21 +314,15 @@ mod tests {
         assert_eq!(client.base_url(), "http://127.0.0.1:1/mock");
     }
 
-    #[test]
-    fn with_page_limit_is_carried_independently_of_the_shared_core() {
-        let limit = NonZeroU32::new(17).unwrap();
-        let client = LseVaultClient::new("key").unwrap().with_page_limit(limit);
-
-        assert_eq!(client.page_limit(), limit);
-        assert!(format!("{client:?}").contains("page_limit: 17"));
-    }
-
-    /// Clones must queue together — otherwise handing a clone to each of N concurrent fetches would
-    /// restore exactly the N × rate the gate exists to prevent.
     #[tokio::test(start_paused = true)]
     async fn a_cloned_client_queues_at_the_same_gate_as_its_original() {
         let pace = Duration::from_millis(300);
-        let client = LseVaultClient::new("key").unwrap().with_pace(pace);
+        // Two permits, so the second caller waits on the pace alone; with the default one it
+        // would wait for the first permit, which this test never releases.
+        let client = LseVaultClient::new("key")
+            .unwrap()
+            .with_concurrency(2)
+            .with_pace(pace);
         let clone = client.clone();
         let started = Instant::now();
 

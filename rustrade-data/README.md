@@ -69,7 +69,7 @@ export decoding), `massive`, `sec-edgar` and `thetadata`.
 | **LseFutures** | `LseFutures::default()`, with `LseSubscriber` | Cfd (continuous front-month proxies) | PublicTrades, OrderBooksL1 |
 | **LseCfd** | `LseCfd::default()`, with `LseSubscriber` | Cfd (indices, commodities, rates, volatility) | PublicTrades, OrderBooksL1 |
 | **LseOptions** | `LseOptions::default()`, with `LseSubscriber` | Option (US equity and ETF contracts) | PublicTrades |
-| **LSE historical** | `LseVaultClient::from_env()` | — | Candles (REST, not a subscription) |
+| **LSE historical** | `LseClient::from_env()` | — | Candles (REST, not a subscription) |
 | **ThetaData** (REST, via a running Theta Terminal) | `ThetaDataClient::new()` | Option, Spot (Equities), indices | Quotes, Candles, open interest, end-of-day, snapshots (historical; not a subscription) |
 
 > **⚠️ London Strategic Edge data is NOT redistributable.** This integration's *code* is MIT

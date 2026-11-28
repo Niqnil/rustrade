@@ -14,6 +14,177 @@ use rustrade_instrument::{
 };
 use smol_str::{SmolStr, StrExt, format_smolstr};
 
+/// A market of LSE Data 3.0, as `/v3/markets` lists it. Every history call names one.
+///
+/// Sent as the provider's folder name ([`as_str`](Self::as_str)), which is what every `/v3` route
+/// takes as `market`. `#[non_exhaustive]` because the provider adds markets: three more (Eurex,
+/// London and Toronto exchange feeds) are listed as coming soon.
+///
+/// [`Nasdaq`](Self::Nasdaq) and [`Cme`](Self::Cme) are exchange feeds sold as their own plans; a
+/// key without one is refused with `403 plan-required`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[non_exhaustive]
+pub enum LseMarketCode {
+    /// US stocks and ETFs.
+    UsStocks,
+    /// UK stocks.
+    UkStocks,
+    /// Canadian stocks.
+    CaStocks,
+    /// European stocks (candles only).
+    EuStocks,
+    /// US option contracts, with Greeks.
+    UsOptions,
+    /// Continuous futures, such as `SP500` and `CRUDEOIL` (no contract chain or expiry).
+    Futures,
+    /// Indices.
+    Indices,
+    /// Forex pairs, spelt `EUR_USD` (candles only).
+    Forex,
+    /// Commodities, spelt `XAU/USD` (candles only).
+    Commodities,
+    /// Cryptocurrencies, spelt `BTCUSDT`.
+    Crypto,
+    /// Nasdaq TotalView (an exchange plan).
+    Nasdaq,
+    /// CME Group contracts, spelt `ESZ6` (an exchange plan).
+    Cme,
+}
+
+impl LseMarketCode {
+    /// Every market this integration knows, in the provider's listing order.
+    pub const ALL: [Self; 12] = [
+        Self::Futures,
+        Self::UsStocks,
+        Self::UkStocks,
+        Self::CaStocks,
+        Self::Indices,
+        Self::Nasdaq,
+        Self::Cme,
+        Self::Forex,
+        Self::Commodities,
+        Self::EuStocks,
+        Self::UsOptions,
+        Self::Crypto,
+    ];
+
+    /// The provider's folder name, sent as `market` on every `/v3` route.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UsStocks => "us_stocks",
+            Self::UkStocks => "uk_stocks",
+            Self::CaStocks => "ca_stocks",
+            Self::EuStocks => "eu_stocks",
+            Self::UsOptions => "us_options",
+            Self::Futures => "futures",
+            Self::Indices => "indices",
+            Self::Forex => "forex",
+            Self::Commodities => "commodities",
+            Self::Crypto => "crypto",
+            Self::Nasdaq => "nasdaq",
+            Self::Cme => "cme",
+        }
+    }
+}
+
+/// The REST spelling of an instrument registered under its websocket spelling.
+///
+/// LSE spells one instrument two ways: the websocket's (`EUR/USD`, `VOD.L`, `SP500.F`, `BTC/USD`,
+/// `AAPL261120C00100000`), which is what instruments are registered under so live ticks match
+/// without translation, and the REST catalogue's (`EUR_USD`, `VOD`, `SP500`, `BTCUSDT`,
+/// `AAPL  261120C00100000`), which every `/v3` market data route takes. This maps the first to the
+/// second for `market`:
+///
+/// | Market | Websocket | REST |
+/// |---|---|---|
+/// | forex | `EUR/USD` | `EUR_USD` |
+/// | futures | `SP500.F` | `SP500` |
+/// | UK, EU, Canadian stocks | `VOD.L`, `ASML.EU`, `RY.TO` | `VOD`, `ASML`, `RY` |
+/// | crypto | `BTC/USD` | `BTCUSDT` |
+/// | US options | `AAPL261120C00100000` | `AAPL  261120C00100000` |
+/// | anything else | unchanged | unchanged |
+///
+/// # ⚠️ Crypto is listed against Tether on REST
+/// The provider labels a crypto pair `/USD` on the websocket and lists it against Tether on REST
+/// (`BTC/USD` is `BTCUSDT`), as its own client maps it. A candle fetched for `BTC/USD` is therefore
+/// a `USDT` price on an instrument registered in `USD`: close, but not the same asset. A pair quoted
+/// in anything but `USD` maps to its base and quote run together (`ETH/BTC` is `ETHBTC`).
+///
+/// # Errors
+/// [`LseError::InvalidInput`] when `symbol` lacks the websocket form its market needs: no `.L`,
+/// `.EU`, `.TO` or `.F` suffix, no `/` in a forex or crypto pair, or not an OSI option symbol. Such
+/// a name is probably registered under the REST spelling, which the quote-asset check could not
+/// verify.
+pub fn rest_symbol_for(market: LseMarketCode, symbol: &str) -> Result<SmolStr, LseError> {
+    let invalid = |form: &str| LseError::InvalidInput {
+        message: format!(
+            "{symbol:?} is not a {market} symbol in the websocket form {form}, which LSE \
+             instruments are registered under"
+        ),
+    };
+    let strip = |suffix: &str| {
+        symbol
+            .len()
+            .checked_sub(suffix.len())
+            .filter(|&split| split > 0)
+            .and_then(|split| {
+                let (head, tail) = (symbol.get(..split)?, symbol.get(split..)?);
+                tail.eq_ignore_ascii_case(suffix)
+                    .then(|| SmolStr::new(head))
+            })
+    };
+
+    match market {
+        LseMarketCode::Forex => symbol
+            .split_once('/')
+            .map(|(base, quote)| format_smolstr!("{base}_{quote}"))
+            .ok_or_else(|| invalid("`EUR/USD`")),
+        LseMarketCode::Futures => strip(".F").ok_or_else(|| invalid("`SP500.F`")),
+        LseMarketCode::UkStocks => strip(".L").ok_or_else(|| invalid("`VOD.L`")),
+        LseMarketCode::EuStocks => strip(".EU").ok_or_else(|| invalid("`ASML.EU`")),
+        LseMarketCode::CaStocks => strip(".TO").ok_or_else(|| invalid("`RY.TO`")),
+        LseMarketCode::Crypto => symbol
+            .split_once('/')
+            .map(|(base, quote)| {
+                if quote.eq_ignore_ascii_case("USD") {
+                    format_smolstr!("{base}USDT")
+                } else {
+                    format_smolstr!("{base}{quote}")
+                }
+            })
+            .ok_or_else(|| invalid("`BTC/USD`")),
+        LseMarketCode::UsOptions => crate::exchange::lse::options::rest_symbol(symbol)
+            .ok_or_else(|| invalid("`AAPL261120C00100000`")),
+        LseMarketCode::UsStocks
+        | LseMarketCode::Indices
+        | LseMarketCode::Commodities
+        | LseMarketCode::Nasdaq
+        | LseMarketCode::Cme => Ok(SmolStr::new(symbol)),
+    }
+}
+
+impl std::fmt::Display for LseMarketCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LseMarketCode {
+    type Err = LseError;
+
+    /// Parse a folder name, as `/v3/markets` and `/v3/usage` spell it.
+    ///
+    /// # Errors
+    /// [`LseError::UnknownMarket`] for a folder this integration does not know, such as a market
+    /// the provider added since.
+    fn from_str(folder: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|market| market.as_str() == folder)
+            .ok_or_else(|| LseError::UnknownMarket(folder.to_owned()))
+    }
+}
+
 /// A London Strategic Edge price dataset.
 ///
 /// The provider also publishes reference datasets (bond yields, credit indices, economics, …).
@@ -660,6 +831,71 @@ impl<InstrumentKey> LseInstrument for MarketInstrumentData<InstrumentKey> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
+    #[test]
+    fn every_market_round_trips_through_its_folder_name() {
+        for market in LseMarketCode::ALL {
+            assert_eq!(market.as_str().parse::<LseMarketCode>().unwrap(), market);
+            assert_eq!(market.to_string(), market.as_str());
+        }
+    }
+
+    #[test]
+    fn websocket_spellings_map_to_rest_spellings() {
+        for (market, websocket, rest) in [
+            (LseMarketCode::Forex, "EUR/USD", "EUR_USD"),
+            (LseMarketCode::Futures, "SP500.F", "SP500"),
+            (LseMarketCode::UkStocks, "VOD.L", "VOD"),
+            (LseMarketCode::UkStocks, "bp.l", "bp"),
+            (LseMarketCode::EuStocks, "ASML.EU", "ASML"),
+            (LseMarketCode::CaStocks, "RY.TO", "RY"),
+            (LseMarketCode::Crypto, "BTC/USD", "BTCUSDT"),
+            (LseMarketCode::Crypto, "ETH/BTC", "ETHBTC"),
+            (
+                LseMarketCode::UsOptions,
+                "AAPL261120C00100000",
+                "AAPL  261120C00100000",
+            ),
+            (LseMarketCode::UsStocks, "AAPL", "AAPL"),
+            (LseMarketCode::Commodities, "XAU/USD", "XAU/USD"),
+        ] {
+            assert_eq!(
+                rest_symbol_for(market, websocket).unwrap(),
+                rest,
+                "{market} {websocket}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_without_its_markets_websocket_form_is_refused() {
+        for (market, symbol) in [
+            (LseMarketCode::UkStocks, "VOD"),
+            (LseMarketCode::UkStocks, ".L"),
+            // The suffix's width from the end falls inside the three-byte `€`.
+            (LseMarketCode::UkStocks, "VOD€"),
+            (LseMarketCode::Forex, "EUR_USD"),
+            (LseMarketCode::Crypto, "BTCUSDT"),
+            (LseMarketCode::Futures, "SP500"),
+            (LseMarketCode::UsOptions, "AAPL"),
+        ] {
+            assert!(
+                matches!(
+                    rest_symbol_for(market, symbol),
+                    Err(LseError::InvalidInput { .. })
+                ),
+                "{market} {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_folder_is_a_typed_error() {
+        assert!(matches!(
+            "xeur".parse::<LseMarketCode>(),
+            Err(LseError::UnknownMarket(folder)) if folder == "xeur"
+        ));
+    }
+
     use super::*;
 
     #[test]

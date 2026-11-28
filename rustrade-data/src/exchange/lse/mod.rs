@@ -1,99 +1,81 @@
 //! London Strategic Edge market data (behind the `lse` feature) — ⚠️ the retrieved data is **not
-//! redistributable**.
+//! redistributable**, and use by or for an organisation needs the provider's licence.
 //!
-//! A free, no-account market-data provider covering FX, equities, ETFs, crypto, commodities,
-//! indices, futures and options, plus reference and macroeconomic series.
+//! A market-data provider covering US, UK, Canadian and European stocks, ETFs, US options with
+//! Greeks, forex, crypto, commodities, indices and futures, plus macroeconomic series. A free key
+//! comes with a free account; exchange feeds (Nasdaq TotalView, CME Group) are paid plans.
 //!
-//! # ⚠️ Licensing — the data is NOT redistributable
+//! # Surfaces
+//! - **History** comes from LSE Data 3.0 (`https://download.londonstrategicedge.com/v3`) through
+//!   [`client::LseClient`]: the key's plan in [`usage`], the catalogue in [`catalogue`], candles in
+//!   [`historical`], option prints, chains, candles and Greeks in [`options`], and a candle replay
+//!   for backtests in [`backtest`].
+//! - **Live** ticks stream over the provider's websocket through the `Lse*` connectors below.
+//! - The pre-3.0 modules still here ([`vault`], [`data_api`], [`export`], [`bond_yield`],
+//!   [`calendar`], [`quota`]) talk to hosts the provider has retired and are being replaced.
+//!
+//! # Licensing
 //! This integration's **code** is MIT-licensed like the rest of this repository. **The data it
-//! retrieves is not.** London Strategic Edge permits use for your own research, trading and model
-//! training — including commercially — but **prohibits redistributing, reselling, or otherwise
-//! making the data available to third parties**, in bulk or through any competing feed, download
-//! service or interface. Their own client library being MIT-licensed covers *that client only* and
-//! confers no rights in the data; the same split applies here.
+//! retrieves is not.** The provider's licence (<https://londonstrategicedge.com/licence>, version
+//! 2026-11-10) allows an account's data for **its holder's own personal use**: their own research,
+//! their own trading and training their own models, and sharing charts and results they produce.
+//! Otherwise:
+//! - **No distribution.** Supplying, showing, publishing or making the data available to anyone
+//!   else, in any form, or running a product or service on it, needs a licence from the provider.
+//!   Storing, resampling or aggregating the data does not make it yours.
+//! - **Organisations need a licence.** Use by or for a company, a fund or any other organisation
+//!   (a startup, a non-profit, paid work for clients) needs the provider's licence. The provider
+//!   exempts one person trading only their own money through their own company.
+//! - **Exchange data** (Nasdaq, CME Group) is also under that exchange's subscriber terms and must
+//!   be deleted when the plan for it ends.
+//! - **History can change**: the provider corrects errors and rebuilds history, so a stored copy
+//!   can go stale.
 //!
-//! In practice: do not commit retrieved data to a public repository, do not publish it as fixtures
-//! or example datasets, and do not re-serve it. Terms: <https://londonstrategicedge.com/terms>
+//! This library is a tool each user runs with their own key, which the licence allows. In
+//! practice: do not commit retrieved data to a public repository, do not publish it as fixtures or
+//! example datasets, and do not re-serve it. The provider's own client being MIT-licensed covers
+//! that client only and confers no rights in the data; the same split applies here. Terms:
+//! <https://londonstrategicedge.com/terms>.
 //!
 //! # Data characteristics
-//! Properties that will silently mislead if assumed away:
+//! Properties that will silently mislead if assumed away. Those marked *pre-3.0* were measured on
+//! the provider's previous API and have not been re-measured on LSE Data 3.0.
 //!
-//! - **FX candles are BID candles — not mid, and not last.** Reconciling a day of `EUR/USD`
-//!   one-minute bars against the tick tape for the same day, open/high/low/close matched the
-//!   **bid** series on 1421 of 1421 minutes and matched the mid or the ask on none. So a backtest
-//!   that fills at the candle close is filling at the bid — systematically favourable by a full
-//!   spread on every buy, in the provider's deepest dataset. This cannot be corrected here without
-//!   inventing a spread. Equity candles, by contrast, track the trade tape; the asymmetry is real
-//!   and per-dataset.
-//! - **Candle volume is not a dependable figure.** For FX the vault omits the field entirely, which
-//!   is modelled as `None` rather than a zero — a zero would aggregate into a legitimate-looking
-//!   total at every derived resolution. (The provider's other host reports a volume for the same
-//!   bar; this integration uses the vault, which does not.) Where the field *is* published it is
-//!   still unreliable: a majority of sampled one-minute equity bars reported `0` in minutes the
-//!   tick tape shows real trades, and one daily series carried a contiguous band roughly 2,000×
-//!   too large. A literal `0` is passed through as `Some(0)`; rewriting it to `None` would be this
-//!   library inventing a fact, and `None` is reserved for a column the provider does not publish.
-//!   Validate before trading on it.
-//! - **⚠️ Candle volume has additionally been reported wrong by three to four orders of magnitude
-//!   since 2026-04-27, in opposite directions on ETFs and on equities.** Unlike the rest of this
-//!   list, which is measured here, this is a third-party report on the provider's public issue
-//!   tracker — repeated across symbols and dates, and unanswered. **ETFs over-report**: a `QQQ`
-//!   one-minute bar was published at 189,272,655,373 against a consolidated **daily** figure of
-//!   33,118,600 for the same session — roughly 5,700× the whole day inside one minute — on
-//!   `QQQ`, `SPY`, `IWM`, `SMH`, `XLE`, `XLF`, `TLT`, every trading day sampled over two months.
-//!   **Equities under-report**: `AAPL`, `MSFT` and `NVDA` daily totals ran at 24–45% of the
-//!   consolidated tape, against 65–80% before the same date, which is the ordinary
-//!   primary-venue-versus-consolidated gap. Splits and liquidity stress were both ruled out by
-//!   the reporter. This integration decodes those figures faithfully, and a shape check passes on
-//!   them: the bars are structurally valid and semantically wrong, so nothing in band distinguishes
-//!   them from correct ones. **Reconcile volume against a second source before sizing anything on
-//!   it**, and treat a volume-derived signal — VWAP, a liquidity filter, a participation-rate
-//!   model — as unusable on this feed until you have.
-//! - **⚠️ History depth varies per dataset and is far shallower than the headline suggests on
-//!   some of them.** `QQQ` in the `etf` dataset was reported carrying a first tick of 2026-04-27
-//!   and 0.2 years of coverage — roughly three months of spot — while options on the same ticker
-//!   reach back to 2014 and equities are stated to reach 2004. Depth is a per-symbol,
-//!   per-dataset property, discoverable from the `first_tick` and `years` fields the provider's
-//!   catalog publishes for each entry. **That catalog is on the discovery host and is not wrapped
-//!   by this integration**, so nothing here can check a requested range against it: a backtest
-//!   asking for years that a symbol does not have receives the bars that exist and no indication
-//!   that the rest were never published. Check depth per symbol before choosing a range.
-//! - **Non-trading days are emitted as FLAT bars, not omitted — daily series are not sparse.**
-//!   Every sampled Saturday and the US Independence Day observance returned a bar with
-//!   `open == high == low == close`; Sundays are absent. A backtest therefore sees a tradeable
-//!   price on a closed market, and the only signal is the flat OHLC. Intraday bars *are* sparse
-//!   (no-trade minutes are absent rather than zero-filled), so the two resolutions differ.
-//! - **These are CFD and aggregated-spot series, not exchange instruments.** `XAU/USD` is spot
-//!   gold rather than a COMEX contract, `SPX500/USD` is a CFD rather than an index or its future,
-//!   and `ES.F` is a continuous front-month proxy with **no contract chain, expiry or roll**.
-//!   There is no venue attribution anywhere in the feed.
+//! - **History is aggregated on request.** The provider builds a candle from the ticks inside the
+//!   window it is asked for, so a window cut mid-period returns a fragment that looks whole.
+//!   [`LseClient::fetch_candles`](client::LseClient::fetch_candles) aligns its windows to whole
+//!   periods for this reason.
+//! - **Crypto is listed against Tether on REST** (`BTCUSDT`) and labelled `/USD` on the websocket
+//!   (`BTC/USD`); see [`market::rest_symbol_for`].
+//! - **These are the provider's own series, not exchange instruments.** The provider states that
+//!   the prices in its own markets are produced with its own methodology and are not represented
+//!   as matching any exchange's published price. `XAU/USD` is spot gold rather than a COMEX
+//!   contract, and a futures symbol such as `SP500` is a continuous proxy with **no contract chain,
+//!   expiry or roll**.
 //! - **Crypto is an aggregated tape**: no funding rates, no liquidations, no venue. It is not a
 //!   substitute for a native exchange connector.
-//! - **The live tick is a QUOTE, not a print.** Its `price` equals its `bid` on every sample taken
-//!   — 3,966 of 3,966 ticks across every dataset family. Both [`PublicTrades`] and [`OrderBooksL1`]
-//!   are served from it, but a trade decoded this way is a bid-side quote wearing a trade's shape
-//!   and is not evidence that a transaction occurred. See [`trade`] for the mapping and its
-//!   reasoning.
-//! - **Live tick `volume` is real on two venues and FABRICATED on two others**, with no in-band
-//!   signal separating them. [`LseCrypto`] and [`LseEquities`] carry a genuine per-tick size, which
-//!   reconciles exactly against the provider's own one-minute candles (ratio `1.000`).
-//!   **[`LseFx`] and [`LseCfd`] carry a hard-coded `1.0`** on every tick of every symbol sampled —
-//!   a placeholder that will aggregate into a legitimate-looking total at any resolution, so
-//!   volume-weighted prices and size filters on those two venues are meaningless rather than merely
-//!   imprecise. Note this differs from the REST vault, which *omits* FX volume entirely; the
-//!   WebSocket invents a value instead.
-//! - **Identical consecutive live ticks are genuine and are never de-duplicated.** Barely a third
-//!   of a sampled run was unique on `(ts, price, bid, ask, volume)`, yet removing the repeats
-//!   destroyed 3–10% of volume that otherwise reconciles exactly. Do not add a de-duplication
-//!   filter; a test pins that both are emitted.
-//! - **London (`.L`) listings are quoted in PENCE**, and the catalog reports no unit. They are
-//!   quoted in GBX, an asset distinct from GBP; see
+//! - *Pre-3.0*: **FX candles were BID candles** — not mid, and not last: a day of `EUR/USD`
+//!   one-minute bars matched the bid series on 1421 of 1421 minutes. A backtest filling at the
+//!   candle close would fill at the bid. Check this on 3.0 data before relying on either reading.
+//! - *Pre-3.0*: **candle volume was not dependable**: a majority of sampled one-minute equity bars
+//!   reported `0` in minutes the tick tape showed trades, and a third-party report on the
+//!   provider's issue tracker found ETF volume three to four orders of magnitude too large from 2026-04-27.
+//!   Reconcile volume against a second source before sizing anything on it.
+//! - **The live tick is a QUOTE, not a print.** Its `price` equalled its `bid` on every sample
+//!   taken — 3,966 of 3,966 ticks across every dataset family. Both [`PublicTrades`] and
+//!   [`OrderBooksL1`] are served from it, but a trade decoded this way is a bid-side quote wearing
+//!   a trade's shape and is not evidence that a transaction occurred. See [`trade`].
+//! - **Live tick `volume` was real on two venues and FABRICATED on two others**, with no in-band
+//!   signal separating them. [`LseCrypto`] and [`LseEquities`] carried a genuine per-tick size;
+//!   **[`LseFx`] and [`LseCfd`] carried a hard-coded `1.0`** on every tick sampled, so
+//!   volume-weighted prices and size filters on those two are meaningless.
+//! - **Identical consecutive live ticks are genuine and are never de-duplicated.** Removing the
+//!   repeats destroyed 3–10% of volume that otherwise reconciled exactly; a test pins that both are
+//!   emitted.
+//! - **London (`.L`) listings are quoted in PENCE** (GBX, an asset distinct from GBP); see
 //!   [`market::quote_asset`].
-//! - **Option greeks are print-triggered, not continuous**: they arrive only with a trade, so a
-//!   contract's greeks are as stale as its last print and an unheld, untraded contract is never
-//!   marked. See [`options`].
-//! - **Dataset slugs are not instrument identities** and do not uniquely identify a series; see
-//!   [`market::slug`].
+//! - **Option Greeks follow trades**: a contract that does not trade is not marked. See
+//!   [`options`].
 
 // A module carries an outer `///` here only when its own file has no `//!` documentation.
 // Supplying both makes rustdoc resolve the file's inner links in THIS module's scope rather than
@@ -106,8 +88,12 @@ pub mod bond_yield;
 
 pub mod calendar;
 
+pub mod catalogue;
+
 /// The WebSocket channel a subscription maps to.
 pub mod channel;
+
+pub mod client;
 
 pub mod connection;
 
@@ -137,8 +123,6 @@ pub mod quota;
 
 pub mod quote;
 
-pub mod reference;
-
 pub mod resume;
 
 pub mod stream;
@@ -151,7 +135,9 @@ pub mod trade;
 
 pub mod transformer;
 
-// HTTP plumbing shared by the provider's two hosts; documented in its own file.
+pub mod usage;
+
+// HTTP plumbing shared by the REST clients; documented in its own file.
 pub(crate) mod transport;
 
 pub mod vault;
